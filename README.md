@@ -68,3 +68,7 @@ tests/CodeCarver.Tests    xUnit suite (fast) + build-verify (compiles carved out
 docs/USAGE.md             how to use it        DESIGN.txt   architecture + rationale
 docs/TOOLING.md           toolchain adapters   docs/TESTING.md   test strategy
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE). © 2026 RelentlessOldMan.
