@@ -16,7 +16,7 @@ minimal slice that still **builds, links, and runs**.
 > ⚠️ **WIP — not yet validated on a real-world production build.** The engine works and the carved
 > output compiles across 20+ open-source repos (below), but it hasn't been proven on a large
 > proprietary target yet. Treat `--prune` (intra-file) as experimental; file-level carving is the
-> sound default. Feedback and bug reports welcome.
+> sound default.
 >
 > Status: **working for C, C++, C#, and TRACE32 `.cmm`.** Tree-sitter front-end, deterministic reachability engine,
 > `#ifdef` resolution, build-log scraping, and an emitter that does both **file-level** and
@@ -68,6 +68,10 @@ tests/CodeCarver.Tests    xUnit suite (fast) + build-verify (compiles carved out
 docs/USAGE.md             how to use it        DESIGN.txt   architecture + rationale
 docs/TOOLING.md           toolchain adapters   docs/TESTING.md   test strategy
 ```
+
+## Contributing
+
+This is a personal tool, published as-is — **issues and pull requests aren't accepted** (PRs auto-close). Fork it and make it your own. 🔪
 
 ## License
 
