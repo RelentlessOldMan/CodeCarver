@@ -44,6 +44,23 @@ CodeCarver handles those by discovering the implicit roots and modelling the non
 edges conservatively: when a target can't be resolved, it keeps the candidate set, trading
 a little precision to never break the build.
 
+## Real results — compiled *image*, not source bytes
+
+The headline number is what lands on the target, so the harness compiles the full build vs. the
+carved build with the pinned gcc at `-Os` and compares the code+data footprint (`text+data` from
+`size` — the bytes that occupy flash), independent of any linker `--gc-sections`:
+
+| Repo | Carve to | Full image | Carved image | Smaller |
+|---|---|---:|---:|---:|
+| cJSON | `cJSON_Parse/Print/Delete` | 21,168 B | 5,388 B | **75%** |
+| tinyexpr | `te_interp` | 34,196 B | 8,356 B | **76%** |
+| qrcodegen | `encodeText`, `getModule` | 10,228 B | 9,388 B | 8% |
+
+Even *with* `-Os` already dead-stripping within each file, the carve removes what the optimizer
+can't: functions that are externally visible (non-`static` API) but unreachable from *your* chosen
+entry points. (qrcodegen is mostly lookup tables that the chosen roots genuinely need — an honest,
+low-win case.) These are asserted per-build in the test suite (`CompiledImageSize_Shrinks_*`).
+
 ## Build & test
 
 ```powershell

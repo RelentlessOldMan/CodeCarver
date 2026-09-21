@@ -17,6 +17,9 @@ namespace CodeCarver.Tests.BuildVerify;
 /// </summary>
 public class BuildVerifyTests
 {
+    private readonly Xunit.Abstractions.ITestOutputHelper _out;
+    public BuildVerifyTests(Xunit.Abstractions.ITestOutputHelper output) => _out = output;
+
     private const string AppC = """
         #include "util.h"
 
@@ -334,6 +337,100 @@ public class BuildVerifyTests
         {
             if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
         }
+    }
+
+    // The headline metric is IMAGE size (what's loaded onto the target), not source bytes. These measure
+    // the real compiled footprint — text+data of the -Os object code, the parts that occupy flash — for
+    // the full build vs the carved build, and assert the carve never grows it. Numbers are surfaced via
+    // test output. Chosen repos have a genuine intra-file win (a few API entry points out of many funcs).
+    [Fact]
+    public void CompiledImageSize_Shrinks_cJSON() =>
+        AssertCarveShrinksCompiledSize("cJSON", "cJSON.h",
+            new[] { "cJSON_Parse", "cJSON_Print", "cJSON_Delete" }, exclude: new[] { "test.c" });
+
+    [Fact]
+    public void CompiledImageSize_Shrinks_Tinyexpr() =>
+        AssertCarveShrinksCompiledSize("tinyexpr", "tinyexpr.h",
+            new[] { "te_interp" }, exclude: Array.Empty<string>());
+
+    [Fact]
+    public void CompiledImageSize_Shrinks_Qrcodegen() =>
+        AssertCarveShrinksCompiledSize(Path.Combine("qrcodegen", "c"), "qrcodegen.h",
+            new[] { "qrcodegen_encodeText", "qrcodegen_getModule" },
+            exclude: new[] { "qrcodegen-demo.c", "qrcodegen-test.c" });
+
+    /// <summary>
+    /// Carve+prune a repo, then compile BOTH the original and the carved .c files with the pinned gcc at
+    /// <c>-Os</c> and compare their real code+data footprint (text+data from <c>size</c>) — the honest
+    /// "how much smaller is the image" number, independent of any linker --gc-sections. Asserts the carve
+    /// never grows the image and reports the reduction.
+    /// </summary>
+    private void AssertCarveShrinksCompiledSize(string repoName, string sentinel, string[] roots, string[] exclude)
+    {
+        var gcc = FindGcc();
+        var size = gcc is null ? null : Path.Combine(Path.GetDirectoryName(gcc)!, "size.exe");
+        if (gcc is null || size is null || !File.Exists(size)) return;
+        var repo = FindUp(Path.Combine(".corpus", repoName));
+        if (repo is null || !File.Exists(Path.Combine(repo, sentinel))) return;
+
+        var work = Path.Combine(Path.GetTempPath(), $"codecarver-size-{repoName}-" + Guid.NewGuid().ToString("N"));
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(work);
+        try
+        {
+            var inputs = Directory.EnumerateFiles(repo, "*.*")
+                .Where(p => p.EndsWith(".c", StringComparison.OrdinalIgnoreCase) ||
+                            p.EndsWith(".h", StringComparison.OrdinalIgnoreCase))
+                .Select(p => (Path.GetFileName(p), File.ReadAllText(p)))
+                .ToList();
+
+            using var fe = new CFrontEnd();
+            var graph = fe.BuildGraph(inputs);
+            var plan = ReachabilityEngine.Compute(graph,
+                new ExplicitRootProvider(symbols: roots).Discover(graph).ToList());
+            FileTreeEmitter.EmitPruned(plan, graph, repo, outDir);
+
+            // Full footprint: every original .c that isn't excluded. Carved footprint: whatever the carve
+            // emitted (dropped files simply aren't there → contribute 0). Same compiler + flags for both.
+            long full = ImageBytes(gcc, size, repo, Directory.EnumerateFiles(repo, "*.c"), exclude, repo);
+            long carved = ImageBytes(gcc, size, outDir, Directory.EnumerateFiles(outDir, "*.c"), exclude, repo);
+
+            var pct = full > 0 ? 100.0 * (full - carved) / full : 0;
+            _out.WriteLine($"{repoName}: compiled image (text+data, -Os)  full {full:N0} B -> carved {carved:N0} B  ({pct:F0}% smaller)");
+            Assert.True(carved <= full, $"{repoName}: carve GREW the compiled image ({full} -> {carved})");
+            Assert.True(carved < full, $"{repoName}: carve saved nothing (both {full} B) — expected an intra-file win");
+        }
+        finally
+        {
+            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+        }
+    }
+
+    /// <summary>Sum of text+data (bytes that land in the image) across the given .c files, compiled -Os.</summary>
+    private long ImageBytes(string gcc, string size, string cwd, IEnumerable<string> cFiles, string[] exclude, string includeDir)
+    {
+        long total = 0;
+        var i = 0;
+        foreach (var c in cFiles)
+        {
+            if (exclude.Contains(Path.GetFileName(c))) continue;
+            var obj = $"m{i++}.o";
+            var (code, _) = Run(gcc, new[] { "-c", "-Os", "-g0", "-I.", "-I" + includeDir, Path.GetFileName(c), "-o", obj }, cwd);
+            if (code != 0) continue; // an include-only TU (e.g. mimalloc) — skip; both sides skip it identically
+            var (sc, so) = Run(size, new[] { obj }, cwd);
+            if (sc == 0) total += ParseSizeTextData(so);
+        }
+        return total;
+    }
+
+    /// <summary>Parse binutils <c>size</c> default output; return text+data of the data row.</summary>
+    private static long ParseSizeTextData(string sizeOutput)
+    {
+        // Two lines: "   text   data    bss    dec ...", then the numbers. Sum text+data.
+        var lines = sizeOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (lines.Length < 2) return 0;
+        var cols = lines[1].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return cols.Length >= 2 && long.TryParse(cols[0], out var t) && long.TryParse(cols[1], out var d) ? t + d : 0;
     }
 
     [Fact]
