@@ -1,0 +1,344 @@
+using CodeCarver.Core.Emit;
+using CodeCarver.Core.Frontend;
+using CodeCarver.Core.Graph;
+using CodeCarver.Core.Preprocess;
+using CodeCarver.Core.Reachability;
+using CodeCarver.Core.Roots;
+using CodeCarver.Frontend;
+
+// CodeCarver CLI — early scaffold. Real subcommands (ingest compile_commands, carve, emit) land as the
+// front-end is built. For now `demo` exercises the deterministic engine end-to-end so the pipeline is
+// runnable and observable from day one.
+
+var cmd = args.Length > 0 ? args[0] : "demo";
+switch (cmd)
+{
+    case "demo":
+        RunDemo();
+        return 0;
+    case "carve":
+        return RunCarve(args);
+    case "scan-log":
+        return RunScanLog(args);
+    case "--version":
+    case "version":
+        Console.WriteLine("CodeCarver 0.0.1 (scaffold)");
+        return 0;
+    default:
+        Console.Error.WriteLine($"unknown command '{cmd}'. try: carve <dir> --roots a,b | demo | version");
+        return 2;
+}
+
+static int RunScanLog(string[] args)
+{
+    if (args.Length < 2 || !File.Exists(args[1]))
+    {
+        Console.Error.WriteLine("usage: scan-log <build-log-file>");
+        return 2;
+    }
+
+    var cmds = BuildLogScraper.Parse(File.ReadAllText(args[1]));
+    var units = cmds.Select(c => c.File).Distinct().Count();
+    var defines = cmds.SelectMany(c => c.Defines).Distinct().OrderBy(x => x, StringComparer.Ordinal).ToList();
+    var includes = cmds.SelectMany(c => c.Includes).Distinct().OrderBy(x => x, StringComparer.Ordinal).ToList();
+
+    Console.WriteLine($"scan-log {args[1]}");
+    Console.WriteLine($"  compile commands : {cmds.Count}");
+    Console.WriteLine($"  translation units: {units}");
+    Console.WriteLine($"  distinct defines : {(defines.Count == 0 ? "(none)" : string.Join(", ", defines.Take(25)))}");
+    Console.WriteLine($"  distinct includes: {(includes.Count == 0 ? "(none)" : string.Join(", ", includes.Take(25)))}");
+    foreach (var c in cmds.Take(5))
+        Console.WriteLine($"    {c.File}  -D[{string.Join(" ", c.Defines)}]  -I[{string.Join(" ", c.Includes)}]");
+    return 0;
+}
+
+static int RunCarve(string[] args)
+{
+    if (args.Length < 2 || !Directory.Exists(args[1]))
+    {
+        Console.Error.WriteLine("usage: carve <dir> --roots sym1,sym2");
+        return 2;
+    }
+    var dir = args[1];
+
+    var roots = Array.Empty<string>();
+    string? outDir = null;
+    var prune = false;
+    var dumpSpans = false;
+    var lang = "c";
+    var defineSpecs = new List<string>();
+    string? buildLog = null;
+    var closedWorld = false;
+    string? manifestPath = null;
+    var excludeDirs = new List<string>();
+    string? probeCompiler = null;
+
+    // A --config JSON file supplies defaults; explicit CLI flags below override it.
+    for (var i = 2; i < args.Length - 1; i++)
+    {
+        if (args[i] != "--config") continue;
+        var cfg = System.Text.Json.JsonSerializer.Deserialize<CarveConfig>(File.ReadAllText(args[i + 1]),
+            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true, ReadCommentHandling = System.Text.Json.JsonCommentHandling.Skip });
+        if (cfg is null) continue;
+        if (cfg.Roots is not null) roots = cfg.Roots;
+        if (cfg.Lang is not null) lang = cfg.Lang.ToLowerInvariant();
+        if (cfg.Out is not null) outDir = cfg.Out;
+        if (cfg.Prune is not null) prune = cfg.Prune.Value;
+        if (cfg.Defines is not null) defineSpecs.AddRange(cfg.Defines);
+        if (cfg.BuildLog is not null) buildLog = cfg.BuildLog;
+        if (cfg.AssumeDefinesComplete is not null) closedWorld = cfg.AssumeDefinesComplete.Value;
+        if (cfg.Exclude is not null) excludeDirs.AddRange(cfg.Exclude);
+        if (cfg.Manifest is not null) manifestPath = cfg.Manifest;
+    }
+
+    for (var i = 2; i < args.Length; i++)
+    {
+        if (args[i] == "--config") { i++; continue; } // already loaded above
+        if (args[i] == "--roots" && i + 1 < args.Length)
+            roots = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        else if (args[i] == "--out" && i + 1 < args.Length)
+            outDir = args[++i];
+        else if (args[i] == "--prune")
+            prune = true;
+        else if (args[i] == "--lang" && i + 1 < args.Length)
+            lang = args[++i].ToLowerInvariant();
+        else if (args[i] == "--define" && i + 1 < args.Length)
+            defineSpecs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        else if (args[i] == "--build-log" && i + 1 < args.Length)
+            buildLog = args[++i];
+        else if (args[i] == "--assume-defines-complete")
+            closedWorld = true;
+        else if (args[i] == "--manifest" && i + 1 < args.Length)
+            manifestPath = args[++i];
+        else if (args[i] == "--exclude" && i + 1 < args.Length)
+            excludeDirs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        else if (args[i] == "--probe" && i + 1 < args.Length)
+            probeCompiler = args[++i];
+        else if (args[i] == "--dump-spans")
+            dumpSpans = true;
+    }
+
+    // Preprocessor config: explicit --define plus any -D flags scraped from a --build-log.
+    if (buildLog is not null && File.Exists(buildLog))
+        defineSpecs.AddRange(BuildLogScraper.Parse(File.ReadAllText(buildLog)).SelectMany(c => c.Defines));
+    var defines = defineSpecs.Count > 0 ? MacroTable.FromDefines(defineSpecs) : null;
+
+    // --probe: ask a real compiler for its complete macro set (predefined + target + -D) and resolve
+    // #ifdefs against that in closed-world mode — accurate, no "is my define list complete?" guessing.
+    if (probeCompiler is not null)
+    {
+        var probed = MacroProbe.Probe(probeCompiler, defineSpecs.Select(d => "-D" + d));
+        if (probed is not null) { defines = probed; closedWorld = true; }
+        else Console.Error.WriteLine($"  warning : --probe '{probeCompiler}' could not run; ignoring it (no probe-based #ifdef resolution)");
+    }
+
+    var exts = lang switch
+    {
+        "cpp" => new[] { ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h" },
+        "csharp" or "cs" => new[] { ".cs" },
+        "cmm" => new[] { ".cmm" },
+        _ => new[] { ".c", ".h" },
+    };
+
+    // Intra-file pruning is only compile-verifiable for C/C++; other languages carve file-level.
+    if (prune && lang is not ("c" or "cpp"))
+    {
+        Console.WriteLine($"  note    : --prune is C/C++ only (needs compile verification); using file-level carve for '{lang}'.");
+        prune = false;
+    }
+
+    if (roots.Length == 0)
+    {
+        Console.Error.WriteLine("carve needs --roots sym1,sym2 (the entry symbols to keep)");
+        return 2;
+    }
+
+    var paths = Directory.EnumerateFiles(dir, "*.*", SearchOption.AllDirectories)
+        .Where(p => exts.Any(e => p.EndsWith(e, StringComparison.OrdinalIgnoreCase)))
+        .Where(p => excludeDirs.Count == 0 ||
+                    !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase)))
+        .ToList();
+    if (paths.Count == 0)
+    {
+        Console.Error.WriteLine($"no {lang} source files found under {dir}");
+        return 2;
+    }
+
+    var inputs = paths.Select(p => (Path.GetRelativePath(dir, p).Replace('\\', '/'), File.ReadAllText(p)));
+    using ICarveFrontEnd fe = lang switch
+    {
+        "cpp" => new CppFrontEnd(),
+        "csharp" or "cs" => new CSharpFrontEnd(),
+        "cmm" => new CmmFrontEnd(),
+        _ => new CFrontEnd(),
+    };
+    var graph = fe.BuildGraph(inputs, defines, closedWorld);
+
+    var rootSet = new ExplicitRootProvider(symbols: roots).Discover(graph).ToList();
+    if (rootSet.Count == 0)
+    {
+        Console.Error.WriteLine($"none of the requested roots were found as symbols: {string.Join(", ", roots)}");
+        return 1;
+    }
+
+    var plan = ReachabilityEngine.Compute(graph, rootSet);
+    var s = plan.Stats;
+
+    if (dumpSpans)
+    {
+        foreach (var n in graph.Nodes
+                     .Where(n => n.Kind is NodeKind.Function or NodeKind.Global or NodeKind.Macro)
+                     .OrderBy(n => n.FilePath, StringComparer.Ordinal)
+                     .ThenBy(n => n.Span.StartLine))
+            Console.WriteLine($"  {(plan.IsKept(n.Id) ? "KEEP" : "drop")} {n.Kind} {n.FilePath}:{n.Span}\t{n.Name}");
+        return 0;
+    }
+
+    // Size accounting: the whole scanned source vs. what the carve keeps (the headline number).
+    long originalBytes = 0;
+    var sizeByRel = new Dictionary<string, long>(StringComparer.Ordinal);
+    foreach (var p in paths)
+    {
+        var len = new FileInfo(p).Length;
+        originalBytes += len;
+        sizeByRel[Path.GetRelativePath(dir, p).Replace('\\', '/')] = len;
+    }
+
+    Console.WriteLine($"CodeCarver — carve of {dir}");
+    Console.WriteLine($"  roots   : {string.Join(", ", roots)}");
+    if (defines is not null)
+        Console.WriteLine($"  config  : {defineSpecs.Distinct().Count()} define(s), #ifdef resolution ON" +
+                          (closedWorld ? " (closed-world: absent macros treated as undefined)" : " (open-world: unknown branches kept)"));
+    Console.WriteLine($"  nodes   : {s.ReachedNodes}/{s.TotalNodes} kept ({s.NodeKeepRatio:P0}), {s.DroppedNodes} carved");
+    Console.WriteLine($"  files   : {s.KeptFiles}/{s.TotalFiles} kept, {s.DroppedFiles} dropped");
+    if (plan.DroppedFiles.Count > 0)
+        Console.WriteLine("  dropped : " + Summarize(plan.DroppedFiles));
+
+    long carvedBytes;
+    if (outDir is not null)
+    {
+        var res = prune
+            ? FileTreeEmitter.EmitPruned(plan, graph, dir, outDir)
+            : FileTreeEmitter.Emit(plan, dir, outDir);
+        carvedBytes = res.BytesWritten;
+        var how = prune ? "pruned (intra-file: unreached functions removed)" : "file-level (whole kept files)";
+        Console.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{how}]");
+        if (prune)
+            Console.WriteLine("  note    : --prune is EXPERIMENTAL — always build-verify. File-level (omit --prune) is the sound default.");
+    }
+    else
+    {
+        carvedBytes = plan.KeptFiles.Sum(f => sizeByRel.TryGetValue(f, out var b) ? b : 0);
+        Console.WriteLine("  (analysis only — pass --out <dir> [--prune] to write the carved tree)");
+    }
+
+    var saved = originalBytes - carvedBytes;
+    var pct = originalBytes > 0 ? (double)saved / originalBytes : 0;
+    Console.WriteLine($"  size    : {originalBytes:N0} B -> {carvedBytes:N0} B  ({pct:P0} smaller, saved {saved:N0} B)");
+
+    if (manifestPath is not null)
+    {
+        var manifest = new
+        {
+            root = dir,
+            roots,
+            lang,
+            defines = defineSpecs.Distinct().ToArray(),
+            closedWorld,
+            pruned = prune,
+            stats = new
+            {
+                s.TotalNodes, s.ReachedNodes, s.DroppedNodes,
+                s.TotalFiles, s.KeptFiles, s.DroppedFiles,
+                originalBytes, carvedBytes, savedBytes = saved,
+            },
+            keptFiles = plan.KeptFiles,
+            droppedFiles = plan.DroppedFiles,
+        };
+        File.WriteAllText(manifestPath,
+            System.Text.Json.JsonSerializer.Serialize(manifest, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+        Console.WriteLine($"  manifest: {manifestPath}");
+    }
+    return 0;
+}
+
+static string Summarize(IReadOnlyList<string> files, int max = 12)
+    => files.Count <= max
+        ? string.Join(", ", files)
+        : string.Join(", ", files.Take(max)) + $", … (+{files.Count - max} more)";
+
+static void RunDemo()
+{
+    // A tiny embedded-flavoured graph that contains every hazard we discussed, so the output shows
+    // the engine handling each: a vector-table ISR, a function-pointer dispatch, a used macro, and
+    // genuinely dead debug code.
+    var b = new GraphBuilder();
+
+    var main = b.Func("main", "main.c", NodeFlags.None, line: 10);
+    var init = b.Func("init", "main.c", line: 30);
+    var runLoop = b.Func("run_loop", "main.c", line: 50);
+    var readSensor = b.Func("read_sensor", "sensor.c", line: 12);
+    var sensorType = b.Type("sensor_t", "sensor.h", line: 4);
+    var scaleMacro = b.Macro("SCALE_MV", "sensor.h", line: 9);
+
+    // A command handler reached ONLY by taking its address and dispatching through a pointer.
+    var dispatch = b.Func("dispatch", "main.c", line: 70);
+    var cmdHandler = b.Func("cmd_handler", "cmd.c", NodeFlags.AddressTaken, line: 20);
+
+    // An ISR reached ONLY via the interrupt vector table — never called in source.
+    var timerIsr = b.Func("Timer_ISR", "isr.c", NodeFlags.AddressTaken, line: 15);
+
+    // Dead code: present in the repo, referenced by nothing reachable.
+    var debugDump = b.Func("unused_debug_dump", "debug.c", line: 8);
+    var debugFmt = b.Func("fmt_hex", "debug.c", line: 40);
+
+    b.Calls(main, init);
+    b.Calls(main, runLoop);
+    b.Calls(main, dispatch);
+    b.Calls(runLoop, readSensor);
+    b.Refs(readSensor, sensorType);
+    b.Expands(readSensor, scaleMacro);
+    b.AddressTaken(dispatch, cmdHandler); // conservative edge: keeps the pointer's target
+    b.Calls(debugDump, debugFmt);         // dead subgraph
+
+    var roots = new List<Root>
+    {
+        new(main, RootKind.EntryPoint, "image entry"),
+        new(timerIsr, RootKind.VectorTable, "IRQ7 -> Timer_ISR"),
+    };
+
+    var safe = ReachabilityEngine.Compute(b.Graph, roots, ReachabilityOptions.Safe);
+    var minimal = ReachabilityEngine.Compute(b.Graph, roots, ReachabilityOptions.MinimalUnsafe);
+
+    Console.WriteLine("CodeCarver demo — carve of a toy embedded image\n");
+    Console.WriteLine($"  nodes total   : {safe.Stats.TotalNodes}");
+    Console.WriteLine($"  nodes kept    : {safe.Stats.ReachedNodes}  ({safe.Stats.NodeKeepRatio:P0})");
+    Console.WriteLine($"  nodes carved  : {safe.Stats.DroppedNodes}");
+    Console.WriteLine($"  files kept    : {string.Join(", ", safe.KeptFiles)}");
+    Console.WriteLine($"  files dropped : {string.Join(", ", safe.DroppedFiles)}");
+
+    Console.WriteLine("\n  why the tricky ones survived:");
+    Console.WriteLine("    " + safe.Explain(timerIsr));
+    Console.WriteLine("    " + safe.Explain(cmdHandler));
+
+    Console.WriteLine("\n  dead code correctly carved:");
+    Console.WriteLine("    " + safe.Explain(debugDump));
+
+    var tax = safe.Stats.ReachedNodes - minimal.Stats.ReachedNodes;
+    Console.WriteLine($"\n  indirection tax (safe - minimal): {tax} node(s) kept only because of");
+    Console.WriteLine("    unresolved function pointers / vtables. Sound carve keeps them; the");
+    Console.WriteLine("    minimal set would have dropped cmd_handler and broken the image.");
+}
+
+sealed class CarveConfig
+{
+    public string[]? Roots { get; set; }
+    public string? Lang { get; set; }
+    public string? Out { get; set; }
+    public bool? Prune { get; set; }
+    public string[]? Defines { get; set; }
+    public string? BuildLog { get; set; }
+    public bool? AssumeDefinesComplete { get; set; }
+    public string[]? Exclude { get; set; }
+    public string? Manifest { get; set; }
+}

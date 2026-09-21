@@ -1,0 +1,13 @@
+<Project>
+
+  <PropertyGroup>
+    <Company>RelentlessOldMan</Company>
+    <Product>CodeCarver</Product>
+    <VersionPrefix>0.0</VersionPrefix>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+</Project>

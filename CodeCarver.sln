@@ -1,0 +1,50 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{33A3F4BA-8204-4B8D-B115-E0B5D5019A40}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodeCarver.Core", "src\CodeCarver.Core\CodeCarver.Core.csproj", "{AE5BE079-04F6-47FE-9293-A1CF798F7019}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodeCarver.Cli", "src\CodeCarver.Cli\CodeCarver.Cli.csproj", "{B6A00C35-6FAF-47B2-AC86-DAA524B3DA9A}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{4B4D24CB-721B-4665-BF31-F914F954CDFB}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodeCarver.Tests", "tests\CodeCarver.Tests\CodeCarver.Tests.csproj", "{6EC532A7-D178-4C4C-9C1B-C5CEEB680D94}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodeCarver.Frontend", "src\CodeCarver.Frontend\CodeCarver.Frontend.csproj", "{C5D86D84-3DDD-4DF6-9123-B0D46655B5B6}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{AE5BE079-04F6-47FE-9293-A1CF798F7019}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AE5BE079-04F6-47FE-9293-A1CF798F7019}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AE5BE079-04F6-47FE-9293-A1CF798F7019}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AE5BE079-04F6-47FE-9293-A1CF798F7019}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B6A00C35-6FAF-47B2-AC86-DAA524B3DA9A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B6A00C35-6FAF-47B2-AC86-DAA524B3DA9A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B6A00C35-6FAF-47B2-AC86-DAA524B3DA9A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B6A00C35-6FAF-47B2-AC86-DAA524B3DA9A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6EC532A7-D178-4C4C-9C1B-C5CEEB680D94}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6EC532A7-D178-4C4C-9C1B-C5CEEB680D94}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6EC532A7-D178-4C4C-9C1B-C5CEEB680D94}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6EC532A7-D178-4C4C-9C1B-C5CEEB680D94}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C5D86D84-3DDD-4DF6-9123-B0D46655B5B6}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C5D86D84-3DDD-4DF6-9123-B0D46655B5B6}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C5D86D84-3DDD-4DF6-9123-B0D46655B5B6}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C5D86D84-3DDD-4DF6-9123-B0D46655B5B6}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{AE5BE079-04F6-47FE-9293-A1CF798F7019} = {33A3F4BA-8204-4B8D-B115-E0B5D5019A40}
+		{B6A00C35-6FAF-47B2-AC86-DAA524B3DA9A} = {33A3F4BA-8204-4B8D-B115-E0B5D5019A40}
+		{6EC532A7-D178-4C4C-9C1B-C5CEEB680D94} = {4B4D24CB-721B-4665-BF31-F914F954CDFB}
+		{C5D86D84-3DDD-4DF6-9123-B0D46655B5B6} = {33A3F4BA-8204-4B8D-B115-E0B5D5019A40}
+	EndGlobalSection
+EndGlobal

@@ -1,0 +1,245 @@
+CodeCarver
+==========
+
+A tool that carves a huge, messy repo down to only the code needed to build and run
+one chosen thing — and removes the unnecessary code inside that thing too. Not merely
+dead-code removal; "unnecessary-code removal" relative to a specific entry set and build
+configuration.
+
+Status: early. The deterministic reachability core, the graph model, the root/edge model,
+a runnable CLI demo, and a green unit-test suite exist (this document + src/ + tests/).
+The language/toolchain front-end (exact preprocessing, real symbol extraction) and the
+emitter (writing the carved tree) are the next milestones. This document is the north
+star and the record of *why* the design is shaped the way it is — the reasons matter more
+than the code.
+
+
+The problem
+-----------
+
+The real target is a ~90 GB polyglot repo (C/C++ dominant, plus .cmm/TRACE32 PRACTICE
+scripts, C#, and others) whose build produces far more than any one use needs. We want
+one image — and only what that image needs, with the bloat inside it removed as well.
+
+The concrete pain that defines success: the produced image is loaded, over a debugger
+link (the .cmm/TRACE32 shape), onto 24 identical chips on a board — the SAME image, not
+24 builds. Each load takes ~3–4 minutes. So load time tracks image size, and every byte
+carved is a byte not loaded 24 times. **Image-size reduction is the headline metric**
+(load saving ≈ size reduction × 24); faster builds are a secondary bonus. Because size
+pays off 24×, going below file granularity to prune unused code inside kept files is
+worth the difficulty.
+
+Hard constraint: the output MUST build and link, and pass whatever tests exercise the
+kept code. This is a "must produce working code" tool. Carving too much (a broken image)
+is a failure; carving too little (leftover fat) is merely suboptimal. The whole design is
+biased accordingly: when unsure, keep.
+
+
+What this is, precisely
+-----------------------
+
+Reachability-based program slicing — the same core idea as a linker's --gc-sections or a
+JS bundler's tree-shaking, generalized to arbitrary languages and to *your* build/run
+configuration. Build a dependency graph (nodes = definitions and containers; edges =
+uses), seed it with roots (what you need), compute the transitive closure, and everything
+outside the closure is unnecessary.
+
+"Dead code" is the special case where the seed is "all public entry points." "Unnecessary
+code" is the general case: unreachable from YOUR specific roots under YOUR build config.
+Same algorithm, different seed.
+
+Two carve granularities:
+  1. File-level  — keep a file if it holds any reachable node (plus what's needed to
+                   compile/parse it: headers, forward decls).
+  2. Intra-file  — within a kept file, keep only the reachable definitions (the 4 of 1000
+                   functions in bob.c). Higher payoff here because of the 24× multiplier,
+                   harder in C/C++ because the preprocessor doesn't respect function
+                   boundaries. Done language-by-language, easiest first.
+
+
+The central design decision: correct-by-construction, single pass
+-----------------------------------------------------------------
+
+There is NO "carve → load on hardware → run → oops → put it back → retry" loop. With a
+90 GB repo and multi-minute loads, trial-and-error is a non-starter. The carve is a single
+deterministic pass, and it is exact given two things:
+
+  1. The exact build configuration — the -D defines and include paths for the one image.
+     The preprocessor is RESOLVED, not guessed: the front-end runs the real preprocessor
+     with the exact flags (from a compile database), so every #ifdef collapses
+     deterministically. The config *is* the answer to "which branch is live."
+
+  2. A COMPLETE set of roots and edges.
+
+Given those, reachability is exact. This is worth stating plainly because it is the whole
+premise: there is no nondeterminism to fight.
+
+So where is the difficulty? Exactly one place: **graph completeness** — edges and roots
+that do not appear syntactically in the source. A single deterministic pass is only as
+correct as its graph. The hazards:
+
+  Non-syntactic EDGES (a call site whose target isn't named there):
+    - function pointers / callbacks  (fp = handler; fp();)
+    - C++ virtual dispatch           (base->foo() may land on any override)
+    - inline asm referencing symbols by name
+    - data-driven dispatch tables
+
+  Implicit ROOTS (entry points that aren't "called" from main):
+    - the interrupt/exception VECTOR TABLE — hardware jumps to an ISR by address; it is
+      never called in source, so a from-main closure silently and deterministically drops
+      it. This is THE classic embedded footgun.
+    - static initializers / .init_array / __attribute__((constructor)) / C++ static init
+      — run before main, referenced by address.
+    - KEEP()/used/retain-forced symbols; exported symbols of a library image.
+
+The engineering job is therefore NOT "prove reachability by running it." It is:
+  (a) enumerate the true roots — explicit (foo/bar/woot) plus the implicit ones above
+      (auto-discover the well-known shapes: vector table, init arrays; let the user
+      declare anything exotic); and
+  (b) model the handful of non-syntactic edge kinds.
+
+Where a target is statically resolvable, resolve it exactly. Where it is not (a function
+pointer we can't trace to a single target), keep the CONSERVATIVE candidate set — all
+address-taken functions of matching signature, all overrides of a called virtual. Still one
+pass, still deterministic; we trade a little precision (keep some extra) to never trade
+soundness. That is the right side of the "must build" constraint.
+
+Optional, once, never a loop: a single compile/link of the carved slice as a completeness
+checkmark (never a load, never a run). And the linker map of the existing bloated build is
+a free CROSS-CHECK — it is exact reachability the real toolchain already computed — that
+our root/edge enumeration missed no whole category. Insurance, not mechanism.
+
+
+The two kinds of "garbage" (we remove both)
+-------------------------------------------
+
+  A. Built but not in the image. The 90 GB build produces piles this image never includes.
+     Excluded by scoping to the one image's inclusion set. The easy, huge win.
+
+  B. In the image but not actually needed. Code the linker KEPT (something referenced it)
+     but the actual use never needs — whole-archive pulls, KEEP()/forced symbols, sections
+     gc-sections couldn't prove dead, features config-enabled but unused. This needs the
+     seed (what we actually call) plus whole-program reachability tighter than the linker's
+     — still sound, still no loop. This is where the image shrinks below what a normal
+     build gives.
+
+Reality check to run early on the real target: how much does carving beat simply enabling
+linker dead-stripping (-ffunction-sections + --gc-sections)? Build-TIME saving is unique to
+carving (gc-sections still compiles everything). Size/load saving partly overlaps, but
+embedded builds routinely miss it (no per-function sections, forced keeps, whole-archive).
+Measure the deltas (image size, build time) before committing to depth.
+
+
+Pipeline
+--------
+
+  1. Configure   Resolve the build config for the one image: which translation units
+                 compile, with which -D/-I. Normally ingested from compile_commands.json.
+  2. Parse       For each needed TU, run the REAL preprocessor with exact flags, extract
+                 nodes (functions, types, globals, MACROS) and edges (calls, refs, expands,
+                 includes) — plus the conservative edges (address-taken, vtable, asm).
+  3. Roots       Explicit (user symbols/files) ∪ implicit (vector table, init arrays,
+                 KEEP'd, exported), auto-discovering the well-known shapes.
+  4. Closure     Single deterministic transitive-closure pass from roots. [BUILT]
+  5. Emit        Write the carved tree: drop unreached files; within kept files drop
+                 unreached definitions (preprocessor-aware). File-level first.
+  6. Verify      Optional single compile/link + linker-map cross-check. Never a loop.
+
+Built today: the graph model (2), the root/edge model (3), and the closure engine (4),
+with a runnable demo and tests. A first real front-end (2) turns C source into a graph via
+tree-sitter. Stages 1, 5, 6 and the rest of (2) are the road ahead.
+
+Front-end technology decision
+- Tree-sitter is the FOUNDATION: it is the only parser that generalizes to every language
+  (C/C++/C#/Python/.cmm), which the "generic, any language" goal requires. libclang is
+  C/C++-only and heavy, so it is an OPTIONAL precision "tightener" added later per language,
+  not the base.
+- The preprocessor is handled generically by a compiler `-E` pre-step (any compiler can
+  preprocess with the exact flags), so tree-sitter sees fully-resolved code. Languages with
+  no preprocessor skip it.
+- Tree-sitter resolves call targets less precisely than a semantic tool, so it over-KEEPS —
+  the safe direction under "must build". We measure the excess against the linker-map oracle
+  and add a semantic tightener (clang for C/C++, Roslyn for C#) only where the data justifies
+  it. Precision is a tunable improvement, not a foundational bet.
+
+
+Tightness ladder (optional inputs, each carves tighter)
+-------------------------------------------------------
+
+The product's core UX: one invariant plus a menu. INVARIANT — every carve is sound and
+buildable even with only roots; less information just makes us OVER-keep (safe: more fat,
+never a broken image). Each optional input the user can supply removes uncertainty and
+carves tighter, never looser. Run with whatever you have; it degrades gracefully.
+
+  Input (CLI flag / config)                      Buys                                Kind
+  ---------------------------------------------  ----------------------------------  -------------
+  roots (symbols / files / entry points)         defines "what we need"              REQUIRED
+  extra/implicit roots (vector table, KEEP, ..)  don't drop indirectly-reached code  completeness
+  build config (defines+includes) OR the         resolve #ifdefs -> drop             tightness
+    build's own preprocessed .i files              dead-branch code
+  semantic analysis on (clang / Roslyn)          precise edges -> fewer keeps        tightness
+  linker map (--gc-sections output)              prune toward the real image +       tightness +
+                                                   soundness cross-check               validation
+  runtime trace / coverage                       carve to exercised paths (tightest) tightness
+
+Two kinds: completeness inputs (roots) keep us from dropping needed code; tightness inputs
+remove what we conservatively kept. All optional and additive; none can break the build, so
+the worst case for a missing input is a looser carve. Shape: `carve --roots foo,bar
+[--preprocessed DIR] [--map FILE] [--trace FILE] [--semantic]`.
+
+
+Fidelity ladder (ship the bottom rung first)
+--------------------------------------------
+
+  L0  Dead-file removal: reachable-file closure, keep whole files, drop the rest. Tractable,
+      safe-ish, and on a 90 GB repo a massive win by itself.
+  L1  Config-resolved file closure: carve per THIS image's build config, not the union of
+      all configs. Needs compile_commands.json.
+  L2  Intra-file pruning: the "4 of 1000 functions" win. Language-by-language, easiest
+      first (C#/Python before C/C++). Highest payoff under the 24× multiplier.
+
+
+Why CodeCarver is a SEPARATE project from CodeCompass
+-----------------------------------------------------
+
+CodeCompass (C:\Playground\CodeCompass) is an in-use local code-search engine that already
+has much of the substrate: go-to-definition + find-references (= graph edges), semantic
+refs for C# (Roslyn) and C/C++ (clang), tree-sitter symbols, a vendored TRACE32 .cmm
+grammar, and 90 GB / memory-mapped scale engineering. Reuse is tempting.
+
+Decision: build CodeCarver STANDALONE; do not share a library with CodeCompass now. The
+clinching reason is a correctness-contract mismatch. CodeCompass is deliberately
+APPROXIMATE — best-effort references, and it explicitly does NOT index macros (they'd
+explode its symbol index). CodeCarver's reachability core must be SOUND, and it needs
+macros as first-class nodes. Sharing would force one of two bad outcomes: making
+CodeCompass sound/macro-aware (scope creep on a separate, in-use project), or CodeCarver
+inheriting approximations it cannot tolerate. They also want different front-ends
+(CodeCarver: exact preprocessing with the real build flags; CodeCompass: fast approximate
+tree-sitter symbols).
+
+What may be worth extracting LATER — only after CodeCarver proves out, and only as neutral,
+config-agnostic infra — is the tree-sitter host + the vendored .cmm grammar DLL, and the
+scalable file walker. The interfaces here (IFrontEnd, IRootProvider) keep that a future
+option, never a commitment. Until then: no coupling, and CodeCompass is not modified.
+
+
+Non-goals / known edges
+-----------------------
+
+  - Not a runtime slicer: we don't require running the image to carve it.
+  - Soundness over minimality: at unresolved indirection we keep extra rather than risk a
+    broken image. The "minimal-unsafe" set is computed only to REPORT the indirection tax.
+  - Correctness is bounded by input fidelity: garbage-in (wrong defines, missing roots) =
+    a wrong carve. Hence the front-end demands the exact build config, not a guess.
+
+
+Open questions (blocking the front-end, not the core)
+-----------------------------------------------------
+
+  - The real target: what is the build command for one image, and can it emit a
+    compile_commands.json (or equivalent per-TU flags)? This artifact is what makes the
+    C/C++ front-end sound instead of guessing.
+  - Toolchain specifics for auto-discovering implicit roots: is this TRACE32/Lauterbach,
+    and what compiler/linker (map-file format, vector-table shape, .init_array layout)?
+  - Is .cmm in scope as a carve INPUT (the scripts select/load what runs, so they may feed
+    the root set) versus merely another language to carve?

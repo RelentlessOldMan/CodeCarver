@@ -1,0 +1,26 @@
+# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+
+# .NET / VS
+*.user
+.vs/
+*.suo
+project.lock.json
+
+# Rider / VS Code
+.idea/
+.vscode/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# CodeCarver: carved output, scratch corpora, and fetched toolchains are never committed
+.carved/
+.corpus/
+.toolchains/
+*.tmp
