@@ -102,11 +102,13 @@ public static class FileTreeEmitter
             if (!string.IsNullOrEmpty(dstDir))
                 Directory.CreateDirectory(dstDir);
 
-            var text = File.ReadAllText(src);
+            // Only files with something to prune are read+rewritten. Everything else — including
+            // multi-GB headers kept whole — is stream-copied, so a big kept file never becomes a
+            // >2GB string in memory (it would throw) and is emitted in bounded memory.
             if (dropByFile.TryGetValue(rel, out var ranges) && ranges.Count > 0)
-                text = RemoveLineRanges(text, ranges);
-
-            File.WriteAllText(dst, text);
+                File.WriteAllText(dst, RemoveLineRanges(File.ReadAllText(src), ranges));
+            else
+                File.Copy(src, dst, overwrite: true);
             bytes += new FileInfo(dst).Length;
             written.Add(rel);
         }

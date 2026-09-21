@@ -72,6 +72,8 @@ static int RunCarve(string[] args)
     string? manifestPath = null;
     var excludeDirs = new List<string>();
     string? probeCompiler = null;
+    long maxParseBytes = 20_000_000; // files bigger than this (e.g. multi-GB generated register headers)
+                                     // skip the parser and are kept whole via #include-closure.
 
     // A --config JSON file supplies defaults; explicit CLI flags below override it.
     for (var i = 2; i < args.Length - 1; i++)
@@ -89,6 +91,7 @@ static int RunCarve(string[] args)
         if (cfg.AssumeDefinesComplete is not null) closedWorld = cfg.AssumeDefinesComplete.Value;
         if (cfg.Exclude is not null) excludeDirs.AddRange(cfg.Exclude);
         if (cfg.Manifest is not null) manifestPath = cfg.Manifest;
+        if (cfg.MaxParseBytes is not null) maxParseBytes = cfg.MaxParseBytes.Value;
     }
 
     for (var i = 2; i < args.Length; i++)
@@ -114,6 +117,8 @@ static int RunCarve(string[] args)
             excludeDirs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         else if (args[i] == "--probe" && i + 1 < args.Length)
             probeCompiler = args[++i];
+        else if (args[i] == "--max-parse-bytes" && i + 1 < args.Length)
+            long.TryParse(args[++i], out maxParseBytes);
         else if (args[i] == "--dump-spans")
             dumpSpans = true;
     }
@@ -164,7 +169,26 @@ static int RunCarve(string[] args)
         return 2;
     }
 
-    var inputs = paths.Select(p => (Path.GetRelativePath(dir, p).Replace('\\', '/'), File.ReadAllText(p)));
+    // Oversized files (multi-GB auto-generated register headers) are never read into a string or parsed:
+    // they'd blow past .NET's ~2GB string limit and explode tree-sitter memory. For languages with
+    // include/DO-closure (C/C++/.cmm) we register them as File nodes with null text — kept whole when a
+    // kept unit includes them, copied verbatim by the emitter. C# has no such closure, so it's exempt.
+    var closureLang = lang is "c" or "cpp" or "cmm";
+    var bigFiles = new List<(string Rel, long Bytes)>();
+    if (closureLang)
+        foreach (var p in paths)
+        {
+            var len = new FileInfo(p).Length;
+            if (len > maxParseBytes)
+                bigFiles.Add((Path.GetRelativePath(dir, p).Replace('\\', '/'), len));
+        }
+    var bigSet = bigFiles.Select(b => b.Rel).ToHashSet(StringComparer.Ordinal);
+
+    var inputs = paths.Select(p =>
+    {
+        var rel = Path.GetRelativePath(dir, p).Replace('\\', '/');
+        return (rel, bigSet.Contains(rel) ? "" : File.ReadAllText(p)); // "" = don't read/parse; keep whole
+    });
     using ICarveFrontEnd fe = lang switch
     {
         "cpp" => new CppFrontEnd(),
@@ -211,6 +235,9 @@ static int RunCarve(string[] args)
                           (closedWorld ? " (closed-world: absent macros treated as undefined)" : " (open-world: unknown branches kept)"));
     Console.WriteLine($"  nodes   : {s.ReachedNodes}/{s.TotalNodes} kept ({s.NodeKeepRatio:P0}), {s.DroppedNodes} carved");
     Console.WriteLine($"  files   : {s.KeptFiles}/{s.TotalFiles} kept, {s.DroppedFiles} dropped");
+    if (bigFiles.Count > 0)
+        Console.WriteLine($"  big     : {bigFiles.Count} file(s) > {maxParseBytes:N0} B not parsed (kept whole via #include-closure): "
+                          + Summarize(bigFiles.OrderByDescending(b => b.Bytes).Select(b => $"{b.Rel} ({b.Bytes:N0} B)").ToList()));
     if (plan.DroppedFiles.Count > 0)
         Console.WriteLine("  dropped : " + Summarize(plan.DroppedFiles));
 
@@ -341,4 +368,5 @@ sealed class CarveConfig
     public bool? AssumeDefinesComplete { get; set; }
     public string[]? Exclude { get; set; }
     public string? Manifest { get; set; }
+    public long? MaxParseBytes { get; set; }
 }

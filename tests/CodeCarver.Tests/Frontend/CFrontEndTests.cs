@@ -174,6 +174,34 @@ public class CFrontEndTests
     }
 
     [Fact]
+    public void OversizedFile_PassedEmpty_IsStillKeptWholeViaIncludeClosure()
+    {
+        // Scalability: a multi-GB auto-generated register header can't be read into a string (>2GB
+        // throws) or parsed (tree-sitter memory explodes). The CLI passes such files with EMPTY text —
+        // they become File nodes only, never parsed — and must still be kept whole when a kept unit
+        // #includes them, and dropped when nothing does. (Here "" stands in for "too big to parse".)
+        const string appC = """
+            #include "chip_regs.h"
+            int use(void) { return REG_BANK7; }
+            """;
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[]
+        {
+            ("app.c", appC),
+            ("chip_regs.h", ""),   // "too big to parse" — registered as a File node only
+            ("other_regs.h", ""),  // also huge, but included by nothing kept
+        });
+
+        var plan = ReachabilityEngine.Compute(graph,
+            new[] { new Root(Find(graph, "use"), RootKind.ExplicitSymbol) });
+
+        Assert.Contains("chip_regs.h", plan.KeptFiles);      // kept whole via #include-closure
+        Assert.Contains("other_regs.h", plan.DroppedFiles);  // nobody includes it -> safe to drop
+        // The oversized header contributed no symbol nodes (never parsed) — only a File node.
+        Assert.DoesNotContain(graph.Nodes, n => n.Kind != NodeKind.File && n.FilePath == "chip_regs.h");
+    }
+
+    [Fact]
     public void PointerReturningFunctions_AreCaptured_AndReachable()
     {
         // Regression: `T *f()` wraps the function_declarator in a pointer_declarator. An earlier query

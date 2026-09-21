@@ -101,9 +101,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var pendingPastes = new List<(NodeId Macro, PasteKind Kind, string Frag)>();
 
         foreach (var (path, text) in inputs)
+        {
+            if (text.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
             ProcessFile(graph, path, text, fileNodeByPath, pathsByBasename,
                         functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
                         pendingMacroRefs, pendingPastes, defines, closedWorldDefines);
+        }
 
         foreach (var (from, name) in pendingCalls)
             ResolveUse(graph, from, name, functionsByName, macrosByName, globalsByName, EdgeKind.Calls);

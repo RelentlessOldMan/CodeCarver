@@ -54,7 +54,8 @@ public sealed class CSharpFrontEnd : ICarveFrontEnd
         var pending = new List<(NodeId From, string Name)>();
 
         foreach (var (path, text) in files)
-            ProcessFile(graph, path, text, functionsByName, pending);
+            if (text.Length > 0) // oversized/empty-file guard (C# has no include-closure so the CLI never skips .cs)
+                ProcessFile(graph, path, text, functionsByName, pending);
 
         foreach (var (from, name) in pending)
             if (functionsByName.TryGetValue(name, out var targets))

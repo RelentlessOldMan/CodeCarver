@@ -9,6 +9,12 @@ namespace CodeCarver.Frontend;
 /// #ifdef resolution). Other languages that don't fit the C-family model (C#, TRACE32 .cmm) implement
 /// this directly. <paramref name="defines"/>/<paramref name="closedWorldDefines"/> are honoured only by
 /// front-ends with a preprocessor; others ignore them.
+///
+/// A file passed with empty <c>Text</c> is a "too big to parse" input (e.g. a multi-GB auto-generated
+/// register header): the caller deliberately does not read it, so it is registered as a
+/// <see cref="NodeKind.File"/> node only — never a string or a parse tree — and is still kept whole via
+/// #include-closure and copied verbatim by the emitter, but never explodes memory. See
+/// <c>--max-parse-bytes</c>.
 /// </summary>
 public interface ICarveFrontEnd : IDisposable
 {

@@ -45,7 +45,8 @@ public sealed class CmmFrontEnd : ICarveFrontEnd
         var pendingIncludes = new List<(NodeId From, string Stem)>(); // DO
 
         foreach (var (path, text) in inputs)
-            ProcessFile(graph, path, text, fileNodeByPath[path], subsByName, pendingCalls, pendingIncludes);
+            if (text.Length > 0) // oversized/empty file: File node already registered; nothing to parse
+                ProcessFile(graph, path, text, fileNodeByPath[path], subsByName, pendingCalls, pendingIncludes);
 
         foreach (var (from, name) in pendingCalls)
             if (subsByName.TryGetValue(name, out var targets))

@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    # Windows: the tree-sitter front-end loads the grammar as a native .dll (tree-sitter-c.dll, …).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build
+        run: dotnet build CodeCarver.sln -c Release
+
+      # Fast suite only. The build-verify tests self-skip when the pinned gcc + corpus are absent
+      # (neither is committed), so they'd pass trivially here — excluding them keeps CI quick and honest.
+      - name: Test (fast)
+        run: dotnet test CodeCarver.sln -c Release --no-build --filter "FullyQualifiedName!~BuildVerify"
