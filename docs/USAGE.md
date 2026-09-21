@@ -55,6 +55,7 @@ Every carve is sound with just `--roots`. Each extra input lets it carve **tight
 | Aggressive prune | `--prune` | intra-file function/table removal (C/C++ only; other languages carve file-level) |
 | Audit | `--manifest m.json` | write a JSON manifest of roots, stats, kept/dropped files, byte counts |
 | Big-file cutoff | `--max-parse-bytes N` | files larger than `N` bytes (default 20 MB) are **not parsed** — kept whole via `#include`-closure, copied verbatim. Lets a carve survive multi-GB auto-generated register headers that would otherwise blow past .NET's ~2 GB string limit and explode parser memory (C/C++/`.cmm` only) |
+| Carve headers | `--prune-headers` | **experimental**: strip unused `#define`s from the big kept headers above (a 1.4 GB register map → the handful of registers you use). Streaming + sound — keeps the transitive closure of needed defines, every non-`#define` line (guards, `#if`, types), and all `#if`-referenced names. Always build-verify (C/C++ only) |
 
 ### Config file
 

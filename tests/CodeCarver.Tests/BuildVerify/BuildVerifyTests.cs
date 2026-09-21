@@ -434,6 +434,55 @@ public class BuildVerifyTests
     }
 
     [Fact]
+    public void HeaderCarve_OfBigRegisterHeader_ShrinksAndStillCompiles()
+    {
+        // End-to-end: a big auto-generated register header (passed empty = "too big to parse", kept whole
+        // via #include-closure) then carved down to only the #defines the code transitively needs — and
+        // the result must still compile. Offsets built from a base address exercise the closure.
+        var gcc = FindGcc();
+        if (gcc is null) return;
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append("#ifndef CHIP_H\n#define CHIP_H\n#define CHIP_BASE 0x40000000\n");
+        for (var i = 0; i < 5000; i++) sb.Append($"#define REG_{i} (CHIP_BASE + 0x{i * 4:X})\n");
+        sb.Append("#endif\n");
+        var chipH = sb.ToString();
+        const string appC = "#include \"chip.h\"\nint use(void){ return REG_2000; }\nint dead(void){ return 0; }\n";
+
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-hc-" + Guid.NewGuid().ToString("N"));
+        var src = Path.Combine(work, "src");
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(src);
+        try
+        {
+            File.WriteAllText(Path.Combine(src, "app.c"), appC);
+            File.WriteAllText(Path.Combine(src, "chip.h"), chipH);
+
+            using var fe = new CFrontEnd();
+            var graph = fe.BuildGraph(new[] { ("app.c", appC), ("chip.h", "") }); // chip.h empty = not parsed
+            var plan = ReachabilityEngine.Compute(graph,
+                new ExplicitRootProvider(symbols: new[] { "use" }).Discover(graph).ToList());
+            FileTreeEmitter.EmitPruned(plan, graph, src, outDir); // copies chip.h whole, prunes app.c's dead()
+
+            var before = new FileInfo(Path.Combine(outDir, "chip.h")).Length;
+            var res = HeaderCarver.Carve(outDir, new[] { "chip.h" });
+            var carved = File.ReadAllText(Path.Combine(outDir, "chip.h"));
+
+            Assert.Contains("#define REG_2000", carved);   // needed
+            Assert.Contains("#define CHIP_BASE", carved);  // pulled in by REG_2000's body
+            Assert.DoesNotContain("#define REG_2001", carved); // unused -> dropped
+            Assert.True(res.BytesAfter < before / 10, $"expected big shrink, {before} -> {res.BytesAfter}");
+
+            var (code, output) = Run(gcc, new[] { "-c", "-I.", "app.c", "-o", "o.o" }, outDir);
+            Assert.True(code == 0, $"carved-header output failed to compile:\n{output}");
+        }
+        finally
+        {
+            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+        }
+    }
+
+    [Fact]
     public void ConfigResolvedCarve_DropsDeadBranchFile_AndBuilds()
     {
         // Closed-world #ifdef resolution: with USE_EXTRA absent, the branch that calls into extra.c is

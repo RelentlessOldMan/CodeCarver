@@ -64,6 +64,7 @@ static int RunCarve(string[] args)
     var roots = Array.Empty<string>();
     string? outDir = null;
     var prune = false;
+    var pruneHeaders = false;
     var dumpSpans = false;
     var lang = "c";
     var defineSpecs = new List<string>();
@@ -92,6 +93,7 @@ static int RunCarve(string[] args)
         if (cfg.Exclude is not null) excludeDirs.AddRange(cfg.Exclude);
         if (cfg.Manifest is not null) manifestPath = cfg.Manifest;
         if (cfg.MaxParseBytes is not null) maxParseBytes = cfg.MaxParseBytes.Value;
+        if (cfg.PruneHeaders is not null) pruneHeaders = cfg.PruneHeaders.Value;
     }
 
     for (var i = 2; i < args.Length; i++)
@@ -103,6 +105,8 @@ static int RunCarve(string[] args)
             outDir = args[++i];
         else if (args[i] == "--prune")
             prune = true;
+        else if (args[i] == "--prune-headers")
+            pruneHeaders = true;
         else if (args[i] == "--lang" && i + 1 < args.Length)
             lang = args[++i].ToLowerInvariant();
         else if (args[i] == "--define" && i + 1 < args.Length)
@@ -252,6 +256,21 @@ static int RunCarve(string[] args)
         Console.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{how}]");
         if (prune)
             Console.WriteLine("  note    : --prune is EXPERIMENTAL — always build-verify. File-level (omit --prune) is the sound default.");
+
+        // --prune-headers: strip unused #defines from the giant register headers we kept whole (C/C++ only).
+        if (pruneHeaders && lang is "c" or "cpp")
+        {
+            var keptBig = bigFiles.Select(b => b.Rel).Where(plan.KeptFiles.Contains).ToList();
+            if (keptBig.Count > 0)
+            {
+                var hc = HeaderCarver.Carve(outDir, keptBig);
+                carvedBytes -= hc.BytesBefore - hc.BytesAfter; // those files shrank on disk
+                var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
+                Console.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} #defines kept, "
+                                  + $"{hc.DefinesDropped:N0} dropped; {hc.BytesBefore:N0} B -> {hc.BytesAfter:N0} B ({hpct:P0} smaller)");
+                Console.WriteLine("  note    : --prune-headers is EXPERIMENTAL (drops unused #defines from kept headers) — always build-verify.");
+            }
+        }
     }
     else
     {
@@ -369,4 +388,5 @@ sealed class CarveConfig
     public string[]? Exclude { get; set; }
     public string? Manifest { get; set; }
     public long? MaxParseBytes { get; set; }
+    public bool? PruneHeaders { get; set; }
 }
