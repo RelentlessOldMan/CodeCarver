@@ -65,6 +65,7 @@ static int RunCarve(string[] args)
     string? outDir = null;
     var prune = false;
     var pruneHeaders = false;
+    var verify = false;
     var dumpSpans = false;
     var lang = "c";
     var defineSpecs = new List<string>();
@@ -108,6 +109,8 @@ static int RunCarve(string[] args)
             prune = true;
         else if (args[i] == "--prune-headers")
             pruneHeaders = true;
+        else if (args[i] == "--verify")
+            verify = true;
         else if (args[i] == "--lang" && i + 1 < args.Length)
             lang = args[++i].ToLowerInvariant();
         else if (args[i] == "--define" && i + 1 < args.Length)
@@ -295,6 +298,26 @@ static int RunCarve(string[] args)
     var pct = originalBytes > 0 ? (double)saved / originalBytes : 0;
     Console.WriteLine($"  size    : {originalBytes:N0} B -> {carvedBytes:N0} B  ({pct:P0} smaller, saved {saved:N0} B)");
 
+    // --verify: compiler-free soundness gate — no KEPT function may call an in-scope function that was
+    // carved out (it wouldn't link). Catches an edge our model missed (a blind spot). C/C++ only.
+    var verifyFailed = false;
+    if (verify && fe is TreeSitterFrontEnd tsv)
+    {
+        var violations = SoundnessCheck.KeptCallingDropped(graph, plan, tsv.CallSites);
+        if (violations.Count == 0)
+            Console.WriteLine("  verify  : OK — every in-scope callee of a kept function is kept");
+        else
+        {
+            verifyFailed = true;
+            Console.WriteLine($"  verify  : {violations.Count} UNSOUND call(s) — a kept function calls an in-scope function that was carved out:");
+            foreach (var v in violations.Take(20))
+                Console.WriteLine($"            {v.Caller}() -> {v.Callee}()  [{v.File}]");
+            if (violations.Count > 20) Console.WriteLine($"            (+{violations.Count - 20} more)");
+        }
+    }
+    else if (verify)
+        Console.WriteLine($"  verify  : (not available for --lang {lang}; C/C++ only)");
+
     if (manifestPath is not null)
     {
         var manifest = new
@@ -318,7 +341,7 @@ static int RunCarve(string[] args)
             System.Text.Json.JsonSerializer.Serialize(manifest, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
         Console.WriteLine($"  manifest: {manifestPath}");
     }
-    return 0;
+    return verifyFailed ? 3 : 0; // non-zero so --verify is usable as a gate in scripts
 }
 
 static string Summarize(IReadOnlyList<string> files, int max = 12)

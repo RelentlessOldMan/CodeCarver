@@ -67,6 +67,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <inheritdoc/>
     public IReadOnlyList<string> Warnings => _warnings;
 
+    private IReadOnlyList<(NodeId From, string Name)> _callSites = Array.Empty<(NodeId, string)>();
+    /// <summary>Every call site found in the last build as (enclosing node, callee name), INCLUDING calls
+    /// that didn't resolve to a defined function. The post-carve soundness gate uses these to check that
+    /// no kept function calls an in-scope function that was carved out (which wouldn't link).</summary>
+    public IReadOnlyList<(NodeId From, string Name)> CallSites => _callSites;
+
     /// <summary>Per-file parse budget (ms). A file whose parse exceeds it is kept whole (see
     /// <see cref="LooksLikeIncludeFragment"/>) — a backstop against tree-sitter's super-linear error
     /// recovery on invalid #include fragments stalling a whole run. Only applied to files big enough to
@@ -141,6 +147,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             LinkPaste(graph, macro, kind, frag, functionsByName, EdgeKind.Calls);
             LinkPaste(graph, macro, kind, frag, globalsByName, EdgeKind.References);
         }
+
+        _callSites = pendingCalls; // retained for the post-carve soundness self-check (--verify)
 
         return graph;
     }
