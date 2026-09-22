@@ -41,6 +41,12 @@ preprocessor has a long tail of exotica, so treat pruned output as "verify by bu
 
 Every carve is sound with just `--roots`. Each extra input lets it carve **tighter**, never looser.
 
+> **Implicit roots are always added.** Symbols the runtime/linker keep regardless of any call —
+> `__attribute__((constructor))`/`((destructor))`/`((used))`/`((retain))` and `.init_array`-family
+> section placement — are auto-discovered and kept (reported on an `implicit:` line), so a self-registering
+> driver or an initcall table isn't silently dropped. Vector-table ISRs are kept the same way (via the
+> file-scope address-taken edge). This is the sound over-approximation; it never drops these.
+
 | Input | Flag | Effect |
 |---|---|---|
 | Entry symbols | `--roots a,b,c` | *(required)* what to keep |

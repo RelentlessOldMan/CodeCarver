@@ -32,6 +32,18 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         @"(?<name>[A-Za-z_]\w*)\s*\([^()]*\)\s*__attribute__\s*\(\(\s*[^()]*?\balias\s*\(\s*""(?<target>[A-Za-z_]\w*)""",
         RegexOptions.Compiled);
 
+    // Keep-attributes: symbols the runtime/linker keep regardless of any call — implicit roots a
+    // from-main closure would silently drop (a self-registering `constructor`, an initcall-section entry).
+    private static readonly Regex AttrBlock = new(
+        @"__attribute__\s*\(\((?<body>(?:[^()]|\([^()]*\))*)\)\)", RegexOptions.Compiled);
+    private static readonly Regex KeepKeyword = new(
+        @"\b(?:constructor|destructor|used|retain)\b|section\s*\(\s*""\.(?:init_array|preinit_array|fini_array)",
+        RegexOptions.Compiled);
+    private static readonly Regex NameBeforeAttr = new( // trailing:  name / name(...) / name[...]  __attribute__
+        @"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]|\([^()]*\))?\s*$", RegexOptions.Compiled);
+    private static readonly Regex NameAfterAttr = new(  // leading:   __attribute__ ... name( / name[ / name =
+        @"^\s*(?:[A-Za-z_][\w*]*[\s*]+)*?([A-Za-z_]\w*)\s*(?:[\(\[=;,]|$)", RegexOptions.Compiled);
+
     // Function names used as DATA — global/array/struct initializers (vector tables, dispatch tables,
     // hooks structs, function-pointer registries). Structural on purpose (only initializer contexts) so
     // it never mistakes a prototype/extern declaration for a reference. For an @il list we scan its span
@@ -128,12 +140,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var pendingMacroRefs = new List<(NodeId From, string Name)>();
         var pendingPastes = new List<(NodeId Macro, PasteKind Kind, string Frag)>();
 
+        var keepNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (path, text) in inputs)
         {
             if (text.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
             ProcessFile(graph, path, text, fileNodeByPath, pathsByBasename,
                         functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
                         pendingMacroRefs, pendingPastes, defines, closedWorldDefines);
+            foreach (var n in ScanKeepAttributes(text)) keepNames.Add(n);
         }
 
         foreach (var (from, name) in pendingCalls)
@@ -157,7 +171,33 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         _callSites = pendingCalls; // retained for the post-carve soundness self-check (--verify)
 
+        // Keep-attributes → implicit roots. Mark every function/global whose declaration carries a
+        // constructor/destructor/used/retain or init-array-section attribute, so AttributeRootProvider
+        // seeds them: they run/are-kept by the runtime or linker, not by any call we could trace.
+        foreach (var name in keepNames)
+        {
+            if (functionsByName.TryGetValue(name, out var fns)) foreach (var id in fns) graph.AddFlag(id, NodeFlags.Keep);
+            if (globalsByName.TryGetValue(name, out var gs)) foreach (var id in gs) graph.AddFlag(id, NodeFlags.Keep);
+        }
+
         return graph;
+    }
+
+    /// <summary>Names decorated with a keep-attribute (constructor/destructor/used/retain/init-array
+    /// section), resolving the decorated symbol whether the attribute leads or trails the declaration.</summary>
+    private static IEnumerable<string> ScanKeepAttributes(string text)
+    {
+        foreach (Match m in AttrBlock.Matches(text))
+        {
+            if (!KeepKeyword.IsMatch(m.Groups["body"].Value)) continue;
+            var before = text.AsSpan(0, m.Index);
+            var mb = NameBeforeAttr.Match(before.Length > 200 ? before[^200..].ToString() : before.ToString());
+            if (mb.Success) { yield return mb.Groups[1].Value; continue; }
+            var afterStart = m.Index + m.Length;
+            var after = text.AsSpan(afterStart);
+            var ma = NameAfterAttr.Match(after.Length > 200 ? after[..200].ToString() : after.ToString());
+            if (ma.Success) yield return ma.Groups[1].Value;
+        }
     }
 
     /// <summary>

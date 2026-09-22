@@ -47,6 +47,23 @@ public sealed class ExplicitRootProvider : IRootProvider
     }
 }
 
+/// <summary>
+/// Auto-discovers implicit roots the linker/runtime keep regardless of any call: functions/globals the
+/// front-end flagged <see cref="NodeFlags.Keep"/> from a <c>constructor</c>/<c>destructor</c>/<c>used</c>/
+/// <c>retain</c> attribute or placement in an <c>.init_array</c>-family section. A from-<c>main</c>
+/// closure silently drops these (a self-registering driver, an initcall entry) — keeping them is the
+/// sound over-approximation.
+/// </summary>
+public sealed class AttributeRootProvider : IRootProvider
+{
+    public IEnumerable<Root> Discover(CodeGraph graph)
+    {
+        foreach (var node in graph.Nodes)
+            if (node.Kind is NodeKind.Function or NodeKind.Global && (node.Flags & NodeFlags.Keep) != 0)
+                yield return new Root(node.Id, RootKind.LinkerKeep, node.Name);
+    }
+}
+
 /// <summary>Unions several providers into one root set.</summary>
 public sealed class CompositeRootProvider : IRootProvider
 {

@@ -1,3 +1,4 @@
+using CodeCarver.Core.Frontend;
 using CodeCarver.Core.Graph;
 using CodeCarver.Core.Reachability;
 using CodeCarver.Core.Roots;
@@ -199,6 +200,34 @@ public class CFrontEndTests
         Assert.Contains("other_regs.h", plan.DroppedFiles);  // nobody includes it -> safe to drop
         // The oversized header contributed no symbol nodes (never parsed) — only a File node.
         Assert.DoesNotContain(graph.Nodes, n => n.Kind != NodeKind.File && n.FilePath == "chip_regs.h");
+    }
+
+    [Fact]
+    public void KeepAttributes_AreImplicitRoots_KeptEvenIfUnreferenced()
+    {
+        // constructor/destructor/used run or are retained by the runtime/linker, not by any call — a
+        // from-main closure would drop a self-registering driver or an initcall and ship a broken image.
+        const string src = """
+            __attribute__((constructor)) static void ctor(void) { }
+            void dtor(void) __attribute__((destructor));
+            void dtor(void) { }
+            __attribute__((used)) static int retained(int x) { return x; }
+            static int dead(int x) { return x; }
+            int used_fn(void) { return 1; }
+            int main(void) { return used_fn(); }
+            """;
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("m.c", src) });
+        var roots = new CompositeRootProvider(
+            new ExplicitRootProvider(symbols: new[] { "main" }),
+            new AttributeRootProvider()).Discover(graph).ToList();
+        var plan = ReachabilityEngine.Compute(graph, roots);
+
+        Assert.True(plan.IsKept(Find(graph, "ctor")));      // __attribute__((constructor))
+        Assert.True(plan.IsKept(Find(graph, "dtor")));      // __attribute__((destructor)), trailing form
+        Assert.True(plan.IsKept(Find(graph, "retained")));  // __attribute__((used))
+        Assert.True(plan.IsKept(Find(graph, "used_fn")));   // main -> used_fn
+        Assert.False(plan.IsKept(Find(graph, "dead")));     // genuinely dead -> carved
     }
 
     [Fact]

@@ -218,10 +218,19 @@ static int RunCarve(string[] args)
         if (fe.Warnings.Count > cap) Console.Error.WriteLine($"  warn    : (+{fe.Warnings.Count - cap} more warnings)");
     }
 
-    var rootSet = new ExplicitRootProvider(symbols: roots).Discover(graph).ToList();
-    if (rootSet.Count == 0)
+    var explicitRoots = new ExplicitRootProvider(symbols: roots).Discover(graph).ToList();
+    if (roots.Length > 0 && explicitRoots.Count == 0)
     {
         Console.Error.WriteLine($"none of the requested roots were found as symbols: {string.Join(", ", roots)}");
+        return 1;
+    }
+    // Implicit roots (constructor/used/init-array) are ALWAYS added: the runtime/linker keep them
+    // regardless of any call, so a from-main closure that dropped them would ship a broken image.
+    var implicitRoots = new AttributeRootProvider().Discover(graph).ToList();
+    var rootSet = explicitRoots.Concat(implicitRoots).ToList();
+    if (rootSet.Count == 0)
+    {
+        Console.Error.WriteLine("no roots to carve from: name entry symbols with --roots");
         return 1;
     }
 
@@ -250,6 +259,9 @@ static int RunCarve(string[] args)
 
     Console.WriteLine($"CodeCarver — carve of {dir}");
     Console.WriteLine($"  roots   : {string.Join(", ", roots)}");
+    if (implicitRoots.Count > 0)
+        Console.WriteLine($"  implicit: {implicitRoots.Count} constructor/used/init-array symbol(s) auto-kept: "
+                          + Summarize(implicitRoots.Select(r => r.Note ?? r.Node.ToString()).Distinct().ToList()));
     if (defines is not null)
         Console.WriteLine($"  config  : {defineSpecs.Distinct().Count()} define(s), #ifdef resolution ON" +
                           (closedWorld ? " (closed-world: absent macros treated as undefined)" : " (open-world: unknown branches kept)"));
