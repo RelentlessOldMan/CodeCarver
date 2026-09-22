@@ -37,16 +37,29 @@ public static class HeaderCarver
 
         // 1. Seed: every identifier used by kept code that ISN'T one of the carved headers. That is the set
         //    of names the compiled output could reference; a define outside its closure is unreachable.
+        //    ALSO collect token-paste fragments: if code builds a name with `##` (`REG_##n##_BASE`), the
+        //    concrete define (`REG_0_BASE`) never appears literally, so we'd wrongly drop it. Any define
+        //    whose name a fragment could form is kept (sound over-approximation — the paste blind spot).
         var needed = new HashSet<string>(StringComparer.Ordinal);
+        var fragments = new HashSet<string>(StringComparer.Ordinal);
         foreach (var f in Directory.EnumerateFiles(outDir, "*", SearchOption.AllDirectories))
         {
             var rel = Path.GetRelativePath(outDir, f).Replace('\\', '/');
             if (bigSet.Contains(rel)) continue;
             foreach (var line in File.ReadLines(f))
+            {
                 AddIdentifiers(needed, line);
+                if (line.Contains("##", StringComparison.Ordinal)) AddPasteFragments(fragments, line);
+            }
         }
 
-        // 2. Fixpoint: grow `needed` with the bodies of needed defines and all #if-condition identifiers,
+        // A define is wanted if the code references its name, OR a paste fragment could build that name.
+        bool Wanted(string name) =>
+            needed.Contains(name) ||
+            fragments.Any(fr => name.StartsWith(fr, StringComparison.Ordinal)
+                             || name.EndsWith(fr, StringComparison.Ordinal));
+
+        // 2. Fixpoint: grow `needed` with the bodies of wanted defines and all #if-condition identifiers,
         //    streaming each header per pass. Terminates because `needed` only grows and is finite. Passes
         //    ≈ the deepest define-dependency chain (small for register maps).
         bool grew = true;
@@ -57,12 +70,12 @@ public static class HeaderCarver
                 foreach (var (name, text, isConditional) in EnumerateLogicalDirectives(path))
                 {
                     if (isConditional) { grew |= AddIdentifiers(needed, text); continue; }
-                    if (name is not null && needed.Contains(name))
+                    if (name is not null && Wanted(name))
                         grew |= AddIdentifiers(needed, text); // keep it -> its body's names are needed too
                 }
         }
 
-        // 3. Emit: rewrite each header, dropping #defines whose name isn't needed (and their continuations).
+        // 3. Emit: rewrite each header, dropping #defines whose name isn't wanted (and their continuations).
         long before = 0, after = 0;
         var kept = 0;
         var dropped = 0;
@@ -70,7 +83,7 @@ public static class HeaderCarver
         {
             before += new FileInfo(path).Length;
             var tmp = path + ".carve.tmp";
-            RewriteDroppingUnneeded(path, tmp, needed, ref kept, ref dropped);
+            RewriteDroppingUnneeded(path, tmp, Wanted, ref kept, ref dropped);
             File.Delete(path);
             File.Move(tmp, path);
             after += new FileInfo(path).Length;
@@ -101,8 +114,8 @@ public static class HeaderCarver
         }
     }
 
-    /// <summary>Copy <paramref name="src"/> to <paramref name="dst"/>, omitting #defines whose name isn't needed.</summary>
-    private static void RewriteDroppingUnneeded(string src, string dst, HashSet<string> needed, ref int kept, ref int dropped)
+    /// <summary>Copy <paramref name="src"/> to <paramref name="dst"/>, omitting #defines the predicate rejects.</summary>
+    private static void RewriteDroppingUnneeded(string src, string dst, Func<string, bool> wanted, ref int kept, ref int dropped)
     {
         using var r = new StreamReader(src);
         using var w = new StreamWriter(dst);
@@ -112,7 +125,7 @@ public static class HeaderCarver
             if (IsDefineDirective(line.TrimStart()))
             {
                 var name = DefineName(line);
-                var drop = name is not null && !needed.Contains(name);
+                var drop = name is not null && !wanted(name);
                 if (drop) dropped++; else kept++;
 
                 // Consume the whole (possibly multi-line) define; write it only if kept.
@@ -165,6 +178,29 @@ public static class HeaderCarver
     {
         var t = line.TrimEnd();
         return t.Length > 0 && t[^1] == '\\';
+    }
+
+    /// <summary>
+    /// Collect the literal identifier fragments adjacent to a <c>##</c> paste (<c>REG_ ## n ## _BASE</c>
+    /// → "REG_", "_BASE"). A define whose name starts or ends with such a fragment could be the concrete
+    /// paste result, so it must be kept. Single-char fragments (usually the pasted parameter) are ignored.
+    /// </summary>
+    private static void AddPasteFragments(HashSet<string> set, string line)
+    {
+        var i = line.IndexOf("##", StringComparison.Ordinal);
+        while (i >= 0)
+        {
+            // fragment immediately before the ##
+            var e = i;
+            while (e > 0 && (char.IsAsciiLetterOrDigit(line[e - 1]) || line[e - 1] == '_')) e--;
+            if (i - e > 1) set.Add(line[e..i]);
+            // fragment immediately after the ##
+            var s = i + 2;
+            var j = s;
+            while (j < line.Length && (char.IsAsciiLetterOrDigit(line[j]) || line[j] == '_')) j++;
+            if (j - s > 1) set.Add(line[s..j]);
+            i = line.IndexOf("##", i + 2, StringComparison.Ordinal);
+        }
     }
 
     /// <summary>Add every C identifier in <paramref name="text"/> to <paramref name="set"/>; return true if any was new.</summary>

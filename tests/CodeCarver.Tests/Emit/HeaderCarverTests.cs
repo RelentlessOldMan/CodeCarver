@@ -74,6 +74,42 @@ public class HeaderCarverTests
     }
 
     [Fact]
+    public void Carve_KeepsTokenPasteTargets_TheParseBlindSpot()
+    {
+        // If code builds a define name with ## (REG_##n##_BASE), the concrete define (REG_1_BASE) never
+        // appears literally, so a literal-identifier seed would wrongly drop it and break the build. The
+        // paste fragments "REG_"/"_BASE" must keep the whole candidate family (sound over-approximation).
+        var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdrp-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "app.c"), """
+                #include "chip.h"
+                #define MAKE_REG(n) REG_##n##_BASE
+                int use(void){ return MAKE_REG(1); }
+                """);
+            File.WriteAllText(Path.Combine(dir, "chip.h"), """
+                #define REG_0_BASE 0x1000
+                #define REG_1_BASE 0x2000
+                #define REG_2_BASE 0x3000
+                #define UNRELATED 0xDEAD
+                """);
+
+            HeaderCarver.Carve(dir, new[] { "chip.h" });
+            var carved = File.ReadAllText(Path.Combine(dir, "chip.h"));
+
+            Assert.Contains("#define REG_1_BASE", carved); // the actual paste target — must survive
+            Assert.Contains("#define REG_0_BASE", carved); // siblings could also be targets (can't know n)
+            Assert.Contains("#define REG_2_BASE", carved);
+            Assert.DoesNotContain("#define UNRELATED", carved); // no fragment match, unreferenced -> dropped
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
     public void Carve_KeptMultiLineDefine_KeepsAllContinuationLines()
     {
         var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdr2-" + Guid.NewGuid().ToString("N"));
