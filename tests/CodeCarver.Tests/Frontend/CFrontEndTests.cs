@@ -202,6 +202,30 @@ public class CFrontEndTests
     }
 
     [Fact]
+    public void IncludeFragment_IsKeptWhole_AndReferencingIncludeDetected()
+    {
+        // Finding A: a header that's a bare byte list #included INSIDE an array initializer is valid in
+        // context but invalid stand-alone (stalls tree-sitter). It must be (a) detected + kept whole with a
+        // warning, and (b) still kept via the include — which tree-sitter misses in that position, so the
+        // include is text-scanned. Dropping it would break the emitted build.
+        var frag = string.Join("\n", Enumerable.Repeat("0x00, 0x11, 0x22, 0x33, 0x44, 0x55,", 60));
+        const string appC = """
+            static const unsigned char img[] = {
+            #include "blob.h"
+            };
+            int use(void){ return img[0]; }
+            """;
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("app.c", appC), ("blob.h", frag) });
+
+        var plan = ReachabilityEngine.Compute(graph,
+            new[] { new Root(Find(graph, "use"), RootKind.ExplicitSymbol) });
+
+        Assert.Contains("blob.h", plan.KeptFiles); // kept via the in-initializer #include (text-scanned)
+        Assert.Contains(fe.Warnings, w => w.Contains("blob.h") && w.Contains("fragment"));
+    }
+
+    [Fact]
     public void PointerReturningFunctions_AreCaptured_AndReachable()
     {
         // Regression: `T *f()` wraps the function_declarator in a pointer_declarator. An earlier query

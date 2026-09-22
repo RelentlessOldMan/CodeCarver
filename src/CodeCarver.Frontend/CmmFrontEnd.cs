@@ -25,24 +25,33 @@ public sealed class CmmFrontEnd : ICarveFrontEnd
     private static readonly Regex Goto = new(@"\bGOTO\s+([A-Za-z_][A-Za-z0-9_]*)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex DoCmd = new(@"\bDO\s+(\S+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    private readonly List<string> _warnings = new();
+    /// <inheritdoc/>
+    public IReadOnlyList<string> Warnings => _warnings;
+
     public CodeGraph BuildGraph(IEnumerable<(string Path, string Text)> files,
                                 MacroTable? defines = null, bool closedWorldDefines = false)
     {
+        _warnings.Clear();
         var graph = new CodeGraph();
         var inputs = files.ToList();
 
         var fileNodeByPath = new Dictionary<string, NodeId>(StringComparer.Ordinal);
-        var fileNodeByStem = new Dictionary<string, NodeId>(StringComparer.OrdinalIgnoreCase); // basename w/o .cmm, for DO
+        // Basename → all files with that stem. DO resolves by basename, so duplicate stems are AMBIGUOUS
+        // (Finding B: silently binding to one wrong file). Keep the list to warn instead of guessing.
+        var filesByStem = new Dictionary<string, List<NodeId>>(StringComparer.OrdinalIgnoreCase);
         foreach (var (path, _) in inputs)
         {
             var fn = graph.GetOrAddNode(NodeKind.File, path);
             fileNodeByPath[path] = fn;
-            fileNodeByStem[Stem(path)] = fn;
+            if (!filesByStem.TryGetValue(Stem(path), out var list))
+                filesByStem[Stem(path)] = list = new List<NodeId>();
+            list.Add(fn);
         }
 
         var subsByName = new Dictionary<string, List<NodeId>>(StringComparer.Ordinal);
-        var pendingCalls = new List<(NodeId From, string Name)>();  // GOSUB/GOTO
-        var pendingIncludes = new List<(NodeId From, string Stem)>(); // DO
+        var pendingCalls = new List<(NodeId From, string Name)>();          // GOSUB/GOTO
+        var pendingIncludes = new List<(NodeId From, string FromPath, string RawArg)>(); // DO
 
         foreach (var (path, text) in inputs)
             if (text.Length > 0) // oversized/empty file: File node already registered; nothing to parse
@@ -52,9 +61,26 @@ public sealed class CmmFrontEnd : ICarveFrontEnd
             if (subsByName.TryGetValue(name, out var targets))
                 foreach (var t in targets) graph.AddEdge(from, t, EdgeKind.Calls);
 
-        foreach (var (from, stem) in pendingIncludes)
-            if (fileNodeByStem.TryGetValue(stem, out var target) && !target.Equals(from))
-                graph.AddEdge(from, target, EdgeKind.Includes);
+        // DO resolution with diagnostics (Finding B): dynamic &var paths can't be resolved; a missing
+        // basename resolves to nothing; a duplicate basename is ambiguous. All were previously silent —
+        // the "100% smaller" trap. Warn, and bind ambiguous DOs deterministically to the first match.
+        foreach (var (from, fromPath, rawArg) in pendingIncludes)
+        {
+            if (rawArg.Contains('&'))
+            {
+                _warnings.Add($"{fromPath}: `DO {rawArg}` uses a variable path (dynamic dispatch) — unresolved; scripts reached only this way may be wrongly dropped (prefer file-level carve here)");
+                continue;
+            }
+            var stem = Stem(rawArg);
+            if (!filesByStem.TryGetValue(stem, out var targets) || targets.Count == 0)
+            {
+                _warnings.Add($"{fromPath}: `DO {rawArg}` — no '{stem}.cmm' among the carved inputs; target unresolved (outside the carve root?)");
+                continue;
+            }
+            if (targets.Count > 1)
+                _warnings.Add($"{fromPath}: `DO {rawArg}` — ambiguous basename '{stem}' matches {targets.Count} files; bound to the first");
+            if (!targets[0].Equals(from)) graph.AddEdge(from, targets[0], EdgeKind.Includes);
+        }
 
         return graph;
     }
@@ -62,7 +88,7 @@ public sealed class CmmFrontEnd : ICarveFrontEnd
     private void ProcessFile(CodeGraph graph, string path, string text, NodeId fileNode,
                              Dictionary<string, List<NodeId>> subsByName,
                              List<(NodeId, string)> pendingCalls,
-                             List<(NodeId, string)> pendingIncludes)
+                             List<(NodeId, string, string)> pendingIncludes)
     {
         var lines = text.Split('\n');
 
@@ -98,7 +124,7 @@ public sealed class CmmFrontEnd : ICarveFrontEnd
 
             foreach (Match g in Gosub.Matches(line)) pendingCalls.Add((from, g.Groups[1].Value));
             foreach (Match g in Goto.Matches(line)) pendingCalls.Add((from, g.Groups[1].Value));
-            foreach (Match d in DoCmd.Matches(line)) pendingIncludes.Add((from, Stem(d.Groups[1].Value)));
+            foreach (Match d in DoCmd.Matches(line)) pendingIncludes.Add((from, path, d.Groups[1].Value));
         }
     }
 

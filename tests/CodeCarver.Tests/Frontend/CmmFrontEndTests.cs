@@ -85,6 +85,28 @@ public class CmmFrontEndTests
         Assert.False(plan.IsKept(Find(graph, "NotReallyCalled"))); // the GOSUB is commented out
     }
 
+    [Fact]
+    public void DoResolution_Warns_OnDynamic_Missing_Ambiguous_ButNotOnCleanDo()
+    {
+        // Finding B: DO resolution is basename-only. A variable path (dynamic), a missing target, and a
+        // duplicate basename all used to fail SILENTLY — the "100% smaller" trap. They must warn; a clean
+        // DO must not.
+        using var fe = new CmmFrontEnd();
+        fe.BuildGraph(new[]
+        {
+            ("main.cmm", "Main:\n  DO worker\n  DO &dyn\n  DO nope\n  RETURN\n"),
+            ("worker.cmm", "W:\n  RETURN\n"),
+            ("a/common.cmm", "A:\n  RETURN\n"),
+            ("b/common.cmm", "B:\n  RETURN\n"),
+            ("root.cmm", "Root:\n  DO common\n  RETURN\n"),
+        });
+
+        Assert.Contains(fe.Warnings, w => w.Contains("&dyn") && w.Contains("dynamic"));
+        Assert.Contains(fe.Warnings, w => w.Contains("nope") && w.Contains("unresolved"));
+        Assert.Contains(fe.Warnings, w => w.Contains("common") && w.Contains("ambiguous"));
+        Assert.DoesNotContain(fe.Warnings, w => w.Contains("worker")); // the one clean DO is silent
+    }
+
     private static NodeId Find(CodeGraph graph, string name) =>
         graph.Nodes.First(n => n.Kind == NodeKind.Function && n.Name == name).Id;
 }

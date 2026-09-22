@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using CodeCarver.Core.Graph;
 using CodeCarver.Core.Preprocess;
 using TreeSitter;
@@ -18,7 +19,11 @@ namespace CodeCarver.Frontend;
 public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 {
     private const string IdentQuery = "(identifier) @id";
-    private const string IncludeQuery = "(preproc_include path: (_) @inc)";
+
+    /// <summary><c>#include "x"</c> or <c>#include &lt;x&gt;</c>, scanned from text (line-oriented) so it
+    /// catches includes tree-sitter misses — e.g. inside an array initializer (the data-fragment case).</summary>
+    private static readonly Regex IncludeLine = new(
+        """^\s*#\s*include\s+(?:"([^"]+)"|<([^>]+)>)""", RegexOptions.Compiled);
 
     // Function names used as DATA — global/array/struct initializers (vector tables, dispatch tables,
     // hooks structs, function-pointer registries). Structural on purpose (only initializer contexts) so
@@ -55,9 +60,19 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private readonly Query _defs;
     private readonly Query _calls;
     private readonly Query _idents;
-    private readonly Query _includes;
     private readonly Query _initRefs;
     private readonly Query _globals;
+
+    private readonly List<string> _warnings = new();
+    /// <inheritdoc/>
+    public IReadOnlyList<string> Warnings => _warnings;
+
+    /// <summary>Per-file parse budget (ms). A file whose parse exceeds it is kept whole (see
+    /// <see cref="LooksLikeIncludeFragment"/>) — a backstop against tree-sitter's super-linear error
+    /// recovery on invalid #include fragments stalling a whole run. Only applied to files big enough to
+    /// plausibly stall (below that they parse near-instantly even when invalid). 0 disables the budget.</summary>
+    public int ParseBudgetMs { get; set; } = 20_000;
+    private const int BudgetMinBytes = 256 * 1024;
 
     protected TreeSitterFrontEnd(string grammarLib, string grammarFn, string defsQuery, string callsQuery)
     {
@@ -65,7 +80,6 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _defs = new Query(_lang, defsQuery);
         _calls = new Query(_lang, callsQuery);
         _idents = new Query(_lang, IdentQuery);
-        _includes = new Query(_lang, IncludeQuery);
         _initRefs = new Query(_lang, InitRefQuery);
         _globals = new Query(_lang, GlobalQuery);
     }
@@ -78,6 +92,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public CodeGraph BuildGraph(IEnumerable<(string Path, string Text)> files, MacroTable? defines = null,
                                 bool closedWorldDefines = false)
     {
+        _warnings.Clear();
         var graph = new CodeGraph();
         var inputs = files.ToList();
 
@@ -130,6 +145,92 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         return graph;
     }
 
+    /// <summary>
+    /// Parse <paramref name="text"/>, but for a file big enough to plausibly trigger tree-sitter's
+    /// super-linear error recovery, do the parse on a throwaway background thread and abandon it if it
+    /// blows <see cref="ParseBudgetMs"/>. Only the parse runs on the worker (no shared state), so an
+    /// abandoned thread — stuck in native error recovery until the process exits — can never corrupt the
+    /// graph. Small files (the vast majority) parse inline; they finish near-instantly even when invalid.
+    /// </summary>
+    private Tree? ParseWithBudget(string text, out bool timedOut)
+    {
+        timedOut = false;
+        if (ParseBudgetMs <= 0 || text.Length < BudgetMinBytes)
+        {
+            using var parser = new Parser(_lang);
+            return parser.Parse(text);
+        }
+
+        Tree? result = null;
+        var worker = new Thread(() =>
+        {
+            var parser = new Parser(_lang); // not `using`: if abandoned, let the process teardown reclaim it
+            result = parser.Parse(text);
+            parser.Dispose();
+        }) { IsBackground = true, Name = "ts-parse-budget" };
+        worker.Start();
+        if (worker.Join(ParseBudgetMs)) return result; // Join true => happens-before on `result`
+        timedOut = true;
+        return null; // abandon the worker; it touches no shared state
+    }
+
+    /// <summary>
+    /// Cheap, streaming heuristic for an #include DATA fragment: a file dominated by lines of bare
+    /// numeric/char literals and separators (a byte table, an X-macro-free constant list) with no
+    /// declaration or preprocessor structure. Such a file is not valid stand-alone C, so parsing it is
+    /// both pointless (nothing to carve) and dangerous (error-recovery blowup). Conservative: needs a
+    /// meaningful line count and a high data-line ratio, so ordinary code never trips it.
+    /// </summary>
+    internal static bool LooksLikeIncludeFragment(string text)
+    {
+        int total = 0, data = 0;
+        var start = 0;
+        for (var i = 0; i <= text.Length; i++)
+        {
+            if (i != text.Length && text[i] != '\n') continue;
+            var line = text.AsSpan(start, i - start).Trim();
+            start = i + 1;
+            if (line.Length == 0) continue;
+            if (line[0] == '#') return false;                    // any preprocessor line => real header
+            if (line.StartsWith("//") || line.StartsWith("/*") || line[0] == '*') continue; // comment
+            total++;
+            if (IsDataLine(line)) data++;
+        }
+        return total >= 50 && data >= total * 0.9;
+    }
+
+    /// <summary>A .c/.cc/.cpp/.cxx/.c++ source file — a translation unit we must always parse.</summary>
+    private static bool IsTranslationUnit(string path)
+    {
+        var dot = path.LastIndexOf('.');
+        if (dot < 0) return false;
+        var ext = path[dot..];
+        return ext.Equals(".c", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".cc", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".cpp", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".cxx", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".c++", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>A line of only numeric/char literals + separators (no identifier, no <c>;</c>).</summary>
+    private static bool IsDataLine(ReadOnlySpan<char> line)
+    {
+        var sawDigit = false;
+        foreach (var c in line)
+        {
+            if (char.IsAsciiDigit(c)) { sawDigit = true; continue; }
+            if (char.IsAsciiLetter(c))
+            {
+                if ("abcdefABCDEFxXuUlL".IndexOf(c) < 0) return false; // a real identifier char => not data
+                continue;
+            }
+            if (c is ' ' or '\t' or ',' or '.' or '+' or '-' or '|' or '&' or '(' or ')'
+                  or '<' or '>' or '{' or '}' or '\'' or '"' or '\\' or '~' or '^' or '*') continue;
+            return false; // a `;`, `=`, `:` etc. — declaration/statement structure, not a bare data list
+        }
+        return sawDigit;
+    }
+
     private static void ResolveUse(CodeGraph graph, NodeId from, string name,
                                    Dictionary<string, List<NodeId>> functionsByName,
                                    Dictionary<string, List<NodeId>> macrosByName,
@@ -170,8 +271,26 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                              MacroTable? defines,
                              bool closedWorldDefines)
     {
-        using var parser = new Parser(_lang);
-        using var tree = parser.Parse(text);
+        // Finding A: some headers are #include fragments (e.g. a bare byte list pasted inside an array
+        // initializer) — valid in context, invalid alone. tree-sitter's error recovery on them is
+        // super-linear (a 2.4 MB blob can stall for minutes). Detect the obvious data-fragment shape and
+        // keep it whole without parsing; a per-file budget backstops anything the heuristic misses. Either
+        // way the file is still kept via #include-closure (its File node is already registered).
+        // Gate the fragment heuristic to non-.c files: a header kept-whole is always sound (#include-
+        // closure keeps it), but skipping a translation unit would lose its symbols. TUs always parse
+        // (the parse budget still backstops a pathological one).
+        if (!IsTranslationUnit(path) && LooksLikeIncludeFragment(text))
+        {
+            _warnings.Add($"{path}: looks like an #include data fragment (not valid stand-alone C) — kept whole, not carved");
+            return;
+        }
+
+        using var tree = ParseWithBudget(text, out var timedOut);
+        if (timedOut)
+        {
+            _warnings.Add($"{path}: parse exceeded the {ParseBudgetMs} ms budget — kept whole, not carved");
+            return;
+        }
         if (tree is null) return;
         var root = tree.RootNode;
         var fileNode = fileNodeByPath[path];
@@ -239,11 +358,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             Add(globalsByName, node.Text, gid);
         }
 
-        // Pass 2: #includes → file/header edges.
-        foreach (var cap in _includes.Execute(root).Captures)
+        // Pass 2: #includes → file/header edges. Scanned from TEXT, not the parse tree: #include is a
+        // line-oriented preprocessor directive, and tree-sitter misses ones in odd positions — notably
+        // `#include "blob.h"` INSIDE an array initializer (the data-fragment pattern). A text scan catches
+        // them all, so a needed fragment header is never silently dropped (would break the emitted build).
+        for (var li = 0; li < srcLines.Length; li++)
         {
-            if (IsDead(cap.Node)) continue;
-            var target = BaseName(Unquote(cap.Node.Text));
+            if (dead is not null && li + 1 < dead.Length && dead[li + 1]) continue;
+            var m = IncludeLine.Match(srcLines[li]);
+            if (!m.Success) continue;
+            var target = BaseName(m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value);
             if (!pathsByBasename.TryGetValue(target, out var targets)) continue;
             foreach (var tp in targets)
                 if (tp != path)
@@ -543,7 +667,6 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     {
         _globals.Dispose();
         _initRefs.Dispose();
-        _includes.Dispose();
         _idents.Dispose();
         _calls.Dispose();
         _defs.Dispose();

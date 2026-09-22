@@ -46,6 +46,9 @@ public sealed class CSharpFrontEnd : ICarveFrontEnd
         _calls = new Query(_lang, CallsQuery);
     }
 
+    /// <inheritdoc/>
+    public IReadOnlyList<string> Warnings => Array.Empty<string>();
+
     public CodeGraph BuildGraph(IEnumerable<(string Path, string Text)> files,
                                 MacroTable? defines = null, bool closedWorldDefines = false)
     {

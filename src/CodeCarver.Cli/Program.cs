@@ -75,6 +75,7 @@ static int RunCarve(string[] args)
     string? probeCompiler = null;
     long maxParseBytes = 20_000_000; // files bigger than this (e.g. multi-GB generated register headers)
                                      // skip the parser and are kept whole via #include-closure.
+    int? parseTimeoutMs = null;      // per-file parse budget backstop (ms); null = front-end default.
 
     // A --config JSON file supplies defaults; explicit CLI flags below override it.
     for (var i = 2; i < args.Length - 1; i++)
@@ -123,6 +124,8 @@ static int RunCarve(string[] args)
             probeCompiler = args[++i];
         else if (args[i] == "--max-parse-bytes" && i + 1 < args.Length)
             long.TryParse(args[++i], out maxParseBytes);
+        else if (args[i] == "--parse-timeout" && i + 1 < args.Length)
+            parseTimeoutMs = int.TryParse(args[++i], out var pt) ? pt * 1000 : null;
         else if (args[i] == "--dump-spans")
             dumpSpans = true;
     }
@@ -200,7 +203,17 @@ static int RunCarve(string[] args)
         "cmm" => new CmmFrontEnd(),
         _ => new CFrontEnd(),
     };
+    if (parseTimeoutMs is not null && fe is TreeSitterFrontEnd tsfe) tsfe.ParseBudgetMs = parseTimeoutMs.Value;
     var graph = fe.BuildGraph(inputs, defines, closedWorld);
+
+    // Non-fatal diagnostics (kept-whole fragments, unresolved/ambiguous .cmm DO). Surfacing these avoids
+    // the "silent 100% smaller" trap. Capped so a tree with hundreds of dynamic DOs doesn't flood output.
+    if (fe.Warnings.Count > 0)
+    {
+        const int cap = 12;
+        foreach (var w in fe.Warnings.Take(cap)) Console.Error.WriteLine("  warn    : " + w);
+        if (fe.Warnings.Count > cap) Console.Error.WriteLine($"  warn    : (+{fe.Warnings.Count - cap} more warnings)");
+    }
 
     var rootSet = new ExplicitRootProvider(symbols: roots).Discover(graph).ToList();
     if (rootSet.Count == 0)
