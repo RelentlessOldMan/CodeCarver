@@ -496,6 +496,37 @@ public class CFrontEndTests
         Assert.True(plan.IsKept(Find(graph, "real_div")));
     }
 
+    [Fact]
+    public void SymbolsInMacroCallInitializer_AreKept_ViaFile()
+    {
+        // A file-scope global initialized by a MACRO invocation (quickjs's
+        // `static const X y = JS_OBJECT_DEF("qjs", qjs_methods, ...)`) references other symbols as macro
+        // arguments. The initializer is a call_expression, not an initializer_list, so the plain init scan
+        // missed the arguments and a table/function referenced only there was dropped → dangling. Pass 5
+        // now scans call_expression initializers too. probe_fn and handlers are referenced ONLY inside the
+        // macro-call initializers.
+        const string src = """
+            typedef struct { void *tab; int len; } Obj;
+
+            static int probe_fn(int x){ return x; }
+            static int handlers[] = { 0 };
+
+            #define REGISTER(t, n) { (t), (n) }
+
+            static const Obj registered = REGISTER(handlers, 1);
+            static const Obj with_fn = REGISTER(probe_fn, 0);
+
+            const void *root(void){ return registered.tab; }
+            """;
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("m.c", src) });
+        var plan = ReachabilityEngine.Compute(graph,
+            new[] { new Root(Find(graph, "root"), RootKind.ExplicitSymbol) });
+
+        Assert.True(plan.IsKept(Find(graph, "probe_fn")));                                  // fn as macro arg
+        Assert.True(plan.IsKept(FindNode(graph, NodeKind.Global, "handlers")));             // table as macro arg
+    }
+
     private static NodeId Find(CodeGraph graph, string name) => FindNode(graph, NodeKind.Function, name);
 
     private static NodeId FindNode(CodeGraph graph, NodeKind kind, string name)

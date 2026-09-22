@@ -29,7 +29,8 @@ $repos = @(
     @{ name = 'rax';        url = 'https://github.com/antirez/rax';       ref = $null;     tier = 'C (radix tree, goto-heavy)' },
     @{ name = 'log.c';      url = 'https://github.com/rxi/log.c';         ref = $null;     tier = 'C (logger with file-scope callback dispatch table; src/ subdir)' },
     @{ name = 'wren';       url = 'https://github.com/wren-lang/wren';    ref = $null;     tier = 'C (scripting VM, computed-goto interpreter loop; exposed the phantom nested-function misparse)' },
-    @{ name = 'janet';      url = 'https://github.com/janet-lang/janet';  ref = $null;     tier = 'C (Lisp VM; macro-defined JANET_CORE_FN bodies + macro-soup method tables; exposed pass-4/ERROR-table ref losses)' }
+    @{ name = 'janet';      url = 'https://github.com/janet-lang/janet';  ref = $null;     tier = 'C (Lisp VM; macro-defined JANET_CORE_FN bodies + macro-soup method tables; exposed pass-4/ERROR-table ref losses)' },
+    @{ name = 'quickjs';    url = 'https://github.com/quickjs-ng/quickjs'; ref = $null;    tier = 'C (JS engine, computed-goto; exposed symbols referenced from a macro-call global initializer)' }
 )
 
 foreach ($r in $repos) {

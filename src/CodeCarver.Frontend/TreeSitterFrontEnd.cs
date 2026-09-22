@@ -55,6 +55,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private const string InitRefQuery = """
         (initializer_list) @il
         (init_declarator value: (identifier) @ref)
+        (init_declarator value: (call_expression) @il)
         (initializer_pair value: (identifier) @ref)
         """;
 
