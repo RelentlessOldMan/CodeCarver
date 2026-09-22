@@ -710,7 +710,19 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (parent is null) return null;
             var t = parent.Type;
             if (t == "function_definition")
+            {
+                // A function_definition nested inside another body whose "parameter list" is really a
+                // CALL's argument list is a MISPARSE — tree-sitter produces it when a macro-label statement
+                // is followed by a call, e.g. wren's `CASE_CODE(CLOSE_UPVALUE): closeUpvalues(fiber,
+                // fiber->stackTop - 1)`, parsing the call as a nested definition whose body is the next
+                // block. That phantom steals the real call's attribution (the call lands in its span, not
+                // the enclosing function) and leaves the true callee unreached → dropped → dangling.
+                // Reject ONLY that shape: nested AND its params aren't real parameter_declarations. A real
+                // top-level function that cascading error-recovery merely nested keeps a valid parameter
+                // list, so it is still captured (crypto libraries with macro-heavy bodies rely on this).
+                if (InsideFunctionBody(parent) && HasCallShapedParameters(parent)) return null;
                 return (parent.StartPosition.Row + 1, parent.EndPosition.Row + 1);
+            }
             if (t is "function_declarator" or "pointer_declarator" or "reference_declarator"
                   or "parenthesized_declarator" or "qualified_identifier" or "template_function")
             {
@@ -720,6 +732,38 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             return null;
         }
         return null;
+    }
+
+    /// <summary>
+    /// True if this function_definition's parameter list is really a CALL's argument list — the tell-tale
+    /// of a call mis-parsed as a nested definition (e.g. <c>closeUpvalues(fiber, fiber->stackTop - 1)</c>).
+    /// A genuine definition's parameters are <c>parameter_declaration</c>s (or empty/<c>void</c>/variadic);
+    /// an argument list holds expressions/identifiers, or the subtree carries a parse ERROR. Conservative:
+    /// only an unmistakable non-parameter child (or error) counts, so a real signature is never rejected.
+    /// </summary>
+    private static bool HasCallShapedParameters(TsNode funcDef)
+    {
+        TsNode? decl = ChildForField(funcDef, "declarator");
+        for (var i = 0; i < 6 && decl is not null && decl.Type != "function_declarator"; i++)
+            decl = ChildForField(decl, "declarator");
+        if (decl is null || decl.Type != "function_declarator") return false; // can't tell — don't reject
+
+        var plist = ChildForField(decl, "parameters");
+        if (plist is null) return false;
+        if (plist.IsError || plist.HasError) return true;
+        foreach (var ch in plist.NamedChildren)
+        {
+            if (ch.IsExtra) continue; // comments
+            if (ch.Type is not ("parameter_declaration" or "variadic_parameter"
+                             or "optional_parameter_declaration")) return true;
+        }
+        return false;
+    }
+
+    private static TsNode? ChildForField(TsNode n, string field)
+    {
+        try { return n.GetChildForField(field); }
+        catch { return null; }
     }
 
     /// <summary>True if a node sits inside a function body — a compound_statement or function_definition

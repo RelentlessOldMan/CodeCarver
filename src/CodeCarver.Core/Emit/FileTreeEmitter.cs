@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.RegularExpressions;
 using CodeCarver.Core.Graph;
 using CodeCarver.Core.Reachability;
 
@@ -40,6 +41,7 @@ public static class FileTreeEmitter
             written.Add(rel);
         }
 
+        CopyUnscannedIncludes(plan, sourceRoot, outDir, written, ref bytes);
         return new EmitResult(written.Count, bytes, written);
     }
 
@@ -113,7 +115,64 @@ public static class FileTreeEmitter
             written.Add(rel);
         }
 
+        CopyUnscannedIncludes(plan, sourceRoot, outDir, written, ref bytes);
         return new EmitResult(written.Count, bytes, written);
+    }
+
+    private static readonly Regex LocalInclude = new(
+        "^\\s*#\\s*include\\s+\"([^\"]+)\"", RegexOptions.Compiled | RegexOptions.Multiline);
+
+    /// <summary>
+    /// Copy files that emitted code <c>#include</c>s but the carve never modelled — a local include with
+    /// a non-source extension (<c>.inc</c>, <c>.def</c>, generated tables) or in an excluded directory.
+    /// Such a file is not a graph node, so the include-closure can't keep it, yet the emitted tree won't
+    /// compile without it. Resolve each <c>"…"</c> include relative to the including file, confined to the
+    /// source tree, and copy any target unknown to the carve — recursing into what it in turn includes.
+    /// Sound: it only ADDS files, never touches an emitted/pruned one, and never resurrects a header the
+    /// carve deliberately dropped (those are graph-known, so excluded here).
+    /// </summary>
+    private static void CopyUnscannedIncludes(CarvePlan plan, string sourceRoot, string outDir,
+                                              List<string> written, ref long bytes)
+    {
+        var root = Path.GetFullPath(sourceRoot);
+        var known = new HashSet<string>(plan.KeptFiles, StringComparer.OrdinalIgnoreCase);
+        foreach (var f in plan.DroppedFiles) known.Add(f);          // graph-known drops: leave dropped
+        var copied = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var queue = new Queue<string>(written);                      // scan every emitted file for includes
+
+        while (queue.Count > 0)
+        {
+            var rel = queue.Dequeue();
+            var full = Path.Combine(sourceRoot, rel);
+            // Read only a bounded prefix: includes live at the top, and a multi-GB kept file must never
+            // become a >2GB string. Files without readable text simply contribute no includes.
+            string text;
+            try
+            {
+                var info = new FileInfo(full);
+                if (!info.Exists || info.Length > 8 * 1024 * 1024) continue;
+                text = File.ReadAllText(full);
+            }
+            catch { continue; }
+
+            var fromDir = Path.GetDirectoryName(full) ?? sourceRoot;
+            foreach (Match m in LocalInclude.Matches(text))
+            {
+                var target = Path.GetFullPath(Path.Combine(fromDir, m.Groups[1].Value));
+                if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue; // outside the tree
+                if (!File.Exists(target)) continue;                  // unresolved here (system/other -I dir)
+                var trel = Path.GetRelativePath(sourceRoot, target).Replace('\\', '/');
+                if (known.Contains(trel) || !copied.Add(trel)) continue; // graph-known or already copied
+
+                var dst = Path.Combine(outDir, trel);
+                var dstDir = Path.GetDirectoryName(dst);
+                if (!string.IsNullOrEmpty(dstDir)) Directory.CreateDirectory(dstDir);
+                File.Copy(target, dst, overwrite: true);
+                bytes += new FileInfo(dst).Length;
+                written.Add(trel);
+                queue.Enqueue(trel);                                 // its own includes may need copying too
+            }
+        }
     }
 
     /// <summary>Net <c>{</c> minus <c>}</c> over a line range, ignoring // and /* */ comments and

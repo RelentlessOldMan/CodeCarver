@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using CodeCarver.Core.Emit;
+using CodeCarver.Core.Graph;
 using CodeCarver.Core.Frontend;
 using CodeCarver.Core.Preprocess;
 using CodeCarver.Core.Reachability;
@@ -681,6 +682,41 @@ public class BuildVerifyTests
         {
             if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
         }
+    }
+
+    [Fact]
+    public void Wren_ComputedGotoLoop_KeepsStaticCalledFromInterpreter()
+    {
+        // Regression for the phantom nested-function misparse. wren's interpreter loop uses computed goto
+        // (`CASE_CODE(x): call(args)` = a bare label + call, no switch). tree-sitter mis-parses a call
+        // like `closeUpvalues(fiber, fiber->stackTop - 1)` as a NESTED function definition, whose span
+        // then steals the real call's attribution — leaving the true static callee unreached and dropped,
+        // so the carved interpreter fails to link. The fix rejects function_definitions nested inside a
+        // function body. Corpus-gated (the misparse is cumulative over the whole 400-line function, so it
+        // only reproduces faithfully on the real file). Assert reachability, not compilation.
+        var repo = FindUp(Path.Combine(".corpus", "wren"));
+        if (repo is null) return;
+        var srcRoot = Path.Combine(repo, "src");
+        if (!Directory.Exists(srcRoot)) return;
+
+        var inputs = Directory.EnumerateFiles(srcRoot, "*.*", SearchOption.AllDirectories)
+            .Where(p => p.EndsWith(".c", StringComparison.OrdinalIgnoreCase)
+                     || p.EndsWith(".h", StringComparison.OrdinalIgnoreCase))
+            .Select(p => (Path.GetRelativePath(srcRoot, p).Replace('\\', '/'), File.ReadAllText(p)))
+            .ToList();
+        if (!inputs.Any(i => i.Item2.Contains("closeUpvalues"))) return; // unexpected layout — skip
+
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(inputs);
+        var roots = new ExplicitRootProvider(symbols: new[] { "wrenNewVM", "wrenInterpret", "wrenFreeVM" })
+            .Discover(graph).ToList();
+        var plan = ReachabilityEngine.Compute(graph, roots);
+
+        // closeUpvalues is a static, called only from runInterpreter's computed-goto loop.
+        var closeUpvalues = graph.Nodes.Where(n => n.Name == "closeUpvalues" && n.Kind == NodeKind.Function).ToList();
+        Assert.NotEmpty(closeUpvalues);
+        Assert.All(closeUpvalues, n => Assert.True(plan.IsKept(n.Id),
+            "closeUpvalues was dropped — the phantom nested-function misparse stole its call attribution"));
     }
 
     /// <summary>Walk up from the test binary to the repo's fetched toolchain, if present.</summary>
