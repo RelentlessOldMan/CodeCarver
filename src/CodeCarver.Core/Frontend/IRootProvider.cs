@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using CodeCarver.Core.Graph;
 using CodeCarver.Core.Roots;
 
@@ -60,6 +61,32 @@ public sealed class AttributeRootProvider : IRootProvider
     {
         foreach (var node in graph.Nodes)
             if (node.Kind is NodeKind.Function or NodeKind.Global && (node.Flags & NodeFlags.Keep) != 0)
+                yield return new Root(node.Id, RootKind.LinkerKeep, node.Name);
+    }
+}
+
+/// <summary>
+/// Roots every in-scope C symbol named in a standalone assembly file (<c>.s</c>/<c>.S</c>). Embedded
+/// startup keeps the vector table and reset handler in assembly (<c>startup_*.s</c>): the table is
+/// <c>.word Handler</c> entries and code does <c>bl func</c> — pure symbol references with no C-level
+/// edge, so a from-<c>main</c> closure drops the handlers. Over-approximates (every identifier token,
+/// incl. mnemonics/registers); only tokens that match a defined symbol become roots.
+/// </summary>
+public sealed class AsmReferenceRootProvider : IRootProvider
+{
+    private static readonly Regex Ident = new(@"[A-Za-z_]\w*", RegexOptions.Compiled);
+    private readonly IReadOnlyList<string> _asmTexts;
+    public AsmReferenceRootProvider(IEnumerable<string> asmTexts) => _asmTexts = asmTexts.ToList();
+
+    public IEnumerable<Root> Discover(CodeGraph graph)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var t in _asmTexts)
+            foreach (Match m in Ident.Matches(t))
+                names.Add(m.Value);
+
+        foreach (var node in graph.Nodes)
+            if (node.Kind is NodeKind.Function or NodeKind.Global && names.Contains(node.Name))
                 yield return new Root(node.Id, RootKind.LinkerKeep, node.Name);
     }
 }

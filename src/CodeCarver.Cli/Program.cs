@@ -227,7 +227,22 @@ static int RunCarve(string[] args)
     // Implicit roots (constructor/used/init-array) are ALWAYS added: the runtime/linker keep them
     // regardless of any call, so a from-main closure that dropped them would ship a broken image.
     var implicitRoots = new AttributeRootProvider().Discover(graph).ToList();
-    var rootSet = explicitRoots.Concat(implicitRoots).ToList();
+
+    // Assembly startup (.s/.S) references C handlers by name (vector table `.word Handler`) — root them.
+    var asmRoots = new List<Root>();
+    if (lang is "c" or "cpp")
+    {
+        var asmTexts = Directory.EnumerateFiles(dir, "*.*", SearchOption.AllDirectories)
+            .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".s" or ".asm")
+            .Where(p => excludeDirs.Count == 0 ||
+                        !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase)))
+            .Where(p => new FileInfo(p).Length <= maxParseBytes)
+            .Select(File.ReadAllText).ToList();
+        if (asmTexts.Count > 0)
+            asmRoots = new AsmReferenceRootProvider(asmTexts).Discover(graph).ToList();
+    }
+
+    var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).ToList();
     if (rootSet.Count == 0)
     {
         Console.Error.WriteLine("no roots to carve from: name entry symbols with --roots");
@@ -262,6 +277,9 @@ static int RunCarve(string[] args)
     if (implicitRoots.Count > 0)
         Console.WriteLine($"  implicit: {implicitRoots.Count} constructor/used/init-array symbol(s) auto-kept: "
                           + Summarize(implicitRoots.Select(r => r.Note ?? r.Node.ToString()).Distinct().ToList()));
+    if (asmRoots.Count > 0)
+        Console.WriteLine($"  asm     : {asmRoots.Count} symbol(s) referenced from .s startup auto-kept: "
+                          + Summarize(asmRoots.Select(r => r.Note ?? r.Node.ToString()).Distinct().ToList()));
     if (defines is not null)
         Console.WriteLine($"  config  : {defineSpecs.Distinct().Count()} define(s), #ifdef resolution ON" +
                           (closedWorld ? " (closed-world: absent macros treated as undefined)" : " (open-world: unknown branches kept)"));
