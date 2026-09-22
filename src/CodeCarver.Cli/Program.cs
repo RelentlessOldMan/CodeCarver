@@ -67,6 +67,7 @@ static int RunCarve(string[] args)
     var pruneHeaders = false;
     var verify = false;
     var dumpSpans = false;
+    string? whySymbol = null;
     var lang = "c";
     var defineSpecs = new List<string>();
     string? buildLog = null;
@@ -131,6 +132,8 @@ static int RunCarve(string[] args)
             parseTimeoutMs = int.TryParse(args[++i], out var pt) ? pt * 1000 : null;
         else if (args[i] == "--dump-spans")
             dumpSpans = true;
+        else if (args[i] == "--why" && i + 1 < args.Length)
+            whySymbol = args[++i];
     }
 
     // Preprocessor config: explicit --define plus any -D flags scraped from a --build-log.
@@ -259,6 +262,21 @@ static int RunCarve(string[] args)
                      .OrderBy(n => n.FilePath, StringComparer.Ordinal)
                      .ThenBy(n => n.Span.StartLine))
             Console.WriteLine($"  {(plan.IsKept(n.Id) ? "KEEP" : "drop")} {n.Kind} {n.FilePath}:{n.Span}\t{n.Name}");
+        return 0;
+    }
+
+    // --why <symbol>: explain the keep-chain (or that it was carved) for a named symbol — for debugging
+    // a carve against a real tree ("why is this huge thing still here?" / "why did this get dropped?").
+    if (whySymbol is not null)
+    {
+        var matches = graph.Nodes.Where(n => n.Kind != NodeKind.File && n.Name == whySymbol).ToList();
+        if (matches.Count == 0)
+        {
+            Console.Error.WriteLine($"no symbol named '{whySymbol}' was found");
+            return 1;
+        }
+        foreach (var n in matches.OrderBy(n => n.FilePath, StringComparer.Ordinal).ThenBy(n => n.Span.StartLine))
+            Console.WriteLine($"  {n.Kind} {n.Name} @ {n.FilePath}:{n.Span}\n    {plan.Explain(n.Id)}");
         return 0;
     }
 

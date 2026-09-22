@@ -32,6 +32,23 @@ public class ReachabilityTests
     }
 
     [Fact]
+    public void Explain_TracesKeepChainToRoot_AndReportsCarved()
+    {
+        var b = new GraphBuilder();
+        var foo = b.Func("foo", "a.c");
+        var bar = b.Func("bar", "a.c");
+        var dead = b.Func("dead", "b.c");
+        b.Calls(foo, bar);
+
+        var plan = ReachabilityEngine.Compute(b.Graph, new[] { new Root(foo, RootKind.ExplicitSymbol) });
+
+        var why = plan.Explain(bar);
+        Assert.Contains("ROOT", why);   // walks back to the seed
+        Assert.Contains("Calls", why);  // via the foo -> bar edge
+        Assert.Contains("CARVED", plan.Explain(dead)); // unreached -> reported as carved
+    }
+
+    [Fact]
     public void FileLevel_DropsFilesWithNoReachedNode()
     {
         var b = new GraphBuilder();
