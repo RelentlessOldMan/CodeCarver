@@ -502,6 +502,17 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var from = EnclosingFunction(funcSpans, cap.Node.StartPosition.Row + 1);
             if (from is { } f)
                 pendingRefs.Add((f, cap.Node.Text));
+            else if (InsideFunctionBody(cap.Node) || InsideError(cap.Node))
+                // Attribute to the file (kept while the file is), same fallback as pass 3's calls, in two
+                // cases EnclosingFunction can't see: (a) inside a function body whose signature we couldn't
+                // capture — a macro-defined header like janet's `JANET_CORE_FN(os_shell, ...)`, so a
+                // callback taken there (`janet_ev_threaded_await(os_shell_subr, ...)`) isn't lost; (b)
+                // inside an ERROR subtree — a file-scope function-pointer table tree-sitter couldn't parse
+                // because it sits in macro-invocation soup (janet's `OPMETHOD(...)` run before the
+                // `JanetMethod x[] = {..., cfun_..., ...}` table). Both are real misparses, not the
+                // clean-parsing file-scope prototype that must NOT be swept in (it would keep every
+                // declared function). Over-approximation bounded to the misparsed region — sound.
+                pendingRefs.Add((fileNode, cap.Node.Text));
         }
 
         // Pass 5: function names used as DATA at FILE SCOPE (tables, hooks, registries). Attributed to
@@ -769,6 +780,21 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <summary>True if a node sits inside a function body — a compound_statement or function_definition
     /// ancestor. Used to reject LOCAL variables from global capture; works even when a function's
     /// signature mis-parsed (its body braces still form a compound_statement).</summary>
+    /// <summary>True if any ancestor (up to the translation unit) is a parse ERROR node — the node sits
+    /// in a region tree-sitter couldn't parse (e.g. a file-scope table buried in macro-invocation soup).
+    /// Used to over-keep function references there rather than silently lose them.</summary>
+    private static bool InsideError(TsNode n)
+    {
+        var p = n.Parent;
+        for (var i = 0; i < 48 && p is not null; i++)
+        {
+            if (p.IsError || p.Type == "ERROR") return true;
+            if (p.Type == "translation_unit") return false;
+            p = p.Parent;
+        }
+        return false;
+    }
+
     private static bool InsideFunctionBody(TsNode n)
     {
         var p = n.Parent;

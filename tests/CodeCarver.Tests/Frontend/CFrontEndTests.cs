@@ -438,6 +438,64 @@ public class CFrontEndTests
         Assert.Equal(1, graph.Nodes.Count(n => n.Kind == NodeKind.Function && n.Name == "real"));
     }
 
+    [Fact]
+    public void CallbackInMacroDefinedFunction_IsKept_ViaFile()
+    {
+        // A function whose signature is hidden behind a macro (janet's `JANET_CORE_FN(name, ...)`) is not
+        // captured, so a callback taken inside its body has no enclosing function to attribute to. It must
+        // fall back to the file, or the callback target is dropped and the carved file dangles. real_root
+        // keeps the file; my_callback is referenced ONLY inside the macro-defined body.
+        const string src = """
+            static int my_callback(int x){ return x + 1; }
+            int register_cb(int (*f)(int));
+
+            #define CORE_FN(name) int name(void)
+
+            CORE_FN(do_register) {
+                return register_cb(my_callback);
+            }
+
+            int real_root(void){ return 7; }
+            """;
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("m.c", src) });
+        var plan = ReachabilityEngine.Compute(graph,
+            new[] { new Root(Find(graph, "real_root"), RootKind.ExplicitSymbol) });
+
+        Assert.True(plan.IsKept(Find(graph, "my_callback")));
+    }
+
+    [Fact]
+    public void FunctionInErrorWrappedTable_IsKept_ViaFile()
+    {
+        // A file-scope function-pointer table buried in macro-invocation soup (janet's `OPMETHOD(...)` run
+        // before a `JanetMethod x[] = {..., cfun, ...}` table) is wrapped by tree-sitter in an ERROR node,
+        // so the initializer_list scan misses it. A real function referenced only there would be dropped.
+        // Identifiers inside an ERROR subtree fall back to the file. root keeps the file; real_div is
+        // referenced ONLY in the mis-parsed table.
+        const string src = """
+            typedef struct { const char *name; void *fn; } M;
+
+            static int real_div(int x){ return x / 2; }
+
+            OPMETHOD(int, s, sub, -)
+            OPMETHOD(int, s, mul, *)
+            DIVMETHOD(int, s, rem, %)
+
+            static M methods[] = {
+                {"div", real_div},
+            };
+
+            int root(void){ return methods[0].name[0]; }
+            """;
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("m.c", src) });
+        var plan = ReachabilityEngine.Compute(graph,
+            new[] { new Root(Find(graph, "root"), RootKind.ExplicitSymbol) });
+
+        Assert.True(plan.IsKept(Find(graph, "real_div")));
+    }
+
     private static NodeId Find(CodeGraph graph, string name) => FindNode(graph, NodeKind.Function, name);
 
     private static NodeId FindNode(CodeGraph graph, NodeKind kind, string name)
