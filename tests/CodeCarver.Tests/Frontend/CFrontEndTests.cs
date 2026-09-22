@@ -527,6 +527,33 @@ public class CFrontEndTests
         Assert.True(plan.IsKept(FindNode(graph, NodeKind.Global, "handlers")));             // table as macro arg
     }
 
+    [Fact]
+    public void SymbolCalledOnlyFromIncludedGeneratedTable_IsKept()
+    {
+        // A function called ONLY from an #included generated table with a non-source extension (LLVM-style
+        // `#include "GenDisassemblerTables.inc"` calling DecodeARRegisterClass) — we don't parse the .inc,
+        // so the call is invisible and the function would be dropped, then the emitter copies the .inc and
+        // it references an undefined symbol. Reference-only includes keep every symbol the table names; the
+        // .c's Includes edge to the table then keeps them. root -> the .c keeps the file keeps the table.
+        const string dotC = """
+            int decode_ar(int r);
+            int decode_ar(int r) { return r + 1; }
+
+            int run(void) {
+            #include "gen_tables.inc"
+                return 0;
+            }
+            """;
+        const string genInc = "    if (decode_ar(tmp)) { return 1; }\n";
+
+        using var fe = new CFrontEnd { ReferenceOnlyIncludes = new[] { ("gen_tables.inc", genInc) } };
+        var graph = fe.BuildGraph(new[] { ("m.c", dotC) });
+        var plan = ReachabilityEngine.Compute(graph,
+            new[] { new Root(Find(graph, "run"), RootKind.ExplicitSymbol) });
+
+        Assert.True(plan.IsKept(Find(graph, "decode_ar")));  // referenced only from the generated .inc table
+    }
+
     private static NodeId Find(CodeGraph graph, string name) => FindNode(graph, NodeKind.Function, name);
 
     private static NodeId FindNode(CodeGraph graph, NodeKind kind, string name)

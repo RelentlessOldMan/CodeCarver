@@ -103,6 +103,18 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public int ParseBudgetMs { get; set; } = 20_000;
     private const int BudgetMinBytes = 256 * 1024;
 
+    /// <summary>
+    /// Local <c>#include</c>d files with a non-source extension (<c>.inc</c>/<c>.def</c>/generated tables)
+    /// that are textually part of a <c>.c</c>'s translation unit but which we do NOT parse as C. We scan
+    /// them for identifiers and keep every symbol they name (over-approximation, like inline asm), so a
+    /// function/global called ONLY from a generated table (LLVM-style <c>GenDisassemblerTables.inc</c>
+    /// calling <c>DecodeARRegisterClass</c>) isn't dropped and left dangling when the emitter copies the
+    /// include. The CLI supplies these; each gets a File node and an Includes edge from its includer, so
+    /// keeping the includer keeps the table keeps everything it references. Empty by default.
+    /// </summary>
+    public IReadOnlyList<(string Path, string Text)> ReferenceOnlyIncludes { get; set; }
+        = Array.Empty<(string, string)>();
+
     protected TreeSitterFrontEnd(string grammarLib, string grammarFn, string defsQuery, string callsQuery)
     {
         _lang = new Language(grammarLib, grammarFn);
@@ -127,8 +139,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         var fileNodeByPath = new Dictionary<string, NodeId>(StringComparer.Ordinal);
         var pathsByBasename = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var (path, _) in inputs)
-        {
+        foreach (var (path, _) in inputs.Concat(ReferenceOnlyIncludes)) // reference includes get File nodes
+        {                                                                // + basenames so #include resolves
+            if (fileNodeByPath.ContainsKey(path)) continue;
             fileNodeByPath[path] = graph.GetOrAddNode(NodeKind.File, path);
             var bas = BaseName(path);
             if (!pathsByBasename.TryGetValue(bas, out var list))
@@ -152,6 +165,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                         functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
                         pendingMacroRefs, pendingPastes, defines, closedWorldDefines);
             foreach (var n in ScanKeepAttributes(text)) keepNames.Add(n);
+        }
+
+        // Reference-only includes (.inc/.def generated tables): not parsed as a TU, but every symbol they
+        // name is kept (attributed to the include's file node, reached via the includer's Includes edge).
+        foreach (var (path, text) in ReferenceOnlyIncludes)
+        {
+            if (text.Length == 0 || !fileNodeByPath.TryGetValue(path, out var incNode)) continue;
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (Match m in Identifier.Matches(text))
+                if (seen.Add(m.Value)) pendingRefs.Add((incNode, m.Value));
         }
 
         foreach (var (from, name) in pendingCalls)

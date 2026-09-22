@@ -24,3 +24,4 @@ Thumbs.db
 .corpus/
 .toolchains/
 *.tmp
+.claude/scheduled_tasks.lock

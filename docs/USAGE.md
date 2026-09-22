@@ -49,8 +49,10 @@ Every carve is sound with just `--roots`. Each extra input lets it carve **tight
 > rooted too (reported on an `asm:` line). And a symbol placed in a **custom section your linker script
 > keeps** — `__attribute__((section(".init_calls")))` where the `.ld` has `KEEP(*(.init_calls*))` — is
 > rooted from the tree's own linker script (reported on a `section:` line), generalising the hardcoded
-> `.init_array` handling to any KEEP'd registration/initcall table. This is the sound over-approximation;
-> it never drops these.
+> `.init_array` handling to any KEEP'd registration/initcall table. Finally, a symbol called only from a
+> generated table `#include`d with a **non-source extension** (`#include "GenTables.inc"`, `.def`, X-macro
+> files) is kept too: those includes aren't parsed as C, but every symbol they name is retained and the
+> file is copied into the output. This is the sound over-approximation; it never drops these.
 
 | Input | Flag | Effect |
 |---|---|---|

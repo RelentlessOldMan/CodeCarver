@@ -201,7 +201,43 @@ static int RunCarve(string[] args)
     {
         var rel = Path.GetRelativePath(dir, p).Replace('\\', '/');
         return (rel, bigSet.Contains(rel) ? "" : File.ReadAllText(p)); // "" = don't read/parse; keep whole
-    });
+    }).ToList();
+
+    // Reference-only includes: local #included files with a NON-source extension (.inc/.def/generated
+    // tables) that are textually part of a .c but which we don't parse as C. A function/global called only
+    // from such a table (LLVM-style GenDisassemblerTables.inc) would otherwise be dropped and left dangling
+    // once the emitter copies the include. Gather them (recursively) so the front-end keeps what they name.
+    var refIncludes = new List<(string Rel, string Text)>();
+    if (closureLang && lang is "c" or "cpp")
+    {
+        var rootFull = Path.GetFullPath(dir);
+        var have = paths.Select(Path.GetFullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var gathered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var incRe = new System.Text.RegularExpressions.Regex("^\\s*#\\s*include\\s+\"([^\"]+)\"",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+        var queue = new Queue<(string Full, string Text)>();
+        foreach (var (rel, text) in inputs)
+            if (text.Length > 0) queue.Enqueue((Path.GetFullPath(Path.Combine(dir, rel)), text));
+        while (queue.Count > 0)
+        {
+            var (fromFull, text) = queue.Dequeue();
+            var fromDir = Path.GetDirectoryName(fromFull) ?? dir;
+            foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
+            {
+                var inc = m.Groups[1].Value;
+                if (exts.Any(e => inc.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue; // .h: parsed already
+                string target;
+                try { target = Path.GetFullPath(Path.Combine(fromDir, inc)); } catch { continue; }
+                if (!target.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase)) continue; // outside the tree
+                if (have.Contains(target) || !gathered.Add(target) || !File.Exists(target)) continue;
+                if (new FileInfo(target).Length > maxParseBytes) continue;
+                var itext = File.ReadAllText(target);
+                refIncludes.Add((Path.GetRelativePath(dir, target).Replace('\\', '/'), itext));
+                queue.Enqueue((target, itext)); // an .inc may include another
+            }
+        }
+    }
+
     using ICarveFrontEnd fe = lang switch
     {
         "cpp" => new CppFrontEnd(),
@@ -209,7 +245,11 @@ static int RunCarve(string[] args)
         "cmm" => new CmmFrontEnd(),
         _ => new CFrontEnd(),
     };
-    if (parseTimeoutMs is not null && fe is TreeSitterFrontEnd tsfe) tsfe.ParseBudgetMs = parseTimeoutMs.Value;
+    if (fe is TreeSitterFrontEnd tsfe)
+    {
+        if (parseTimeoutMs is not null) tsfe.ParseBudgetMs = parseTimeoutMs.Value;
+        if (refIncludes.Count > 0) tsfe.ReferenceOnlyIncludes = refIncludes;
+    }
     var graph = fe.BuildGraph(inputs, defines, closedWorld);
 
     // Non-fatal diagnostics (kept-whole fragments, unresolved/ambiguous .cmm DO). Surfacing these avoids
