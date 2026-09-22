@@ -578,8 +578,62 @@ public class BuildVerifyTests
         }
     }
 
+    [Fact]
+    public void EmbeddedFirmware_CarvesSound_AndLinksWithArmGcc()
+    {
+        // The real target is an ARM image loaded via TRACE32. Carve a real Cortex-M3 firmware (vector
+        // table, weak-alias handlers, linker script), then LINK it with arm-none-eabi-gcc and confirm:
+        // it links, the unused functions are physically gone from the image, and the ISRs + alias target
+        // (reached only via the table) survived. Skips cleanly without the ARM toolchain / fixture.
+        var armgcc = FindArmGcc();
+        if (armgcc is null) return;
+        var fixture = FindUp(Path.Combine("examples", "cortexm-firmware"));
+        if (fixture is null || !File.Exists(Path.Combine(fixture, "firmware.ld"))) return;
+
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-fw-" + Guid.NewGuid().ToString("N"));
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(work);
+        try
+        {
+            var srcs = new[] { "startup.c", "main.c", "handlers.c" };
+            var inputs = srcs.Select(f => (f, File.ReadAllText(Path.Combine(fixture, f)))).ToList();
+
+            using var fe = new CFrontEnd();
+            var graph = fe.BuildGraph(inputs);
+            var plan = ReachabilityEngine.Compute(graph,
+                new ExplicitRootProvider(symbols: new[] { "Reset_Handler" }).Discover(graph).ToList());
+            FileTreeEmitter.EmitPruned(plan, graph, fixture, outDir);
+            File.Copy(Path.Combine(fixture, "firmware.ld"), Path.Combine(outDir, "firmware.ld"), overwrite: true);
+
+            var args = new[] { "-mcpu=cortex-m3", "-mthumb", "-ffreestanding", "-nostdlib",
+                               "-Wl,-T,firmware.ld", "-o", "carved.elf" }
+                       .Concat(srcs).ToArray();
+            var (code, output) = Run(armgcc, args, outDir);
+            Assert.True(code == 0, $"carved firmware failed to link with arm-none-eabi-gcc:\n{output}");
+
+            var nm = Path.Combine(Path.GetDirectoryName(armgcc)!, "arm-none-eabi-nm.exe");
+            var (_, syms) = Run(nm, new[] { "carved.elf" }, outDir);
+            Assert.DoesNotContain("unused_helper", syms);       // dead app fn — carved out of the image
+            Assert.DoesNotContain("really_unused_isr", syms);   // dead ISR (not in any table) — carved out
+            Assert.Contains("SysTick_Handler", syms);           // reached only via the vector table
+            Assert.Contains("Default_Handler", syms);           // weak-alias target — must survive
+        }
+        finally
+        {
+            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+        }
+    }
+
     /// <summary>Walk up from the test binary to the repo's fetched toolchain, if present.</summary>
     private static string? FindGcc() => FindUp(Path.Combine(".toolchains", "w64devkit", "bin", "gcc.exe"), file: true);
+
+    /// <summary>Find the fetched portable arm-none-eabi-gcc (version is in the folder name), if present.</summary>
+    private static string? FindArmGcc()
+    {
+        var tools = FindUp(".toolchains");
+        return tools is null ? null
+            : Directory.EnumerateFiles(tools, "arm-none-eabi-gcc.exe", SearchOption.AllDirectories).FirstOrDefault();
+    }
 
     /// <summary>Find a file or directory by walking up from the test binary; null if not found.</summary>
     private static string? FindUp(string relative, bool file = false)

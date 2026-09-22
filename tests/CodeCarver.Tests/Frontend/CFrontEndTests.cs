@@ -202,6 +202,40 @@ public class CFrontEndTests
     }
 
     [Fact]
+    public void VectorTableAndWeakAlias_KeepIsrsAndAliasTarget_DropUnused()
+    {
+        // The embedded shape: ISRs reached only through the vector table, and unused handlers declared as
+        // weak aliases to a Default_Handler. Rooting the reset handler must keep the table's ISRs AND the
+        // alias TARGET (dropping it breaks the link — a real bug the ARM tier caught), and drop dead code.
+        const string startup = """
+            extern int main(void);
+            void Reset_Handler(void);
+            void SysTick_Handler(void);
+            void Default_Handler(void);
+            void NMI_Handler(void) __attribute__((weak, alias("Default_Handler")));
+            void (* const g_vectors[])(void) = { Reset_Handler, NMI_Handler, SysTick_Handler };
+            void Reset_Handler(void) { main(); }
+            void Default_Handler(void) { for(;;){} }
+            """;
+        const string app = """
+            void SysTick_Handler(void) { }
+            int used(void) { return 1; }
+            int dead(void) { return 0; }
+            int main(void) { return used(); }
+            """;
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("startup.c", startup), ("app.c", app) });
+        var plan = ReachabilityEngine.Compute(graph,
+            new[] { new Root(Find(graph, "Reset_Handler"), RootKind.EntryPoint) });
+
+        Assert.True(plan.IsKept(Find(graph, "SysTick_Handler")));  // reached via the vector table
+        Assert.True(plan.IsKept(Find(graph, "NMI_Handler")));      // alias symbol, in the table
+        Assert.True(plan.IsKept(Find(graph, "Default_Handler")));  // alias TARGET — must survive
+        Assert.True(plan.IsKept(Find(graph, "used")));             // main -> used
+        Assert.False(plan.IsKept(Find(graph, "dead")));            // nothing reaches it
+    }
+
+    [Fact]
     public void IncludeFragment_IsKeptWhole_AndReferencingIncludeDetected()
     {
         // Finding A: a header that's a bare byte list #included INSIDE an array initializer is valid in

@@ -28,8 +28,9 @@ minimal slice that still **builds, links, and runs**.
 > streams it down to just the `#define`s you transitively use (a 45 MB / 1M-define header → a few hundred
 > bytes, in one test). Carve → prune → **compile-clean** is
 > verified on 20+ real repos (cJSON, SQLite, Lua, zlib, mongoose, mimalloc, monocypher, tiny-regex-c,
-> qrcodegen, rax, …); C# and `.cmm` carve file-level. See [`docs/USAGE.md`](docs/USAGE.md) to use it,
-> and [`DESIGN.txt`](DESIGN.txt) for the *why*.
+> qrcodegen, rax, …), and **link-clean on real Cortex-M firmware** with `arm-none-eabi-gcc` — vector-table
+> ISRs and weak-alias handlers survive, dead code leaves the image. C# and `.cmm` carve file-level. See
+> [`docs/USAGE.md`](docs/USAGE.md) to use it, and [`DESIGN.txt`](DESIGN.txt) for the *why*.
 
 ## The idea in one paragraph
 

@@ -28,7 +28,27 @@ if (Test-Path $gcc) {
     Write-Host "Installed: $((& $gcc --version | Select-Object -First 1))"
 }
 
-# Future pins go here (arm-none-eabi-gcc for embedded ELF / vector-table verification; LLVM/Clang for
-# the -E preprocessing engine and the semantic tightener) — same download-once, verify pattern.
+# --- arm-none-eabi-gcc: portable ARM cross-toolchain for embedded ELF / vector-table verification ---
+# The real target is a Cortex-class image loaded via TRACE32, so build-verify the carve on ACTUAL ARM
+# firmware (vector table, weak-alias handlers, linker script) — not just host x64. xPack ships a clean
+# portable zip (no installer). ~278 MB download.
+$armVer = '13.3.1-1.1'
+$armUrl  = "https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v$armVer/xpack-arm-none-eabi-gcc-$armVer-win32-x64.zip"
+$armZip  = Join-Path $tools 'arm-none-eabi-gcc.zip'
+$armDir  = Join-Path $tools "xpack-arm-none-eabi-gcc-$armVer"
+$armGcc  = Join-Path $armDir 'bin\arm-none-eabi-gcc.exe'
+
+if (Test-Path $armGcc) {
+    Write-Host "arm-none-eabi-gcc already present ($((& $armGcc --version | Select-Object -First 1)))."
+} else {
+    Write-Host "Downloading arm-none-eabi-gcc $armVer (~278 MB)..."
+    Invoke-WebRequest -Uri $armUrl -OutFile $armZip
+    Expand-Archive -Path $armZip -DestinationPath $tools -Force
+    Remove-Item $armZip -Force
+    Write-Host "Installed: $((& $armGcc --version | Select-Object -First 1))"
+}
+
+# Future pins go here (LLVM/Clang for the -E preprocessing engine and the semantic tightener) — same
+# download-once, verify pattern.
 
 Write-Host "Toolchains ready in $tools"

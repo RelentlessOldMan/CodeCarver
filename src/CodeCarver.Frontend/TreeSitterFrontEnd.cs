@@ -25,6 +25,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private static readonly Regex IncludeLine = new(
         """^\s*#\s*include\s+(?:"([^"]+)"|<([^>]+)>)""", RegexOptions.Compiled);
 
+    /// <summary><c>void h(void) __attribute__((weak, alias("target")))</c> — a GCC symbol alias. The
+    /// aliasing name IS the target function, so without an edge to the target, dropping the target breaks
+    /// the link. Ubiquitous in embedded startup, where every unused handler aliases a Default_Handler.</summary>
+    private static readonly Regex AliasAttr = new(
+        @"(?<name>[A-Za-z_]\w*)\s*\([^()]*\)\s*__attribute__\s*\(\(\s*[^()]*?\balias\s*\(\s*""(?<target>[A-Za-z_]\w*)""",
+        RegexOptions.Compiled);
+
     // Function names used as DATA — global/array/struct initializers (vector tables, dispatch tables,
     // hooks structs, function-pointer registries). Structural on purpose (only initializer contexts) so
     // it never mistakes a prototype/extern declaration for a reference. For an @il list we scan its span
@@ -380,6 +387,22 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             foreach (var tp in targets)
                 if (tp != path)
                     graph.AddEdge(fileNode, fileNodeByPath[tp], EdgeKind.Includes);
+        }
+
+        // Pass 2b: symbol aliases. `void NMI_Handler(void) __attribute__((alias("Default_Handler")))` is a
+        // bodyless declaration tree-sitter treats as a prototype (uncaptured), yet it IS a real symbol the
+        // vector table points at — and it REQUIRES its target. Register the alias name as a function and
+        // link it to the target, so a reference to the alias (e.g. from the vector table) keeps the target.
+        foreach (Match m in AliasAttr.Matches(text))
+        {
+            var name = m.Groups["name"].Value;
+            if (Keywords.Contains(name)) continue;
+            var ln = 1;
+            for (var k = 0; k < m.Index && k < text.Length; k++) if (text[k] == '\n') ln++;
+            var aid = graph.GetOrAddNode(NodeKind.Function, name, path, new SourceSpan(ln, ln));
+            graph.AddEdge(aid, fileNode, EdgeKind.DefinedIn);
+            Add(functionsByName, name, aid);
+            pendingCalls.Add((aid, m.Groups["target"].Value)); // alias -> target: keeping the alias keeps it
         }
 
         // Pass 3: direct calls, attributed to the enclosing function by span.
