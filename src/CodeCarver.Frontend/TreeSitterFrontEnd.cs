@@ -44,6 +44,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private static readonly Regex NameAfterAttr = new(  // leading:   __attribute__ ... name( / name[ / name =
         @"^\s*(?:[A-Za-z_][\w*]*[\s*]+)*?([A-Za-z_]\w*)\s*(?:[\(\[=;,]|$)", RegexOptions.Compiled);
 
+    private static readonly Regex AsmKeyword = new(@"\b(?:__asm__|__asm|asm)\b", RegexOptions.Compiled);
+    private static readonly Regex Identifier = new(@"[A-Za-z_]\w*", RegexOptions.Compiled);
+
     // Function names used as DATA — global/array/struct initializers (vector tables, dispatch tables,
     // hooks structs, function-pointer registries). Structural on purpose (only initializer contexts) so
     // it never mistakes a prototype/extern declaration for a reference. For an @il list we scan its span
@@ -181,6 +184,31 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
 
         return graph;
+    }
+
+    /// <summary>
+    /// Identifiers appearing inside inline-asm blocks (<c>asm("bl helper")</c>, <c>asm(".word my_isr")</c>).
+    /// A symbol reached ONLY from inline asm has no C-level edge, so a from-main closure drops it and the
+    /// link/behaviour breaks. Over-approximates (every identifier in the block, incl. mnemonics/registers);
+    /// non-matching ones resolve to nothing and are harmless. Bounded: scans each asm parenthesis group.
+    /// </summary>
+    private static IEnumerable<string> ScanAsmIdentifiers(string text)
+    {
+        foreach (Match m in AsmKeyword.Matches(text))
+        {
+            var i = m.Index + m.Length;
+            while (i < text.Length && text[i] != '(' && text[i] != ';' && text[i] != '{' && text[i] != '}') i++;
+            if (i >= text.Length || text[i] != '(') continue;
+            var start = i;
+            var depth = 0;
+            for (; i < text.Length; i++)
+            {
+                if (text[i] == '(') depth++;
+                else if (text[i] == ')' && --depth == 0) { i++; break; }
+            }
+            foreach (Match id in Identifier.Matches(text[start..i]))
+                yield return id.Value;
+        }
     }
 
     /// <summary>Names decorated with a keep-attribute (constructor/destructor/used/retain/init-array
@@ -444,6 +472,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             Add(functionsByName, name, aid);
             pendingCalls.Add((aid, m.Groups["target"].Value)); // alias -> target: keeping the alias keeps it
         }
+
+        // Pass 2c: inline-asm symbol references. A function/global named only inside asm("...") is kept
+        // via the file (attributed to fileNode, like a file-scope address-take), so it survives if this
+        // translation unit is kept. Sound over-approximation for the inline-asm blind spot.
+        foreach (var id in ScanAsmIdentifiers(text))
+            pendingRefs.Add((fileNode, id));
 
         // Pass 3: direct calls, attributed to the enclosing function by span.
         var calleePositions = new HashSet<(int, int)>();

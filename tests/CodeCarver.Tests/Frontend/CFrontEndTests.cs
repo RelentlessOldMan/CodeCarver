@@ -203,6 +203,30 @@ public class CFrontEndTests
     }
 
     [Fact]
+    public void InlineAsmSymbolReference_KeepsTarget()
+    {
+        // A symbol named only inside inline asm (`bl helper`, `.word my_isr`) has no C-level edge — a
+        // from-main closure drops it and the link/behaviour breaks. It must be kept; unrelated dead code not.
+        const string src = """
+            void helper(void);
+            void my_isr(void);
+            void helper(void) { }
+            void my_isr(void) { }
+            int trampoline(void) { __asm__ volatile ("bl helper\n\t.word my_isr"); return 0; }
+            int dead(void) { return 0; }
+            int main(void) { return trampoline(); }
+            """;
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("m.c", src) });
+        var plan = ReachabilityEngine.Compute(graph,
+            new[] { new Root(Find(graph, "main"), RootKind.EntryPoint) });
+
+        Assert.True(plan.IsKept(Find(graph, "helper")));  // referenced from inline asm
+        Assert.True(plan.IsKept(Find(graph, "my_isr")));  // referenced from inline asm
+        Assert.False(plan.IsKept(Find(graph, "dead")));   // genuinely unused
+    }
+
+    [Fact]
     public void KeepAttributes_AreImplicitRoots_KeptEvenIfUnreferenced()
     {
         // constructor/destructor/used run or are retained by the runtime/linker, not by any call — a
