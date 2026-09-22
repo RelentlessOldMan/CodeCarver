@@ -13,6 +13,10 @@ SECTIONS
 {
     .isr_vector : { KEEP(*(.isr_vector)) } > FLASH
 
+    /* Registration table: init hooks the linker collects by walking this section. KEEP() stops
+     * --gc-sections from discarding them; nothing calls them, so a from-main carve must keep them too. */
+    .init_calls : { KEEP(*(.init_calls*)) } > FLASH
+
     .text : {
         *(.text*)
         *(.rodata*)

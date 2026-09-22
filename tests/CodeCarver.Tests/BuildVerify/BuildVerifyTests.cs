@@ -624,6 +624,65 @@ public class BuildVerifyTests
         }
     }
 
+    [Fact]
+    public void LinkerKeepSection_SurvivesCarve_AndLinksWithArmGcc()
+    {
+        // A symbol kept ONLY by the linker script's KEEP(*(.init_calls*)) — not `used`, not in an
+        // .init_array-family section, reached by no call. Carve from main/Reset_Handler alone drops it
+        // unless LinkerSectionRootProvider unions the .ld's KEEP'd sections with the symbol's
+        // section(...) attribute. Prove it end-to-end: the table survives, links, and its hook target
+        // comes with it, while a dead symbol in the same file is still carved.
+        var armgcc = FindArmGcc();
+        if (armgcc is null) return;
+        var fixture = FindUp(Path.Combine("examples", "cortexm-firmware"));
+        if (fixture is null || !File.Exists(Path.Combine(fixture, "registry.c"))) return;
+
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-keep-" + Guid.NewGuid().ToString("N"));
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(work);
+        try
+        {
+            var srcs = new[] { "startup.c", "main.c", "handlers.c", "registry.c" };
+            var inputs = srcs.Select(f => (f, File.ReadAllText(Path.Combine(fixture, f)))).ToList();
+            var linker = File.ReadAllText(Path.Combine(fixture, "firmware.ld"));
+
+            using var fe = new CFrontEnd();
+            var graph = fe.BuildGraph(inputs);
+
+            // Compose the same roots the CLI does for an embedded C carve: explicit entry + the implicit
+            // linker/runtime keeps, INCLUDING the KEEP'd-section provider driven by firmware.ld.
+            var roots = new ExplicitRootProvider(symbols: new[] { "Reset_Handler", "main" }).Discover(graph)
+                .Concat(new AttributeRootProvider().Discover(graph))
+                .Concat(new LinkerSectionRootProvider(inputs.Select(i => i.Item2), new[] { linker }).Discover(graph))
+                .ToList();
+            var plan = ReachabilityEngine.Compute(graph, roots);
+
+            // The KEEP'd table (and its hook target) must be kept; the dead sibling must not be.
+            Assert.Contains(graph.Nodes.First(n => n.Name == "reg_table").Id, plan.Reached);
+            Assert.Contains(graph.Nodes.First(n => n.Name == "boot_step_a").Id, plan.Reached);
+            Assert.DoesNotContain(graph.Nodes.First(n => n.Name == "boot_step_dead").Id, plan.Reached);
+
+            FileTreeEmitter.EmitPruned(plan, graph, fixture, outDir);
+            File.Copy(Path.Combine(fixture, "firmware.ld"), Path.Combine(outDir, "firmware.ld"), overwrite: true);
+
+            var args = new[] { "-mcpu=cortex-m3", "-mthumb", "-ffreestanding", "-nostdlib",
+                               "-Wl,-T,firmware.ld", "-o", "carved.elf" }
+                       .Concat(srcs).ToArray();
+            var (code, output) = Run(armgcc, args, outDir);
+            Assert.True(code == 0, $"carved firmware with KEEP'd section failed to link:\n{output}");
+
+            var nm = Path.Combine(Path.GetDirectoryName(armgcc)!, "arm-none-eabi-nm.exe");
+            var (_, syms) = Run(nm, new[] { "carved.elf" }, outDir);
+            Assert.Contains("reg_table", syms);          // in the KEEP'd section — survives
+            Assert.Contains("boot_step_a", syms);        // reached via the table's initializer
+            Assert.DoesNotContain("boot_step_dead", syms); // unreferenced sibling — carved out
+        }
+        finally
+        {
+            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+        }
+    }
+
     /// <summary>Walk up from the test binary to the repo's fetched toolchain, if present.</summary>
     private static string? FindGcc() => FindUp(Path.Combine(".toolchains", "w64devkit", "bin", "gcc.exe"), file: true);
 

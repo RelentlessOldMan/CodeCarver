@@ -245,7 +245,27 @@ static int RunCarve(string[] args)
             asmRoots = new AsmReferenceRootProvider(asmTexts).Discover(graph).ToList();
     }
 
-    var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).ToList();
+    // A symbol placed in a custom section that the linker script KEEP()s (initcall / registration
+    // tables) is collected by the linker, never called — root it so a from-main closure can't drop it.
+    // Gated on a linker script actually being present, so non-embedded trees pay nothing.
+    var sectionRoots = new List<Root>();
+    if (lang is "c" or "cpp")
+    {
+        bool Included(string p) => excludeDirs.Count == 0 ||
+            !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase));
+        var linkerScripts = Directory.EnumerateFiles(dir, "*.*", SearchOption.AllDirectories)
+            .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".ld" or ".lds" or ".ldscript")
+            .Where(Included).Where(p => new FileInfo(p).Length <= maxParseBytes)
+            .Select(File.ReadAllText).ToList();
+        if (linkerScripts.Count > 0)
+        {
+            var srcTexts = paths.Where(p => new FileInfo(p).Length <= maxParseBytes)
+                                .Select(File.ReadAllText).ToList();
+            sectionRoots = new LinkerSectionRootProvider(srcTexts, linkerScripts).Discover(graph).ToList();
+        }
+    }
+
+    var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots).ToList();
     if (rootSet.Count == 0)
     {
         Console.Error.WriteLine("no roots to carve from: name entry symbols with --roots");
@@ -298,6 +318,9 @@ static int RunCarve(string[] args)
     if (asmRoots.Count > 0)
         Console.WriteLine($"  asm     : {asmRoots.Count} symbol(s) referenced from .s startup auto-kept: "
                           + Summarize(asmRoots.Select(r => r.Note ?? r.Node.ToString()).Distinct().ToList()));
+    if (sectionRoots.Count > 0)
+        Console.WriteLine($"  section : {sectionRoots.Count} symbol(s) in linker KEEP()'d section(s) auto-kept: "
+                          + Summarize(sectionRoots.Select(r => r.Note ?? r.Node.ToString()).Distinct().ToList()));
     if (defines is not null)
         Console.WriteLine($"  config  : {defineSpecs.Distinct().Count()} define(s), #ifdef resolution ON" +
                           (closedWorld ? " (closed-world: absent macros treated as undefined)" : " (open-world: unknown branches kept)"));

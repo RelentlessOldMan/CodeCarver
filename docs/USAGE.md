@@ -45,7 +45,12 @@ Every carve is sound with just `--roots`. Each extra input lets it carve **tight
 > `__attribute__((constructor))`/`((destructor))`/`((used))`/`((retain))` and `.init_array`-family
 > section placement — are auto-discovered and kept (reported on an `implicit:` line), so a self-registering
 > driver or an initcall table isn't silently dropped. Vector-table ISRs are kept the same way (via the
-> file-scope address-taken edge). This is the sound over-approximation; it never drops these.
+> file-scope address-taken edge). Symbols referenced only from a standalone `.s`/`.S` startup file are
+> rooted too (reported on an `asm:` line). And a symbol placed in a **custom section your linker script
+> keeps** — `__attribute__((section(".init_calls")))` where the `.ld` has `KEEP(*(.init_calls*))` — is
+> rooted from the tree's own linker script (reported on a `section:` line), generalising the hardcoded
+> `.init_array` handling to any KEEP'd registration/initcall table. This is the sound over-approximation;
+> it never drops these.
 
 | Input | Flag | Effect |
 |---|---|---|

@@ -91,6 +91,103 @@ public sealed class AsmReferenceRootProvider : IRootProvider
     }
 }
 
+/// <summary>
+/// Roots C symbols placed in a custom section that a linker script keeps with <c>KEEP(...)</c>. The
+/// compiler emits such a symbol into its <c>__attribute__((section("x")))</c> section, but nothing
+/// <i>calls</i> it — an initcall / driver-registration / command table entry, collected only by the
+/// linker walking the section. It is <c>KEEP(*(x))</c> in the linker script precisely because
+/// <c>--gc-sections</c> would otherwise discard it, and (unlike a <c>used</c> symbol) there is no
+/// C-level edge to reach it from <c>main</c>. Without this it is silently dropped and the image loses
+/// the entry. Generalises the always-kept <c>.init_array</c> family to <b>any</b> KEEP'd section named
+/// by the tree's own linker script. Over-approximates deliberately: any symbol whose section matches a
+/// KEEP'd pattern is rooted — extra keeps only cost a little size, they never break the build.
+/// </summary>
+public sealed class LinkerSectionRootProvider : IRootProvider
+{
+    // Grab the input-section pattern(s) inside a KEEP(...): everything up to the first ')' after KEEP(
+    // — for KEEP(*(.foo)) that's "*(.foo", for KEEP(*(SORT(.foo.*))) that's "*(SORT(.foo.*", from which
+    // the dotted section tokens are then extracted. Robust to the usual nesting without balancing parens.
+    private static readonly Regex KeepDirective = new(@"KEEP\s*\((?<body>[^)]*)", RegexOptions.Compiled);
+    private static readonly Regex SectionToken = new(@"\.[A-Za-z_][\w.*?\[\]\-]*", RegexOptions.Compiled);
+
+    private static readonly Regex AttrBlock = new(
+        @"__attribute__\s*\(\((?<body>(?:[^()]|\([^()]*\))*)\)\)", RegexOptions.Compiled);
+    private static readonly Regex SectionAttr = new(
+        @"section\s*\(\s*""(?<s>[^""]+)""", RegexOptions.Compiled);
+    private static readonly Regex NameBeforeAttr = new(  // trailing:  name / name[...]  __attribute__
+        @"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]|\([^()]*\))?\s*$", RegexOptions.Compiled);
+    private static readonly Regex NameAfterAttr = new(   // leading:   __attribute__ ... [type] name
+        @"^\s*(?:[A-Za-z_][\w*]*[\s*]+)*?([A-Za-z_]\w*)\s*(?:[\(\[=;,]|$)", RegexOptions.Compiled);
+
+    private readonly IReadOnlyList<string> _sourceTexts;
+    private readonly IReadOnlyList<string> _linkerScriptTexts;
+
+    public LinkerSectionRootProvider(IEnumerable<string> sourceTexts, IEnumerable<string> linkerScriptTexts)
+    {
+        _sourceTexts = sourceTexts.ToList();
+        _linkerScriptTexts = linkerScriptTexts.ToList();
+    }
+
+    public IEnumerable<Root> Discover(CodeGraph graph)
+    {
+        var kept = KeptSectionMatchers(_linkerScriptTexts);
+        if (kept.Count == 0) yield break;
+
+        // symbol name -> the section it is placed in that a linker script KEEPs.
+        var wanted = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var text in _sourceTexts)
+            foreach (var (symbol, section) in SectionPlacements(text))
+                if (!wanted.ContainsKey(symbol) && kept.Any(re => re.IsMatch(section)))
+                    wanted[symbol] = section;
+
+        if (wanted.Count == 0) yield break;
+        foreach (var node in graph.Nodes)
+            if (node.Kind is NodeKind.Function or NodeKind.Global && wanted.TryGetValue(node.Name, out var sec))
+                yield return new Root(node.Id, RootKind.LinkerKeep, $"{node.Name} in KEEP section {sec}");
+    }
+
+    /// <summary>Every KEEP'd input-section pattern in the linker scripts, as an anchored glob-matcher
+    /// (<c>*</c>→any, <c>?</c>→one). A malformed KEEP is skipped, not guessed at — the baseline roots
+    /// still hold, so this can only add keeps, never remove a needed one.</summary>
+    private static List<Regex> KeptSectionMatchers(IEnumerable<string> linkerScriptTexts)
+    {
+        var matchers = new List<Regex>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var text in linkerScriptTexts)
+            foreach (Match keep in KeepDirective.Matches(text))
+                foreach (Match tok in SectionToken.Matches(keep.Groups["body"].Value))
+                    if (seen.Add(tok.Value))
+                        matchers.Add(GlobToRegex(tok.Value));
+        return matchers;
+    }
+
+    private static Regex GlobToRegex(string glob)
+    {
+        var pattern = "^" + Regex.Escape(glob).Replace("\\*", ".*").Replace("\\?", ".") + "$";
+        return new Regex(pattern, RegexOptions.Compiled);
+    }
+
+    /// <summary>(symbol, section) for every <c>__attribute__((section("x")))</c> placement, resolving the
+    /// decorated symbol whether the attribute leads or trails the declaration.</summary>
+    private static IEnumerable<(string Symbol, string Section)> SectionPlacements(string text)
+    {
+        foreach (Match m in AttrBlock.Matches(text))
+        {
+            var sm = SectionAttr.Match(m.Groups["body"].Value);
+            if (!sm.Success) continue;
+            var section = sm.Groups["s"].Value;
+
+            var before = text.AsSpan(0, m.Index);
+            var mb = NameBeforeAttr.Match(before.Length > 200 ? before[^200..].ToString() : before.ToString());
+            if (mb.Success) { yield return (mb.Groups[1].Value, section); continue; }
+
+            var after = text.AsSpan(m.Index + m.Length);
+            var ma = NameAfterAttr.Match(after.Length > 200 ? after[..200].ToString() : after.ToString());
+            if (ma.Success) yield return (ma.Groups[1].Value, section);
+        }
+    }
+}
+
 /// <summary>Unions several providers into one root set.</summary>
 public sealed class CompositeRootProvider : IRootProvider
 {

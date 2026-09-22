@@ -33,4 +33,48 @@ public class RootProviderTests
         Assert.DoesNotContain(dead, rooted); // not named in asm
         // `mov`, `r0`, `r1`, `.section` etc. match no symbol, so they contribute no roots.
     }
+
+    [Fact]
+    public void LinkerSectionRootProvider_RootsSymbolsInKeptSections_WildcardAndExact()
+    {
+        var b = new GraphBuilder();
+        var early = b.Func("early_init", "init.c");   // leading attribute, wildcard section
+        var cmd = b.Global("cmd_reboot", "cmd.c");    // trailing attribute, exact section
+        var normal = b.Func("helper", "cmd.c");       // no section attribute
+        var otherSec = b.Func("in_ram_fn", "cmd.c");  // in a section the linker does NOT KEEP
+
+        var sources = new[]
+        {
+            "__attribute__((section(\".initcall1.init\"))) void early_init(void) { }",
+            "const cmd_t cmd_reboot __attribute__((used, section(\".commands\"))) = { };",
+            "__attribute__((section(\".data.ram\"))) int in_ram_fn(void) { return 0; }",
+        };
+        const string linker = """
+            SECTIONS {
+              .init : { KEEP(*(SORT(.initcall*.init))) }
+              .cmd  : { KEEP(*(.commands)) }
+              .ram  : { *(.data.ram) }   /* referenced but NOT KEEP()'d */
+            }
+            """;
+
+        var rooted = new LinkerSectionRootProvider(sources, new[] { linker }).Discover(b.Graph)
+            .Select(r => r.Node).ToHashSet();
+
+        Assert.Contains(early, rooted);       // .initcall1.init matches KEEP(*(SORT(.initcall*.init)))
+        Assert.Contains(cmd, rooted);         // .commands matches KEEP(*(.commands))
+        Assert.DoesNotContain(normal, rooted);   // no section attribute at all
+        Assert.DoesNotContain(otherSec, rooted); // .data.ram is placed but not KEEP()'d
+    }
+
+    [Fact]
+    public void LinkerSectionRootProvider_NoLinkerScript_RootsNothing()
+    {
+        var b = new GraphBuilder();
+        _ = b.Func("early_init", "init.c");
+        var sources = new[] { "__attribute__((section(\".initcall1.init\"))) void early_init(void){}" };
+
+        // Without any KEEP()'d section it cannot know a section is retained → adds nothing (sound: the
+        // baseline roots/attributes still hold; this provider only ever *adds* keeps).
+        Assert.Empty(new LinkerSectionRootProvider(sources, System.Array.Empty<string>()).Discover(b.Graph));
+    }
 }
