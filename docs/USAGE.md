@@ -135,10 +135,28 @@ carve src/ --roots main --prune --out out/
 cc -c out/*.c -Iout/            # or your real build, pointed at out/
 ```
 
+## First run on a large repo
+
+Recommended workflow the first time you point it at a big, unfamiliar tree:
+
+```
+carve <dir> --roots a,b,c                 # 1. analysis only (no --out): stats, dropped files, warnings
+carve <dir> --roots a,b,c --verify        # 2. soundness gate: flags any kept fn calling a dropped one (exit 3)
+carve <dir> --roots a,b,c --prune --out o --manifest m.json   # 3. emit + a JSON audit of what was kept
+cc -c o/*.c -Io/                          # 4. build the output (the only real guarantee)
+```
+
+It's built to survive a messy real tree: a file it can't read or can't parse is **skipped with a
+`warn:` line and kept whole** (never crashes the whole run), multi-GB generated headers are parsed-
+skipped (`--max-parse-bytes`), and a file that blows the parse budget is kept whole (`--parse-timeout`).
+Read the `warn:` lines — they're where the carve was uncertain. For a slow run, `CODECARVER_TIMING=1`
+prints a per-phase + slow-file breakdown to stderr.
+
 ## Diagnostics
 
 ```
 carve <dir> --roots foo --dump-spans     # per-definition KEEP/drop with file:line and kind
+carve <dir> --roots foo --why sym        # why a symbol was kept (its chain to a root) or that it was carved
 ```
 
 ## What CodeCarver does not do

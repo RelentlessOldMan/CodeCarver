@@ -91,6 +91,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <inheritdoc/>
     public IReadOnlyList<string> Warnings => _warnings;
 
+    private readonly List<string> _forceKeepFiles = new();
+    /// <summary>Files whose extraction threw and were skipped (kept whole rather than crashing the run) —
+    /// the CLI roots these so their code is emitted intact, since we couldn't analyse them.</summary>
+    public IReadOnlyList<string> ForceKeepFiles => _forceKeepFiles;
+
     private IReadOnlyList<(NodeId From, string Name)> _callSites = Array.Empty<(NodeId, string)>();
     /// <summary>Every call site found in the last build as (enclosing node, callee name), INCLUDING calls
     /// that didn't resolve to a defined function. The post-carve soundness gate uses these to check that
@@ -148,6 +153,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                                 bool closedWorldDefines = false)
     {
         _warnings.Clear();
+        _forceKeepFiles.Clear();
         var graph = new CodeGraph();
         var inputs = files.ToList();
         BuildScopeMacros(inputs); // scope-opening macros to expand for parsing (see field docs)
@@ -179,10 +185,18 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         {
             if (text.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
             if (timeFiles) fsw.Restart();
-            ProcessFile(graph, path, text, fileNodeByPath, pathsByBasename,
-                        functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
-                        pendingMacroRefs, pendingPastes, defines, closedWorldDefines);
-            foreach (var n in ScanKeepAttributes(text)) keepNames.Add(n);
+            try
+            {
+                ProcessFile(graph, path, text, fileNodeByPath, pathsByBasename,
+                            functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
+                            pendingMacroRefs, pendingPastes, defines, closedWorldDefines);
+                foreach (var n in ScanKeepAttributes(text)) keepNames.Add(n);
+            }
+            catch (Exception ex)   // never let one pathological file sink a whole-repo carve
+            {
+                _warnings.Add($"{path}: extraction failed ({ex.GetType().Name}: {ex.Message}) — kept whole, not carved");
+                _forceKeepFiles.Add(path);
+            }
             if (timeFiles && fsw.ElapsedMilliseconds >= 300)
                 Console.Error.WriteLine($"  slowfile: {fsw.ElapsedMilliseconds,6} ms  {path} ({text.Length:N0} B)");
         }

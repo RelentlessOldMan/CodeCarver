@@ -200,11 +200,20 @@ static int RunCarve(string[] args)
         }
     var bigSet = bigFiles.Select(b => b.Rel).ToHashSet(StringComparer.Ordinal);
 
-    var inputs = paths.Select(p =>
+    var inputs = new List<(string Rel, string Text)>(paths.Count);
+    var readErrors = 0;
+    foreach (var p in paths)
     {
         var rel = Path.GetRelativePath(dir, p).Replace('\\', '/');
-        return (rel, bigSet.Contains(rel) ? "" : File.ReadAllText(p)); // "" = don't read/parse; keep whole
-    }).ToList();
+        if (bigSet.Contains(rel)) { inputs.Add((rel, "")); continue; } // "" = don't read/parse; keep whole
+        try { inputs.Add((rel, File.ReadAllText(p))); }
+        catch (Exception ex)   // an unreadable/locked/odd file must not sink the whole run
+        {
+            readErrors++;
+            if (readErrors <= 12) Console.Error.WriteLine($"  warn    : could not read {rel} ({ex.GetType().Name}) — skipped");
+        }
+    }
+    if (readErrors > 12) Console.Error.WriteLine($"  warn    : (+{readErrors - 12} more unreadable files skipped)");
 
     // Reference-only includes: local #included files with a NON-source extension (.inc/.def/generated
     // tables) that are textually part of a .c but which we don't parse as C. A function/global called only
@@ -262,6 +271,13 @@ static int RunCarve(string[] args)
         _tsw.Restart();
     }
     Mark("input+refscan"); // time spent gathering inputs + reference includes above
+
+    // Sign of life for a large tree so a multi-minute analyze isn't a silent black box (and you can see
+    // how far it got if it's interrupted). CODECARVER_TIMING=1 adds a per-phase + slow-file breakdown.
+    var scanBytes = inputs.Sum(i => (long)i.Text.Length);
+    if (inputs.Count > 500 || scanBytes > 50_000_000)
+        Console.Error.WriteLine($"  scanning: {inputs.Count:N0} files (~{scanBytes / 1_000_000.0:N0} MB)"
+                                + (bigFiles.Count > 0 ? $" + {bigFiles.Count} big-file(s) kept whole" : "") + " -- analyzing...");
 
     var graph = fe.BuildGraph(inputs, defines, closedWorld);
     Mark("build-graph");
@@ -323,7 +339,14 @@ static int RunCarve(string[] args)
     // constructor AND whatever it calls in its init-list/body must survive (a real pugixml dangling bug).
     var ctorRoots = lang is "cpp" ? new ConstructorRootProvider().Discover(graph).ToList() : new List<Root>();
 
-    var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots).Concat(ctorRoots).ToList();
+    // A file whose extraction threw was kept whole (not analysed) — root it so its code is emitted intact
+    // rather than silently dropped. Sound over-approximation for the "couldn't parse it" case.
+    var forceKeep = fe is TreeSitterFrontEnd tsk ? tsk.ForceKeepFiles : Array.Empty<string>();
+    var forceKeepRoots = forceKeep.Count > 0
+        ? new ExplicitRootProvider(files: forceKeep).Discover(graph).ToList() : new List<Root>();
+
+    var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots)
+                               .Concat(ctorRoots).Concat(forceKeepRoots).ToList();
     if (rootSet.Count == 0)
     {
         Console.Error.WriteLine("no roots to carve from: name entry symbols with --roots");
