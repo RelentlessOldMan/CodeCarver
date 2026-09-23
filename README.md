@@ -72,6 +72,10 @@ dotnet build CodeCarver.sln -c Release
 ./check.ps1 -Big -Fetch     # also pull the pinned gcc + corpus and compile carved real repos
 ```
 
+The corpus + toolchains are fetched by script, and `fuzz.ps1` replays the exact carve-and-recompile
+loop that found the fmt / simdjson / pugixml / wren bugs — so anyone can reproduce both the validation
+and the bug-hunt. See [`docs/REPRODUCE.md`](docs/REPRODUCE.md).
+
 ## Carve something
 
 ```powershell
@@ -91,6 +95,7 @@ src/CodeCarver.Cli        the `carve` / `scan-log` / `demo` commands
 tests/CodeCarver.Tests    xUnit suite (fast) + build-verify (compiles carved output with gcc)
 docs/USAGE.md             how to use it        DESIGN.txt   architecture + rationale
 docs/TOOLING.md           toolchain adapters   docs/TESTING.md   test strategy
+fetch-*.ps1 · fuzz.ps1    fetch corpus/toolchains · carve-fuzz a repo (docs/REPRODUCE.md)
 ```
 
 ## Contributing

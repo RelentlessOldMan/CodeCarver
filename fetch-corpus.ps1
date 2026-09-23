@@ -5,7 +5,9 @@ $root   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $corpus = Join-Path $root '.corpus'
 New-Item -ItemType Directory -Force -Path $corpus | Out-Null
 
-# Pinned to tags/refs for reproducibility. Tier notes the language/shape it exercises.
+# Varied real repos the carver is exercised against; see docs/REPRODUCE.md for the fuzz invocations.
+# A few are tag-pinned (ref); the rest clone the default branch — pin `ref` to a commit for byte-exact
+# replay over time. Tier notes the language/shape each one exercises (and any bug it exposed).
 $repos = @(
     @{ name = 'tiny-AES-c'; url = 'https://github.com/kokke/tiny-AES-c'; ref = $null;     tier = 'embedded C (ifdef modes, tables)' },
     @{ name = 'cJSON';      url = 'https://github.com/DaveGamble/cJSON';  ref = 'v1.7.18'; tier = 'C library (99 files; carves 99->2)' },
