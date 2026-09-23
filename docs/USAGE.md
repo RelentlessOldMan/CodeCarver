@@ -65,6 +65,7 @@ Every carve is sound with just `--roots`. Each extra input lets it carve **tight
 | Probe compiler | `--probe cc` | run `cc -dM -E` for the compiler's **complete** macro set (predefined + target + `-D`) and resolve `#ifdef`s closed-world against it — accurate, no "is my define list complete?" guess |
 | Complete-config | `--assume-defines-complete` | closed-world without probing: trust the supplied defines as complete |
 | Write output | `--out DIR` | emit the carved tree |
+| Aux build files | `--aux "Makefile,*.cmd"` | extra non-source files to copy verbatim into `--out` (Makefiles, TI `.cmd` linker files, …) on top of the linker scripts + startup assembly copied automatically |
 | Aggressive prune | `--prune` | intra-file function/table removal (C/C++ only; other languages carve file-level) |
 | Audit | `--manifest m.json` | write a JSON manifest of roots, stats, kept/dropped files, byte counts |
 | Explain | `--why sym` | print the keep-chain for a symbol back to its root (or that it was carved) — debugging "why is this still here / why did this drop?" |

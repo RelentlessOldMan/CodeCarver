@@ -74,6 +74,7 @@ static int RunCarve(string[] args)
     var closedWorld = false;
     string? manifestPath = null;
     var excludeDirs = new List<string>();
+    var auxGlobs = new List<string>();   // extra build files to copy verbatim into --out (Makefiles, .cmd, …)
     string? probeCompiler = null;
     long maxParseBytes = 20_000_000; // files bigger than this (e.g. multi-GB generated register headers)
                                      // skip the parser and are kept whole via #include-closure.
@@ -124,6 +125,8 @@ static int RunCarve(string[] args)
             manifestPath = args[++i];
         else if (args[i] == "--exclude" && i + 1 < args.Length)
             excludeDirs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        else if (args[i] == "--aux" && i + 1 < args.Length)
+            auxGlobs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         else if (args[i] == "--probe" && i + 1 < args.Length)
             probeCompiler = args[++i];
         else if (args[i] == "--max-parse-bytes" && i + 1 < args.Length)
@@ -397,6 +400,19 @@ static int RunCarve(string[] args)
                                   + $"{hc.DefinesDropped:N0} dropped; {hc.BytesBefore:N0} B -> {hc.BytesAfter:N0} B ({hpct:P0} smaller)");
                 Console.WriteLine("  note    : --prune-headers is EXPERIMENTAL (drops unused #defines from kept headers) — always build-verify.");
             }
+        }
+
+        // Build-support files: an embedded image also needs its linker script(s) and startup assembly to
+        // link — they aren't C translation units, so the carve never modelled them, but the emitted tree
+        // won't build without them. Copy them verbatim (plus any --aux globs). Generic; --exclude prunes
+        // board/arch variants the same way it does for source.
+        if (lang is "c" or "cpp")
+        {
+            var sup = BuildSupportEmitter.Copy(dir, outDir, plan.KeptFiles, excludeDirs, auxGlobs);
+            carvedBytes += sup.Bytes;
+            if (sup.Count > 0)
+                Console.WriteLine($"  support : {sup.Count} build file(s) copied verbatim (linker scripts + startup assembly"
+                                  + (auxGlobs.Count > 0 ? " + --aux" : "") + ") so the carved tree links");
         }
     }
     else

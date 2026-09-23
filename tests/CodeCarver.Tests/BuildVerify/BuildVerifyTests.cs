@@ -604,7 +604,7 @@ public class BuildVerifyTests
             var plan = ReachabilityEngine.Compute(graph,
                 new ExplicitRootProvider(symbols: new[] { "Reset_Handler" }).Discover(graph).ToList());
             FileTreeEmitter.EmitPruned(plan, graph, fixture, outDir);
-            File.Copy(Path.Combine(fixture, "firmware.ld"), Path.Combine(outDir, "firmware.ld"), overwrite: true);
+            BuildSupportEmitter.Copy(fixture, outDir, plan.KeptFiles, System.Array.Empty<string>(), System.Array.Empty<string>()); // emit .ld like the CLI
 
             var args = new[] { "-mcpu=cortex-m3", "-mthumb", "-ffreestanding", "-nostdlib",
                                "-Wl,-T,firmware.ld", "-o", "carved.elf" }
@@ -664,7 +664,7 @@ public class BuildVerifyTests
             Assert.DoesNotContain(graph.Nodes.First(n => n.Name == "boot_step_dead").Id, plan.Reached);
 
             FileTreeEmitter.EmitPruned(plan, graph, fixture, outDir);
-            File.Copy(Path.Combine(fixture, "firmware.ld"), Path.Combine(outDir, "firmware.ld"), overwrite: true);
+            BuildSupportEmitter.Copy(fixture, outDir, plan.KeptFiles, System.Array.Empty<string>(), System.Array.Empty<string>()); // emit .ld like the CLI
 
             var args = new[] { "-mcpu=cortex-m3", "-mthumb", "-ffreestanding", "-nostdlib",
                                "-Wl,-T,firmware.ld", "-o", "carved.elf" }
@@ -677,6 +677,57 @@ public class BuildVerifyTests
             Assert.Contains("reg_table", syms);          // in the KEEP'd section — survives
             Assert.Contains("boot_step_a", syms);        // reached via the table's initializer
             Assert.DoesNotContain("boot_step_dead", syms); // unreferenced sibling — carved out
+        }
+        finally
+        {
+            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void RealRepo_AsmStartupAndLinkerScript_EmittedAndLinks_WithArmGcc()
+    {
+        // The build-support-file emission on a REAL internet embedded repo: dwelch67's bare-metal Cortex-M0
+        // sample has a .s vector table (`.word reset`), a single .c, and a .ld. Carve it, and the emitter
+        // must copy the startup .s and linker .ld alongside the carved .c so the tree still assembles +
+        // links with arm-none-eabi-gcc. Corpus-gated (fetch-corpus.ps1 clones dwelch67/stm32_samples).
+        var armgcc = FindArmGcc();
+        if (armgcc is null) return;
+        var samples = FindUp(Path.Combine(".corpus", "stm32_samples"));
+        if (samples is null) return;
+        var sample = Path.Combine(samples, "DWLQFP32", "blinker03");
+        if (!File.Exists(Path.Combine(sample, "flash.s")) || !File.Exists(Path.Combine(sample, "flash.ld"))) return;
+
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-asm-" + Guid.NewGuid().ToString("N"));
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(work);
+        try
+        {
+            var srcs = Directory.EnumerateFiles(sample, "*.c").Select(Path.GetFileName).ToArray();
+            var inputs = srcs.Select(f => (f!, File.ReadAllText(Path.Combine(sample, f!)))).ToList();
+
+            using var fe = new CFrontEnd();
+            var graph = fe.BuildGraph(inputs);
+            // Root the C entry AND the C symbols named from the .s vector table (as the CLI does).
+            var asmTexts = Directory.EnumerateFiles(sample, "*.s").Select(File.ReadAllText).ToList();
+            var roots = new ExplicitRootProvider(symbols: new[] { "notmain" }).Discover(graph)
+                .Concat(new AsmReferenceRootProvider(asmTexts).Discover(graph))
+                .ToList();
+            var plan = ReachabilityEngine.Compute(graph, roots);
+            FileTreeEmitter.EmitPruned(plan, graph, sample, outDir);
+
+            // The feature under test: startup .s + linker .ld copied alongside the carved .c.
+            var sup = BuildSupportEmitter.Copy(sample, outDir, plan.KeptFiles,
+                System.Array.Empty<string>(), System.Array.Empty<string>());
+            Assert.True(sup.Count >= 2);
+            Assert.True(File.Exists(Path.Combine(outDir, "flash.s")));   // startup assembly emitted
+            Assert.True(File.Exists(Path.Combine(outDir, "flash.ld")));  // linker script emitted
+
+            var args = new[] { "-mcpu=cortex-m0", "-mthumb", "-nostdlib", "-ffreestanding",
+                               "-T", "flash.ld", "flash.s" }
+                       .Concat(srcs!).Append("-o").Append("carved.elf").ToArray();
+            var (code, output) = Run(armgcc, args, outDir);
+            Assert.True(code == 0, $"carved real-repo firmware (.s + .ld) failed to link:\n{output}");
         }
         finally
         {

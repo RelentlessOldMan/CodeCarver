@@ -31,7 +31,8 @@ $repos = @(
     @{ name = 'wren';       url = 'https://github.com/wren-lang/wren';    ref = $null;     tier = 'C (scripting VM, computed-goto interpreter loop; exposed the phantom nested-function misparse)' },
     @{ name = 'janet';      url = 'https://github.com/janet-lang/janet';  ref = $null;     tier = 'C (Lisp VM; macro-defined JANET_CORE_FN bodies + macro-soup method tables; exposed pass-4/ERROR-table ref losses)' },
     @{ name = 'quickjs';    url = 'https://github.com/quickjs-ng/quickjs'; ref = $null;    tier = 'C (JS engine, computed-goto; exposed symbols referenced from a macro-call global initializer)' },
-    @{ name = 'capstone';   url = 'https://github.com/capstone-engine/capstone'; ref = $null; tier = 'C (disassembler; huge generated .inc instruction tables #included into .c; exposed the reference-only-include gap)' }
+    @{ name = 'capstone';   url = 'https://github.com/capstone-engine/capstone'; ref = $null; tier = 'C (disassembler; huge generated .inc instruction tables #included into .c; exposed the reference-only-include gap)' },
+    @{ name = 'stm32_samples'; url = 'https://github.com/dwelch67/stm32_samples'; ref = $null; tier = 'C (bare-metal Cortex-M: real .s startup + .ld; validates build-support-file emission links with arm-none-eabi-gcc)' }
 )
 
 foreach ($r in $repos) {
