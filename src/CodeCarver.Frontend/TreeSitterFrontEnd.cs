@@ -173,13 +173,18 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var pendingPastes = new List<(NodeId Macro, PasteKind Kind, string Frag)>();
 
         var keepNames = new HashSet<string>(StringComparer.Ordinal);
+        var timeFiles = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null;
+        var fsw = new System.Diagnostics.Stopwatch();
         foreach (var (path, text) in inputs)
         {
             if (text.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
+            if (timeFiles) fsw.Restart();
             ProcessFile(graph, path, text, fileNodeByPath, pathsByBasename,
                         functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
                         pendingMacroRefs, pendingPastes, defines, closedWorldDefines);
             foreach (var n in ScanKeepAttributes(text)) keepNames.Add(n);
+            if (timeFiles && fsw.ElapsedMilliseconds >= 300)
+                Console.Error.WriteLine($"  slowfile: {fsw.ElapsedMilliseconds,6} ms  {path} ({text.Length:N0} B)");
         }
 
         // Reference-only includes (.inc/.def generated tables): not parsed as a TU, but every symbol they
@@ -233,6 +238,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// </summary>
     private static IEnumerable<string> ScanAsmIdentifiers(string text)
     {
+        if (!text.Contains("asm")) yield break; // cheap guard: skip the regex on files with no inline asm
         foreach (Match m in AsmKeyword.Matches(text))
         {
             var i = m.Index + m.Length;
@@ -254,6 +260,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// section), resolving the decorated symbol whether the attribute leads or trails the declaration.</summary>
     private static IEnumerable<string> ScanKeepAttributes(string text)
     {
+        if (!text.Contains("__attribute__")) yield break; // cheap guard: no attributes -> skip the regex
         foreach (Match m in AttrBlock.Matches(text))
         {
             if (!KeepKeyword.IsMatch(m.Groups["body"].Value)) continue;
@@ -560,7 +567,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // bodyless declaration tree-sitter treats as a prototype (uncaptured), yet it IS a real symbol the
         // vector table points at — and it REQUIRES its target. Register the alias name as a function and
         // link it to the target, so a reference to the alias (e.g. from the vector table) keeps the target.
-        foreach (Match m in AliasAttr.Matches(text))
+        foreach (Match m in text.Contains("alias") ? AliasAttr.Matches(text) : (IEnumerable<Match>)Array.Empty<Match>())
         {
             var name = m.Groups["name"].Value;
             if (Keywords.Contains(name)) continue;
@@ -578,6 +585,18 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         foreach (var id in ScanAsmIdentifiers(text))
             pendingRefs.Add((fileNode, id));
 
+        // O(1) enclosing-function lookup. Fill a per-line array with the SMALLEST span covering each line
+        // (widest first, so nested/smaller spans overwrite). This turns the per-identifier enclosing
+        // lookup below from O(identifiers x functions) into O(lines + identifiers) — the difference
+        // between ~18s and <1s on a 9 MB amalgamated header.
+        var maxLine = 0;
+        foreach (var s in funcSpans) if (s.End > maxLine) maxLine = s.End;
+        var byLine = new NodeId?[maxLine + 2];
+        foreach (var s in funcSpans.OrderByDescending(s => s.End - s.Start))
+            for (var r = s.Start; r <= s.End && r < byLine.Length; r++)
+                byLine[r] = s.Id;
+        NodeId? Enclosing(int row) => row >= 0 && row < byLine.Length ? byLine[row] : null;
+
         // Pass 3: direct calls, attributed to the enclosing function by span.
         var calleePositions = new HashSet<(int, int)>();
         foreach (var cap in _calls.Execute(root).Captures)
@@ -588,22 +607,25 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             // unusual macro-prefixed / bare-typedef-return declaration like zlib's `local gzFile gz_open`
             // or `void ZLIB_INTERNAL _tr_flush_block`). That function stays in the emitted file, so keep
             // its callees whenever the file is kept — attribute the call to the file node.
-            var from = EnclosingFunction(funcSpans, cap.Node.StartPosition.Row + 1) ?? fileNode;
+            var from = Enclosing(cap.Node.StartPosition.Row + 1) ?? fileNode;
             pendingCalls.Add((from, cap.Node.Text));
         }
 
         // Pass 4: non-call references INSIDE functions (address-taken: a callback passed/assigned).
+        // InsideError only matters when the file actually has a parse error somewhere; checking once
+        // avoids a costly ancestor walk per file-scope identifier in the common (clean-parse) case.
+        var treeHasError = root.HasError;
         foreach (var cap in _idents.Execute(root).Captures)
         {
             if (IsDead(cap.Node)) continue;
             var pos = (cap.Node.StartPosition.Row, cap.Node.StartPosition.Column);
             if (defNamePositions.Contains(pos) || calleePositions.Contains(pos)) continue;
-            var from = EnclosingFunction(funcSpans, cap.Node.StartPosition.Row + 1);
+            var from = Enclosing(cap.Node.StartPosition.Row + 1);
             if (from is { } f)
                 pendingRefs.Add((f, cap.Node.Text));
-            else if (InsideFunctionBody(cap.Node) || InsideError(cap.Node))
+            else if (InsideFunctionBody(cap.Node) || (treeHasError && InsideError(cap.Node)))
                 // Attribute to the file (kept while the file is), same fallback as pass 3's calls, in two
-                // cases EnclosingFunction can't see: (a) inside a function body whose signature we couldn't
+                // cases the enclosing-function lookup can't see: (a) inside a function body whose signature we couldn't
                 // capture — a macro-defined header like janet's `JANET_CORE_FN(os_shell, ...)`, so a
                 // callback taken there (`janet_ev_threaded_await(os_shell_subr, ...)`) isn't lost; (b)
                 // inside an ERROR subtree — a file-scope function-pointer table tree-sitter couldn't parse
@@ -622,7 +644,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         {
             if (IsDead(cap.Node)) continue;
             var startRow = cap.Node.StartPosition.Row + 1;
-            if (EnclosingFunction(funcSpans, startRow) is not null) continue; // file scope only
+            if (Enclosing(startRow) is not null) continue; // file scope only
 
             if (cap.Name == "il")
             {
@@ -966,19 +988,6 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             n = parent;
         }
         return null;
-    }
-
-    private static NodeId? EnclosingFunction(List<(int Start, int End, NodeId Id)> spans, int row)
-    {
-        NodeId? best = null;
-        var bestWidth = int.MaxValue;
-        foreach (var (start, end, id) in spans)
-        {
-            if (row < start || row > end) continue;
-            var width = end - start;
-            if (width < bestWidth) { bestWidth = width; best = id; }
-        }
-        return best;
     }
 
     public void Dispose()

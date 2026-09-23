@@ -253,7 +253,18 @@ static int RunCarve(string[] args)
         if (parseTimeoutMs is not null) tsfe.ParseBudgetMs = parseTimeoutMs.Value;
         if (refIncludes.Count > 0) tsfe.ReferenceOnlyIncludes = refIncludes;
     }
+    // Opt-in phase timing (CODECARVER_TIMING=1) to stderr — used for the performance work.
+    var _tsw = System.Diagnostics.Stopwatch.StartNew();
+    var _timing = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null;
+    void Mark(string phase)
+    {
+        if (_timing) Console.Error.WriteLine($"  timing  : {phase,-14} {_tsw.ElapsedMilliseconds,7} ms");
+        _tsw.Restart();
+    }
+    Mark("input+refscan"); // time spent gathering inputs + reference includes above
+
     var graph = fe.BuildGraph(inputs, defines, closedWorld);
+    Mark("build-graph");
 
     // Non-fatal diagnostics (kept-whole fragments, unresolved/ambiguous .cmm DO). Surfacing these avoids
     // the "silent 100% smaller" trap. Capped so a tree with hundreds of dynamic DOs doesn't flood output.
@@ -319,7 +330,9 @@ static int RunCarve(string[] args)
         return 1;
     }
 
+    Mark("roots");
     var plan = ReachabilityEngine.Compute(graph, rootSet);
+    Mark("reachability");
     var s = plan.Stats;
 
     if (dumpSpans)
@@ -385,6 +398,7 @@ static int RunCarve(string[] args)
         var res = prune
             ? FileTreeEmitter.EmitPruned(plan, graph, dir, outDir)
             : FileTreeEmitter.Emit(plan, dir, outDir);
+        Mark("emit");
         carvedBytes = res.BytesWritten;
         var how = prune ? "pruned (intra-file: unreached functions removed)" : "file-level (whole kept files)";
         Console.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{how}]");
