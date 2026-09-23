@@ -1,3 +1,4 @@
+using CodeCarver.Core.Frontend;
 using CodeCarver.Core.Graph;
 using CodeCarver.Core.Reachability;
 using CodeCarver.Core.Roots;
@@ -91,6 +92,35 @@ public class CppFrontEndTests
         Assert.True(plan.IsKept(entry));                                          // root captured despite macro ns
         Assert.True(plan.IsKept(graph.Nodes.First(n => n.Name == "helper").Id));  // reached entry -> helper
         Assert.False(plan.IsKept(graph.Nodes.First(n => n.Name == "dead").Id));   // unreached -> carved
+    }
+
+    [Fact]
+    public void ConstructorInitListCallee_IsKept()
+    {
+        // A constructor runs on every instantiation (untraceable) and can't be pruned; because it IS
+        // emitted, whatever it calls in its member-initializer list must be kept too — or the carved
+        // constructor references an undefined function (real pugixml bug: xml_buffered_writer's ctor
+        // called get_write_encoding in its init list). ConstructorRootProvider roots the constructor so
+        // its callees follow. `use` reaches the type Writer; nothing calls the ctor or the helper.
+        const string src = """
+            int compute_mode(int x);
+            struct Writer {
+                int mode;
+                Writer(int x) : mode(compute_mode(x)) {}
+                int emit() const { return mode; }
+            };
+            int compute_mode(int x) { return x + 1; }
+            int use() { Writer w(3); return w.emit(); }
+            int dead_helper() { return 9; }
+            """;
+        using var fe = new CppFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("w.cpp", src) });
+        var roots = new ExplicitRootProvider(symbols: new[] { "use" }).Discover(graph)
+            .Concat(new ConstructorRootProvider().Discover(graph)).ToList();
+        var plan = ReachabilityEngine.Compute(graph, roots);
+
+        Assert.True(plan.IsKept(graph.Nodes.First(n => n.Name == "compute_mode").Id)); // ctor init-list callee kept
+        Assert.False(plan.IsKept(graph.Nodes.First(n => n.Name == "dead_helper").Id)); // genuinely dead -> carved
     }
 
     [Fact]

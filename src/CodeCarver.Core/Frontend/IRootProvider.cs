@@ -188,6 +188,31 @@ public sealed class LinkerSectionRootProvider : IRootProvider
     }
 }
 
+/// <summary>
+/// Roots C++ constructors — a function whose name is a class/struct type name. A constructor runs on
+/// every instantiation (<c>T x;</c>, <c>T{}</c>, a static/global instance, <c>new T</c>, a base or
+/// member of another constructed class) — none of which is a traceable call, so a constructor always
+/// looks unreachable. It cannot be pruned (removing it makes the class's implicit default constructor
+/// ill-formed), and because it IS emitted, whatever it calls in its member-initializer list / body must
+/// be kept too. Rooting constructors makes the closure sound: the constructor and its callees survive.
+/// Over-approximates (keeps every class's constructor + its init dependencies) — the sound price of not
+/// modelling instantiation. In C this only fires on the rare function-named-like-a-struct (harmless).
+/// </summary>
+public sealed class ConstructorRootProvider : IRootProvider
+{
+    public IEnumerable<Root> Discover(CodeGraph graph)
+    {
+        var typeNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var node in graph.Nodes)
+            if (node.Kind == NodeKind.Type) typeNames.Add(node.Name);
+        if (typeNames.Count == 0) yield break;
+
+        foreach (var node in graph.Nodes)
+            if (node.Kind == NodeKind.Function && typeNames.Contains(node.Name))
+                yield return new Root(node.Id, RootKind.LinkerKeep, $"constructor {node.Name}");
+    }
+}
+
 /// <summary>Unions several providers into one root set.</summary>
 public sealed class CompositeRootProvider : IRootProvider
 {

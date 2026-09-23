@@ -35,7 +35,8 @@ $repos = @(
     @{ name = 'stm32_samples'; url = 'https://github.com/dwelch67/stm32_samples'; ref = $null; tier = 'C (bare-metal Cortex-M: real .s startup + .ld; validates build-support-file emission links with arm-none-eabi-gcc)' },
     @{ name = 'fmt';        url = 'https://github.com/fmtlib/fmt';        ref = $null;     tier = 'C++ (macro-opened namespace FMT_BEGIN_NAMESPACE + FMT_TRY/CATCH; exposed the scope-macro-expansion + macro-function gaps)' },
     @{ name = 'tinyxml2';   url = 'https://github.com/leethomason/tinyxml2'; ref = $null;  tier = 'C++ (classes; exposed class-first-member brace shatter + header inline pruning)' },
-    @{ name = 'simdjson';   url = 'https://github.com/simdjson/simdjson';  ref = $null;    tier = 'C++ (template/amalgamation; exposed constructor pruning + orphaned template<...> prefix)' }
+    @{ name = 'simdjson';   url = 'https://github.com/simdjson/simdjson';  ref = $null;    tier = 'C++ (template/amalgamation; exposed constructor pruning + orphaned template<...> prefix)' },
+    @{ name = 'pugixml';    url = 'https://github.com/zeux/pugixml';      ref = $null;     tier = 'C++ (macro-opened namespaces PUGI_IMPL_NS_BEGIN; exposed constructor init-list callee dropped)' }
 )
 
 foreach ($r in $repos) {

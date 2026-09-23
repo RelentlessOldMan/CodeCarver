@@ -308,7 +308,11 @@ static int RunCarve(string[] args)
         }
     }
 
-    var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots).ToList();
+    // C++ constructors run on every instantiation (untraceable) and can't be pruned, so root them: the
+    // constructor AND whatever it calls in its init-list/body must survive (a real pugixml dangling bug).
+    var ctorRoots = lang is "cpp" ? new ConstructorRootProvider().Discover(graph).ToList() : new List<Root>();
+
+    var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots).Concat(ctorRoots).ToList();
     if (rootSet.Count == 0)
     {
         Console.Error.WriteLine("no roots to carve from: name entry symbols with --roots");

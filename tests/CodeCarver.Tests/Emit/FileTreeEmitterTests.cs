@@ -169,12 +169,13 @@ public class FileTreeEmitterTests
 
             using var fe = new CodeCarver.Frontend.CppFrontEnd();
             var graph = fe.BuildGraph(new[] { ("impl.cpp", impl) });
-            var plan = ReachabilityEngine.Compute(graph,
-                new ExplicitRootProvider(symbols: new[] { "run" }).Discover(graph).ToList());
+            var roots = new ExplicitRootProvider(symbols: new[] { "run" }).Discover(graph)
+                .Concat(new ConstructorRootProvider().Discover(graph)).ToList();  // constructors are roots
+            var plan = ReachabilityEngine.Compute(graph, roots);
             FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
 
             var carved = File.ReadAllText(Path.Combine(outDir, "impl.cpp"));
-            Assert.Contains("Thing()", carved);                         // constructor kept
+            Assert.Contains("Thing()", carved);                         // constructor kept (via ConstructorRootProvider)
             Assert.DoesNotContain("template<int N>", carved);           // template prefix removed with its method
             Assert.DoesNotContain("scale", carved);                     // the unreached templated method is gone
             Assert.Contains("keep", carved);                            // reached method kept
