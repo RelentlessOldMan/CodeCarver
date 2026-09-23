@@ -838,7 +838,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 // top-level function that cascading error-recovery merely nested keeps a valid parameter
                 // list, so it is still captured (crypto libraries with macro-heavy bodies rely on this).
                 if (InsideFunctionBody(parent) && HasCallShapedParameters(parent)) return null;
-                return (parent.StartPosition.Row + 1, parent.EndPosition.Row + 1);
+                var start = parent.StartPosition.Row + 1;
+                // Include a leading `template<...>` (possibly several, nested) so pruning a templated
+                // function/method removes the whole thing — otherwise the `template<int N>` line is left
+                // orphaned above the deleted body: `template<int N>\n };` → "expected unqualified-id".
+                var tp = parent.Parent;
+                while (tp is not null && tp.Type == "template_declaration") { start = tp.StartPosition.Row + 1; tp = tp.Parent; }
+                return (start, parent.EndPosition.Row + 1);
             }
             if (t is "function_declarator" or "pointer_declarator" or "reference_declarator"
                   or "parenthesized_declarator" or "qualified_identifier" or "template_function")

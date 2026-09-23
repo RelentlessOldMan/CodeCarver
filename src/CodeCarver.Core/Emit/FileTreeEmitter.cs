@@ -69,14 +69,24 @@ public static class FileTreeEmitter
         // carved library). Removing an unreached inline method from a header (C++ especially) silently
         // breaks such a caller. Headers are kept whole; only implementation units are pruned. This also
         // sidesteps a class of C++ mis-parses where a giant function's span swallows a nested class.
+        // Constructors are invoked IMPLICITLY (`Foo x;`, `Foo{}`, a global/static instance, `new Foo`) —
+        // never through a call we can trace — so a constructor is almost always "unreached" yet removing
+        // it makes the class's implicit default constructor ill-formed and the build fails (simdjson).
+        // A constructor is a function whose name is a class/struct type name; destructors (~Foo) and
+        // operators aren't captured as functions, so they're already kept whole. We never prune these.
+        var typeNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var n in graph.Nodes)
+            if (n.Kind == NodeKind.Type) typeNames.Add(n.Name);
+
         var spansByFile = new Dictionary<string, List<(int Start, int End, bool Drop)>>(StringComparer.Ordinal);
         foreach (var n in graph.Nodes)
         {
             if (n.Kind is not (NodeKind.Function or NodeKind.Global)) continue;
             if (n.FilePath is not { } f || !n.Span.IsKnown || IsHeader(f)) continue;
+            var isCtor = n.Kind == NodeKind.Function && typeNames.Contains(n.Name);
             if (!spansByFile.TryGetValue(f, out var list))
                 spansByFile[f] = list = new List<(int, int, bool)>();
-            list.Add((n.Span.StartLine, n.Span.EndLine, !plan.IsKept(n.Id)));
+            list.Add((n.Span.StartLine, n.Span.EndLine, !isCtor && !plan.IsKept(n.Id)));
         }
 
         // A dropped function is only safe to remove if its span does not overlap another function's.

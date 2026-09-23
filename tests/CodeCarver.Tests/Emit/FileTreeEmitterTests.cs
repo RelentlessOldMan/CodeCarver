@@ -1,4 +1,5 @@
 using CodeCarver.Core.Emit;
+using CodeCarver.Core.Frontend;
 using CodeCarver.Core.Graph;
 using CodeCarver.Core.Reachability;
 using CodeCarver.Core.Roots;
@@ -133,6 +134,50 @@ public class FileTreeEmitterTests
             Assert.True(File.Exists(Path.Combine(outDir, "flash.ld")));
             Assert.False(File.Exists(Path.Combine(outDir, "stm32f7", "startup_f7.s"))); // excluded variant
             Assert.Equal(1, res.Count);
+        }
+        finally
+        {
+            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void EmitPruned_KeepsConstructor_AndWholeTemplatePrefix()
+    {
+        // Two C++ pruning-soundness regressions (found in simdjson):
+        //  1) a CONSTRUCTOR (function whose name == a class/struct type) is invoked implicitly, never via a
+        //     traced call, so it looks unreached — but removing it makes the class's implicit default ctor
+        //     ill-formed. Constructors are never pruned.
+        //  2) a templated method's `template<...>` line sits ABOVE the captured function_definition; pruning
+        //     it must remove the template prefix too, or `template<int N>\n};` dangles.
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-ctor-" + Guid.NewGuid().ToString("N"));
+        var srcDir = Path.Combine(work, "src");
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(srcDir);
+        try
+        {
+            const string impl = """
+                struct Thing {
+                    Thing() {}
+                    template<int N>
+                    int scale() const { return N; }
+                    int keep() const { return 1; }
+                };
+                int run() { Thing t; return t.keep(); }
+                """;
+            File.WriteAllText(Path.Combine(srcDir, "impl.cpp"), impl);
+
+            using var fe = new CodeCarver.Frontend.CppFrontEnd();
+            var graph = fe.BuildGraph(new[] { ("impl.cpp", impl) });
+            var plan = ReachabilityEngine.Compute(graph,
+                new ExplicitRootProvider(symbols: new[] { "run" }).Discover(graph).ToList());
+            FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
+
+            var carved = File.ReadAllText(Path.Combine(outDir, "impl.cpp"));
+            Assert.Contains("Thing()", carved);                         // constructor kept
+            Assert.DoesNotContain("template<int N>", carved);           // template prefix removed with its method
+            Assert.DoesNotContain("scale", carved);                     // the unreached templated method is gone
+            Assert.Contains("keep", carved);                            // reached method kept
         }
         finally
         {
