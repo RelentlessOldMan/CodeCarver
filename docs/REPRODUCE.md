@@ -74,5 +74,8 @@ with `./check.ps1 -Big` once the ARM toolchain + corpus are fetched.
   exclude tests.
 - **`0 baseline`** means the repo doesn't compile standalone here (needs its own generated headers or a
   config, e.g. mbedtls/PSA). Not a carve bug — just not fuzzable without its build system.
-- The corpus repos are cloned at their **default branch** (a few are tag-pinned). For byte-identical
-  replay over time, pin `ref` in `fetch-corpus.ps1` to a commit; day-to-day the latest clone is fine.
+- Every corpus repo is **pinned to a commit SHA** in `fetch-corpus.ps1` (a commit is immutable, so a
+  clone is byte-identical over time). `git clone --branch` can't take a raw SHA, so the script
+  shallow-*fetches* the commit (`git fetch --depth 1 origin <sha>`; GitHub allows fetch-by-SHA). The
+  only way a pin can fail is the upstream repo being deleted/made private — not drift. To advance a pin,
+  swap in a newer SHA (`git ls-remote <url> HEAD`).
