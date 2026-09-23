@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.RegularExpressions;
 using CodeCarver.Core.Graph;
 using CodeCarver.Core.Preprocess;
@@ -103,6 +104,19 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public int ParseBudgetMs { get; set; } = 20_000;
     private const int BudgetMinBytes = 256 * 1024;
 
+    // Scope-opening macros (`FMT_BEGIN_NAMESPACE`, `PUGI_IMPL_NS_BEGIN` → `namespace fmt {` …). tree-sitter
+    // can't see through them, so a file that opens its scope with one mis-parses entirely and NO function
+    // is captured — the C++ library carve can't even find its roots. We expand ONLY these (not value
+    // macros) and ONLY for parsing, on a single line so every node's LINE number still maps to the
+    // original text the emitter prunes. Built once across all inputs (the #define is often in a header).
+    private static readonly Regex ObjectLikeDefine = new(
+        @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+((?:\\\r?\n|[^\r\n])*)",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+    private Dictionary<string, string> _scopeMacros = new(StringComparer.Ordinal);
+    private Regex? _scopeRegex;
+    private HashSet<string> _macroNames = new(StringComparer.Ordinal); // every #define'd name (object + fn-like)
+    private static readonly Regex AnyDefine = new(@"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)", RegexOptions.Compiled | RegexOptions.Multiline);
+
     /// <summary>
     /// Local <c>#include</c>d files with a non-source extension (<c>.inc</c>/<c>.def</c>/generated tables)
     /// that are textually part of a <c>.c</c>'s translation unit but which we do NOT parse as C. We scan
@@ -136,6 +150,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _warnings.Clear();
         var graph = new CodeGraph();
         var inputs = files.ToList();
+        BuildScopeMacros(inputs); // scope-opening macros to expand for parsing (see field docs)
 
         var fileNodeByPath = new Dictionary<string, NodeId>(StringComparer.Ordinal);
         var pathsByBasename = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
@@ -259,6 +274,63 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// abandoned thread — stuck in native error recovery until the process exits — can never corrupt the
     /// graph. Small files (the vast majority) parse inline; they finish near-instantly even when invalid.
     /// </summary>
+    /// <summary>Collect object-like macros whose replacement is scope-structural (opens/closes a
+    /// namespace or brace scope), across ALL inputs (the #define is often in a header, the use in a .cc).
+    /// Value macros (numbers, attributes) are deliberately left alone — expanding them risks changing a
+    /// parse that already works. Multi-line (<c>\</c>-continued) replacements are flattened to one line so
+    /// expansion never shifts line numbers.</summary>
+    private void BuildScopeMacros(IReadOnlyList<(string Path, string Text)> inputs)
+    {
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (_, text) in inputs)
+        {
+            if (text.Length == 0) continue;
+            foreach (Match m in ObjectLikeDefine.Matches(text))
+            {
+                var name = m.Groups[1].Value;
+                if (map.ContainsKey(name)) continue;
+                var repl = Regex.Replace(m.Groups[2].Value, @"\\\r?\n", " ").Replace("\r", " ").Replace("\n", " ").Trim();
+                if (repl.Length == 0 || repl.Length > 200) continue;
+                // Scope OPENERS/CLOSERS only: an unbalanced net brace count (`namespace fmt {` = +2, `}}` =
+                // -2) or the `namespace` keyword. A brace-BALANCED replacement is a value macro — a
+                // compound literal like wren's `((Value){ VAL_NULL, { 0 } })` — and expanding it would
+                // corrupt a parse that already works. Those must be left alone.
+                var net = 0;
+                foreach (var c in repl) { if (c == '{') net++; else if (c == '}') net--; }
+                if (net == 0 && !repl.Contains("namespace")) continue;
+                map[name] = repl;
+            }
+        }
+        _scopeMacros = map;
+        _scopeRegex = map.Count == 0 ? null
+            : new Regex(@"\b(?:" + string.Join("|", map.Keys.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
+
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (_, text) in inputs)
+            if (text.Length > 0)
+                foreach (Match m in AnyDefine.Matches(text)) names.Add(m.Groups[1].Value);
+        _macroNames = names;
+    }
+
+    /// <summary>Replace scope-opening macros with their (single-line) expansion, for parsing only. Skips
+    /// preprocessor lines (the #define itself, #if using the macro) and preserves the line count exactly,
+    /// so a captured node's line numbers still index the original text the emitter reads.</summary>
+    private string ExpandScopeMacros(string text)
+    {
+        if (_scopeRegex is null) return text;
+        var lines = text.Split('\n');
+        var sb = new StringBuilder(text.Length + 128);
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            if (!line.TrimStart().StartsWith('#'))
+                line = _scopeRegex.Replace(line, mm => _scopeMacros.TryGetValue(mm.Value, out var r) ? r : mm.Value);
+            sb.Append(line);
+            if (i < lines.Length - 1) sb.Append('\n');
+        }
+        return sb.ToString();
+    }
+
     private Tree? ParseWithBudget(string text, out bool timedOut)
     {
         timedOut = false;
@@ -392,7 +464,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             return;
         }
 
-        using var tree = ParseWithBudget(text, out var timedOut);
+        // Expand scope-opening macros for PARSING only (line-preserving), so a file that opens its
+        // namespace with `FMT_BEGIN_NAMESPACE` is structured correctly and its functions are captured.
+        // Everything else (spans, dead-line map, initializer scans) uses the ORIGINAL text below.
+        using var tree = ParseWithBudget(ExpandScopeMacros(text), out var timedOut);
         if (timedOut)
         {
             _warnings.Add($"{path}: parse exceeded the {ParseBudgetMs} ms budget — kept whole, not carved");
@@ -736,8 +811,15 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// not a definition, so we return null and skip it. This is what makes pointer-returning functions
     /// (<c>T *f()</c>) get captured while prototypes and function-pointer parameters do not.
     /// </summary>
-    private static (int Start, int End)? DefinitionSpan(TsNode nameNode)
+    private (int Start, int End)? DefinitionSpan(TsNode nameNode)
     {
+        // A "function" whose name is a #define'd macro is never a real definition — a control-flow macro
+        // like fmt's `FMT_CATCH(...) {}` (catch (x)) or a scope macro parses as a function; capturing it
+        // truncates the real enclosing function and prunes the macro line (shattering try/catch). The
+        // preprocessor would expand any real same-named function, so no genuine definition is lost. Reject
+        // it whatever the nesting (tree-sitter may float it to file scope after truncating its neighbour).
+        if (_macroNames.Contains(nameNode.Text)) return null;
+
         var n = nameNode;
         for (var i = 0; i < 12; i++)
         {

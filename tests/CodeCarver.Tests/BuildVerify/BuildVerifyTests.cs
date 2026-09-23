@@ -775,6 +775,59 @@ public class BuildVerifyTests
     private static string? FindGxx() => FindUp(Path.Combine(".toolchains", "w64devkit", "bin", "g++.exe"), file: true);
 
     [Fact]
+    public void Cpp_ControlFlowMacro_TryCatch_NotPrunedAsNestedFunction()
+    {
+        // fmt wraps try/catch in macros: `FMT_TRY { … } FMT_CATCH(...) {}`. tree-sitter parses
+        // `FMT_CATCH(...) {}` as a nested function definition; capturing it truncated the enclosing
+        // function and PRUNED the `catch`, leaving `try { }` with no handler → won't compile. The
+        // front-end rejects a nested "definition" whose name is a known macro. Build with g++ to prove
+        // the try/catch survives.
+        var gxx = FindGxx();
+        if (gxx is null) return;
+
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-cpptc-" + Guid.NewGuid().ToString("N"));
+        var srcDir = Path.Combine(work, "src");
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(srcDir);
+        try
+        {
+            const string hdr = "#define APP_TRY try\n#define APP_CATCH(x) catch (x)\n";
+            const string appCpp = """
+                #include "macros.h"
+                int risky();
+                int handle(int x) {
+                    APP_TRY {
+                        return risky();
+                    }
+                    APP_CATCH(...) {}
+                    return -1;
+                }
+                int risky() { return 1; }
+                int dead() { return 99; }
+                """;
+            File.WriteAllText(Path.Combine(srcDir, "macros.h"), hdr);
+            File.WriteAllText(Path.Combine(srcDir, "app.cpp"), appCpp);
+
+            using var fe = new CppFrontEnd();
+            var graph = fe.BuildGraph(new[] { ("macros.h", hdr), ("app.cpp", appCpp) });
+            var plan = ReachabilityEngine.Compute(graph,
+                new ExplicitRootProvider(symbols: new[] { "handle" }).Discover(graph).ToList());
+            FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
+
+            var carved = File.ReadAllText(Path.Combine(outDir, "app.cpp"));
+            Assert.Contains("APP_CATCH", carved);        // the catch macro survived (not pruned)
+            Assert.DoesNotContain("dead", carved);       // genuine dead code still pruned
+
+            var (code, output) = Run(gxx, new[] { "-std=c++17", "-c", "app.cpp", "-I.", "-o", "app.o" }, outDir);
+            Assert.True(code == 0, $"carved C++ with try/catch macros failed to compile:\n{output}");
+        }
+        finally
+        {
+            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+        }
+    }
+
+    [Fact]
     public void Cpp_PruneFirstClassMember_AndHeaderInline_StillCompiles()
     {
         // Two C++ pruning-soundness regressions in one build:
