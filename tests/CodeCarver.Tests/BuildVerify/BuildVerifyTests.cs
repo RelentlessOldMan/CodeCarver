@@ -57,6 +57,58 @@ public class BuildVerifyTests
         }
         """;
 
+    [Theory]
+    [InlineData("carved-base64-encode", "sl_base64_encode")]
+    [InlineData("carved-sanitize", "sl_trim,sl_to_upper")]
+    public void Example_Stringlib_CheckedInCarveIsUpToDate_AndCompiles(string outName, string roots)
+    {
+        // The examples/stringlib carved trees are checked in as documentation. Regenerate them and assert
+        // they match byte-for-byte (so they can never silently drift from the tool), then compile them.
+        var ex = FindUp(Path.Combine("examples", "stringlib"));
+        if (ex is null) return;
+        var src = Path.Combine(ex, "src");
+        var golden = Path.Combine(ex, outName);
+        if (!Directory.Exists(golden)) return;
+
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-ex-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var inputs = Directory.EnumerateFiles(src, "*.*")
+                .Where(p => p.EndsWith(".c") || p.EndsWith(".h"))
+                .Select(p => (Path.GetFileName(p)!, File.ReadAllText(p))).ToList();
+            using var fe = new CFrontEnd();
+            var graph = fe.BuildGraph(inputs);
+            var plan = ReachabilityEngine.Compute(graph,
+                new ExplicitRootProvider(symbols: roots.Split(',')).Discover(graph).ToList());
+            FileTreeEmitter.EmitPruned(plan, graph, src, work);
+
+            static string Norm(string s) => s.Replace("\r\n", "\n");
+            var checkedIn = Directory.EnumerateFiles(golden, "*.*", SearchOption.AllDirectories).ToList();
+            foreach (var f in checkedIn)
+            {
+                var rel = Path.GetRelativePath(golden, f);
+                var regen = Path.Combine(work, rel);
+                Assert.True(File.Exists(regen), $"{outName}/{rel} is checked in but the carve no longer emits it — regenerate the example");
+                Assert.True(Norm(File.ReadAllText(f)) == Norm(File.ReadAllText(regen)),
+                    $"{outName}/{rel} is stale — re-run the carve and commit the updated example");
+            }
+            var regenCount = Directory.EnumerateFiles(work, "*.*", SearchOption.AllDirectories).Count();
+            Assert.Equal(checkedIn.Count, regenCount); // no files emitted that aren't checked in
+
+            var gcc = FindGcc();
+            if (gcc is not null)
+            {
+                var obj = Path.Combine(work, "o.o");   // output to temp so the checked-in dir stays clean
+                foreach (var c in Directory.EnumerateFiles(golden, "*.c"))
+                {
+                    var (code, output) = Run(gcc, new[] { "-c", Path.GetFileName(c), "-I.", "-o", obj }, golden);
+                    Assert.True(code == 0, $"checked-in example {outName}/{Path.GetFileName(c)} does not compile:\n{output}");
+                }
+            }
+        }
+        finally { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); }
+    }
+
     [Fact]
     public void PrunedCarve_StillCompilesAndLinks()
     {

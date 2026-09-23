@@ -632,6 +632,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 var startCol = cap.Node.StartPosition.Column;
                 var endRow = cap.Node.EndPosition.Row + 1;
                 var endCol = cap.Node.EndPosition.Column;
+                var inBlock = false; // /* */ state carried across the initializer's lines
                 for (var r = startRow; r <= endRow && r - 1 < srcLines.Length; r++)
                 {
                     var line = srcLines[r - 1];
@@ -640,7 +641,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     var from = r == startRow ? Math.Min(startCol, line.Length) : 0;
                     var to = r == endRow ? Math.Min(endCol, line.Length) : line.Length;
                     if (from < to)
-                        foreach (var id in LineIdentifiers(line[from..to]))
+                        // Blank comments and string/char literals first: a symbol named only in a comment
+                        // (`/* used by foo */`) or string ("foo") is NOT a real reference, and treating it
+                        // as one keeps dead code (a common table pattern with per-entry comments).
+                        foreach (var id in LineIdentifiers(StripNonCode(line[from..to], ref inBlock)))
                             pendingRefs.Add((fileNode, id));
                 }
             }
@@ -676,6 +680,33 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (hit)
                 foreach (var n in kv.Value) graph.AddEdge(macro, n, edge);
         }
+    }
+
+    /// <summary>Blank out // and /* */ comments and string/char-literal contents on a line, so a symbol
+    /// name that appears only in a comment or a string is not mistaken for a code reference. <paramref
+    /// name="inBlock"/> carries <c>/* */</c> state across the lines of a multi-line initializer.</summary>
+    private static string StripNonCode(string s, ref bool inBlock)
+    {
+        var sb = new StringBuilder(s.Length);
+        var quote = '\0';
+        for (var c = 0; c < s.Length; c++)
+        {
+            var ch = s[c];
+            if (inBlock)
+            {
+                if (ch == '*' && c + 1 < s.Length && s[c + 1] == '/') { inBlock = false; c++; }
+            }
+            else if (quote != '\0')
+            {
+                if (ch == '\\') c++;                       // skip an escaped char (\" \\ \')
+                else if (ch == quote) quote = '\0';
+            }
+            else if (ch == '/' && c + 1 < s.Length && s[c + 1] == '/') break;      // line comment: rest is dead
+            else if (ch == '/' && c + 1 < s.Length && s[c + 1] == '*') { inBlock = true; c++; }
+            else if (ch is '"' or '\'') quote = ch;
+            else sb.Append(ch);
+        }
+        return sb.ToString();
     }
 
     /// <summary>C identifiers appearing in a line of source (used to scan initializer-table bodies).</summary>

@@ -84,7 +84,9 @@ dotnet run --project src/CodeCarver.Cli -- demo          # a narrated toy embedd
 ```
 
 Full command/option reference — the tightness ladder, `#ifdef` resolution, build-log scraping, the
-size report — is in [`docs/USAGE.md`](docs/USAGE.md).
+size report — is in [`docs/USAGE.md`](docs/USAGE.md). For worked examples with inputs **and** carved
+outputs checked in, start at [`examples/`](examples) (the `stringlib` walkthrough shows file-level +
+intra-file + table pruning on one small library).
 
 ## Layout
 
