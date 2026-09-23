@@ -772,6 +772,68 @@ public class BuildVerifyTests
 
     /// <summary>Walk up from the test binary to the repo's fetched toolchain, if present.</summary>
     private static string? FindGcc() => FindUp(Path.Combine(".toolchains", "w64devkit", "bin", "gcc.exe"), file: true);
+    private static string? FindGxx() => FindUp(Path.Combine(".toolchains", "w64devkit", "bin", "g++.exe"), file: true);
+
+    [Fact]
+    public void Cpp_PruneFirstClassMember_AndHeaderInline_StillCompiles()
+    {
+        // Two C++ pruning-soundness regressions in one build:
+        //  1) pruning a class's FIRST member (a constructor) must not delete the enclosing `class X {` /
+        //     `public:` — the shared-brace heuristic used to swallow it (tinyxml2's html5-printer).
+        //  2) an unreached inline method in a HEADER must NOT be pruned — a caller in another TU (or the
+        //     app that consumes the carved library) needs it (tinyxml2's XMLDocument::ErrorID).
+        var gxx = FindGxx();
+        if (gxx is null) return;
+
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-cpp-" + Guid.NewGuid().ToString("N"));
+        var srcDir = Path.Combine(work, "src");
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(srcDir);
+        try
+        {
+            const string widgetH = """
+                #ifndef WIDGET_H
+                #define WIDGET_H
+                class Widget {
+                public:
+                    Widget() {}                 // first member — unreached; must not break the class
+                    int unused_inline() const { return 42; }  // header inline — must NOT be pruned
+                    int keep() const { return 7; }
+                };
+                #endif
+                """;
+            const string appCpp = """
+                #include "widget.h"
+                int run(Widget* w) { return w->keep(); }
+                int dead(Widget* w) { return w->keep() + 1; } // unreached — pruned from this TU
+                """;
+            File.WriteAllText(Path.Combine(srcDir, "widget.h"), widgetH);
+            File.WriteAllText(Path.Combine(srcDir, "app.cpp"), appCpp);
+
+            using var fe = new CppFrontEnd();
+            var graph = fe.BuildGraph(new[] { ("widget.h", widgetH), ("app.cpp", appCpp) });
+            var plan = ReachabilityEngine.Compute(graph,
+                new ExplicitRootProvider(symbols: new[] { "run" }).Discover(graph).ToList());
+            FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
+
+            // The header is emitted whole (inline method retained); the class opening survived.
+            var hdr = File.ReadAllText(Path.Combine(outDir, "widget.h"));
+            Assert.Contains("class Widget", hdr);
+            Assert.Contains("unused_inline", hdr);                        // header not pruned
+            Assert.DoesNotContain("dead", File.ReadAllText(Path.Combine(outDir, "app.cpp"))); // TU still pruned
+
+            // A driver using run() and the header inline directly must compile+link.
+            File.WriteAllText(Path.Combine(outDir, "_verify.cpp"),
+                "#include \"widget.h\"\nint run(Widget*);\n"
+                + "int main(){ Widget w; return run(&w) + w.unused_inline(); }\n");
+            var (code, output) = Run(gxx, new[] { "-std=c++17", "app.cpp", "_verify.cpp", "-I.", "-o", "v.exe" }, outDir);
+            Assert.True(code == 0, $"carved C++ failed to build:\n{output}");
+        }
+        finally
+        {
+            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+        }
+    }
 
     /// <summary>Find the fetched portable arm-none-eabi-gcc (version is in the folder name), if present.</summary>
     private static string? FindArmGcc()

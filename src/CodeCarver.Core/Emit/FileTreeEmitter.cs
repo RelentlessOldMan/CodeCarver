@@ -64,11 +64,16 @@ public static class FileTreeEmitter
 
         // Gather ALL prunable definition spans per file — functions AND initialized globals (data
         // tables) — kept + dropped, so we can detect misparse/overlap and remove unreached ones.
+        // HEADERS are never pruned: a header is the API surface, and its inline/template definitions may
+        // be used by any translation unit — including code OUTSIDE the carve (the app that consumes the
+        // carved library). Removing an unreached inline method from a header (C++ especially) silently
+        // breaks such a caller. Headers are kept whole; only implementation units are pruned. This also
+        // sidesteps a class of C++ mis-parses where a giant function's span swallows a nested class.
         var spansByFile = new Dictionary<string, List<(int Start, int End, bool Drop)>>(StringComparer.Ordinal);
         foreach (var n in graph.Nodes)
         {
             if (n.Kind is not (NodeKind.Function or NodeKind.Global)) continue;
-            if (n.FilePath is not { } f || !n.Span.IsKnown) continue;
+            if (n.FilePath is not { } f || !n.Span.IsKnown || IsHeader(f)) continue;
             if (!spansByFile.TryGetValue(f, out var list))
                 spansByFile[f] = list = new List<(int, int, bool)>();
             list.Add((n.Span.StartLine, n.Span.EndLine, !plan.IsKept(n.Id)));
@@ -175,6 +180,17 @@ public static class FileTreeEmitter
         }
     }
 
+    /// <summary>A C/C++ header — its definitions are API/inline/template code any translation unit may
+    /// use, so intra-file pruning leaves headers whole (extensionless includes like <c>&lt;vector&gt;</c>
+    /// aren't graph files here). Implementation units (.c/.cc/.cpp/.cxx) are what get pruned.</summary>
+    private static bool IsHeader(string path)
+    {
+        var ext = Path.GetExtension(path);
+        return ext.Length > 0 && ext[0] == '.' &&
+               ext.ToLowerInvariant() is ".h" or ".hpp" or ".hxx" or ".hh" or ".h++"
+                                      or ".inl" or ".ipp" or ".tcc" or ".tpp";
+    }
+
     /// <summary>Net <c>{</c> minus <c>}</c> over a line range, ignoring // and /* */ comments and
     /// string/char literals. Zero means the range encloses whole, balanced blocks (safe to remove).</summary>
     private static int NetBraces(string[] lines, int start, int end)
@@ -221,19 +237,30 @@ public static class FileTreeEmitter
             // removing it would strip a head or leave a dangling tail. Keep it whole (sound).
             if (NetBraces(lines, s, e) != 0) continue;
 
-            // Shared-closing-brace case: an `#if X / TYPE foo(...){ / #else / TYPE bar(...){ / #endif`
-            // gives two signatures ONE body — tree-sitter captures only the #else one, so its span's
-            // closing `}` is really shared with the #if signature above (the compiler compiles exactly
-            // one branch, so it sees a matched pair). Removing the span alone orphans the preserved `{`.
-            // Extend the removal UP to swallow that signature line so the whole construct goes together.
+            // A net-open brace in the lines just above the span can mean two very different things:
+            //  (a) an `#if X / TYPE foo(...){ / #else / TYPE bar(...){ / #endif` dual-signature construct —
+            //      two signatures share ONE body/closing `}`; tree-sitter captured only the #else one, so
+            //      removing its span alone orphans the #if signature's `{`. The drop must extend UP to
+            //      swallow that signature line. OR
+            //  (b) the span is simply the first member of a class / namespace / extern-"C" block, whose
+            //      opening brace is above. Its own braces are balanced (checked just above), so removing it
+            //      as-is is correct — extending up would delete the ENCLOSING scope's `{` and shatter it
+            //      (a real C++ bug: pruning a class's first method took out `class X {` and `public:`).
+            // Only (a) has a preprocessor directive between the orphaned open-brace line and the drop; use
+            // that to tell them apart. Without one, don't extend — the balanced span removes on its own.
             var start = s;
             var pre = NetBraces(lines, Math.Max(1, s - 10), s - 1);
             if (pre > 0)
             {
+                var candidate = s;
                 for (var k = s - 1; k >= Math.Max(1, s - 12); k--)
                     if (NetBraces(lines, k, k) > 0 && NetBraces(lines, k, s - 1) == pre)
-                        start = k; // the orphaned open-brace signature line
-                if (start == s) continue; // couldn't locate it -> keep whole (sound)
+                        candidate = k; // the orphaned open-brace signature line
+                var sharedUnderPreproc = false;
+                for (var k = candidate; candidate != s && k < s; k++)
+                    if (lines[k - 1].TrimStart().StartsWith('#')) { sharedUnderPreproc = true; break; }
+                if (sharedUnderPreproc) start = candidate; // (a) dual-signature — extend up
+                // else (b): enclosing scope, leave start = s; remove the balanced span alone.
             }
             for (var i = Math.Max(1, start); i <= e && i <= lines.Length; i++)
                 drop[i] = true;
