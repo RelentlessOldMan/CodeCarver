@@ -22,6 +22,7 @@ Thumbs.db
 # CodeCarver: carved output, scratch corpora, and fetched toolchains are never committed
 .carved/
 .corpus/
+.oracle-cpp/
 .toolchains/
 *.tmp
 .claude/scheduled_tasks.lock

@@ -132,6 +132,26 @@ itself**: `gcc <carved>/*.c empty_main.c -Wl,--gc-sections -Wl,--undefined=<root
 `undefined reference` there is a genuine dangling drop (this is exactly how the adler32 bug surfaced).
 For C++, `CC=g++ ...` (after `sudo apt install g++`).
 
+**C++ link oracle (one command).** `wsl-cpp-oracle.sh` automates the link-the-carved-output check for
+C++: carve the repo to `--out` on Windows, then link that carved tree against a tiny driver `main()`
+that calls the roots. Committed drivers live in `oracle/` (e.g. `oracle/tinyxml2_driver.cpp`,
+`oracle/pugixml_driver.cpp`). An `undefined reference` means the carve dropped a symbol a root reaches.
+
+```powershell
+# Windows: carve to --out (roots must match the driver's calls)
+carve <repo> --lang cpp --roots <syms> --prune --out .oracle-cpp/<name>
+```
+```bash
+# WSL (after: sudo apt install -y g++):
+INC="-I/mnt/c/.../.oracle-cpp/<name>" \
+  bash wsl-cpp-oracle.sh /mnt/c/.../.oracle-cpp/<name> /mnt/c/.../oracle/<name>_driver.cpp
+```
+
+The script excludes `*test*`/`*demo*` units, links with `--gc-sections`, and prints undefined
+references / compile errors. Note: header-only template libraries (e.g. fmt) carry their bodies in
+headers, so file-level carving can't shrink them — the meaningful C++ oracle targets are single-unit
+libraries with a `.cpp` (tinyxml2, pugixml) or amalgamations (simdjson).
+
 ## 6. Triage a finding
 
 For each break, capture enough to reproduce:
