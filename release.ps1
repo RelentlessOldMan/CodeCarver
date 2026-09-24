@@ -18,7 +18,10 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
-function RunGit { param([Parameter(ValueFromRemainingArguments=$true)][string[]]$a) $o = & git @a 2>&1; if ($LASTEXITCODE -ne 0) { throw "git $($a -join ' ') failed: $o" }; return $o }
+# NOTE: no 2>&1 -- merging git's normal stderr progress into the success stream would, under
+# $ErrorActionPreference='Stop', turn it into a terminating error even on exit 0. Let stderr print;
+# gate purely on $LASTEXITCODE.
+function RunGit { param([Parameter(ValueFromRemainingArguments=$true)][string[]]$a) $o = & git @a; if ($LASTEXITCODE -ne 0) { throw "git $($a -join ' ') failed" }; return $o }
 
 # --- 1. clean working tree (else the zip wouldn't correspond to ANY commit) ---
 $dirty = & git status --porcelain
