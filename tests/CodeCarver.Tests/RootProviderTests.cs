@@ -1,6 +1,7 @@
 using System.Linq;
 using CodeCarver.Core.Frontend;
 using CodeCarver.Core.Graph;
+using CodeCarver.Core.Roots;
 using Xunit;
 
 namespace CodeCarver.Tests;
@@ -64,6 +65,28 @@ public class RootProviderTests
         Assert.Contains(cmd, rooted);         // .commands matches KEEP(*(.commands))
         Assert.DoesNotContain(normal, rooted);   // no section attribute at all
         Assert.DoesNotContain(otherSec, rooted); // .data.ram is placed but not KEEP()'d
+    }
+
+    [Fact]
+    public void ExplicitRootProvider_ResolvesOnlyRealNames_TypoAmongValidIsDetectable()
+    {
+        // A firmware root set is a long hand-maintained list of ISRs/exported API. A SINGLE typo among
+        // valid names must NOT be silently absorbed (it would carve the real symbol away and look like a
+        // clean success + bigger win). Each resolved root carries its name in .Note, so the CLI can
+        // subtract to find exactly which requested names resolved to nothing -> per-root warnings, and
+        // --strict-roots turns any unresolved into a non-zero exit. (Program.cs)
+        var b = new GraphBuilder();
+        b.Func("main", "main.c");
+        b.Func("USART1_IRQHandler", "isr.c");
+
+        var requested = new[] { "main", "USART1_IRQHandler", "USART1_IRQHandlerTYPO", "MissingISR" };
+        var roots = new ExplicitRootProvider(symbols: requested).Discover(b.Graph).ToList();
+        var resolved = roots.Where(r => r.Kind == RootKind.ExplicitSymbol && r.Note is not null)
+                            .Select(r => r.Note!).ToHashSet();
+        var unresolved = requested.Where(r => !resolved.Contains(r)).ToList();
+
+        Assert.Equal(new[] { "main", "USART1_IRQHandler" }.ToHashSet(), resolved);
+        Assert.Equal(new[] { "USART1_IRQHandlerTYPO", "MissingISR" }, unresolved); // typos surfaced, not swallowed
     }
 
     [Fact]

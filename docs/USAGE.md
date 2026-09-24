@@ -15,7 +15,13 @@ carve <dir> --roots foo,bar --out out/    # write the carved tree (file-level, t
 ```
 
 Point it at a source directory and name the entry symbols (functions) you need. It traces every
-dependency and reports what's kept vs. dropped, with a size summary:
+dependency and reports what's kept vs. dropped, with a size summary.
+
+Every requested root that resolves to nothing is reported (`warn: requested root '<x>' was NOT found`),
+and the summary's `roots` line calls out unresolved names — so a typo among a long hand-maintained root
+list can't silently carve a real symbol away and look like a bigger win. Add **`--strict-roots`** to
+make *any* unresolved root a hard failure (non-zero exit) — recommended for a firmware image whose roots
+are a curated ISR/exported-API list (see `docs/WORKREPO.md`).
 
 ```
 CodeCarver — carve of .corpus/cJSON

@@ -66,6 +66,7 @@ static int RunCarve(string[] args)
     var prune = false;
     var pruneHeaders = false;
     var verify = false;
+    var strictRoots = false;
     var dumpSpans = false;
     string? whySymbol = null;
     var lang = "c";
@@ -113,6 +114,8 @@ static int RunCarve(string[] args)
             pruneHeaders = true;
         else if (args[i] == "--verify")
             verify = true;
+        else if (args[i] == "--strict-roots")
+            strictRoots = true;
         else if (args[i] == "--lang" && i + 1 < args.Length)
             lang = args[++i].ToLowerInvariant();
         else if (args[i] == "--define" && i + 1 < args.Length)
@@ -292,10 +295,29 @@ static int RunCarve(string[] args)
     }
 
     var explicitRoots = new ExplicitRootProvider(symbols: roots).Discover(graph).ToList();
+    // Per-root resolution. A firmware root set is a long hand-maintained list of ISRs/exported API
+    // ("the whole game", WORKREPO.md §0); a SINGLE typo among valid names would otherwise carve that
+    // symbol away silently and look like a clean success plus a bigger size win. So report every
+    // requested name that resolved to nothing, and — with --strict-roots — fail the run.
+    var resolvedNames = new HashSet<string>(
+        explicitRoots.Where(r => r.Kind == RootKind.ExplicitSymbol && r.Note is not null).Select(r => r.Note!),
+        StringComparer.Ordinal);
+    var unresolvedRoots = roots.Where(r => !resolvedNames.Contains(r)).ToList();
     if (roots.Length > 0 && explicitRoots.Count == 0)
     {
         Console.Error.WriteLine($"none of the requested roots were found as symbols: {string.Join(", ", roots)}");
         return 1;
+    }
+    if (unresolvedRoots.Count > 0)
+    {
+        foreach (var u in unresolvedRoots)
+            Console.Error.WriteLine($"  warn    : requested root '{u}' was NOT found as a symbol — nothing rooted for it " +
+                                    "(typo? macro-defined signature? excluded/other-variant file?)");
+        if (strictRoots)
+        {
+            Console.Error.WriteLine($"strict-roots: {unresolvedRoots.Count} of {roots.Length} requested roots unresolved — failing (drop --strict-roots to proceed anyway).");
+            return 1;
+        }
     }
     // Implicit roots (constructor/used/init-array) are ALWAYS added: the runtime/linker keep them
     // regardless of any call, so a from-main closure that dropped them would ship a broken image.
@@ -394,7 +416,10 @@ static int RunCarve(string[] args)
     }
 
     Console.WriteLine($"CodeCarver — carve of {dir}");
-    Console.WriteLine($"  roots   : {string.Join(", ", roots)}");
+    // Show what actually rooted; call out unresolved names inline so a partial resolution can't read as
+    // a clean success (see the per-root warnings above).
+    Console.WriteLine($"  roots   : {string.Join(", ", roots.Where(resolvedNames.Contains))}"
+                      + (unresolvedRoots.Count > 0 ? $"   [{unresolvedRoots.Count} UNRESOLVED: {string.Join(", ", unresolvedRoots)}]" : ""));
     if (implicitRoots.Count > 0)
         Console.WriteLine($"  implicit: {implicitRoots.Count} constructor/used/init-array symbol(s) auto-kept: "
                           + Summarize(implicitRoots.Select(r => r.Note ?? r.Node.ToString()).Distinct().ToList()));

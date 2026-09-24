@@ -44,6 +44,14 @@ wrong. Enumerate:
 > Rule of thumb: if dropping it would leave the chip unable to boot, respond to an interrupt, or answer
 > a command you poke over TRACE32 — it's a root.
 
+**Guard the list with `--strict-roots`.** Because the root set is long and hand-maintained, a single
+typo'd ISR/API name would otherwise carve that symbol away silently and look like a *cleaner* result
+(bigger size win). CodeCarver warns per unresolved root and flags them on the `roots` summary line;
+`--strict-roots` turns any unresolved root into a non-zero exit. Use it in CI / the preset so a typo
+fails loudly instead of shipping a broken image. If a name is legitimately absent for this variant
+(defined only under a different `#ifdef`, or in an excluded board dir), fix the name/exclude — don't
+drop the flag.
+
 ## 1. Smoke test (analysis only, no write)
 
 ```
