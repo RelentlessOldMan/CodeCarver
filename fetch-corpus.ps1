@@ -39,7 +39,15 @@ $repos = @(
     @{ name = 'fmt';        url = 'https://github.com/fmtlib/fmt';                 sha = '6d71f74624be5daa548073ff8e4e0c8aa5476010'; tier = 'C++ (macro-opened namespace FMT_BEGIN_NAMESPACE + FMT_TRY/CATCH; scope-macro-expansion + macro-function gaps)' },
     @{ name = 'tinyxml2';   url = 'https://github.com/leethomason/tinyxml2';       sha = '8224e427b655b83dae5e2298f1e6919523a78737'; tier = 'C++ (classes; class-first-member brace shatter + header inline pruning)' },
     @{ name = 'simdjson';   url = 'https://github.com/simdjson/simdjson';          sha = '82d0b8ef5068557221639cbc6494de4a9b9cf700'; tier = 'C++ (template/amalgamation; constructor pruning + orphaned template<...> prefix)' },
-    @{ name = 'pugixml';    url = 'https://github.com/zeux/pugixml';               sha = '27b68329de32cf9c601ca8eb6c588fd639960c40'; tier = 'C++ (macro-opened namespaces PUGI_IMPL_NS_BEGIN; constructor init-list callee dropped)' }
+    @{ name = 'pugixml';    url = 'https://github.com/zeux/pugixml';               sha = '27b68329de32cf9c601ca8eb6c588fd639960c40'; tier = 'C++ (macro-opened namespaces PUGI_IMPL_NS_BEGIN; constructor init-list callee dropped)' },
+    # Embedded/firmware-shaped (mirror the real TRACE32 target: #ifdef config, port layers, weak aliases,
+    # fn-pointer tables) + exotic C++ single-header macro monsters. Added to widen the bug-hunt net.
+    @{ name = 'FreeRTOS-Kernel'; url = 'https://github.com/FreeRTOS/FreeRTOS-Kernel'; sha = '8be86d4a24fd4091f8f4192018423ab590f408db'; tier = 'embedded C (RTOS: portable macros, fn-pointer task tables, config-heavy)' },
+    @{ name = 'lwip';       url = 'https://github.com/lwip-tcpip/lwip';            sha = 'd08f4773edd0182b7910fc8f046eed82ffcd67c9'; tier = 'embedded C (TCP/IP stack; deeply #ifdef-configured, callback tables)' },
+    @{ name = 'littlefs';   url = 'https://github.com/littlefs-project/littlefs';  sha = '6cb4e86540eca0d9ba62500a298385c9d863c8be'; tier = 'embedded C (flash filesystem; single lfs.c/lfs_util.c, macro-heavy)' },
+    @{ name = 'nanopb';     url = 'https://github.com/nanopb/nanopb';              sha = '9ee650a0583f3b811f1f9e1eb1299c1dd89be8b5'; tier = 'embedded C (protobuf; macro-driven field tables)' },
+    @{ name = 'doctest';    url = 'https://github.com/doctest/doctest';            sha = 'd44d4f6e66232d716af82f00a063759e9d0e50d6'; tier = 'C++ single-header (macro-monster test framework)' },
+    @{ name = 'tomlplusplus'; url = 'https://github.com/marzer/tomlplusplus';      sha = '1e8829b793b66ad17011732a146b8077d379b011'; tier = 'C++ single-header (heavy templates + macro-opened namespaces)' }
 )
 
 # A repo is "present" only if it fully checked out - sentinel .git/HEAD. A dir with no .git is a partial

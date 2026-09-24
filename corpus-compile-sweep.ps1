@@ -32,6 +32,8 @@ $cases = @(
   @{ n='zlib';         lang='c';   roots='deflate,inflate,compress2,adler32,crc32';              inc='' },
   @{ n='cwalk';        lang='c';   roots='cwk_path_get_basename,cwk_path_join,cwk_path_normalize'; inc='include' },
   @{ n='utf8proc';     lang='c';   roots='utf8proc_decompose,utf8proc_map,utf8proc_NFC';         inc='' },
+  @{ n='littlefs';     lang='c';   roots='lfs_mount,lfs_format,lfs_file_open,lfs_file_read,lfs_file_write,lfs_file_close,lfs_unmount,lfs_dir_open,lfs_dir_read'; inc='' },
+  @{ n='nanopb';       lang='c';   roots='pb_encode,pb_decode,pb_ostream_from_buffer,pb_istream_from_buffer,pb_encode_delimited,pb_decode_delimited'; inc='' },
   @{ n='tinyxml2';     lang='cpp'; roots='LoadFile,SaveFile,Parse,Print,Accept';                 inc='' },
   @{ n='pugixml';      lang='cpp'; roots='load_file,load_string,load_buffer,save';               inc='src' },
   @{ n='simdjson';     lang='cpp'; roots='parse,iterate,load,load_many';                         inc='singleheader' }
