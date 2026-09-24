@@ -24,5 +24,9 @@ Thumbs.db
 .corpus/
 .oracle-cpp/
 .toolchains/
+
+# Filled-in presets carry real repo paths/roots — keep only the .example templates
+presets/*.ps1
+!presets/*.example.ps1
 *.tmp
 .claude/scheduled_tasks.lock

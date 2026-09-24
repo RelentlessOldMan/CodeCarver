@@ -76,7 +76,10 @@ The corpus + toolchains are fetched by script, and `fuzz.ps1` replays the exact 
 loop that found the fmt / simdjson / pugixml / wren bugs — so anyone can reproduce both the validation
 and the bug-hunt. See [`docs/REPRODUCE.md`](docs/REPRODUCE.md). To stress-test it against **your own**
 repo and shake out issues, follow [`docs/SHAKEDOWN.md`](docs/SHAKEDOWN.md) (written to be handed to a
-local coding-agent session).
+local coding-agent session). For an **embedded firmware image** specifically — where image size is the
+metric and roots are ISRs/vector-table/exported API — use the tailored
+[`docs/WORKREPO.md`](docs/WORKREPO.md) runbook and the fill-in-the-blanks
+[`presets/embedded-arm.example.ps1`](presets/embedded-arm.example.ps1) driver.
 
 ## Carve something
 
@@ -101,6 +104,9 @@ docs/USAGE.md             how to use it        DESIGN.txt   architecture + ratio
 docs/TOOLING.md           toolchain adapters   docs/TESTING.md   test strategy
 fetch-*.ps1 · fuzz.ps1    fetch corpus/toolchains · carve-fuzz a repo (docs/REPRODUCE.md)
 docs/SHAKEDOWN.md         runbook to hammer it against your own repo and find issues
+docs/WORKREPO.md          tailored runbook for a real firmware image (size metric, ISR/vector roots)
+presets/                  fill-in-the-blanks carve+build+size drivers (embedded-arm.example.ps1)
+wsl-*-oracle.sh           Linux soundness oracles: linker-map (C) · link carved --out (C++) · object-symbol
 ```
 
 ## Contributing
