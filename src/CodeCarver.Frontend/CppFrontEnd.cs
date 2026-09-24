@@ -26,9 +26,18 @@ public sealed class CppFrontEnd() : TreeSitterFrontEnd("tree-sitter-cpp.dll", "t
         (preproc_function_def name: (identifier) @macro)
         """;
 
+    // Calls carry the callee name. Besides plain / member / qualified calls, we must also match calls
+    // made with EXPLICIT TEMPLATE ARGUMENTS — `foo<N>(x)`, `obj.prev<2>(x)`, `ns::foo<T>(x)`. tree-sitter
+    // parses `foo<N>` as a `template_function` (free) and `obj.prev<2>` as a `template_method` (member),
+    // NOT as a bare identifier / field_identifier, so without these patterns the call edge is missed and a
+    // template function/method invoked ONLY that way is pruned — the carve then fails to compile
+    // (simdjson's `simd8::prev<N>`, `get<N>`, `shr<N>` … caught by the C++ link oracle).
     private const string CallsQuery = """
         (call_expression function: (identifier) @callee)
         (call_expression function: (field_expression field: (field_identifier) @callee))
         (call_expression function: (qualified_identifier name: (identifier) @callee))
+        (call_expression function: (template_function name: (identifier) @callee))
+        (call_expression function: (field_expression field: (template_method name: (field_identifier) @callee)))
+        (call_expression function: (qualified_identifier name: (template_function name: (identifier) @callee)))
         """;
 }

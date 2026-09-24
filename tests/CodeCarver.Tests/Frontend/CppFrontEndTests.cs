@@ -124,6 +124,37 @@ public class CppFrontEndTests
     }
 
     [Fact]
+    public void TemplateArgumentCall_KeepsCallee()
+    {
+        // A function/method invoked with EXPLICIT template arguments — `compute<3>(x)`, `s.prev<2>(x)` —
+        // must still create a call edge to the callee. tree-sitter parses `compute<3>` as a template_function
+        // and `s.prev<2>` as a template_method (NOT a plain identifier / field_identifier), so without the
+        // template-call query patterns the edge is missed and the callee is pruned -> the carve fails to
+        // compile. This is the real simdjson `simd8::prev<N>` (and get<N>/shr<N>) drop the C++ link oracle
+        // caught: those methods were called only with explicit template args and got dropped.
+        const string src = """
+            int base_helper(int x) { return x + 1; }
+            template<int N> int compute(int x) { return base_helper(x) + N; }
+            struct S {
+                int member_helper(int x) const { return x * 2; }
+                template<int N> int prev(int x) const { return member_helper(x) + N; }
+            };
+            int root(S& s) { return compute<3>(5) + s.prev<2>(7); }
+            int dead(int x) { return x; }
+            """;
+        using var fe = new CppFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("t.cpp", src) });
+        var roots = new ExplicitRootProvider(symbols: new[] { "root" }).Discover(graph).ToList();
+        var plan = ReachabilityEngine.Compute(graph, roots);
+
+        Assert.True(plan.IsKept(graph.Nodes.First(n => n.Name == "compute").Id));       // free template fn: compute<3>(5)
+        Assert.True(plan.IsKept(graph.Nodes.First(n => n.Name == "base_helper").Id));   // its callee follows
+        Assert.True(plan.IsKept(graph.Nodes.First(n => n.Name == "prev").Id));          // template method: s.prev<2>(7)
+        Assert.True(plan.IsKept(graph.Nodes.First(n => n.Name == "member_helper").Id)); // its callee follows
+        Assert.False(plan.IsKept(graph.Nodes.First(n => n.Name == "dead").Id));         // unreferenced -> carved
+    }
+
+    [Fact]
     public void ValueMacroWithBalancedBraces_IsNotExpanded()
     {
         // A value macro (compound literal `((V){ 0 })`) has BALANCED braces — it must NOT be treated as a

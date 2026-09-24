@@ -147,10 +147,18 @@ INC="-I/mnt/c/.../.oracle-cpp/<name>" \
   bash wsl-cpp-oracle.sh /mnt/c/.../.oracle-cpp/<name> /mnt/c/.../oracle/<name>_driver.cpp
 ```
 
-The script excludes `*test*`/`*demo*` units, links with `--gc-sections`, and prints undefined
-references / compile errors. Note: header-only template libraries (e.g. fmt) carry their bodies in
-headers, so file-level carving can't shrink them — the meaningful C++ oracle targets are single-unit
-libraries with a `.cpp` (tinyxml2, pugixml) or amalgamations (simdjson).
+The script excludes `*test*`/`*demo*` units (and any `EXCLUDE=<regex>`, e.g. C++20 module units),
+links with `--gc-sections`, and prints undefined references / compile errors. Note: header-only
+template libraries (e.g. fmt) carry their bodies in headers, so file-level carving can't shrink them —
+the meaningful C++ oracle targets are single-unit libraries with a `.cpp` (tinyxml2, pugixml),
+amalgamations (simdjson), or a header compiled under `--prune-headers` (nlohmann/json).
+
+**Whole-corpus sweep (one command):** `./cpp-oracle-sweep.ps1` carves every present C++ corpus repo and
+runs the oracle against each with a committed driver (`oracle/<name>_driver.cpp`). This is how the
+**template-argument-call** soundness bug was caught: simdjson calls `simd8::prev<N>`/`get<N>`/`shr<N>`
+only with explicit template args (`obj.prev<2>(x)`), which tree-sitter parses as `template_method` /
+`template_function` — the call query didn't match those, so the methods were pruned and the carve
+failed to compile. Fixed by adding template-call patterns to `CppFrontEnd.CallsQuery`.
 
 ## 6. Triage a finding
 

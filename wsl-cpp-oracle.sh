@@ -21,8 +21,11 @@ command -v g++ >/dev/null 2>&1 || { echo "g++ not installed — run: sudo apt in
 inc="${INC:--I$carved}"
 std="${STD:--std=c++17}"
 # Only the carved translation units (top-level .cpp/.cc in the carved tree), plus the driver.
+# EXCLUDE is an extra basename regex (egrep) for units to skip (e.g. C++20 module units like fmt.cc).
+excl="${EXCLUDE:-}"
 mapfile -t units < <(find "$carved" -maxdepth 2 \( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' \) \
-                     ! -name '*test*' ! -name '*demo*' ! -name 'html5-printer*')
+                     ! -name '*test*' ! -name '*demo*' ! -name 'html5-printer*' \
+                     | { if [ -n "$excl" ]; then grep -vE "$excl"; else cat; fi; })
 echo "linking ${#units[@]} carved unit(s) + driver with g++ $std ..."
 if g++ $std -O0 -ffunction-sections -fdata-sections $inc "$@" \
        "${units[@]}" "$driver" ${LIBS:-} -Wl,--gc-sections -o /tmp/cpp_oracle_elf 2>/tmp/cpp_oracle_err; then
