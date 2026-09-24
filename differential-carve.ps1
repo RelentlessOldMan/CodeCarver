@@ -20,7 +20,12 @@ param(
     [switch]$Prune,
     [switch]$PruneHeaders,
     [string]$BuildLog = '',
-    [string]$Defines = ''
+    [string]$Defines = '',
+    # Parse budget (seconds) forwarded to --parse-timeout. Default 0 = DISABLED for the differential:
+    # the budget is a wall-clock decision (a big file kept-whole if its parse blows the budget), so a
+    # slower network share could keep-whole a file it carved locally -- a timing difference, not a path
+    # bug. Disabling it isolates path-handling/determinism from I/O speed. Set >0 to test with a budget.
+    [int]$ParseTimeout = 0
 )
 $ErrorActionPreference = 'Stop'
 $cli = Join-Path $PSScriptRoot 'src\CodeCarver.Cli\bin\Release\net8.0\CodeCarver.Cli.dll'
@@ -39,6 +44,7 @@ function CarveTo([string]$repo, [string]$out, [string]$man) {
     if ($PruneHeaders) { $a += '--prune-headers' }
     if ($BuildLog)     { $a += @('--build-log', $BuildLog) }
     if ($Defines)      { $a += @('--define', $Defines) }
+    $a += @('--parse-timeout', "$ParseTimeout")   # 0 = disabled (see param note): isolate path from timing
     $sw = [Diagnostics.Stopwatch]::StartNew()
     & dotnet $cli @a 2>&1 | Select-String 'nodes|files|size|verify|warn' | ForEach-Object { Write-Host "    $_" }
     $sw.Stop()

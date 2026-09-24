@@ -107,6 +107,7 @@ docs/SHAKEDOWN.md         runbook to hammer it against your own repo and find is
 docs/WORKREPO.md          tailored runbook for a real firmware image (size metric, ISR/vector roots)
 presets/                  fill-in-the-blanks carve+build+size drivers (embedded-arm.example.ps1)
 differential-carve.ps1    carve same repo from two paths (local vs network share); assert identical
+release.ps1               package a versioned zip ONLY for a commit already pushed to origin
 wsl-*-oracle.sh           Linux soundness oracles: linker-map (C) · link carved --out (C++) · object-symbol
 ```
 

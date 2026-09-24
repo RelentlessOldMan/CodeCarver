@@ -176,6 +176,13 @@ kept/dropped file sets) and every emitted file byte-for-byte, and prints `DIFFER
 `FAIL` is directly file-able (capture the differing entries). This is the recommended way to exercise
 the network path safely before spending toolchain time on a build.
 
+The harness disables the parse budget by default (`-ParseTimeout 0`) on purpose: the budget is a
+wall-clock decision (a huge file is kept-whole if its parse blows the timeout), so a slower share could
+keep-whole a file it carved locally — a *timing* difference, not a path bug. Disabling it isolates
+path-handling from I/O speed. If a `FAIL` appears, first compare the `warn:` lines: different warnings
+(a skipped unreadable file, a parse-budget keep-whole) mean the two runs saw different *inputs* — an
+environment effect, not a defect. Same inputs + same warnings + different output is the real bug.
+
 ---
 
 See `presets/embedded-arm.example.ps1` for a fill-in-the-blanks driver that runs §1–§4 and prints the

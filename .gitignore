@@ -28,5 +28,9 @@ Thumbs.db
 # Filled-in presets carry real repo paths/roots — keep only the .example templates
 presets/*.ps1
 !presets/*.example.ps1
+
+# Release artifacts (produced by release.ps1) are never committed — they live on the git remote's
+# releases, traceable by the commit SHA stamped in each zip.
+dist/
 *.tmp
 .claude/scheduled_tasks.lock
