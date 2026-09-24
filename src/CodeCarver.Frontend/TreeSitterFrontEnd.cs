@@ -119,8 +119,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         RegexOptions.Compiled | RegexOptions.Multiline);
     private Dictionary<string, string> _scopeMacros = new(StringComparer.Ordinal);
     private Regex? _scopeRegex;
-    private HashSet<string> _macroNames = new(StringComparer.Ordinal); // every #define'd name (object + fn-like)
-    private static readonly Regex AnyDefine = new(@"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)", RegexOptions.Compiled | RegexOptions.Multiline);
+    // FUNCTION-LIKE macro names (`#define NAME(...)`). A real function can't share a name with one (the
+    // preprocessor would mangle its definition), so a "function" whose name is here is a misparse — a
+    // macro invocation like fmt's `FMT_CATCH(...) {}` parsed as a definition. OBJECT-like rename macros
+    // (`#define adler32 z_adler32`, zlib's Z_PREFIX) CAN coincide with a real function name, so those must
+    // NOT reject the definition — doing so dropped adler32 and broke the link (caught by the map oracle).
+    private HashSet<string> _funcLikeMacroNames = new(StringComparer.Ordinal);
+    private static readonly Regex FuncLikeDefine = new(@"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(", RegexOptions.Compiled | RegexOptions.Multiline);
 
     /// <summary>
     /// Local <c>#include</c>d files with a non-source extension (<c>.inc</c>/<c>.def</c>/generated tables)
@@ -326,11 +331,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _scopeRegex = map.Count == 0 ? null
             : new Regex(@"\b(?:" + string.Join("|", map.Keys.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
 
-        var names = new HashSet<string>(StringComparer.Ordinal);
+        var fnLike = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (_, text) in inputs)
             if (text.Length > 0)
-                foreach (Match m in AnyDefine.Matches(text)) names.Add(m.Groups[1].Value);
-        _macroNames = names;
+                foreach (Match m in FuncLikeDefine.Matches(text)) fnLike.Add(m.Groups[1].Value);
+        _funcLikeMacroNames = fnLike;
     }
 
     /// <summary>Replace scope-opening macros with their (single-line) expansion, for parsing only. Skips
@@ -880,12 +885,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// </summary>
     private (int Start, int End)? DefinitionSpan(TsNode nameNode)
     {
-        // A "function" whose name is a #define'd macro is never a real definition — a control-flow macro
-        // like fmt's `FMT_CATCH(...) {}` (catch (x)) or a scope macro parses as a function; capturing it
-        // truncates the real enclosing function and prunes the macro line (shattering try/catch). The
-        // preprocessor would expand any real same-named function, so no genuine definition is lost. Reject
-        // it whatever the nesting (tree-sitter may float it to file scope after truncating its neighbour).
-        if (_macroNames.Contains(nameNode.Text)) return null;
+        // A "function" whose name is a FUNCTION-LIKE macro is never a real definition — a macro invocation
+        // like fmt's `FMT_CATCH(...) {}` (catch (x)) parsed as one; capturing it truncates the real
+        // enclosing function and prunes the macro line (shattering try/catch). A real function can't share
+        // a name with a function-like macro (the preprocessor would mangle its definition), so nothing
+        // real is lost. Object-like RENAME macros (`#define adler32 z_adler32`, zlib Z_PREFIX) are NOT in
+        // this set — they legitimately coincide with a real function name, and rejecting those dropped
+        // the real function and broke the link (a bug the map oracle caught).
+        if (_funcLikeMacroNames.Contains(nameNode.Text)) return null;
 
         var n = nameNode;
         for (var i = 0; i < 12; i++)

@@ -554,6 +554,27 @@ public class CFrontEndTests
         Assert.True(plan.IsKept(Find(graph, "decode_ar")));  // referenced only from the generated .inc table
     }
 
+    [Fact]
+    public void FunctionNamedLikeObjectMacro_IsStillCaptured()
+    {
+        // A real function can share a name with an OBJECT-like rename macro — zlib's `#define adler32
+        // z_adler32` under Z_PREFIX, kept in open-world mode. It must NOT be rejected as a macro-misparse:
+        // doing so dropped the real adler32 and the carved output failed to link (caught by the WSL
+        // linker-map oracle). Only FUNCTION-like macros (FMT_CATCH-style) reject a same-named "definition".
+        const string hdr = "#define checksum z_checksum\n";     // object-like rename macro (a la Z_PREFIX)
+        const string src = """
+            #include "prefix.h"
+            int checksum(const char *s) { return (int)*s; }     // the REAL function
+            int use(const char *s) { return checksum(s); }
+            """;
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("prefix.h", hdr), ("m.c", src) });
+        var plan = ReachabilityEngine.Compute(graph,
+            new[] { new Root(Find(graph, "use"), RootKind.ExplicitSymbol) });
+
+        Assert.True(plan.IsKept(Find(graph, "checksum"))); // real fn captured + reached via use() -> checksum
+    }
+
     private static NodeId Find(CodeGraph graph, string name) => FindNode(graph, NodeKind.Function, name);
 
     private static NodeId FindNode(CodeGraph graph, NodeKind kind, string name)

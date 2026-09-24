@@ -100,6 +100,28 @@ before but fails after.
 If most files show `0 baseline` it means they need your real build config to compile — fall back to
 step 3 (build `out/` with your toolchain), which is the authoritative test anyway.
 
+## 5b. The linker-map oracle (Linux/WSL — the strongest test)
+
+If you have Linux (WSL is fine) this is the highest-signal check: build the repo's full source with
+`--gc-sections` and force-keep the roots, so the **linker** discards everything unreachable — then assert
+every function the linker kept is also kept by the carve. If the linker kept one the carve dropped,
+that's a real soundness bug (the carve would fail to link). This catches cross-file drops that per-file
+syntax checks miss — it's how the `adler32`/Z_PREFIX bug was found.
+
+```powershell
+# On Windows: carve + dump the kept/all function sets
+carve <repo> --roots <syms> --dump-spans > spans.txt
+# (extract KEEP Function names -> cc_kept.txt, all Function names -> cc_all.txt)
+```
+```bash
+# In WSL, from the repo root:
+INC="-I. -Isrc" LIBS="-lm" bash wsl-map-oracle.sh <repoDirUnderMntC> cc_kept.txt cc_all.txt "<syms>" <cfiles...>
+```
+
+**Match the configs.** The oracle build and the carve must use the *same* `-D` flags, or you get false
+mismatches (e.g. a repo's name-mangling macros). Feed the carve the real config (`--build-log` /
+`--define` / `--probe`) so both see the same world.
+
 ## 6. Triage a finding
 
 For each break, capture enough to reproduce:
