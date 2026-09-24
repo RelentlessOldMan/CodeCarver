@@ -106,6 +106,7 @@ fetch-*.ps1 · fuzz.ps1    fetch corpus/toolchains · carve-fuzz a repo (docs/RE
 docs/SHAKEDOWN.md         runbook to hammer it against your own repo and find issues
 docs/WORKREPO.md          tailored runbook for a real firmware image (size metric, ISR/vector roots)
 presets/                  fill-in-the-blanks carve+build+size drivers (embedded-arm.example.ps1)
+differential-carve.ps1    carve same repo from two paths (local vs network share); assert identical
 wsl-*-oracle.sh           Linux soundness oracles: linker-map (C) · link carved --out (C++) · object-symbol
 ```
 

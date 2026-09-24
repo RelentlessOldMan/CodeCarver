@@ -156,5 +156,27 @@ good report reads: *"carving `<REPO>` for roots `<X>` with `--prune`: `foo.c` fa
 undeclared; `--why get_bar` says CARVED; it's called from a `FOO_TABLE(...)` macro at foo.c:120."*
 That's directly fixable as a front-end/emitter change with a regression test.
 
+## 8. Local vs network file-share differential (no toolchain needed)
+
+Before you can build, one more source-only signal worth collecting: carve the **same repo from two
+locations** — your local copy and a copy on a network share (UNC `\\server\share\...` or a mapped
+drive) — and assert the carve **decisions are byte-identical**. The source location must never change
+what's kept or dropped; if local and network disagree, that's a real bug — path normalization (UNC vs
+drive-letter, backslash/forward-slash, `>260`-char long paths, case-folding) or nondeterministic
+ordering. It also times both runs so you see the network I/O cost on the big tree.
+
+```powershell
+./differential-carve.ps1 -RepoA C:\work\firmware -RepoB \\server\share\firmware `
+    -Roots <ROOTS> -Lang <LANG> -Exclude <EXCLUDE> -Prune
+# determinism only (same path twice): omit -RepoB
+```
+
+It compares the manifest (everything except the absolute `root` line — roots, defines, stats,
+kept/dropped file sets) and every emitted file byte-for-byte, and prints `DIFFERENTIAL PASS/FAIL`. A
+`FAIL` is directly file-able (capture the differing entries). This is the recommended way to exercise
+the network path safely before spending toolchain time on a build.
+
+---
+
 See `presets/embedded-arm.example.ps1` for a fill-in-the-blanks driver that runs §1–§4 and prints the
-image-size delta.
+image-size delta, and `differential-carve.ps1` (§8) for the local-vs-network check.
