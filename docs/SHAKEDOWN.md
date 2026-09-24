@@ -122,6 +122,16 @@ INC="-I. -Isrc" LIBS="-lm" bash wsl-map-oracle.sh <repoDirUnderMntC> cc_kept.txt
 mismatches (e.g. a repo's name-mangling macros). Feed the carve the real config (`--build-log` /
 `--define` / `--probe`) so both see the same world.
 
+**Two caveats on the nm comparison.** (1) `wsl-map-oracle.sh` compiles with `-fvisibility=hidden` so the
+linker's kept set is *reachable-from-roots*, not *every exported symbol* — otherwise a public API that
+merely *calls* the roots (e.g. tiny-regex-c's `re_match` → `re_matchp`) shows as a false "violation"
+even though the carve correctly dropped it. A few repos still export such symbols; treat a flagged
+function that is itself an unused top-level API (nothing kept calls it) as a false positive — confirm
+with `--why`. (2) The most robust check, free of that noise, is simply to **link the carved `--out`
+itself**: `gcc <carved>/*.c empty_main.c -Wl,--gc-sections -Wl,--undefined=<root>...` — an
+`undefined reference` there is a genuine dangling drop (this is exactly how the adler32 bug surfaced).
+For C++, `CC=g++ ...` (after `sudo apt install g++`).
+
 ## 6. Triage a finding
 
 For each break, capture enough to reproduce:

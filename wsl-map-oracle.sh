@@ -17,8 +17,12 @@ IFS=',' read -ra R <<< "$roots"
 for r in "${R[@]}"; do undef="$undef -Wl,--undefined=$r"; done
 echo 'int main(void){return 0;}' > /tmp/mo_main.c   # empty entry; roots kept via --undefined
 
-if ! gcc -O0 -ffunction-sections -fdata-sections ${INC:-} "$@" /tmp/mo_main.c ${LIBS:-} \
-        -Wl,--gc-sections $undef -o /tmp/mo_elf 2>/tmp/mo_err; then
+# -fvisibility=hidden is essential: without it, every global function goes in the dynamic symbol table
+# and --gc-sections keeps it (a potential dynamic entry), so the "linker kept" set would include exported
+# functions NOT reachable from the roots — false violations. Hidden makes kept == reachable-from-roots,
+# matching the carve. -Wl,--undefined re-exposes exactly the roots so they (and their callees) survive.
+if ! ${CC:-gcc} -O0 -fvisibility=hidden -ffunction-sections -fdata-sections ${INC:-} "$@" /tmp/mo_main.c ${LIBS:-} \
+        -Wl,--gc-sections $undef -o /tmp/mo_elf 2>/tmp/mo_err; then   # CC=g++ for C++ repos
     echo "BUILD FAILED (repo doesn't build standalone here):"; head -8 /tmp/mo_err; exit 2
 fi
 
