@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
-# Clear stray test hosts from an interrupted run — they lock build outputs and cause "file in use".
+# Clear stray test hosts from an interrupted run - they lock build outputs and cause "file in use".
 Get-Process testhost -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
 if ($Fetch) {

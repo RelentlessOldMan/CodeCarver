@@ -3,7 +3,7 @@
 # --prune) -> build each carved tree with YOUR toolchain -> report IMAGE SIZE before/after.
 # Copy to presets/embedded-arm.ps1 (gitignored) and edit. Nothing here is proprietary; it's a template.
 
-# ============================== CONFIG — EDIT THIS BLOCK ==============================
+# ============================== CONFIG - EDIT THIS BLOCK ==============================
 $Repo    = 'C:\path\to\firmware'                 # <REPO> firmware source root
 $Roots   = 'main,Reset_Handler,SysTick_Handler,USART1_IRQHandler,app_entry'  # <ROOTS> see WORKREPO.md 0
 $Lang    = 'c'                                   # 'c' or 'cpp'
@@ -36,7 +36,7 @@ Carve @() | Select-String 'roots|nodes|files|implicit|asm:|section:|warn|none of
 Write-Host "`n== 2. Compiler-free soundness gate (--prune --verify) ==" -ForegroundColor Cyan
 $v = Carve @('--prune','--verify')
 $v | Select-String 'verify|violation|->'
-if ($LASTEXITCODE -ne 0) { Write-Host "  VERIFY FAILED — fix before trusting a --prune image (run --why on the callee)." -ForegroundColor Red }
+if ($LASTEXITCODE -ne 0) { Write-Host "  VERIFY FAILED - fix before trusting a --prune image (run --why on the callee)." -ForegroundColor Red }
 
 Write-Host "`n== 3. Carve file-level (safe floor) and --prune (aggressive) ==" -ForegroundColor Cyan
 $outFile  = Join-Path $Repo '..\carved-file'
@@ -55,7 +55,7 @@ foreach ($t in @(@{n='file-level'; o=$outFile}, @{n='--prune'; o=$outPrune})) {
     Write-Host "  --- building $($t.n): $($t.o) ---"
     $b = $BuildCmd.Replace('{OUT}', $t.o)
     Invoke-Expression $b
-    if ($LASTEXITCODE -ne 0) { Write-Host "  BUILD FAILED for $($t.n) — a dropped symbol/broken structure (see WORKREPO.md 7)." -ForegroundColor Red; continue }
+    if ($LASTEXITCODE -ne 0) { Write-Host "  BUILD FAILED for $($t.n) - a dropped symbol/broken structure (see WORKREPO.md 7)." -ForegroundColor Red; continue }
     Write-Host "  size ($($t.n)):" -ForegroundColor Green
     Invoke-Expression ($SizeCmd.Replace('{OUT}', $t.o))
 }

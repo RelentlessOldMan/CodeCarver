@@ -42,19 +42,38 @@ $repos = @(
     @{ name = 'pugixml';    url = 'https://github.com/zeux/pugixml';               sha = '27b68329de32cf9c601ca8eb6c588fd639960c40'; tier = 'C++ (macro-opened namespaces PUGI_IMPL_NS_BEGIN; constructor init-list callee dropped)' }
 )
 
+# A repo is "present" only if it fully checked out - sentinel .git/HEAD. A dir with no .git is a partial
+# from an interrupted/failed fetch; treat it as absent and re-fetch (otherwise a broken partial would be
+# skipped forever and silently poison every downstream test).
+function FullyFetched([string]$d) { (Test-Path $d) -and (Test-Path (Join-Path $d '.git\HEAD')) }
+
+$failed = @()
 foreach ($r in $repos) {
     $dest = Join-Path $corpus $r.name
-    if (Test-Path $dest) { Write-Host "$($r.name) already present."; continue }
+    if (FullyFetched $dest) { Write-Host "$($r.name) already present."; continue }
+    if (Test-Path $dest) { Write-Host "$($r.name): partial/incomplete - re-fetching."; Remove-Item -Recurse -Force $dest }
     Write-Host "Fetching $($r.name)@$($r.sha.Substring(0,10))  [$($r.tier)]..."
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
     Push-Location $dest
     try {
-        git init -q
-        git remote add origin $r.url
-        # Shallow-fetch the exact commit (GitHub allows fetch-by-SHA), then check it out.
-        git fetch -q --depth 1 origin $r.sha
-        git -c advice.detachedHead=false checkout -q FETCH_HEAD
-    } finally { Pop-Location }
+        # Gate each step on $LASTEXITCODE (git writes progress to stderr; don't rely on throw). Any
+        # failure removes the partial dir so the next run retries cleanly rather than skipping it.
+        & git init -q;                                      if ($LASTEXITCODE) { throw "git init" }
+        & git remote add origin $r.url;                     if ($LASTEXITCODE) { throw "git remote add" }
+        & git fetch -q --depth 1 origin $r.sha;             if ($LASTEXITCODE) { throw "git fetch $($r.sha)" }
+        & git -c advice.detachedHead=false checkout -q FETCH_HEAD; if ($LASTEXITCODE) { throw "git checkout" }
+    }
+    catch {
+        Pop-Location
+        Write-Host "  FAILED ($($r.name)): $_ - removing partial dir." -ForegroundColor Yellow
+        Remove-Item -Recurse -Force $dest -ErrorAction SilentlyContinue
+        $failed += $r.name
+        continue
+    }
+    Pop-Location
+}
+if ($failed.Count -gt 0) {
+    Write-Host "`n$($failed.Count) repo(s) failed to fetch (network?): $($failed -join ', '). Re-run to retry just those." -ForegroundColor Yellow
 }
 
 Write-Host "Corpus ready in $corpus (all commit-pinned)"
