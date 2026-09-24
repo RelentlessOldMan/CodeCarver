@@ -155,6 +155,34 @@ public class CppFrontEndTests
     }
 
     [Fact]
+    public void MacroSpecifierBeforeQualifiedMethod_IsCaptured()
+    {
+        // pugixml load_file/load_string gap: `PUGI_IMPL_FN xml_parse_result xml_document::load_string(...)`
+        // where PUGI_IMPL_FN -> inline. tree-sitter can't tell the macro qualifier from a return type, so a
+        // method with (specifier macro + NON-primitive return + qualified name) mis-parses and isn't
+        // captured -> can't be rooted -- while a void-returning sibling parses fine because `void` is a
+        // keyword. We BLANK specifier/empty object-like macros (inline/static/noexcept/...) for parsing so
+        // the definition is seen. A macro expanding to a NON-specifier is left alone (and would still fail),
+        // which is the exact pre-fix behaviour this guards against.
+        const string src = """
+            #define PUGI_IMPL_FN inline
+            struct xml_parse_result { int x; };
+            struct xml_document { };
+            namespace pugi {
+                PUGI_IMPL_FN xml_parse_result xml_document::load_string(const char_t* contents, unsigned int options)
+                {
+                    return load_buffer(contents, options);
+                }
+                PUGI_IMPL_FN void xml_document::save() const { return; }
+            }
+            """;
+        using var fe = new CppFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("pugi.cpp", src) });
+        Assert.Contains(graph.Nodes, n => n.Kind == NodeKind.Function && n.Name == "load_string"); // captured via blanking
+        Assert.Contains(graph.Nodes, n => n.Kind == NodeKind.Function && n.Name == "save");         // void sibling
+    }
+
+    [Fact]
     public void ValueMacroWithBalancedBraces_IsNotExpanded()
     {
         // A value macro (compound literal `((V){ 0 })`) has BALANCED braces — it must NOT be treated as a

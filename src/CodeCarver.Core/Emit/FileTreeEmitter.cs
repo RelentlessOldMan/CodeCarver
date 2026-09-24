@@ -262,7 +262,15 @@ public static class FileTreeEmitter
                 var sharedUnderPreproc = false;
                 for (var k = candidate; candidate != s && k < s; k++)
                     if (lines[k - 1].TrimStart().StartsWith('#')) { sharedUnderPreproc = true; break; }
-                if (sharedUnderPreproc) start = candidate; // (a) dual-signature — extend up
+                // (a) dual-signature: the orphaned open-brace line is a FUNCTION SIGNATURE (has a
+                // parameter list) sharing the drop's body. A bare `{` / `namespace X {` / `class X {`
+                // scope-opener has no parens — extending up into it would delete the ENCLOSING scope's
+                // brace (and any complete kept definition between), shattering the file. That false
+                // positive is exactly what a `namespace pugi {` immediately followed by `#ifndef` hits
+                // (real pugixml xpath_exception bug). Require parens on the candidate; when unsure, don't
+                // extend (keep more = sound).
+                var candidateIsSignature = lines[candidate - 1].Contains('(') || lines[candidate - 1].Contains(')');
+                if (sharedUnderPreproc && candidateIsSignature) start = candidate; // (a) dual-signature — extend up
                 // else (b): enclosing scope, leave start = s; remove the balanced span alone.
             }
             for (var i = Math.Max(1, start); i <= e && i <= lines.Length; i++)

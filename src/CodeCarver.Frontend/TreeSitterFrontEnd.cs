@@ -119,6 +119,26 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         RegexOptions.Compiled | RegexOptions.Multiline);
     private Dictionary<string, string> _scopeMacros = new(StringComparer.Ordinal);
     private Regex? _scopeRegex;
+
+    // Object-like macro whose body is EMPTY (`#define X` with no replacement) — an annotation/marker
+    // macro that expands to nothing (calling-convention stubs, feature markers).
+    private static readonly Regex ValuelessDefine = new(
+        @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]*\r?$", RegexOptions.Compiled | RegexOptions.Multiline);
+    // A macro body that is PURELY function specifier(s) — a LEADING slot (`inline`/`static` before the
+    // return type, e.g. pugixml's PUGI_IMPL_FN -> inline) or a TRAILING slot (`) <here> {`, e.g.
+    // PUGIXML_NOEXCEPT_IF_NOT_COMPACT -> noexcept). tree-sitter can't tell an UNDEFINED-looking macro
+    // token from a return type, so `PUGI_IMPL_FN xml_parse_result xml_document::load_file(...)` (macro +
+    // NON-primitive return + qualified name) mis-parses and the function isn't captured — while a
+    // void-returning one parses because `void` is a keyword. Blanking a specifier can never make a
+    // definition un-parseable; it only drops the specifier from the PARSE copy (emit is untouched).
+    private static readonly Regex SpecifierMacroBody = new(
+        @"^(?:\s*(?:inline|__inline|__forceinline|static|constexpr|consteval|constinit|explicit|virtual|friend|extern|noexcept(?:\s*\([^()]*\))?|throw\s*\(\s*\)|const|volatile|override|final|mutable))+$",
+        RegexOptions.Compiled);
+    // Object-like macros that expand to a specifier or to nothing — blanked (length-preserving) for
+    // PARSING only. tree-sitter can't see through them, so `foo() PUGIXML_NOEXCEPT_IF_NOT_COMPACT {`
+    // mis-parses and the function (plus several after it, via error recovery) is never captured and so
+    // can't be rooted — the pugixml load_file/load_string gap. Emitted output is untouched.
+    private Regex? _blankRegex;
     // FUNCTION-LIKE macro names (`#define NAME(...)`). A real function can't share a name with one (the
     // preprocessor would mangle its definition), so a "function" whose name is here is a misparse — a
     // macro invocation like fmt's `FMT_CATCH(...) {}` parsed as a definition. OBJECT-like rename macros
@@ -331,6 +351,38 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _scopeRegex = map.Count == 0 ? null
             : new Regex(@"\b(?:" + string.Join("|", map.Keys.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
 
+        // Specifier/empty object-like macros to blank for parsing (see _blankRegex docs). Collect ALL
+        // object-like definitions (valued + valueless), seed the blank set with those that are empty or a
+        // pure specifier, then close transitively (a macro whose body is a single already-blankable macro,
+        // e.g. PUGIXML_NOEXCEPT_IF_NOT_COMPACT -> PUGIXML_NOEXCEPT -> noexcept).
+        var defs = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (_, text) in inputs)
+        {
+            if (text.Length == 0) continue;
+            foreach (Match m in ObjectLikeDefine.Matches(text))
+            {
+                var n = m.Groups[1].Value;
+                if (!defs.ContainsKey(n))
+                    defs[n] = Regex.Replace(m.Groups[2].Value, @"\\\r?\n", " ").Replace("\r", " ").Replace("\n", " ").Trim();
+            }
+            foreach (Match m in ValuelessDefine.Matches(text))
+            {
+                var n = m.Groups[1].Value;
+                if (!defs.ContainsKey(n)) defs[n] = "";
+            }
+        }
+        var blank = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var kv in defs)
+            if (kv.Value.Length == 0 || SpecifierMacroBody.IsMatch(kv.Value)) blank.Add(kv.Key);
+        for (var changed = true; changed;)   // transitive closure (bounded: the set only grows)
+        {
+            changed = false;
+            foreach (var kv in defs)
+                if (!blank.Contains(kv.Key) && blank.Contains(kv.Value)) { blank.Add(kv.Key); changed = true; }
+        }
+        _blankRegex = blank.Count == 0 ? null
+            : new Regex(@"\b(?:" + string.Join("|", blank.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
+
         var fnLike = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (_, text) in inputs)
             if (text.Length > 0)
@@ -343,14 +395,21 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// so a captured node's line numbers still index the original text the emitter reads.</summary>
     private string ExpandScopeMacros(string text)
     {
-        if (_scopeRegex is null) return text;
+        if (_scopeRegex is null && _blankRegex is null) return text;
         var lines = text.Split('\n');
         var sb = new StringBuilder(text.Length + 128);
         for (var i = 0; i < lines.Length; i++)
         {
             var line = lines[i];
             if (!line.TrimStart().StartsWith('#'))
-                line = _scopeRegex.Replace(line, mm => _scopeMacros.TryGetValue(mm.Value, out var r) ? r : mm.Value);
+            {
+                if (_scopeRegex is not null)
+                    line = _scopeRegex.Replace(line, mm => _scopeMacros.TryGetValue(mm.Value, out var r) ? r : mm.Value);
+                // Blank specifier/empty macros with equal-length spaces so LINE and COLUMN still map to the
+                // original text the emitter reads (the token is on the same line as the function signature).
+                if (_blankRegex is not null)
+                    line = _blankRegex.Replace(line, mm => new string(' ', mm.Length));
+            }
             sb.Append(line);
             if (i < lines.Length - 1) sb.Append('\n');
         }

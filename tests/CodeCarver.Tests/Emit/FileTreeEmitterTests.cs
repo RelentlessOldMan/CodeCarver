@@ -187,6 +187,64 @@ public class FileTreeEmitterTests
     }
 
     [Fact]
+    public void EmitPruned_DropInsideNamespaceIfdef_KeepsEnclosingBraceAndSiblings()
+    {
+        // Real pugixml bug (exposed once specifier-macro methods were captured): dropping a function that
+        // sits just below `namespace X {` immediately followed by `#ifndef` made the emitter's "extend up
+        // for a dual-signature #if/#else" heuristic mistake the NAMESPACE's open brace for a shared
+        // signature brace (a `#` directive sits between them) and swallow the `{` AND a kept sibling above
+        // the drop -> `namespace X` with no `{` -> the carved file won't compile. Extending up must only
+        // happen when the orphaned line is a real signature (has parens), never a bare scope-opener.
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-nsbrace-" + Guid.NewGuid().ToString("N"));
+        var srcDir = Path.Combine(work, "src");
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(srcDir);
+        try
+        {
+            const string impl = """
+                namespace ns
+                {
+                #ifndef NO_EXC
+                	int keeper(int r)
+                	{
+                		return r + 1;
+                	}
+
+                	const char* dropme()
+                	{
+                		return "x";
+                	}
+
+                	int alsokeep()
+                	{
+                		return 2;
+                	}
+                #endif
+                }
+                """;
+            File.WriteAllText(Path.Combine(srcDir, "impl.cpp"), impl);
+
+            using var fe = new CodeCarver.Frontend.CppFrontEnd();
+            var graph = fe.BuildGraph(new[] { ("impl.cpp", impl) });
+            var roots = new ExplicitRootProvider(symbols: new[] { "keeper", "alsokeep" }).Discover(graph).ToList();
+            var plan = ReachabilityEngine.Compute(graph, roots);
+            FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
+
+            var carved = File.ReadAllText(Path.Combine(outDir, "impl.cpp"));
+            Assert.Contains("namespace ns", carved);
+            Assert.Equal(                                                   // braces still balanced
+                carved.Split('{').Length, carved.Split('}').Length);
+            Assert.Contains("keeper", carved);                             // kept sibling above the drop survived
+            Assert.Contains("alsokeep", carved);                           // kept sibling below survived
+            Assert.DoesNotContain("dropme", carved);                       // the unreached function is gone
+        }
+        finally
+        {
+            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+        }
+    }
+
+    [Fact]
     public void Emit_PreservesNestedLayout()
     {
         var work = Path.Combine(Path.GetTempPath(), "codecarver-emit-" + Guid.NewGuid().ToString("N"));
