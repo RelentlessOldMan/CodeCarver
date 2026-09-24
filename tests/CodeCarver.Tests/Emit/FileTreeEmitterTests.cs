@@ -245,6 +245,50 @@ public class FileTreeEmitterTests
     }
 
     [Fact]
+    public void EmitPruned_DroppedFunctionOverlappingKeptNestedDef_KeepsWholeFile()
+    {
+        // Real tinyxml2 xmltest.cpp bug (found by the corpus compile-diff sweep): a local class/lambda
+        // inside a big function whose method is reached (by name / virtual dispatch) while the ENCLOSING
+        // function is not reached. The enclosing function's span can't be cleanly removed (it contains a
+        // kept node), so it's kept whole -- but it may CALL sibling functions reachability dropped, and
+        // pruning those leaves the kept-whole function calling an undeclared symbol. When a dropped span
+        // overlaps a kept one, we keep the WHOLE FILE (sound). Here big_fn (dropped) contains Local::shared
+        // (kept via the 'shared' root) and calls helper (dropped) -> helper must survive.
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-overlap-" + Guid.NewGuid().ToString("N"));
+        var srcDir = Path.Combine(work, "src");
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(srcDir);
+        try
+        {
+            const string impl = """
+                int shared() { return 1; }
+                int helper() { return 7; }
+                int big_fn() {
+                    struct Local { int shared() { return 5; } };
+                    Local l;
+                    return l.shared() + helper();
+                }
+                int run() { return shared(); }
+                """;
+            File.WriteAllText(Path.Combine(srcDir, "impl.cpp"), impl);
+
+            using var fe = new CodeCarver.Frontend.CppFrontEnd();
+            var graph = fe.BuildGraph(new[] { ("impl.cpp", impl) });
+            var roots = new ExplicitRootProvider(symbols: new[] { "run" }).Discover(graph).ToList();
+            var plan = ReachabilityEngine.Compute(graph, roots);
+            FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
+
+            var carved = File.ReadAllText(Path.Combine(outDir, "impl.cpp"));
+            Assert.Contains("helper", carved);   // sibling that the kept-whole big_fn calls survived (no dangling)
+            Assert.Contains("big_fn", carved);   // the overlap-kept enclosing function is present
+        }
+        finally
+        {
+            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+        }
+    }
+
+    [Fact]
     public void Emit_PreservesNestedLayout()
     {
         var work = Path.Combine(Path.GetTempPath(), "codecarver-emit-" + Guid.NewGuid().ToString("N"));

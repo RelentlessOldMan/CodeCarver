@@ -89,6 +89,19 @@ public static class FileTreeEmitter
         foreach (var (f, list) in spansByFile)
         {
             list.Sort((a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.End.CompareTo(b.End));
+
+            // If a DROPPED function's span overlaps a KEPT one, the parse nested/mis-grouped this file —
+            // e.g. a local class or lambda defined INSIDE a big function, whose method is reached (by name /
+            // virtual dispatch) while the enclosing function is not. The enclosing function is then kept
+            // whole (its span can't be cleanly removed), but it may CALL other top-level functions in the
+            // file that reachability dropped — pruning those would leave the kept-whole function dangling
+            // (real tinyxml2 xmltest.cpp: a visitor class inside main() is reached via Accept, main is kept,
+            // and its helper example_1() was wrongly pruned -> "example_1 was not declared"). We can't tell
+            // what the kept-whole function references, so keep the WHOLE FILE (sound over-approximation).
+            var kept = list.Where(x => !x.Drop).ToList();
+            var droppedOverlapsKept = list.Any(d => d.Drop && kept.Any(k => k.Start <= d.End && d.Start <= k.End));
+            if (droppedOverlapsKept) continue;
+
             var drops = new List<(int, int)>();
             for (var i = 0; i < list.Count; i++)
             {
