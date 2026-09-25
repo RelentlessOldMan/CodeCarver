@@ -109,6 +109,8 @@ presets/                  fill-in-the-blanks carve+build+size drivers (embedded-
 differential-carve.ps1    carve same repo from two paths (local vs network share); assert identical
 release.ps1               package a versioned zip ONLY for a commit already pushed to origin
 wsl-*-oracle.sh           Linux soundness oracles: linker-map (C) · link carved --out (C++) · object-symbol
+make-carver-corpus.ps1    fabricate a COMPILABLE synthetic firmware repo with a known call graph
+carver-oracle.ps1         ground-truth oracle: carve it, assert kept==reachable, BUILD carved, size delta
 corpus-compile-sweep.ps1  carve every corpus repo, compile each file baseline-vs-carved, flag regressions
 cpp-oracle-sweep.ps1      link every carved C++ corpus repo against a root-calling driver (needs g++)
 ```
