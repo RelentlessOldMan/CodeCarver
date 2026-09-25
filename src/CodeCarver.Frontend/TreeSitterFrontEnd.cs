@@ -416,7 +416,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         return sb.ToString();
     }
 
-    private Tree? ParseWithBudget(string text, out bool timedOut)
+    // Worker stack for the budgeted parse. A `new Thread(start)` gets .NET's DEFAULT ~1MB stack — much
+    // smaller than the main thread's — and tree-sitter's deep native error-recovery on a large/degenerate
+    // file overflows it, surfacing as a native AccessViolation (0xC0000005) that the CLR will NOT deliver
+    // to a managed catch, so the process dies silently (real eval-#2 crash: ~3% of >=256KB worker parses;
+    // never on the inline main-thread path). A large explicit stack lets the recursion fit.
+    private const int WorkerStackBytes = 64 * 1024 * 1024;
+
+    private Tree? ParseWithBudget(string text, string path, out bool timedOut)
     {
         timedOut = false;
         if (ParseBudgetMs <= 0 || text.Length < BudgetMinBytes)
@@ -425,15 +432,26 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             return parser.Parse(text);
         }
 
+        // Breadcrumb BEFORE the parse: an AV is a corrupted-state exception we can't catch, so this stderr
+        // line (flushed) is the only way a crash is attributable to a file instead of reading as a CI flake.
+        Console.Error.WriteLine($"  bigparse: {path} ({text.Length:N0} B, {ParseBudgetMs} ms budget) ...");
+        Console.Error.Flush();
+
         Tree? result = null;
+        Exception? failure = null;
         var worker = new Thread(() =>
         {
-            var parser = new Parser(_lang); // not `using`: if abandoned, let the process teardown reclaim it
-            result = parser.Parse(text);
-            parser.Dispose();
-        }) { IsBackground = true, Name = "ts-parse-budget" };
+            // not `using`: if abandoned on timeout, let process teardown reclaim it. A managed parse error
+            // (not an AV) is captured and reported as keep-whole rather than propagated.
+            try { var parser = new Parser(_lang); result = parser.Parse(text); parser.Dispose(); }
+            catch (Exception ex) { failure = ex; }
+        }, WorkerStackBytes) { IsBackground = true, Name = "ts-parse-budget" };
         worker.Start();
-        if (worker.Join(ParseBudgetMs)) return result; // Join true => happens-before on `result`
+        if (worker.Join(ParseBudgetMs)) // Join true => happens-before on `result`/`failure`
+        {
+            if (failure is not null) { _warnings.Add($"{path}: parse threw {failure.GetType().Name} — kept whole, not carved"); return null; }
+            return result;
+        }
         timedOut = true;
         return null; // abandon the worker; it touches no shared state
     }
@@ -552,7 +570,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // Expand scope-opening macros for PARSING only (line-preserving), so a file that opens its
         // namespace with `FMT_BEGIN_NAMESPACE` is structured correctly and its functions are captured.
         // Everything else (spans, dead-line map, initializer scans) uses the ORIGINAL text below.
-        using var tree = ParseWithBudget(ExpandScopeMacros(text), out var timedOut);
+        using var tree = ParseWithBudget(ExpandScopeMacros(text), path, out var timedOut);
         if (timedOut)
         {
             _warnings.Add($"{path}: parse exceeded the {ParseBudgetMs} ms budget — kept whole, not carved");

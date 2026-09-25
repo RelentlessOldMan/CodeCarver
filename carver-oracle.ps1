@@ -86,7 +86,8 @@ function HostBuild($srcRootDir, $tag) {
     $cf = (CFiles $srcRootDir | ForEach-Object { ToWsl $_ }) -join ' '
     if (-not $cf) { return $null }
     $inc = ToWsl $srcRootDir
-    $r = wsl -d Ubuntu -- bash -c "gcc -O0 -I$inc $cf -o /tmp/cc_$tag 2>/tmp/cc_${tag}err; echo SIZE=`$(stat -c%s /tmp/cc_$tag 2>/dev/null)"
+    # rm the target FIRST so a failed build can't leave a stale binary that stat() reads as a false success.
+    $r = wsl -d Ubuntu -- bash -c "rm -f /tmp/cc_$tag; gcc -O0 -I$inc $cf -o /tmp/cc_$tag 2>/tmp/cc_${tag}err; echo SIZE=`$(stat -c%s /tmp/cc_$tag 2>/dev/null)"
     $s = ($r | Select-String 'SIZE=(\d+)').Matches.Groups[1].Value
     if ($s) { return [int]$s }
     Write-Host ("    host link FAIL ($tag):") -ForegroundColor Red
@@ -96,6 +97,7 @@ function HostBuild($srcRootDir, $tag) {
 function ArmBuild($srcRootDir, $elf) {
     $cf = CFiles $srcRootDir
     if (-not $cf) { return $null }
+    if (Test-Path $elf) { Remove-Item $elf -Force }   # no stale ELF -> a failed link can't read as success
     & $armGcc -mcpu=cortex-m4 -mthumb -O0 -ffreestanding -nostdlib "-Wl,-eapp_reset" "-Wl,-Ttext=0x08000000" "-I$srcRootDir" @cf -o $elf 2>$elf.err
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $elf)) { Write-Host "    ARM link FAIL:" -ForegroundColor Red; Get-Content "$elf.err" -ErrorAction SilentlyContinue | Select-Object -First 8 | ForEach-Object { "      $_" }; return $null }
     $line = (& $armSize $elf | Select-Object -Last 1)

@@ -475,7 +475,12 @@ static int RunCarve(string[] args)
         if (lang is "c" or "cpp")
         {
             var sup = BuildSupportEmitter.Copy(dir, outDir, plan.KeptFiles, excludeDirs, auxGlobs);
+            // Support files (.ld/.s/--aux) are copied VERBATIM -- identical bytes before and after. They
+            // were never in `paths` (not parsed source), so counting them only in carvedBytes skewed the
+            // headline (real eval-#2 bug: a module with big .s startup printed "-122% smaller"). Add the
+            // SAME bytes to originalBytes so they're delta-neutral and the % reflects the real source carve.
             carvedBytes += sup.Bytes;
+            originalBytes += sup.Bytes;
             if (sup.Count > 0)
                 Console.WriteLine($"  support : {sup.Count} build file(s) copied verbatim (linker scripts + startup assembly"
                                   + (auxGlobs.Count > 0 ? " + --aux" : "") + ") so the carved tree links");
