@@ -142,6 +142,44 @@ public class FileTreeEmitterTests
     }
 
     [Fact]
+    public void BuildSupport_AuxSeparatorGlob_NoCrash_ResolvesAndWarns()
+    {
+        // eval-#4 BUG 2: a --aux glob with a path separator ("gen/*.inc", "/*.inc") was passed straight to
+        // Directory.EnumerateFiles, which accepts a FILENAME pattern only, so it threw and crashed the
+        // process (exit -532462766). It must normalize dir/pattern globs, strip leading separators, never
+        // throw, and warn (not silently copy nothing) when a glob matches no files.
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-glob-" + Guid.NewGuid().ToString("N"));
+        var srcDir = Path.Combine(work, "src");
+        Directory.CreateDirectory(Path.Combine(srcDir, "gen"));
+        try
+        {
+            File.WriteAllText(Path.Combine(srcDir, "gen", "tables.inc"), "1\n");
+            File.WriteAllText(Path.Combine(srcDir, "top.inc"), "2\n");
+            string[] none = System.Array.Empty<string>();
+
+            // separator glob -> resolves the subdir file, no crash, no warning
+            var o1 = Path.Combine(work, "o1");
+            var r1 = BuildSupportEmitter.Copy(srcDir, o1, none, none, new[] { "gen/*.inc" });
+            Assert.True(File.Exists(Path.Combine(o1, "gen", "tables.inc")));
+            Assert.Empty(r1.Warnings);
+
+            // leading-separator glob normalizes to a root pattern (recursive), no crash
+            var o2 = Path.Combine(work, "o2");
+            var r2 = BuildSupportEmitter.Copy(srcDir, o2, none, none, new[] { "/*.inc" });
+            Assert.True(File.Exists(Path.Combine(o2, "top.inc")));
+
+            // no-match glob -> warns instead of copying nothing silently
+            var o3 = Path.Combine(work, "o3");
+            var r3 = BuildSupportEmitter.Copy(srcDir, o3, none, none, new[] { "*.nomatch" });
+            Assert.Contains(r3.Warnings, w => w.Contains("*.nomatch"));
+        }
+        finally
+        {
+            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+        }
+    }
+
+    [Fact]
     public void EmitPruned_KeepsConstructor_AndWholeTemplatePrefix()
     {
         // Two C++ pruning-soundness regressions (found in simdjson):

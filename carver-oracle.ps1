@@ -81,6 +81,26 @@ else { Write-Host "  [T1 soundness] !!! DROPPED $($missing.Count) that must surv
 if ($leaked.Count -eq 0) { Write-Host "  [T1 precision] all $($m.expectedDropped.Count) dead functions DROPPED." -ForegroundColor Green }
 else { Write-Host "  [T1 precision] kept $($leaked.Count) dead (over-keep; sound but loose): $($leaked -join ', ')" -ForegroundColor Yellow }
 
+# --- T1b: FIXPOINT (eval-#4 idea) -- carve the carved tree AGAIN with the same roots; a correct closure is
+# idempotent, so T'' must be byte-identical to T'. This re-runs the WHOLE pipeline on DIFFERENT input, so
+# unlike --verify (whose call sites come from the same list that built the edges) it can catch a
+# closure/emit bug --verify is blind to. Compiler-free and cheap. ---
+function TreeHashes($d) {
+    $h = @{}
+    Get-ChildItem -Recurse $d -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $rel = $_.FullName.Substring((Resolve-Path $d).Path.Length).TrimStart('\','/').Replace('\','/')
+        $h[$rel] = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash
+    }
+    return $h
+}
+$fpOut = "$Out-carved-fp"
+if (Test-Path $fpOut) { Remove-Item $fpOut -Recurse -Force }
+& dotnet $cli carve $carveOut --lang c --roots $roots --prune --out $fpOut --aux '*.ld' 2>&1 | Out-Null
+$h1 = TreeHashes $carveOut; $h2 = TreeHashes $fpOut
+$fpDiff = @($h1.Keys | Where-Object { -not $h2.ContainsKey($_) -or $h1[$_] -ne $h2[$_] }) + @($h2.Keys | Where-Object { -not $h1.ContainsKey($_) })
+if ($fpDiff.Count -eq 0) { Write-Host "  [T1b fixpoint] re-carve is byte-identical ($($h1.Count) files) -- closure is idempotent." -ForegroundColor Green }
+else { Write-Host "  [T1b fixpoint] !!! re-carve DIFFERS on $($fpDiff.Count) path(s): $(( $fpDiff | Select-Object -First 6) -join ', ')" -ForegroundColor Red; $fail++ }
+
 # --- host + ARM builds: a shared helper compiles a file list and returns "OK <size>" or "FAIL" ---
 function HostBuild($srcRootDir, $tag) {
     $cf = (CFiles $srcRootDir | ForEach-Object { ToWsl $_ }) -join ' '

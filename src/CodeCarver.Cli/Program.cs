@@ -242,6 +242,34 @@ static int RunCarve(string[] args)
         var gathered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var incRe = new System.Text.RegularExpressions.Regex("^\\s*#\\s*include\\s+\"([^\"]+)\"",
             System.Text.RegularExpressions.RegexOptions.Multiline);
+
+        // Search dirs for non-sibling resolution: the -I dirs from --build-log (the real build finds an
+        // .inc via -I from ANOTHER subdirectory — resolving only beside the includer dropped it silently
+        // and the carved tree wouldn't compile: eval-#4 BUG 1).
+        var searchDirs = new List<string>();
+        if (buildLog is not null && File.Exists(buildLog))
+            foreach (var incDir in BuildLogScraper.Parse(File.ReadAllText(buildLog)).SelectMany(c => c.Includes).Distinct())
+                try { var f = Path.GetFullPath(Path.Combine(dir, incDir)); if (Directory.Exists(f)) searchDirs.Add(f); } catch { }
+
+        // Last-resort basename index of EVERY file in the tree (names only — cheap even on a huge tree),
+        // built lazily on the first include that neither a sibling nor a -I dir resolves.
+        Dictionary<string, List<string>>? byBase = null;
+        Dictionary<string, List<string>> BaseIndex()
+        {
+            if (byBase is null)
+            {
+                byBase = new(StringComparer.OrdinalIgnoreCase);
+                foreach (var f in Directory.EnumerateFiles(rootFull, "*", SearchOption.AllDirectories))
+                {
+                    var bn = Path.GetFileName(f);
+                    if (!byBase.TryGetValue(bn, out var l)) byBase[bn] = l = new List<string>();
+                    l.Add(f);
+                }
+            }
+            return byBase;
+        }
+
+        var unresolved = new HashSet<(string, string)>();
         var queue = new Queue<(string Full, string Text)>();
         foreach (var (rel, text) in inputs)
             if (text.Length > 0) queue.Enqueue((Path.GetFullPath(Path.Combine(dir, rel)), text));
@@ -253,14 +281,34 @@ static int RunCarve(string[] args)
             {
                 var inc = m.Groups[1].Value;
                 if (exts.Any(e => inc.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue; // .h: parsed already
-                string target;
-                try { target = Path.GetFullPath(Path.Combine(fromDir, inc)); } catch { continue; }
-                if (!target.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase)) continue; // outside the tree
-                if (have.Contains(target) || !gathered.Add(target) || !File.Exists(target)) continue;
-                if (new FileInfo(target).Length > maxParseBytes) continue;
-                var itext = File.ReadAllText(target);
-                refIncludes.Add((Path.GetRelativePath(dir, target).Replace('\\', '/'), itext));
-                queue.Enqueue((target, itext)); // an .inc may include another
+
+                // Resolve in order: beside the includer, then each -I dir, then (last resort) by basename
+                // anywhere in the tree. Over-approximate: take every in-tree match (sound for building).
+                var cands = new List<string>();
+                void TryCand(string cand)
+                {
+                    try { var f = Path.GetFullPath(cand); if (f.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase) && File.Exists(f)) cands.Add(f); } catch { }
+                }
+                TryCand(Path.Combine(fromDir, inc));
+                foreach (var sd in searchDirs) TryCand(Path.Combine(sd, inc));
+                if (cands.Count == 0 && BaseIndex().TryGetValue(Path.GetFileName(inc), out var hits)) cands.AddRange(hits);
+
+                if (cands.Count == 0)
+                {
+                    var fromRel = Path.GetRelativePath(dir, fromFull).Replace('\\', '/');
+                    if (unresolved.Add((fromRel, inc)))
+                        Console.Error.WriteLine($"  warn    : {fromRel}: #include \"{inc}\" resolved to no file in the tree — "
+                                                + "the carved tree may not compile (supply -I via --build-log)");
+                    continue;
+                }
+                foreach (var target in cands)
+                {
+                    if (have.Contains(target) || !gathered.Add(target) || !File.Exists(target)) continue;
+                    if (new FileInfo(target).Length > maxParseBytes) continue;
+                    var itext = File.ReadAllText(target);
+                    refIncludes.Add((Path.GetRelativePath(dir, target).Replace('\\', '/'), itext));
+                    queue.Enqueue((target, itext)); // an .inc may include another
+                }
             }
         }
     }
@@ -496,6 +544,7 @@ static int RunCarve(string[] args)
             if (sup.Count > 0)
                 Console.WriteLine($"  support : {sup.Count} build file(s) copied verbatim (linker scripts + startup assembly"
                                   + (auxGlobs.Count > 0 ? " + --aux" : "") + ") so the carved tree links");
+            foreach (var w in sup.Warnings) Console.Error.WriteLine($"  warn    : {w}");
         }
     }
     else
