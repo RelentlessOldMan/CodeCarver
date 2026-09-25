@@ -20,6 +20,11 @@ dotnet build CodeCarver.sln -c Release            # the CLI
 Use the built DLL directly to avoid `dotnet run` overhead on big repos:
 `dotnet src/CodeCarver.Cli/bin/Release/net8.0/CodeCarver.Cli.dll carve ...` (called `carve` below).
 
+**Record the version you tested.** `carve version` prints `CodeCarver <semver>+<git-sha>[-dirty]` — the
+commit is stamped into the build, so cite this exact string in any report (it also heads every carve's
+summary and is written to each `--manifest` as `codecarverVersion`). `-dirty` means the built tree had
+uncommitted changes; a clean pulled build won't show it. Rebuild after a `git pull` so the stamp updates.
+
 Pick your inputs:
 - **roots** — the entry symbols a build actually needs (ISRs, `main`, exported API, task entry points).
 - **--lang** — `c` or `cpp` (default `c`).

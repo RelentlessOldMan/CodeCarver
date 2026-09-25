@@ -10,6 +10,27 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Product>CodeCarver</Product>
+    <Version>0.1.0</Version>
   </PropertyGroup>
+
+  <!-- Stamp the git commit into the build so `carve version` / the carve summary / the manifest report
+       EXACTLY what was built - a pulled build can be cited by version, not just "some commit". .NET appends
+       SourceRevisionId to AssemblyInformationalVersion as `<Version>+<sha>`. ContinueOnError so an offline /
+       no-git build still succeeds (version is then just <Version>). -dirty flags an uncommitted tree. -->
+  <Target Name="StampGitSha" BeforeTargets="GetAssemblyVersion;GenerateAssemblyInfo" Condition="'$(SourceRevisionId)' == ''">
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; rev-parse --short=9 HEAD"
+          ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitSha" />
+    </Exec>
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; status --porcelain"
+          ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitDirty" />
+    </Exec>
+    <PropertyGroup>
+      <SourceRevisionId Condition="'$(_GitSha)' != '' and '$(_GitDirty)' == ''">$(_GitSha)</SourceRevisionId>
+      <SourceRevisionId Condition="'$(_GitSha)' != '' and '$(_GitDirty)' != ''">$(_GitSha)-dirty</SourceRevisionId>
+    </PropertyGroup>
+  </Target>
 
 </Project>

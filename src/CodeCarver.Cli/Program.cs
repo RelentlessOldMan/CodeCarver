@@ -1,3 +1,4 @@
+using System.Reflection;
 using CodeCarver.Core.Emit;
 using CodeCarver.Core.Frontend;
 using CodeCarver.Core.Graph;
@@ -22,11 +23,22 @@ switch (cmd)
         return RunScanLog(args);
     case "--version":
     case "version":
-        Console.WriteLine("CodeCarver 0.0.1 (scaffold)");
+        Console.WriteLine($"CodeCarver {Version()}");
         return 0;
     default:
         Console.Error.WriteLine($"unknown command '{cmd}'. try: carve <dir> --roots a,b | demo | version");
         return 2;
+}
+
+// The build stamps the git commit into AssemblyInformationalVersion (see the .csproj StampGitSha target),
+// so this is `<Version>+<sha>` (or `+<sha>-dirty`) -- a pulled build reports EXACTLY what was built, which
+// is what a work-machine session should cite instead of a bare commit. Falls back to the bare version if a
+// build had no git (offline).
+static string Version()
+{
+    var info = System.Reflection.Assembly.GetExecutingAssembly()
+        .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+    return string.IsNullOrEmpty(info) ? "0.1.0" : info;
 }
 
 static int RunScanLog(string[] args)
@@ -415,7 +427,7 @@ static int RunCarve(string[] args)
         sizeByRel[Path.GetRelativePath(dir, p).Replace('\\', '/')] = len;
     }
 
-    Console.WriteLine($"CodeCarver — carve of {dir}");
+    Console.WriteLine($"CodeCarver {Version()} — carve of {dir}");
     // Show what actually rooted; call out unresolved names inline so a partial resolution can't read as
     // a clean success (see the per-root warnings above).
     Console.WriteLine($"  roots   : {string.Join(", ", roots.Where(resolvedNames.Contains))}"
@@ -520,6 +532,7 @@ static int RunCarve(string[] args)
     {
         var manifest = new
         {
+            codecarverVersion = Version(),   // exactly which build produced this carve (git commit stamped)
             root = dir,
             roots,
             lang,
