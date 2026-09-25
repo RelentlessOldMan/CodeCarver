@@ -291,7 +291,16 @@ static int RunCarve(string[] args)
                 }
                 TryCand(Path.Combine(fromDir, inc));
                 foreach (var sd in searchDirs) TryCand(Path.Combine(sd, inc));
-                if (cands.Count == 0 && BaseIndex().TryGetValue(Path.GetFileName(inc), out var hits)) cands.AddRange(hits);
+                if (cands.Count == 0 && BaseIndex().TryGetValue(Path.GetFileName(inc), out var hits))
+                {
+                    cands.AddRange(hits);
+                    // The basename fallback is over-approximate: if a name occurs in several dirs it emits
+                    // ALL of them (sound for building, but a source of bloat). Note it so an over-keep is
+                    // attributable -- supply -I via --build-log to resolve it exactly.
+                    if (hits.Count > 1 && unresolved.Add(("ambig:" + Path.GetFileName(inc), inc)))
+                        Console.Error.WriteLine($"  warn    : #include \"{inc}\" matched {hits.Count} files by basename "
+                                                + "(kept all — sound but may over-keep; supply -I via --build-log to disambiguate)");
+                }
 
                 if (cands.Count == 0)
                 {

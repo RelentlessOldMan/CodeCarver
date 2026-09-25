@@ -39,7 +39,8 @@ public static class BuildSupportEmitter
             foreach (var p in MatchGlob(sourceRoot, glob))
                 if (Keep(p)) { picked.Add(p); matched++; }
             if (matched == 0)
-                warnings.Add($"--aux glob '{glob}' matched no files under {sourceRoot}");
+                warnings.Add($"--aux glob '{glob}' matched no files under {sourceRoot} "
+                             + "(a bare pattern like '*.inc' already searches all subdirectories)");
         }
 
         var already = new HashSet<string>(alreadyEmittedRel, StringComparer.OrdinalIgnoreCase);
@@ -69,6 +70,10 @@ public static class BuildSupportEmitter
     internal static IEnumerable<string> MatchGlob(string root, string glob)
     {
         glob = (glob ?? "").Replace('\\', '/').Trim();
+        // Enumeration is ALWAYS recursive (AllDirectories), so `**/` (recurse-any-dir) is redundant and a
+        // bare `**` just means "any name" -> `*`. Normalizing these makes the syntax a user reaches for
+        // ('**/*.inc', 'sub/**/*.inc') work instead of matching nothing.
+        glob = glob.Replace("**/", "").Replace("**", "*");
         while (glob.StartsWith("./", StringComparison.Ordinal)) glob = glob.Substring(2);
         glob = glob.TrimStart('/');
         var baseDir = root;

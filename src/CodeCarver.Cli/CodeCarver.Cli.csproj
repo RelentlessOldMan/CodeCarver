@@ -23,7 +23,10 @@
           ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_GitSha" />
     </Exec>
-    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; status --porcelain"
+    <!-- The untracked-files=no flag: only TRACKED modifications mean "dirty". A plain porcelain status also
+         lists untracked files (a scratch dir, build output), so it falsely stamped dirty on a clean
+         checkout (eval 3/5), and a marker that fires on nearly every tree gets ignored. -->
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; status --porcelain --untracked-files=no"
           ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_GitDirty" />
     </Exec>
