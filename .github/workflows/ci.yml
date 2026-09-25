@@ -12,6 +12,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so the build's 1.0.<commit-count> version stamp is accurate
 
       - uses: actions/setup-dotnet@v4
         with:

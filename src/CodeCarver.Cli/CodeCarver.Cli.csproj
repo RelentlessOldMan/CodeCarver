@@ -11,7 +11,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <Product>CodeCarver</Product>
-    <Version>0.1.0</Version>
+    <!-- Fallback only (no git): the real version is 1.0.<commit-count> set by StampGitSha below, so the
+         patch number bumps by one on every commit/push (like CodeCompass 1.0.NNN). -->
+    <Version>1.0.0</Version>
   </PropertyGroup>
 
   <!-- Stamp the git commit into the build so `carve version` / the carve summary / the manifest report
@@ -23,6 +25,12 @@
           ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_GitSha" />
     </Exec>
+    <!-- Monotonic patch number = total commit count, so it increments on every commit/push (CodeCompass
+         style). Needs full history: a shallow CI clone would count 1 (CI sets fetch-depth: 0). -->
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; rev-list --count HEAD"
+          ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitCount" />
+    </Exec>
     <!-- The untracked-files=no flag: only TRACKED modifications mean "dirty". A plain porcelain status also
          lists untracked files (a scratch dir, build output), so it falsely stamped dirty on a clean
          checkout (eval 3/5), and a marker that fires on nearly every tree gets ignored. -->
@@ -31,6 +39,7 @@
       <Output TaskParameter="ConsoleOutput" PropertyName="_GitDirty" />
     </Exec>
     <PropertyGroup>
+      <Version Condition="'$(_GitCount)' != ''">1.0.$(_GitCount)</Version>
       <SourceRevisionId Condition="'$(_GitSha)' != '' and '$(_GitDirty)' == ''">$(_GitSha)</SourceRevisionId>
       <SourceRevisionId Condition="'$(_GitSha)' != '' and '$(_GitDirty)' != ''">$(_GitSha)-dirty</SourceRevisionId>
     </PropertyGroup>
