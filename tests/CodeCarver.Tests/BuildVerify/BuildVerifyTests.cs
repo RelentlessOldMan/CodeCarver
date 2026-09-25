@@ -777,7 +777,7 @@ public class BuildVerifyTests
 
             var args = new[] { "-mcpu=cortex-m0", "-mthumb", "-nostdlib", "-ffreestanding",
                                "-T", "flash.ld", "flash.s" }
-                       .Concat(srcs!).Append("-o").Append("carved.elf").ToArray();
+                       .Concat(srcs!).Append("-o").Append("carved.elf").Select(s => s!).ToArray();
             var (code, output) = Run(armgcc, args, outDir);
             Assert.True(code == 0, $"carved real-repo firmware (.s + .ld) failed to link:\n{output}");
         }

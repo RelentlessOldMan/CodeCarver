@@ -180,6 +180,32 @@ public class FileTreeEmitterTests
     }
 
     [Fact]
+    public void MatchGlob_StarStarAnywhere_AndBasenameRecursion()
+    {
+        // eval-#6: a naive Replace("**/","") turned a/**/b/*.inc into the literal a/b/*.inc and SILENTLY
+        // dropped a/q/b/y.inc (a partial match read as success). MatchGlob now regex-matches the relative
+        // path, so ** works mid-path; a separator-less pattern still matches by basename at any depth.
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-mg-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(work, "a", "b"));
+        Directory.CreateDirectory(Path.Combine(work, "a", "q", "b"));
+        try
+        {
+            File.WriteAllText(Path.Combine(work, "top.inc"), "1");
+            File.WriteAllText(Path.Combine(work, "a", "b", "x.inc"), "1");
+            File.WriteAllText(Path.Combine(work, "a", "q", "b", "y.inc"), "1");
+            string[] Names(string glob) => BuildSupportEmitter.MatchGlob(work, glob)
+                .Select(f => Path.GetFileName(f)!).OrderBy(n => n, System.StringComparer.Ordinal).ToArray();
+
+            Assert.Equal(new[] { "x.inc", "y.inc" }, Names("a/**/b/*.inc"));            // mid-path ** (the regression)
+            Assert.Equal(new[] { "top.inc", "x.inc", "y.inc" }, Names("*.inc"));        // basename, any depth
+            Assert.Equal(new[] { "top.inc", "x.inc", "y.inc" }, Names("**/*.inc"));     // leading **/ = any depth
+            Assert.Equal(new[] { "x.inc" }, Names("a/b/*.inc"));                        // anchored: one segment
+            Assert.Empty(Names("nope/*.zzz"));                                          // no match, no throw
+        }
+        finally { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); }
+    }
+
+    [Fact]
     public void EmitPruned_KeepsConstructor_AndWholeTemplatePrefix()
     {
         // Two C++ pruning-soundness regressions (found in simdjson):

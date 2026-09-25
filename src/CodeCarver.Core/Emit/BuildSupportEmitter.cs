@@ -1,3 +1,6 @@
+using System.Text;
+using System.Text.RegularExpressions;
+
 namespace CodeCarver.Core.Emit;
 
 /// <summary>Outcome of copying build-support files alongside a carved tree.</summary>
@@ -67,27 +70,60 @@ public static class BuildSupportEmitter
     /// (relative subdir, filename pattern), strip leading <c>/</c> and <c>./</c>, and enumerate that subdir
     /// recursively. An invalid pattern or missing subdir yields nothing (the caller warns) instead of throwing.
     /// </summary>
-    internal static IEnumerable<string> MatchGlob(string root, string glob)
+    public static IEnumerable<string> MatchGlob(string root, string glob)
     {
         glob = (glob ?? "").Replace('\\', '/').Trim();
-        // Enumeration is ALWAYS recursive (AllDirectories), so `**/` (recurse-any-dir) is redundant and a
-        // bare `**` just means "any name" -> `*`. Normalizing these makes the syntax a user reaches for
-        // ('**/*.inc', 'sub/**/*.inc') work instead of matching nothing.
-        glob = glob.Replace("**/", "").Replace("**", "*");
         while (glob.StartsWith("./", StringComparison.Ordinal)) glob = glob.Substring(2);
         glob = glob.TrimStart('/');
-        var baseDir = root;
-        var pattern = glob;
-        var slash = glob.LastIndexOf('/');
-        if (slash >= 0)
-        {
-            var sub = glob.Substring(0, slash).Replace('/', Path.DirectorySeparatorChar);
-            pattern = glob.Substring(slash + 1);
-            baseDir = Path.Combine(root, sub);
-        }
-        if (pattern.Length == 0) pattern = "*";
+        if (glob.Length == 0) return Array.Empty<string>();
+
+        // Match the file's FULL path RELATIVE TO ROOT against the glob as a regex, so `**` works ANYWHERE
+        // (leading, mid-path a/**/b, or standalone) rather than being string-stripped -- a naive
+        // Replace("**/","") turned a/**/b/*.inc into the literal a/b/*.inc and SILENTLY dropped a/q/b/y.inc
+        // (eval-#6 under-match). Enumeration is rooted at the longest wildcard-free leading dir so a huge
+        // tree isn't fully walked when the glob is anchored (e.g. sub/**/x -> walk only sub/).
+        // A separator-less pattern (e.g. *.inc) matches by BASENAME at any depth (recursive) -- the common
+        // --aux case; a pattern WITH a '/' is anchored at the root and uses * / ** for path structure.
+        var hasSlash = glob.Contains('/');
+        var segs = glob.Split('/');
+        var lit = 0;
+        while (lit < segs.Length - 1 && segs[lit].IndexOfAny(new[] { '*', '?' }) < 0) lit++;
+        var litPrefix = string.Join("/", segs.Take(lit));
+        var baseDir = litPrefix.Length == 0 ? root : Path.Combine(root, litPrefix.Replace('/', Path.DirectorySeparatorChar));
         if (!Directory.Exists(baseDir)) return Array.Empty<string>();
-        try { return Directory.EnumerateFiles(baseDir, pattern, SearchOption.AllDirectories); }
-        catch (ArgumentException) { return Array.Empty<string>(); }  // still-invalid pattern -> no crash
+
+        var rx = GlobToRegex(glob, matchAnyDepth: !hasSlash);
+        var hits = new List<string>();
+        IEnumerable<string> files;
+        try { files = Directory.EnumerateFiles(baseDir, "*", SearchOption.AllDirectories); }
+        catch (Exception) { return Array.Empty<string>(); }
+        foreach (var f in files)
+            if (rx.IsMatch(Path.GetRelativePath(root, f).Replace('\\', '/')))
+                hits.Add(f);
+        return hits;
+    }
+
+    /// <summary>Glob -> anchored regex over '/'-separated relative paths. `**/` = zero-or-more directory
+    /// segments, standalone `**` = any chars, `*` = any run within one segment, `?` = one non-separator.</summary>
+    private static Regex GlobToRegex(string glob, bool matchAnyDepth)
+    {
+        var sb = new StringBuilder("^");
+        if (matchAnyDepth) sb.Append("(?:.*/)?");   // separator-less pattern -> match basename at any depth
+        for (var i = 0; i < glob.Length; i++)
+        {
+            var c = glob[i];
+            if (c == '*' && i + 1 < glob.Length && glob[i + 1] == '*')
+            {
+                i++;                                       // consumed the second '*'
+                if (i + 1 < glob.Length && glob[i + 1] == '/') { sb.Append("(?:.*/)?"); i++; } // `**/` -> zero+ dirs
+                else sb.Append(".*");                       // trailing/standalone `**`
+            }
+            else if (c == '*') sb.Append("[^/]*");
+            else if (c == '?') sb.Append("[^/]");
+            else if (c == '/') sb.Append('/');
+            else sb.Append(Regex.Escape(c.ToString()));
+        }
+        sb.Append('$');
+        return new Regex(sb.ToString(), RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     }
 }
