@@ -100,9 +100,36 @@ function WriteC([string]$dir, [string]$name, [string[]]$body) {
 # A dense-but-valid function body so pruning it saves real bytes (the size-delta signal).
 function Filler { $ls = @(); for ($k = 0; $k -lt 40; $k++) { $ls += "    acc = (acc * 1664525u + 1013904223u) ^ (acc >> 3);" }; return $ls }
 
+# A giant register-map header: MacroDensity object-like #defines, capped at MaxHeaderMB. This is the byte
+# pathology; it's generated into src/ with fixed names and #included by util.c below, so it becomes part of
+# a REACHABLE translation unit -- exercising the big-file parse path (--parse-timeout / max-parse-bytes)
+# and the stream-copy-whole emit on a file the carve must keep.
+function New-RegHeader([string]$path, [int]$defines, [long]$maxBytes, [int]$fam) {
+    $guard = "REGMAP_" + [IO.Path]::GetFileNameWithoutExtension($path).ToUpper() + "_H"
+    $sw = [IO.StreamWriter]::new($path, $false, [Text.Encoding]::ASCII, 1MB)
+    try {
+        $sw.Write("#ifndef $guard`n#define $guard`n")
+        $reg = 0; $emitted = 0; $sb = [Text.StringBuilder]::new(6MB)
+        while ($emitted -lt $defines -and $sw.BaseStream.Length -lt $maxBytes) {
+            [void]$sb.Clear()
+            for ($k = 0; $k -lt 16384 -and $emitted -lt $defines; $k++) {
+                [void]$sb.Append("#define HWIO_BLK${fam}_REG${reg}_ADDR (0x40000000u + 0x$(($reg*4).ToString('x6')))`n#define HWIO_BLK${fam}_REG${reg}_MSK 0xffu`n"); $reg++; $emitted += 2
+            }
+            $sw.Write($sb.ToString())
+        }
+        $sw.Write("#endif`n")
+    } finally { $sw.Close() }
+}
+$giantInclude = @()
+if ($nGiant -gt 0) {
+    Write-Host "  $nGiant giant register header(s) (<=${MaxHeaderMB}MB, $MacroDensity defines) ..."
+    for ($i = 0; $i -lt $nGiant; $i++) { New-RegHeader (Join-Path $srcRoot "regmap_$i.h") $MacroDensity ([long]$MaxHeaderMB * 1MB) $i }
+    $giantInclude = @("#include ""regmap_0.h""")   # util.c is in src/ (same dir) -> resolves; pulls the giant into a kept TU
+}
+
 # --- REACHABLE tree: main -> app_main -> stage_0..N; each stage -> util_common -> util_leaf ---
 Write-Host "  reachable tree: $nStage stages + util ..."
-WriteC $srcRoot "util" (@(
+WriteC $srcRoot "util" ($giantInclude + @(
     "unsigned util_leaf(unsigned x) { return x ^ 0x5a5a5a5au; }",
     "unsigned util_common(unsigned x) {",
     "    unsigned acc = util_leaf(x);") + (Filler) + @("    return acc;", "}"))
@@ -182,27 +209,7 @@ SECTIONS {
 }
 "@ -Encoding ascii
 
-# --- firmware STRUCTURE knobs (giant headers / blobs / tiny files) ---
-function New-RegHeader([string]$path, [int]$defines, [long]$maxBytes, [int]$fam) {
-    $guard = "REGMAP_" + [IO.Path]::GetFileNameWithoutExtension($path).ToUpper() + "_H"
-    $sw = [IO.StreamWriter]::new($path, $false, [Text.Encoding]::ASCII, 1MB)
-    try {
-        $sw.Write("#ifndef $guard`n#define $guard`n")
-        $reg = 0; $emitted = 0; $sb = [Text.StringBuilder]::new(6MB)
-        while ($emitted -lt $defines -and $sw.BaseStream.Length -lt $maxBytes) {
-            [void]$sb.Clear()
-            for ($k = 0; $k -lt 16384 -and $emitted -lt $defines; $k++) {
-                [void]$sb.Append("#define HWIO_BLK${fam}_REG${reg}_ADDR (0x40000000u + 0x$(($reg*4).ToString('x6')))`n#define HWIO_BLK${fam}_REG${reg}_MSK 0xffu`n"); $reg++; $emitted += 2
-            }
-            $sw.Write($sb.ToString())
-        }
-        $sw.Write("#endif`n")
-    } finally { $sw.Close() }
-}
-if ($nGiant -gt 0) {
-    Write-Host "  $nGiant giant register header(s) (<=${MaxHeaderMB}MB, $MacroDensity defines) ..."
-    for ($i = 0; $i -lt $nGiant; $i++) { New-RegHeader (Join-Path (PickDir) "regmap_$i.h") $MacroDensity ([long]$MaxHeaderMB * 1MB) $i }
-}
+# --- firmware STRUCTURE knobs (data blobs / tiny files); giant headers generated earlier ---
 if ($nBlob -gt 0) {
     Write-Host "  $nBlob data blob(s) ..."
     for ($i = 0; $i -lt $nBlob; $i++) {
