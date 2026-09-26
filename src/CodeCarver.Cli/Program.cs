@@ -85,7 +85,7 @@ static int RunCarve(string[] args)
     string? traceFormat = null;    // optional regex (named 'fn'/'file'/'line') for a non-default trace format
     var lang = "c";
     var defineSpecs = new List<string>();
-    string? buildLog = null;
+    var buildLogs = new List<string>();   // repeatable: the written log AND the stdout capture can differ
     var closedWorld = false;
     string? manifestPath = null;
     var excludeDirs = new List<string>();
@@ -107,7 +107,7 @@ static int RunCarve(string[] args)
         if (cfg.Out is not null) outDir = cfg.Out;
         if (cfg.Prune is not null) prune = cfg.Prune.Value;
         if (cfg.Defines is not null) defineSpecs.AddRange(cfg.Defines);
-        if (cfg.BuildLog is not null) buildLog = cfg.BuildLog;
+        if (cfg.BuildLog is not null) buildLogs.Add(cfg.BuildLog);
         if (cfg.AssumeDefinesComplete is not null) closedWorld = cfg.AssumeDefinesComplete.Value;
         if (cfg.Exclude is not null) excludeDirs.AddRange(cfg.Exclude);
         if (cfg.Manifest is not null) manifestPath = cfg.Manifest;
@@ -135,7 +135,9 @@ static int RunCarve(string[] args)
         else if (args[i] == "--define" && i + 1 < args.Length)
             defineSpecs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         else if (args[i] == "--build-log" && i + 1 < args.Length)
-            buildLog = args[++i];
+            // Repeatable AND comma-separated: --build-log a.log --build-log b.log, or --build-log a.log,b.log.
+            // Union all of them (the written log and the stdout capture often differ; both carry real flags).
+            buildLogs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         else if (args[i] == "--assume-defines-complete")
             closedWorld = true;
         else if (args[i] == "--manifest" && i + 1 < args.Length)
@@ -178,9 +180,19 @@ static int RunCarve(string[] args)
         }
     }
 
-    // Preprocessor config: explicit --define plus any -D flags scraped from a --build-log.
-    if (buildLog is not null && File.Exists(buildLog))
-        defineSpecs.AddRange(BuildLogScraper.Parse(File.ReadAllText(buildLog)).SelectMany(c => c.Defines));
+    // Preprocessor config: explicit --define plus -D flags scraped from EVERY --build-log (parsed once here
+    // and reused for include-dir resolution below). A named-but-missing log is a silent-config trap -> warn.
+    var buildCmds = new List<CompileCommand>();
+    foreach (var bl in buildLogs.Distinct())
+    {
+        if (!File.Exists(bl)) { Console.Error.WriteLine($"  warn    : --build-log file not found: {bl} (skipped)"); continue; }
+        buildCmds.AddRange(BuildLogScraper.Parse(File.ReadAllText(bl)));
+    }
+    if (buildCmds.Count > 0)
+    {
+        defineSpecs.AddRange(buildCmds.SelectMany(c => c.Defines));
+        Console.Error.WriteLine($"  build   : {buildLogs.Distinct().Count()} build-log(s), {buildCmds.Count} compile command(s) scraped");
+    }
     var defines = defineSpecs.Count > 0 ? MacroTable.FromDefines(defineSpecs) : null;
 
     // --probe: ask a real compiler for its complete macro set (predefined + target + -D) and resolve
@@ -270,13 +282,12 @@ static int RunCarve(string[] args)
         var incRe = new System.Text.RegularExpressions.Regex("^\\s*#\\s*include\\s+\"([^\"]+)\"",
             System.Text.RegularExpressions.RegexOptions.Multiline);
 
-        // Search dirs for non-sibling resolution: the -I dirs from --build-log (the real build finds an
-        // .inc via -I from ANOTHER subdirectory — resolving only beside the includer dropped it silently
-        // and the carved tree wouldn't compile: eval-#4 BUG 1).
+        // Search dirs for non-sibling resolution: the -I/-isystem dirs from EVERY --build-log (the real build
+        // finds an .inc via -I from ANOTHER subdirectory — resolving only beside the includer dropped it
+        // silently and the carved tree wouldn't compile: eval-#4 BUG 1). Reuses the already-parsed buildCmds.
         var searchDirs = new List<string>();
-        if (buildLog is not null && File.Exists(buildLog))
-            foreach (var incDir in BuildLogScraper.Parse(File.ReadAllText(buildLog)).SelectMany(c => c.Includes).Distinct())
-                try { var f = Path.GetFullPath(Path.Combine(dir, incDir)); if (Directory.Exists(f)) searchDirs.Add(f); } catch { }
+        foreach (var incDir in buildCmds.SelectMany(c => c.Includes).Distinct())
+            try { var f = Path.GetFullPath(Path.Combine(dir, incDir)); if (Directory.Exists(f)) searchDirs.Add(f); } catch { }
 
         // Last-resort basename index of EVERY file in the tree (names only — cheap even on a huge tree),
         // built lazily on the first include that neither a sibling nor a -I dir resolves.

@@ -87,6 +87,9 @@ and, more dangerously, can mismatch your build if it guesses. Pin the world to y
 - `--build-log <make -n output>` — the exact `-D`/`-I`/`-isystem` flags your build uses (best). **A raw
   build stdout capture works too**: the scraper extracts the compile command lines and ignores the rest
   (warnings, echoes), so `--build-log build-stdout.txt` is fine — no need to pre-filter it.
+  **`--build-log` is repeatable** — pass the written log AND the stdout capture (they often differ):
+  `--build-log make.log --build-log build-stdout.txt` (or comma-separated). CodeCarver unions the `-D`/`-I`
+  from all of them; a named-but-missing log warns rather than silently degrading the config.
 - or `--define CHIP=X,FEATURE_Y,...` — the defines for **this** image variant.
 - or `--probe <arm-none-eabi-gcc>` — let CodeCarver ask the compiler for its predefined macros.
 
