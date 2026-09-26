@@ -222,12 +222,31 @@ if ($nCsv -gt 0) {
     for ($i = 0; $i -lt $nCsv; $i++) { Set-Content (Join-Path (PickDir) "data_$i.csv") "id,val`n$i,$($rng.Next())" -Encoding ascii }
 }
 
+# --- synthetic RUNTIME TRACE: a subset of the reachable functions, as if a real run exercised them.
+# Every traced function is reachable, so it MUST end up in a carve's kept set (the trace-as-soundness-oracle
+# check in carver-oracle.ps1) -- and rooting the trace must keep them too. Format is the default TraceFile
+# shape: a bare 'funcName' per line, with a few 'funcName file:line' to exercise that column. When the real
+# trace format lands, regenerate here (or pass --trace-format to the CLI) -- nothing else changes. ---
+$traced = New-Object System.Collections.Generic.List[string]
+$traced.Add("app_main"); $traced.Add("util_common"); $traced.Add("util_leaf")
+for ($i = 0; $i -lt $nStage; $i += 2) { $traced.Add("stage_$i") }   # "the run" hit every other stage
+$traceLines = New-Object System.Collections.Generic.List[string]
+$traceLines.Add("# synthetic runtime trace (functions executed in a sample run)")
+for ($i = 0; $i -lt $traced.Count; $i++) {
+    # sprinkle the optional file:line column on a few entries to exercise the parser
+    if ($i % 3 -eq 0) { $traceLines.Add("$($traced[$i]) src/mod$i.c:$((($i + 1) * 7))") } else { $traceLines.Add($traced[$i]) }
+}
+$tracePath = Join-Path (Split-Path $outFull) ((Split-Path $outFull -Leaf) + "-trace.txt")
+Set-Content $tracePath ($traceLines -join "`n") -Encoding ascii
+
 # --- ground-truth manifest ---
 $manifest = [ordered]@{
     roots           = @("main")
     expectedKept    = @($expectedKept | Sort-Object -Unique)
     expectedDropped = @($expectedDropped | Sort-Object -Unique)
     allFuncs        = @($allFuncs | Sort-Object -Unique)
+    traced          = @($traced | Sort-Object -Unique)   # subset of reachable; must be kept by any carve
+    tracePath       = $tracePath
 }
 $mpath = Join-Path (Split-Path $outFull) ((Split-Path $outFull -Leaf) + "-manifest.json")
 ($manifest | ConvertTo-Json -Depth 5) | Set-Content $mpath -Encoding ascii

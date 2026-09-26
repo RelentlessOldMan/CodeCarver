@@ -84,12 +84,31 @@ image) is the authoritative test.**
 An `#ifdef`-heavy firmware tree carves *looser* than needed in open-world mode (unknown branches kept)
 and, more dangerously, can mismatch your build if it guesses. Pin the world to your actual build:
 
-- `--build-log <make -n output>` — the exact `-D`/`-I` flags your build uses (best).
+- `--build-log <make -n output>` — the exact `-D`/`-I`/`-isystem` flags your build uses (best). **A raw
+  build stdout capture works too**: the scraper extracts the compile command lines and ignores the rest
+  (warnings, echoes), so `--build-log build-stdout.txt` is fine — no need to pre-filter it.
 - or `--define CHIP=X,FEATURE_Y,...` — the defines for **this** image variant.
 - or `--probe <arm-none-eabi-gcc>` — let CodeCarver ask the compiler for its predefined macros.
 
 Match this to the variant you're carving (chip rev, app-vs-bootloader). Getting it right is both a
 tightness win (smaller image) and a soundness guard (no branch mismatch). See `docs/USAGE.md` §tightness.
+
+### 3b. Runtime trace (the tightest input) — `--trace`
+
+If you have a **trace of the functions a real run executed** (name, and optionally `file:line`), it's the
+strongest input CodeCarver takes. Two roles at once:
+
+- **Roots** — `--trace run.trace` roots every traced function, so the carve is guaranteed to keep what
+  actually ran, *including the dynamic-dispatch / function-pointer edges static reachability can't see*.
+- **Soundness oracle** — a traced function that a plain carve *dropped* means the static analysis missed a
+  real edge. On the real tree that's the highest-signal check short of building: carve with your normal
+  roots, then confirm every traced function is in the kept set (the manifest's `keptFiles` / `--dump-spans`).
+
+The trace format isn't fixed to your toolchain's yet, so extraction is a **configurable regex**:
+`--trace-format '<regex with a named (?<fn>...) group, optional (?<file>..)/(?<line>..)>'`. The default
+handles a bare `funcName` per line or `funcName file:line`. When your friend's format lands, it's a
+`--trace-format` change, not a code change. (The synthetic corpus already emits a `-trace.txt` and the
+oracle asserts traced ⊆ kept, so the whole path is exercised locally today.)
 
 ## 4. The authoritative test — build the carved image and compare size
 

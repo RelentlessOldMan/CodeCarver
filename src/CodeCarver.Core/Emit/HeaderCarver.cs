@@ -42,7 +42,8 @@ public static class HeaderCarver
         //    whose name a fragment could form is kept (sound over-approximation — the paste blind spot).
         var needed = new HashSet<string>(StringComparer.Ordinal);
         var fragments = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var f in Directory.EnumerateFiles(outDir, "*", SearchOption.AllDirectories))
+        var walk = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
+        foreach (var f in Directory.EnumerateFiles(outDir, "*", walk))
         {
             var rel = Path.GetRelativePath(outDir, f).Replace('\\', '/');
             if (bigSet.Contains(rel)) continue;

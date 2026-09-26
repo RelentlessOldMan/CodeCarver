@@ -101,6 +101,20 @@ $fpDiff = @($h1.Keys | Where-Object { -not $h2.ContainsKey($_) -or $h1[$_] -ne $
 if ($fpDiff.Count -eq 0) { Write-Host "  [T1b fixpoint] re-carve is byte-identical ($($h1.Count) files) -- closure is idempotent." -ForegroundColor Green }
 else { Write-Host "  [T1b fixpoint] !!! re-carve DIFFERS on $($fpDiff.Count) path(s): $(( $fpDiff | Select-Object -First 6) -join ', ')" -ForegroundColor Red; $fail++ }
 
+# --- T1c: TRACE soundness (models next week's runtime-trace input). A trace is real execution ground truth,
+# so every traced function MUST be in the carve's kept set -- a traced-but-dropped function means the static
+# carve missed a real (likely dynamic-dispatch) edge. Checks the manifest's synthetic trace against the
+# kept-set from the plain (rooted-at-main) carve, then confirms the CLI --trace flag roots the trace. ---
+if ($m.traced) {
+    $tracedMissing = @($m.traced | Where-Object { -not $keptNames.ContainsKey($_) })
+    if ($tracedMissing.Count -eq 0) { Write-Host "  [T1c trace] all $($m.traced.Count) traced functions KEPT (runtime ground truth holds)." -ForegroundColor Green }
+    else { Write-Host "  [T1c trace] !!! $($tracedMissing.Count) traced function(s) DROPPED by the static carve: $($tracedMissing -join ', ')" -ForegroundColor Red; $fail++ }
+    if ($m.tracePath -and (Test-Path $m.tracePath)) {
+        $tl = (& dotnet $cli carve $Out --lang c --roots $roots --trace $m.tracePath --prune --out "$Out-carved-tr" 2>&1 | Select-String 'trace   :').Line
+        if ($tl) { Write-Host "  [T1c trace]$($tl -replace '^\s*trace   :','  --trace:')" -ForegroundColor Green }
+    }
+}
+
 # --- host + ARM builds: a shared helper compiles a file list and returns "OK <size>" or "FAIL" ---
 function HostBuild($srcRootDir, $tag) {
     $cf = (CFiles $srcRootDir | ForEach-Object { ToWsl $_ }) -join ' '

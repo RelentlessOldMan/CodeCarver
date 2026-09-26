@@ -81,6 +81,8 @@ static int RunCarve(string[] args)
     var strictRoots = false;
     var dumpSpans = false;
     string? whySymbol = null;
+    string? tracePath = null;      // runtime trace: functions a real run executed (roots + soundness oracle)
+    string? traceFormat = null;    // optional regex (named 'fn'/'file'/'line') for a non-default trace format
     var lang = "c";
     var defineSpecs = new List<string>();
     string? buildLog = null;
@@ -157,6 +159,10 @@ static int RunCarve(string[] args)
             { Console.Error.WriteLine($"--parse-timeout needs a non-negative integer (seconds; 0 disables), got '{args[i]}'"); return 2; }
             parseTimeoutMs = pt * 1000;
         }
+        else if (args[i] == "--trace" && i + 1 < args.Length)
+            tracePath = args[++i];
+        else if (args[i] == "--trace-format" && i + 1 < args.Length)
+            traceFormat = args[++i];
         else if (args[i] == "--dump-spans")
             dumpSpans = true;
         else if (args[i] == "--why" && i + 1 < args.Length)
@@ -457,8 +463,28 @@ static int RunCarve(string[] args)
     var forceKeepRoots = forceKeep.Count > 0
         ? new ExplicitRootProvider(files: forceKeep).Discover(graph).ToList() : new List<Root>();
 
+    // Runtime trace (functions a real run executed): root them so the carve is guaranteed to keep what ran,
+    // including dynamic-dispatch / function-pointer edges static reachability can't see. Trace names are
+    // machine-generated (many external/libc), so they do NOT go through the --strict-roots per-root warnings;
+    // instead the summary reports how many resolved in-scope.
+    var traceRoots = new List<Root>();
+    var traceTotal = 0;
+    if (tracePath is not null)
+    {
+        if (!File.Exists(tracePath)) { Console.Error.WriteLine($"--trace file not found: {tracePath}"); return 2; }
+        System.Text.RegularExpressions.Regex? pat = null;
+        if (traceFormat is not null)
+            try { pat = new System.Text.RegularExpressions.Regex(traceFormat); }
+            catch (Exception ex) { Console.Error.WriteLine($"--trace-format is not a valid regex: {ex.Message}"); return 2; }
+        var traceNames = TraceFile.FunctionNames(TraceFile.Parse(File.ReadAllText(tracePath), pat));
+        traceTotal = traceNames.Count;
+        traceRoots = new ExplicitRootProvider(symbols: traceNames).Discover(graph).ToList();
+        if (traceTotal == 0)
+            Console.Error.WriteLine("  warn    : --trace produced 0 function names (does --trace-format have a named 'fn' group?)");
+    }
+
     var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots)
-                               .Concat(ctorRoots).Concat(forceKeepRoots).ToList();
+                               .Concat(ctorRoots).Concat(forceKeepRoots).Concat(traceRoots).ToList();
     if (rootSet.Count == 0)
     {
         Console.Error.WriteLine("no roots to carve from: name entry symbols with --roots");
@@ -519,6 +545,12 @@ static int RunCarve(string[] args)
     if (sectionRoots.Count > 0)
         Console.WriteLine($"  section : {sectionRoots.Count} symbol(s) in linker KEEP()'d section(s) auto-kept: "
                           + Summarize(sectionRoots.Select(r => r.Note ?? r.Node.ToString()).Distinct().ToList()));
+    if (tracePath is not null)
+    {
+        var traceResolved = traceRoots.Select(r => r.Note).Where(n => n is not null).Distinct().Count();
+        Console.WriteLine($"  trace   : {traceTotal} function(s) from {Path.GetFileName(tracePath)} rooted; {traceResolved} resolved in-scope"
+                          + (traceTotal > traceResolved ? $", {traceTotal - traceResolved} not found (external/inlined/not captured)" : ""));
+    }
     if (defines is not null)
         Console.WriteLine($"  config  : {defineSpecs.Distinct().Count()} define(s), #ifdef resolution ON" +
                           (closedWorld ? " (closed-world: absent macros treated as undefined)" : " (open-world: unknown branches kept)"));
