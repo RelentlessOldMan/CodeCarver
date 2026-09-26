@@ -206,6 +206,50 @@ public class FileTreeEmitterTests
     }
 
     [Fact]
+    public void BuildSupport_AuxDotDotGlob_Refused_DoesNotWriteOutsideOut()
+    {
+        // eval-#7 HIGH: a '..' --aux glob resolved outside the source root, and dst = Combine(outDir, rel)
+        // carried the '../' into the output path -> it could OVERWRITE a sibling of --out (violating the
+        // write-only-under-out rule). Must be refused with a clear warning, and nothing outside --out touched.
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-dd-" + Guid.NewGuid().ToString("N"));
+        var srcDir = Path.Combine(work, "src");
+        var outDir = Path.Combine(work, "out");
+        var siblingDir = Path.Combine(work, "cfg");
+        Directory.CreateDirectory(srcDir);
+        Directory.CreateDirectory(siblingDir);
+        try
+        {
+            var sibling = Path.Combine(siblingDir, "settings.inc");
+            File.WriteAllText(sibling, "ORIGINAL");
+            string[] none = System.Array.Empty<string>();
+
+            var res = BuildSupportEmitter.Copy(srcDir, outDir, none, none, new[] { "../cfg/*.inc" });
+
+            Assert.Contains(res.Warnings, w => w.Contains("refused"));
+            Assert.Equal(0, res.Count);
+            Assert.Equal("ORIGINAL", File.ReadAllText(sibling)); // sibling of --out NOT overwritten
+        }
+        finally { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); }
+    }
+
+    [Fact]
+    public void MatchGlob_UsesOnDiskCasing_NotGlobCasing()
+    {
+        // eval-#7 LOW: emitting into the glob's casing ('SUB/') would break '#include "sub/a.inc"' on a
+        // case-sensitive build host. Enumerating from root means every segment carries its real disk casing.
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-case-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(work, "sub", "deep"));
+        try
+        {
+            File.WriteAllText(Path.Combine(work, "sub", "deep", "a.inc"), "1");
+            var hit = BuildSupportEmitter.MatchGlob(work, "SUB/**/*.INC").Single();
+            var rel = Path.GetRelativePath(work, hit).Replace('\\', '/');
+            Assert.Equal("sub/deep/a.inc", rel); // real on-disk casing, not the glob's 'SUB'
+        }
+        finally { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); }
+    }
+
+    [Fact]
     public void EmitPruned_KeepsConstructor_AndWholeTemplatePrefix()
     {
         // Two C++ pruning-soundness regressions (found in simdjson):

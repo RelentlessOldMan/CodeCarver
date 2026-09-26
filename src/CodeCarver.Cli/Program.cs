@@ -189,7 +189,10 @@ static int RunCarve(string[] args)
         return 2;
     }
 
-    var paths = Directory.EnumerateFiles(dir, "*.*", SearchOption.AllDirectories)
+    // Recursive walk that SKIPS unreadable dirs (common on a network share) rather than throwing LATER
+    // inside the lazy enumeration and leaving a partial run (eval-#7). Reused for every AllDirectories scan.
+    var recurse = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
+    var paths = Directory.EnumerateFiles(dir, "*.*", recurse)
         .Where(p => exts.Any(e => p.EndsWith(e, StringComparison.OrdinalIgnoreCase)))
         .Where(p => excludeDirs.Count == 0 ||
                     !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase)))
@@ -259,7 +262,7 @@ static int RunCarve(string[] args)
             if (byBase is null)
             {
                 byBase = new(StringComparer.OrdinalIgnoreCase);
-                foreach (var f in Directory.EnumerateFiles(rootFull, "*", SearchOption.AllDirectories))
+                foreach (var f in Directory.EnumerateFiles(rootFull, "*", recurse))
                 {
                     var bn = Path.GetFileName(f);
                     if (!byBase.TryGetValue(bn, out var l)) byBase[bn] = l = new List<string>();
@@ -396,7 +399,7 @@ static int RunCarve(string[] args)
     var asmRoots = new List<Root>();
     if (lang is "c" or "cpp")
     {
-        var asmTexts = Directory.EnumerateFiles(dir, "*.*", SearchOption.AllDirectories)
+        var asmTexts = Directory.EnumerateFiles(dir, "*.*", recurse)
             .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".s" or ".asm")
             .Where(p => excludeDirs.Count == 0 ||
                         !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase)))
@@ -414,7 +417,7 @@ static int RunCarve(string[] args)
     {
         bool Included(string p) => excludeDirs.Count == 0 ||
             !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase));
-        var linkerScripts = Directory.EnumerateFiles(dir, "*.*", SearchOption.AllDirectories)
+        var linkerScripts = Directory.EnumerateFiles(dir, "*.*", recurse)
             .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".ld" or ".lds" or ".ldscript")
             .Where(Included).Where(p => new FileInfo(p).Length <= maxParseBytes)
             .Select(File.ReadAllText).ToList();
