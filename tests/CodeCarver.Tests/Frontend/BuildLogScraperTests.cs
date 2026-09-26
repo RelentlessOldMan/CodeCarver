@@ -93,6 +93,44 @@ public class BuildLogScraperTests
     }
 
     [Fact]
+    public void IncludeSearchVariants_isystem_iquote_idirafter_AreCaptured()
+    {
+        // Embedded builds pass toolchain/CMSIS/HAL headers via -isystem etc., not just -I. All feed include
+        // resolution (a non-sibling .inc reached this way otherwise only surfaces via the basename fallback).
+        const string line = "arm-none-eabi-gcc -Icore -isystem /opt/cmsis/inc -iquote local -idirafter after -c m.c";
+        var cmd = Assert.Single(BuildLogScraper.Parse(line));
+        Assert.Equal(new[] { "core", "/opt/cmsis/inc", "local", "after" }, cmd.Includes);
+    }
+
+    [Fact]
+    public void SiblingToolchainTools_AreNotTreatedAsCompiles()
+    {
+        // clang-tidy carries a .c token but is NOT a compile; gcc-ar / arm-none-eabi-ld share a prefix but
+        // aren't compilers. None should produce a compile command.
+        Assert.Empty(BuildLogScraper.Parse("clang-tidy foo.c -- -Iinc"));
+        Assert.Empty(BuildLogScraper.Parse("gcc-ar rcs libx.a a.o b.o"));
+        Assert.Empty(BuildLogScraper.Parse("arm-none-eabi-ld -T link.ld a.o -o out.elf"));
+    }
+
+    [Fact]
+    public void QuotedDefineValue_KeepsSpacesAsOneDefine()
+    {
+        const string line = "gcc -D\"MSG=hello world\" -c a.c";
+        var cmd = Assert.Single(BuildLogScraper.Parse(line));
+        Assert.Contains("MSG=hello world", cmd.Defines);
+    }
+
+    [Fact]
+    public void ResponseFileArg_DoesNotCrash_StillFindsInlineSource()
+    {
+        // @rsp files aren't expanded (a documented limitation) but must never crash; a visible source still
+        // yields a command (its .rsp-only flags are simply unseen).
+        var cmd = Assert.Single(BuildLogScraper.Parse("gcc @flags.rsp -DINLINE -c a.c"));
+        Assert.Equal("a.c", cmd.File);
+        Assert.Contains("INLINE", cmd.Defines);
+    }
+
+    [Fact]
     public void MultiLineLog_ParsesEachCompileLine()
     {
         const string log = """

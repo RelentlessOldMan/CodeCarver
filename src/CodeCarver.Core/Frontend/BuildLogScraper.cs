@@ -20,6 +20,13 @@ public static class BuildLogScraper
     private static readonly string[] SourceExtensions =
         { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
 
+    // Toolchain tools that SHARE a compiler prefix but are NOT compilers (gcc-ar, arm-none-eabi-ld,
+    // clang-tidy, clang-format). Without this the loose "starts with gcc/clang" match below flags them, and
+    // one that happens to carry a source token (clang-tidy foo.c) would be mis-scraped as a compile command.
+    private static readonly string[] NotCompilerTools =
+        { "ar", "nm", "ranlib", "objcopy", "objdump", "size", "strip", "gcov", "gprof",
+          "ld", "as", "gdb", "tidy", "format", "check", "cpp", "cov" };
+
     public static IReadOnlyList<CompileCommand> Parse(string log)
     {
         var results = new List<CompileCommand>();
@@ -61,6 +68,11 @@ public static class BuildLogScraper
             else if (a.StartsWith("-D", StringComparison.Ordinal) || a.StartsWith("/D", StringComparison.Ordinal))
                 defines.Add(a[2..]);
             else if (a is "-I" or "/I") { if (i + 1 < args.Count) includes.Add(args[++i]); }
+            // -isystem / -iquote / -idirafter DIR: the other GCC/Clang include-search forms, used heavily by
+            // embedded builds for toolchain / CMSIS / HAL headers. They take the dir as the NEXT token. Feeding
+            // these to include resolution matters -- a non-sibling .inc reached via -isystem otherwise falls to
+            // the (over-approximate, warning) basename fallback.
+            else if (a is "-isystem" or "-iquote" or "-idirafter") { if (i + 1 < args.Count) includes.Add(args[++i]); }
             else if (a.StartsWith("-I", StringComparison.Ordinal) || a.StartsWith("/I", StringComparison.Ordinal))
                 includes.Add(a[2..]);
         }
@@ -82,6 +94,12 @@ public static class BuildLogScraper
         if (token.StartsWith('-')) return false; // not '/': Unix compiler paths (/usr/bin/gcc) start with it
         var name = FileNameOf(token);
         if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) name = name[..^4];
+
+        // Exclude sibling toolchain tools (gcc-ar, clang-tidy, arm-none-eabi-ld) before the loose prefix match.
+        foreach (var t in NotCompilerTools)
+            if (name.Equals(t, StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith("-" + t, StringComparison.OrdinalIgnoreCase))
+                return false;
 
         foreach (var c in KnownCompilers)
             if (name.Equals(c, StringComparison.OrdinalIgnoreCase) ||

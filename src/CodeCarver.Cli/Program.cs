@@ -145,13 +145,31 @@ static int RunCarve(string[] args)
         else if (args[i] == "--probe" && i + 1 < args.Length)
             probeCompiler = args[++i];
         else if (args[i] == "--max-parse-bytes" && i + 1 < args.Length)
-            long.TryParse(args[++i], out maxParseBytes);
+        {
+            // Validate: a typo'd value silently became 0/negative -> every file "too big" -> kept whole ->
+            // nothing parsed -> misleading "roots not found". Fail clearly instead.
+            if (!long.TryParse(args[++i], out maxParseBytes) || maxParseBytes < 0)
+            { Console.Error.WriteLine($"--max-parse-bytes needs a non-negative integer (bytes), got '{args[i]}'"); return 2; }
+        }
         else if (args[i] == "--parse-timeout" && i + 1 < args.Length)
-            parseTimeoutMs = int.TryParse(args[++i], out var pt) ? pt * 1000 : null;
+        {
+            if (!int.TryParse(args[++i], out var pt) || pt < 0)
+            { Console.Error.WriteLine($"--parse-timeout needs a non-negative integer (seconds; 0 disables), got '{args[i]}'"); return 2; }
+            parseTimeoutMs = pt * 1000;
+        }
         else if (args[i] == "--dump-spans")
             dumpSpans = true;
         else if (args[i] == "--why" && i + 1 < args.Length)
             whySymbol = args[++i];
+        else
+        {
+            // Unknown or incomplete option. Previously ignored silently, so a typo'd flag (e.g. --strict-root,
+            // --prun) just didn't apply and the carve looked fine -- exactly the silent-mistake class the evals
+            // flag. Fail loudly.
+            Console.Error.WriteLine($"unknown or incomplete option '{args[i]}'. try: carve <dir> --roots a,b [--lang c|cpp] "
+                                    + "[--prune] [--out DIR] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G]");
+            return 2;
+        }
     }
 
     // Preprocessor config: explicit --define plus any -D flags scraped from a --build-log.
