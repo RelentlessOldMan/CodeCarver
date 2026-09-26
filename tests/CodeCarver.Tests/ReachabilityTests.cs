@@ -1,3 +1,4 @@
+using System.Linq;
 using CodeCarver.Core.Frontend;
 using CodeCarver.Core.Graph;
 using CodeCarver.Core.Reachability;
@@ -29,6 +30,36 @@ public class ReachabilityTests
         Assert.False(plan.IsKept(dead));
         Assert.Equal(3, plan.Stats.ReachedNodes);
         Assert.Equal(1, plan.Stats.DroppedNodes);
+    }
+
+    [Fact]
+    public void MultiRoot_KeepsUnionOfSingleRootCarves_Monotone()
+    {
+        // eval-#6 monotonicity: carving {A,B} together must keep AT LEAST everything A alone and B alone
+        // keep -- more roots can never keep less. Guards the multi-root path (where an anomaly was reported).
+        var b = new GraphBuilder();
+        var a = b.Func("a", "a.c");
+        var bb = b.Func("bb", "b.c");
+        var shared = b.Func("shared", "s.c");   // reached by both
+        var onlyA = b.Func("onlyA", "a.c");
+        var onlyB = b.Func("onlyB", "b.c");
+        var dead = b.Func("dead", "d.c");       // reached by neither
+        b.Calls(a, onlyA); b.Calls(a, shared);
+        b.Calls(bb, onlyB); b.Calls(bb, shared);
+
+        var pa = ReachabilityEngine.Compute(b.Graph, new[] { new Root(a, RootKind.ExplicitSymbol) });
+        var pb = ReachabilityEngine.Compute(b.Graph, new[] { new Root(bb, RootKind.ExplicitSymbol) });
+        var pab = ReachabilityEngine.Compute(b.Graph,
+            new[] { new Root(a, RootKind.ExplicitSymbol), new Root(bb, RootKind.ExplicitSymbol) });
+
+        foreach (var n in new[] { a, bb, shared, onlyA, onlyB })
+            if (pa.IsKept(n) || pb.IsKept(n))
+                Assert.True(pab.IsKept(n), "more roots kept less -- monotonicity violated");
+        Assert.False(pab.IsKept(dead));
+
+        var filesAB = pab.KeptFiles.ToHashSet();
+        foreach (var f in pa.KeptFiles.Concat(pb.KeptFiles))
+            Assert.Contains(f, filesAB);   // kept-file set is a superset of each single-root carve
     }
 
     [Fact]
