@@ -40,6 +40,12 @@ $m = Get-Content $Manifest -Raw | ConvertFrom-Json
 # Assert the contract version BEFORE trusting the manifest. v1 (CodeSpawner) nests symbols under `symbols`,
 # carries `_meta`, and emits an EXPLICIT call graph as `edges` (symbol -> [symbols it calls]) - so we no
 # longer infer caller from a ref site's file. See tools\codespawner\manifest-schema.md.
+# This oracle scopes to the func_i CALL CHAIN (a reachability property). CodeSpawner's later additive v1
+# fields are for other consumers and are intentionally IGNORED here: `dupGroups`/`_meta.populations`
+# (indexer dedup / shape), and `expectedMiss` symbols (token-paste `handler_##id` names an indexer is
+# expected to miss). Those aren't func-chain nodes, so they never affect soundness/precision below. (If a
+# future preset wires a paste-CALL from the reachable chain to an expectedMiss handler, THAT becomes a real
+# carver-soundness case worth a dedicated check - coordinate with CodeSpawner when the pathology suite settles.)
 $ver = $m._meta.manifestVersion
 if ($ver -ne 1) { throw "manifest version $ver != 1 - this oracle speaks v1 (regenerate with a v1 CodeSpawner)" }
 $syms = $m.symbols
