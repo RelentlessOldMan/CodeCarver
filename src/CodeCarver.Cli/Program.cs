@@ -279,14 +279,21 @@ static int RunCarve(string[] args)
     // include/DO-closure (C/C++/.cmm) we register them as File nodes with null text — kept whole when a
     // kept unit includes them, copied verbatim by the emitter. C# has no such closure, so it's exempt.
     var closureLang = lang is "c" or "cpp" or "cmm";
+    // One stat per file: capture every source file's size ONCE here (rel path -> bytes) and reuse the map
+    // for big-file detection now and the final size accounting later, instead of stat'ing every file twice
+    // (a full extra pass of syscalls over the whole tree — noticeable on a large/network source root).
+    var sizeByRel = new Dictionary<string, long>(StringComparer.Ordinal);
+    long originalBytes = 0;
     var bigFiles = new List<(string Rel, long Bytes)>();
-    if (closureLang)
-        foreach (var p in paths)
-        {
-            var len = new FileInfo(p).Length;
-            if (len > maxParseBytes)
-                bigFiles.Add((Path.GetRelativePath(dir, p).Replace('\\', '/'), len));
-        }
+    foreach (var p in paths)
+    {
+        var rel = Path.GetRelativePath(dir, p).Replace('\\', '/');
+        long len;
+        try { len = new FileInfo(p).Length; } catch { len = 0; } // a vanished/locked file: size 0, still tracked
+        sizeByRel[rel] = len;
+        originalBytes += len;
+        if (closureLang && len > maxParseBytes) bigFiles.Add((rel, len));
+    }
     var bigSet = bigFiles.Select(b => b.Rel).ToHashSet(StringComparer.Ordinal);
 
     var inputs = new List<(string Rel, string Text)>(paths.Count);
@@ -572,15 +579,9 @@ static int RunCarve(string[] args)
         return 0;
     }
 
-    // Size accounting: the whole scanned source vs. what the carve keeps (the headline number).
-    long originalBytes = 0;
-    var sizeByRel = new Dictionary<string, long>(StringComparer.Ordinal);
-    foreach (var p in paths)
-    {
-        var len = new FileInfo(p).Length;
-        originalBytes += len;
-        sizeByRel[Path.GetRelativePath(dir, p).Replace('\\', '/')] = len;
-    }
+    // Size accounting uses the sizeByRel map + originalBytes computed once during the input scan above
+    // (the whole scanned source vs. what the carve keeps — the headline number). Support-file bytes are
+    // added to originalBytes below so verbatim-copied .ld/.s are delta-neutral.
 
     Console.WriteLine($"CodeCarver {Version()} — carve of {dir}");
     // Show what actually rooted; call out unresolved names inline so a partial resolution can't read as

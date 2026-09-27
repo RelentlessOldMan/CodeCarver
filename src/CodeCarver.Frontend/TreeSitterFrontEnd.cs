@@ -86,6 +86,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private readonly Query _idents;
     private readonly Query _initRefs;
     private readonly Query _globals;
+    // Reused across the sequential parse loop: a native TSParser is cheap to re-use but not free to
+    // create/destroy, and BuildGraph parses thousands of files one at a time on this thread. The budgeted
+    // (large-file) path still uses its OWN parser on the worker thread — this instance is single-threaded,
+    // touched only by the inline path. Lazily created; disposed with the front-end.
+    private Parser? _inlineParser;
 
     private readonly List<string> _warnings = new();
     /// <inheritdoc/>
@@ -427,10 +432,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     {
         timedOut = false;
         if (ParseBudgetMs <= 0 || text.Length < BudgetMinBytes)
-        {
-            using var parser = new Parser(_lang);
-            return parser.Parse(text);
-        }
+            return (_inlineParser ??= new Parser(_lang)).Parse(text);
 
         // Breadcrumb BEFORE the parse: an AV is a corrupted-state exception we can't catch, so this stderr
         // line (flushed) is the only way a crash is attributable to a file instead of reading as a CI flake.
@@ -1090,6 +1092,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
     public void Dispose()
     {
+        _inlineParser?.Dispose();
         _globals.Dispose();
         _initRefs.Dispose();
         _idents.Dispose();
