@@ -228,6 +228,68 @@ public sealed class CliIntegrationTests
     }
 
     [Fact]
+    public void Carve_OutNonEmptyNonCarveDir_Refused_DataIntact()
+    {
+        // Regression (eval #8 HIGH): the atomic emit must NOT wipe a pre-existing --out it didn't create.
+        var src = MakeTree(out var work);
+        try
+        {
+            var outDir = Path.Combine(work, "precious");
+            Directory.CreateDirectory(Path.Combine(outDir, ".git"));
+            File.WriteAllText(Path.Combine(outDir, "notes.txt"), "MINE");
+            File.WriteAllText(Path.Combine(outDir, ".git", "HEAD"), "ref");
+
+            var r = RunCli("carve", src, "--roots", "run", "--out", outDir);
+            if (r is null) return;
+            var (code, outp) = r.Value;
+            Assert.Equal(2, code);
+            Assert.Contains("not empty and was not created by CodeCarver", outp);
+            Assert.Equal("MINE", File.ReadAllText(Path.Combine(outDir, "notes.txt"))); // untouched
+            Assert.True(File.Exists(Path.Combine(outDir, ".git", "HEAD")));            // .git untouched
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Carve_OutNonEmptyNonCarveDir_WithClean_Succeeds()
+    {
+        var src = MakeTree(out var work);
+        try
+        {
+            var outDir = Path.Combine(work, "precious");
+            Directory.CreateDirectory(outDir);
+            File.WriteAllText(Path.Combine(outDir, "notes.txt"), "MINE");
+
+            var r = RunCli("carve", src, "--roots", "run", "--out", outDir, "--clean");
+            if (r is null) return;
+            var (code, _) = r.Value;
+            Assert.Equal(0, code);
+            Assert.True(File.Exists(Path.Combine(outDir, "main.c")));       // replaced with the carve
+            Assert.False(File.Exists(Path.Combine(outDir, "notes.txt")));   // --clean authorized removal
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Carve_ReEmitIntoPriorCarveOutput_NoCleanNeeded()
+    {
+        // A directory CodeCarver itself produced carries the marker, so a re-carve into it is seamless.
+        var src = MakeTree(out var work);
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            var r1 = RunCli("carve", src, "--roots", "run", "--out", outDir);
+            if (r1 is null) return;
+            Assert.Equal(0, r1.Value.Code);
+
+            var r2 = RunCli("carve", src, "--roots", "run", "--out", outDir); // again, no --clean
+            Assert.Equal(0, r2!.Value.Code);
+            Assert.True(File.Exists(Path.Combine(outDir, "main.c")));
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
     public void Carve_Diag_WritesPackage()
     {
         var src = MakeTree(out var work);

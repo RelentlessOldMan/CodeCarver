@@ -70,7 +70,8 @@ Every carve is sound with just `--roots`. Each extra input lets it carve **tight
 | Build log | `--build-log build.txt` | scrape real per-file `-D` flags from a build log (see `scan-log`) |
 | Probe compiler | `--probe cc` | run `cc -dM -E` for the compiler's **complete** macro set (predefined + target + `-D`) and resolve `#ifdef`s closed-world against it — accurate, no "is my define list complete?" guess |
 | Complete-config | `--assume-defines-complete` | closed-world without probing: trust the supplied defines as complete |
-| Write output | `--out DIR` | emit the carved tree |
+| Write output | `--out DIR` | emit the carved tree. Written atomically (staged, then swapped into place) so a crash mid-emit can't leave a half-written tree. `--out` must be **outside** the source tree; a **non-empty** `--out` that CodeCarver didn't create is refused (so it can't wipe a checkout or your own files) — re-carving a prior CodeCarver output is seamless |
+| Replace output | `--clean` | permit replacing a non-empty `--out` CodeCarver did **not** create (explicit opt-in to overwrite its contents) |
 | Aux build files | `--aux "Makefile,*.cmd"` | extra non-source files to copy verbatim into `--out` (Makefiles, TI `.cmd` linker files, …) on top of the linker scripts + startup assembly copied automatically |
 | Aggressive prune | `--prune` | intra-file function/table removal (C/C++ only; other languages carve file-level) |
 | Audit | `--manifest m.json` | write a JSON manifest of roots, stats, kept/dropped files, byte counts |

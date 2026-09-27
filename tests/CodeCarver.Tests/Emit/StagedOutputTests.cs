@@ -27,7 +27,9 @@ public sealed class StagedOutputTests
             using var staged = StagedOutput.Begin(outDir);
 
             Assert.True(Directory.Exists(staged.Dir));
-            Assert.Empty(Directory.EnumerateFileSystemEntries(staged.Dir));
+            // Staging starts with only the marker file (dropped so the promoted --out is recognizable).
+            Assert.Equal(new[] { StagedOutput.MarkerName },
+                Directory.EnumerateFileSystemEntries(staged.Dir).Select(Path.GetFileName).ToArray());
             Assert.NotEqual(Path.GetFullPath(outDir), Path.GetFullPath(staged.Dir));
             Assert.Equal(Path.GetDirectoryName(Path.GetFullPath(outDir)),
                          Path.GetDirectoryName(Path.GetFullPath(staged.Dir))); // same parent -> same volume
@@ -125,6 +127,62 @@ public sealed class StagedOutputTests
                 .Where(n => n!.StartsWith(".ccstaging", StringComparison.Ordinal) || n.Contains(".ccold"))
                 .ToList();
             Assert.Empty(leftovers);
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void PromotedOutput_CarriesMarker_AndIsRecognized()
+    {
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            using (var staged = StagedOutput.Begin(outDir))
+            {
+                File.WriteAllText(Path.Combine(staged.Dir, "a.c"), "1");
+                staged.Promote();
+            }
+            Assert.True(File.Exists(Path.Combine(outDir, StagedOutput.MarkerName)));
+            Assert.True(StagedOutput.IsCodeCarverOutput(outDir));  // a re-carve can safely replace it
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void IsCodeCarverOutput_FalseForArbitraryDir()
+    {
+        var work = NewWork();
+        try
+        {
+            File.WriteAllText(Path.Combine(work, "notes.txt"), "mine");
+            Assert.False(StagedOutput.IsCodeCarverOutput(work));   // no marker -> not ours -> must not be wiped
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Promote_WhenRenameBlockedByOpenHandle_FallsBackToCopy()
+    {
+        // Reproduces the Windows AV/indexer failure: a handle held open on a just-written staged file blocks
+        // the directory rename. Promote must retry and then fall back to copying the tree in, so the carve
+        // still lands instead of exiting with a spurious failure.
+        if (!OperatingSystem.IsWindows()) return; // the sharing-violation-on-rename behavior is Windows-specific
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            using var staged = StagedOutput.Begin(outDir);
+            File.WriteAllText(Path.Combine(staged.Dir, "a.c"), "hello");
+            var locked = Path.Combine(staged.Dir, "locked.c");
+            File.WriteAllText(locked, "held");
+            // Hold a handle that allows readers (so the copy fallback can read it) but blocks the rename.
+            using (var _ = new FileStream(locked, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                staged.Promote(); // rename fails -> retries -> copy fallback
+            }
+            Assert.True(File.Exists(Path.Combine(outDir, "a.c")));
+            Assert.True(File.Exists(Path.Combine(outDir, "locked.c")));
         }
         finally { Cleanup(work); }
     }

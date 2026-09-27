@@ -106,6 +106,7 @@ static int RunCarve(string[] args)
     var closedWorld = false;
     string? manifestPath = null;
     string? diagPath = null;       // --diag: write ONE source-free, shareable diagnostic .zip for this run
+    var clean = false;             // --clean: permit replacing a non-empty --out we didn't create
     var excludeDirs = new List<string>();
     var auxGlobs = new List<string>();   // extra build files to copy verbatim into --out (Makefiles, .cmd, …)
     string? probeCompiler = null;
@@ -179,6 +180,8 @@ static int RunCarve(string[] args)
             manifestPath = args[++i];
         else if (args[i] == "--diag" && i + 1 < args.Length)
             diagPath = args[++i];
+        else if (args[i] == "--clean")
+            clean = true;
         else if (args[i] == "--exclude" && i + 1 < args.Length)
             excludeDirs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         else if (args[i] == "--aux" && i + 1 < args.Length)
@@ -212,7 +215,7 @@ static int RunCarve(string[] args)
             // --prun) just didn't apply and the carve looked fine -- exactly the silent-mistake class the evals
             // flag. Fail loudly.
             Console.Error.WriteLine($"unknown or incomplete option '{args[i]}'. try: carve <dir> --roots a,b [--lang c|cpp] "
-                                    + "[--prune] [--out DIR] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G] [--diag Z]");
+                                    + "[--prune] [--out DIR] [--clean] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G] [--diag Z]");
             return 2;
         }
     }
@@ -231,6 +234,20 @@ static int RunCarve(string[] args)
             Console.Error.WriteLine($"--out must not be the source tree or nested within it (or vice versa): "
                 + $"source '{Path.GetFullPath(dir)}' overlaps out '{outFull}'. Emitting there would overwrite your "
                 + "source. Choose an output directory outside the scanned tree.");
+            return 2;
+        }
+        // Never destroy data we didn't create. The emit atomically REPLACES --out (staging is promoted over
+        // it), so a --out pointing at a checkout, a home dir, or any pre-existing folder would wipe it. Only
+        // proceed when --out is empty/absent, was itself produced by CodeCarver (carries the marker — the
+        // normal re-carve case), or --clean explicitly authorizes replacing arbitrary contents.
+        bool outNonEmpty;
+        try { outNonEmpty = Directory.Exists(outFull) && Directory.EnumerateFileSystemEntries(outFull).Any(); }
+        catch (Exception ex) { Console.Error.WriteLine($"--out '{outFull}' is not accessible ({ex.GetType().Name}: {ex.Message})"); return 2; }
+        if (outNonEmpty && !clean && !StagedOutput.IsCodeCarverOutput(outFull))
+        {
+            Console.Error.WriteLine($"--out '{outFull}' is not empty and was not created by CodeCarver — refusing to "
+                + "overwrite it (it could be a checkout, a home directory, or your own files). Choose an empty or new "
+                + "directory, or pass --clean to replace its contents.");
             return 2;
         }
     }
@@ -710,8 +727,23 @@ static int RunCarve(string[] args)
         }
 
         // Everything staged successfully — swap it into place atomically. Only now is any prior --out
-        // touched (moved aside, then deleted once the new tree is confirmed in place).
-        staged.Promote();
+        // touched (moved aside, then deleted once the new tree is confirmed in place). Promote retries
+        // transient AV/indexer rename locks and falls back to copy; if it STILL fails, the carve itself
+        // succeeded and the prior --out is left intact — say so clearly rather than an opaque crash.
+        try
+        {
+            staged.Promote();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"  error   : the carve succeeded ({res.FilesWritten} files staged) but the final "
+                + $"swap into {outDir} failed ({ex.GetType().Name}: {ex.Message}). Your previous {outDir} is unchanged. "
+                + "This is usually a transient AV/indexer lock — retry, or use a fresh --out.");
+            diag.SetFailure(ex);
+            if (diagPath is not null && diag.TryWritePackage(diagPath, out var zpf, out _))
+                Console.Error.WriteLine($"  diag    : diagnostic package (with failure) written -> {zpf}");
+            return 1;
+        }
     }
     else
     {
