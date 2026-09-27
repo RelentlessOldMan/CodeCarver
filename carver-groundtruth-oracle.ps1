@@ -43,9 +43,10 @@ $m = Get-Content $Manifest -Raw | ConvertFrom-Json
 # This oracle scopes to the func_i CALL CHAIN (a reachability property). CodeSpawner's later additive v1
 # fields are for other consumers and are intentionally IGNORED here: `dupGroups`/`_meta.populations`
 # (indexer dedup / shape), and `expectedMiss` symbols (token-paste `handler_##id` names an indexer is
-# expected to miss). Those aren't func-chain nodes, so they never affect soundness/precision below. (If a
-# future preset wires a paste-CALL from the reachable chain to an expectedMiss handler, THAT becomes a real
-# carver-soundness case worth a dedicated check - coordinate with CodeSpawner when the pathology suite settles.)
+# expected to miss). Confirmed on CodeSpawner v1.0.3: expectedMiss symbols are ISOLATED in the call graph
+# (no `edges` in OR out), so they are genuinely unreachable and a carver correctly drops them as dead code —
+# a symbol-EXTRACTION concern, not a carve-reachability one, nothing for this oracle to assert. Revisit only
+# if a future preset makes them reachable (a paste-CALL from the chain) — then it'd be a LinkPaste-soundness case.
 $ver = $m._meta.manifestVersion
 if ($ver -ne 1) { throw "manifest version $ver != 1 - this oracle speaks v1 (regenerate with a v1 CodeSpawner)" }
 $syms = $m.symbols
