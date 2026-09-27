@@ -142,4 +142,71 @@ public class BuildLogScraperTests
         var cmds = BuildLogScraper.Parse(log);
         Assert.Equal(2, cmds.Count);
     }
+
+    // --- compile_commands.json (CMake + the synthetic generator emit this; --build-log accepts it too) ---
+
+    [Fact]
+    public void CompileCommandsJson_GeneratorCommandForm_ExtractsIncludesAndFile()
+    {
+        // Mirrors make-firmware-corpus.ps1's emitted entry: clang -I"<dir>" -I"<out>" -c "<file>", with the
+        // escaped inner quotes a real compile_commands.json carries. (Raw string => the \" are literal.)
+        const string json = """
+            [
+              { "directory": "/proj/block0", "file": "/proj/block0/src_0.c",
+                "command": "clang -I\"/proj/block0\" -I\"/proj\" -c \"/proj/block0/src_0.c\"" }
+            ]
+            """;
+        var cmd = Assert.Single(BuildLogScraper.Parse(json));
+        Assert.Equal("/proj/block0/src_0.c", cmd.File);
+        Assert.Equal(new[] { "/proj/block0", "/proj" }, cmd.Includes);
+    }
+
+    [Fact]
+    public void CompileCommandsJson_ArgumentsForm_ExtractsDefinesAndIncludes()
+    {
+        // The argv-array form (clang -MJ / some tools emit this instead of a command string).
+        const string json = """
+            [
+              { "directory": "/p", "file": "/p/main.c",
+                "arguments": ["arm-none-eabi-gcc", "-DSTM32F407xx", "-DUSE_HAL", "-I", "/p/inc",
+                              "-isystem", "/opt/cmsis", "-c", "/p/main.c"] }
+            ]
+            """;
+        var cmd = Assert.Single(BuildLogScraper.Parse(json));
+        Assert.Equal("/p/main.c", cmd.File);
+        Assert.Equal(new[] { "STM32F407xx", "USE_HAL" }, cmd.Defines);
+        Assert.Equal(new[] { "/p/inc", "/opt/cmsis" }, cmd.Includes);
+    }
+
+    [Fact]
+    public void CompileCommandsJson_MultipleEntries_OneCommandPerTU()
+    {
+        const string json = """
+            [
+              { "directory": "/p", "file": "/p/a.c", "command": "gcc -DA -Iinc -c /p/a.c" },
+              { "directory": "/p", "file": "/p/b.c", "command": "gcc -DB -c /p/b.c" }
+            ]
+            """;
+        var cmds = BuildLogScraper.Parse(json);
+        Assert.Equal(2, cmds.Count);
+        Assert.Contains(cmds, c => c.File == "/p/a.c" && c.Defines.Contains("A") && c.Includes.Contains("inc"));
+        Assert.Contains(cmds, c => c.File == "/p/b.c" && c.Defines.Contains("B"));
+    }
+
+    [Fact]
+    public void CompileCommandsJson_Malformed_ReturnsEmpty_NoThrow()
+    {
+        // A truncated/invalid DB must be tolerated (empty), exactly like an unrecognised log line — never fatal.
+        var ex = Record.Exception(() => Assert.Empty(BuildLogScraper.Parse("[ { \"file\": \"a.c\", \"command\": ")));
+        Assert.Null(ex);
+    }
+
+    [Fact]
+    public void ManifestJsonObject_IsNotMisreadAsCompileDb()
+    {
+        // The generator's ground-truth manifest is a JSON OBJECT ({...}), NOT a compile DB ([...]). Feeding it
+        // to --build-log by mistake must yield no bogus compile commands (only a leading '[' triggers JSON).
+        const string json = """{ "_meta": { "manifestVersion": 1 }, "symbols": { "func_0": { "def": "src_0.c:10", "refs": [] } } }""";
+        Assert.Empty(BuildLogScraper.Parse(json));
+    }
 }

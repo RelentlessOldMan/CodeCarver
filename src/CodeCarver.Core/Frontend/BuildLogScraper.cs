@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace CodeCarver.Core.Frontend;
 
 /// <summary>
@@ -11,6 +13,12 @@ namespace CodeCarver.Core.Frontend;
 /// <c>/D//I</c>), splits multi-source compile lines into one command each, honours a leading
 /// <c>cd DIR &amp;&amp;</c>, and skips link-only lines. Deliberately tolerant: an unrecognised line is
 /// skipped, never fatal.
+///
+/// <para>It ALSO accepts a <c>compile_commands.json</c> (a JSON array of <c>{directory,file,command}</c> or
+/// <c>{directory,file,arguments[]}</c> entries) — the format CMake and our synthetic generator emit, and
+/// the shape a real build's DB has when one exists. <see cref="Parse"/> auto-detects it (leading <c>[</c>)
+/// so the same <c>--build-log</c> flag consumes either a text log or a JSON DB. A malformed DB yields
+/// nothing rather than throwing, matching the text path's tolerance.</para>
 /// </summary>
 public static class BuildLogScraper
 {
@@ -29,6 +37,9 @@ public static class BuildLogScraper
 
     public static IReadOnlyList<CompileCommand> Parse(string log)
     {
+        if (string.IsNullOrEmpty(log)) return Array.Empty<CompileCommand>();
+        if (LooksLikeCompileDb(log)) return ParseCompileDb(log);   // compile_commands.json
+
         var results = new List<CompileCommand>();
         foreach (var line in JoinContinuations(log))
         {
@@ -56,6 +67,75 @@ public static class BuildLogScraper
         }
         return results;
     }
+
+    /// <summary>First non-whitespace char is <c>[</c> — a JSON array, i.e. a compile_commands.json (a text
+    /// build log never starts that way). BOM-tolerant.</summary>
+    private static bool LooksLikeCompileDb(string text)
+    {
+        foreach (var ch in text)
+        {
+            if (ch == '﻿' || char.IsWhiteSpace(ch)) continue; // skip BOM + leading whitespace
+            return ch == '[';
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Parse a compile_commands.json. Each entry may carry <c>command</c> (a full command string, tokenized
+    /// like a log line) or <c>arguments</c> (an argv array); the <c>file</c> field, when present, is the
+    /// authoritative translation unit. Same <c>-D</c>/<c>-I</c>/<c>-isystem</c> extraction as the text path.
+    /// Tolerant: malformed JSON, a non-array root, or an odd entry is skipped, never fatal.
+    /// </summary>
+    private static IReadOnlyList<CompileCommand> ParseCompileDb(string json)
+    {
+        var results = new List<CompileCommand>();
+        JsonDocument doc;
+        try { doc = JsonDocument.Parse(json, new JsonDocumentOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip }); }
+        catch (JsonException) { return results; }
+        using (doc)
+        {
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return results;
+            foreach (var entry in doc.RootElement.EnumerateArray())
+            {
+                if (entry.ValueKind != JsonValueKind.Object) continue;
+                var dir = GetString(entry, "directory") ?? ".";
+                var file = GetString(entry, "file");
+
+                List<string> tokens;
+                if (entry.TryGetProperty("arguments", out var argsEl) && argsEl.ValueKind == JsonValueKind.Array)
+                    tokens = argsEl.EnumerateArray().Where(x => x.ValueKind == JsonValueKind.String)
+                                   .Select(x => x.GetString()!).ToList();
+                else
+                {
+                    var cmd = GetString(entry, "command");
+                    if (cmd is null) continue;   // entry with neither command nor arguments — skip
+                    tokens = Tokenize(cmd);
+                }
+
+                // Drop the driver token (and any wrapper before it) like the text path; if none is
+                // recognised, keep all tokens so an explicit "file" entry still yields its flags.
+                var ci = IndexOfCompiler(tokens);
+                var args = ci >= 0 ? tokens.GetRange(ci + 1, tokens.Count - ci - 1) : tokens;
+                var (defines, includes) = ExtractFlags(args);
+
+                var sources = file is not null ? new List<string> { file } : args.Where(IsSourceFile).ToList();
+                if (sources.Count == 0) continue;
+                foreach (var src in sources)
+                    results.Add(new CompileCommand
+                    {
+                        File = src,
+                        Directory = dir,
+                        Arguments = args,
+                        Defines = defines,
+                        Includes = includes,
+                    });
+            }
+        }
+        return results;
+    }
+
+    private static string? GetString(JsonElement obj, string name)
+        => obj.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
 
     private static (IReadOnlyList<string> Defines, IReadOnlyList<string> Includes) ExtractFlags(List<string> args)
     {

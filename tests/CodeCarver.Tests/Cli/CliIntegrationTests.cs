@@ -306,6 +306,29 @@ public sealed class CliIntegrationTests
         finally { Cleanup(work); }
     }
 
+    [Fact]
+    public void Carve_BuildLog_AcceptsCompileCommandsJson()
+    {
+        // --build-log must consume a compile_commands.json (CMake + the synthetic generator emit this), not
+        // just a text log. Proven end to end: the CLI reports the scraped compile-command count.
+        var src = MakeTree(out var work);
+        try
+        {
+            var main = Path.Combine(src, "main.c");
+            var db = Path.Combine(work, "compile_commands.json");
+            File.WriteAllText(db, "[ { \"directory\": \"" + src.Replace("\\", "/") +
+                "\", \"file\": \"" + main.Replace("\\", "/") +
+                "\", \"command\": \"gcc -DFEATURE_X -I. -c main.c\" } ]");
+
+            var r = RunCli("carve", src, "--roots", "run", "--build-log", db);
+            if (r is null) return;
+            var (code, outp) = r.Value;
+            Assert.Equal(0, code);
+            Assert.Contains("compile command(s) scraped", outp); // the DB was parsed + used
+        }
+        finally { Cleanup(work); }
+    }
+
     private static void Cleanup(string work)
     {
         try { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); } catch { }
