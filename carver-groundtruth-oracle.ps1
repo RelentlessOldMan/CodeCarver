@@ -1,14 +1,16 @@
 # carver-groundtruth-oracle.ps1
-# Ground-truth SOUNDNESS + PRECISION oracle for CodeCarver, driven by the synthetic firmware corpus's
-# manifest (make-firmware-corpus.ps1 emits <out>-manifest.json: every func_i's def site + the sites that
-# call it). Because the generator KNOWS the true call graph, a carve becomes a pass/fail assertion with no
-# compiler: carve to a chosen root, and CodeCarver MUST keep every function transitively reachable from it
-# (soundness); anything extra is measured (precision). This is the strongest correctness test we can run
-# without a real build, and it works at 100 GB scale (giant register headers carry no call edges, so we
-# skip them via -MaxParseBytes to bound memory - correctness of the func chain is unaffected).
+# Ground-truth SOUNDNESS + PRECISION oracle for CodeCarver, driven by a CodeSpawner corpus's v1 manifest
+# (the vendored tools\codespawner\codespawner.exe emits <out>-manifest.json: _meta + a `symbols` map whose
+# `edges` are the true call graph). Because the generator KNOWS the call graph, a carve becomes a pass/fail
+# assertion with no compiler: carve to a chosen root, and CodeCarver MUST keep every function transitively
+# reachable from it (soundness); anything extra is measured (precision). This is the strongest correctness
+# test we can run without a real build, and it works at 100 GB scale (giant register headers carry no call
+# edges, so we skip them via -MaxParseBytes to bound memory - correctness of the func chain is unaffected).
 #
-# Usage:
-#   ./carver-groundtruth-oracle.ps1 -Corpus C:\Playground\CodeCompass\.corpus\_death
+# Generate a corpus first (see docs/USAGE.md in the CodeSpawner repo):
+#   tools\codespawner\codespawner.exe gen --out <tree> --scale 0.01 --giant-headers 0 --cfiles 30
+# Then:
+#   ./carver-groundtruth-oracle.ps1 -Corpus <tree>
 #   ./carver-groundtruth-oracle.ps1 -Corpus <tree> -Manifest <tree>-manifest.json -Root func_100
 [CmdletBinding()]
 param(
@@ -34,32 +36,33 @@ if (-not (Test-Path $Manifest)) { throw "manifest not found: $Manifest (generate
 
 Write-Host "== parsing ground-truth manifest ==" -ForegroundColor Cyan
 $m = Get-Content $Manifest -Raw | ConvertFrom-Json
-# Build: symbol -> def-file basename, and the CALL graph (caller -> callees). A ref site of symbol S lives
-# in the file of the function that CALLS S; that caller is whichever symbol is DEFINED in that file.
+
+# Assert the contract version BEFORE trusting the manifest. v1 (CodeSpawner) nests symbols under `symbols`,
+# carries `_meta`, and emits an EXPLICIT call graph as `edges` (symbol -> [symbols it calls]) - so we no
+# longer infer caller from a ref site's file. See tools\codespawner\manifest-schema.md.
+$ver = $m._meta.manifestVersion
+if ($ver -ne 1) { throw "manifest version $ver != 1 - this oracle speaks v1 (regenerate with a v1 CodeSpawner)" }
+$syms = $m.symbols
+Write-Host ("manifest v{0}, seed {1}, generator {2}" -f $ver, $m._meta.seed, $m._meta.generatorVersion)
+
+# symbol -> def-file basename (the seed-stable identity), and the call graph straight from `edges`.
 $defBase = @{}          # symbol -> def file basename (e.g. src_42.c)
-$defFileToSym = @{}     # normalized def file path -> symbol
-foreach ($p in $m.PSObject.Properties) {
+$calls   = @{}          # caller symbol -> list of callee symbols
+foreach ($p in $syms.PSObject.Properties) {
   $defFile = ($p.Value.def -replace ':\d+$','')
   $defBase[$p.Name] = [System.IO.Path]::GetFileName($defFile)
-  $defFileToSym[$defFile.ToLowerInvariant()] = $p.Name
-}
-$calls = @{}            # caller symbol -> list of callee symbols
-foreach ($p in $m.PSObject.Properties) {
-  $callee = $p.Name
-  foreach ($r in @($p.Value.refs)) {
-    if (-not $r) { continue }
-    $rf = ($r -replace ':\d+$','').ToLowerInvariant()
-    $caller = $defFileToSym[$rf]
-    if ($caller) {
-      if (-not $calls.ContainsKey($caller)) { $calls[$caller] = New-Object System.Collections.Generic.List[string] }
-      $calls[$caller].Add($callee)
-    }
+  # @($null).Count is 1 for an absent property, so filter to real edge names before counting.
+  $edges = @($p.Value.edges) | Where-Object { $_ }
+  if ($edges.Count -gt 0) {
+    $lst = New-Object System.Collections.Generic.List[string]
+    foreach ($e in $edges) { $lst.Add([string]$e) }
+    $calls[$p.Name] = $lst
   }
 }
 
 # Default root: the middle of the func_ chain (so the expected set is a strict subset -> precision matters).
 if (-not $Root) {
-  $idxs = @($m.PSObject.Properties.Name | Where-Object { $_ -match '^func_(\d+)$' } | ForEach-Object { [int]($_ -replace 'func_','') })
+  $idxs = @($syms.PSObject.Properties.Name | Where-Object { $_ -match '^func_(\d+)$' } | ForEach-Object { [int]($_ -replace 'func_','') })
   $mid = [int](($idxs | Measure-Object -Maximum).Maximum / 2)
   $Root = "func_$mid"
 }

@@ -12,7 +12,7 @@ namespace CodeCarver.Tests;
 /// In-process ground-truth carve oracle: a small synthetic firmware TU whose call graph is KNOWN, wired
 /// with the same root providers the CLI uses, then asserted against the true reachable/dead sets. This is
 /// the CI-safe (no compiler / no PowerShell / no WSL) permanent gate for the full-scale synthetic oracle
-/// in make-carver-corpus.ps1 + carver-oracle.ps1: it locks in that a carve rooted at main keeps exactly
+/// (carver-groundtruth-oracle.ps1 over a vendored-CodeSpawner corpus): it locks in that a carve rooted at main keeps exactly
 /// the reachable closure PLUS the implicit-root closures (vector table, constructor) and drops the dead
 /// chain -- the correctness property, not just "it didn't crash".
 /// </summary>

@@ -1,3 +1,6 @@
 # Shell scripts must stay LF — CRLF breaks the `#!/usr/bin/env bash` shebang under WSL/Linux
 # (`bad interpreter: .../bash^M`). These are run inside WSL by the linker-map / C++ link oracles.
 *.sh text eol=lf
+
+# The vendored CodeSpawner generator is a native-AOT binary — never apply text/EOL normalization.
+tools/codespawner/*.exe binary
