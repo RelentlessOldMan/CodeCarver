@@ -227,6 +227,23 @@ public sealed class CliIntegrationTests
         finally { Cleanup(work); }
     }
 
+    [Fact]
+    public void Carve_Diag_WritesPackage()
+    {
+        var src = MakeTree(out var work);
+        try
+        {
+            var zip = Path.Combine(work, "diag.zip");
+            var r = RunCli("carve", src, "--roots", "run", "--diag", zip);
+            if (r is null) return;
+            var (code, outp) = r.Value;
+            Assert.Equal(0, code);
+            Assert.True(File.Exists(zip));
+            Assert.Contains("diagnostic package", outp);
+        }
+        finally { Cleanup(work); }
+    }
+
     private static void Cleanup(string work)
     {
         try { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); } catch { }

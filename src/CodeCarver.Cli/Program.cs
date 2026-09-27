@@ -1,4 +1,5 @@
 using System.Reflection;
+using CodeCarver.Core.Diagnostics;
 using CodeCarver.Core.Emit;
 using CodeCarver.Core.Frontend;
 using CodeCarver.Core.Graph;
@@ -18,7 +19,23 @@ switch (cmd)
         RunDemo();
         return 0;
     case "carve":
-        return RunCarve(args);
+        // Top-level safety net: an UNEXPECTED exception (a bug, an odd I/O failure) must not dump a raw
+        // stack trace and die with an opaque code. Report it cleanly, and — if --diag was requested —
+        // still write the diagnostic package with the failure captured, so a crash is diagnosable too.
+        try { return RunCarve(args); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"carve failed unexpectedly: {ex.GetType().Name}: {ex.Message}");
+            if (DiagState.Report is { } rpt && DiagState.Path is { } dp)
+            {
+                rpt.SetFailure(ex);
+                if (rpt.TryWritePackage(dp, out var zp, out var derr))
+                    Console.Error.WriteLine($"  diag    : diagnostic package (with failure) written -> {zp}");
+                else
+                    Console.Error.WriteLine($"  warn    : could not write --diag package '{dp}' ({derr})");
+            }
+            return 1;
+        }
     case "scan-log":
         return RunScanLog(args);
     case "--version":
@@ -88,6 +105,7 @@ static int RunCarve(string[] args)
     var buildLogs = new List<string>();   // repeatable: the written log AND the stdout capture can differ
     var closedWorld = false;
     string? manifestPath = null;
+    string? diagPath = null;       // --diag: write ONE source-free, shareable diagnostic .zip for this run
     var excludeDirs = new List<string>();
     var auxGlobs = new List<string>();   // extra build files to copy verbatim into --out (Makefiles, .cmd, …)
     string? probeCompiler = null;
@@ -159,6 +177,8 @@ static int RunCarve(string[] args)
             closedWorld = true;
         else if (args[i] == "--manifest" && i + 1 < args.Length)
             manifestPath = args[++i];
+        else if (args[i] == "--diag" && i + 1 < args.Length)
+            diagPath = args[++i];
         else if (args[i] == "--exclude" && i + 1 < args.Length)
             excludeDirs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         else if (args[i] == "--aux" && i + 1 < args.Length)
@@ -192,7 +212,7 @@ static int RunCarve(string[] args)
             // --prun) just didn't apply and the carve looked fine -- exactly the silent-mistake class the evals
             // flag. Fail loudly.
             Console.Error.WriteLine($"unknown or incomplete option '{args[i]}'. try: carve <dir> --roots a,b [--lang c|cpp] "
-                                    + "[--prune] [--out DIR] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G]");
+                                    + "[--prune] [--out DIR] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G] [--diag Z]");
             return 2;
         }
     }
@@ -214,6 +234,25 @@ static int RunCarve(string[] args)
             return 2;
         }
     }
+
+    // Diagnostic collector for this run: a source-free snapshot (version/env/params/stats/warnings/timings)
+    // written to ONE shareable .zip on request via --diag, or automatically on an unhandled failure (the
+    // top-level handler in the dispatcher reads DiagState). Cheap to build unconditionally so breadcrumbs
+    // accumulate; only WRITTEN when --diag is set. Paths are redacted at write time (no username leaks).
+    var diag = DiagnosticReport.Start();
+    DiagState.Report = diag;
+    DiagState.Path = diagPath;
+    diag.Set("codecarverVersion", Version());
+    diag.Set("os", System.Runtime.InteropServices.RuntimeInformation.OSDescription);
+    diag.Set("runtime", System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription);
+    diag.Set("processArch", System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.ToString());
+    diag.Set("commandLine", "carve " + string.Join(" ", args.Skip(1)));
+    diag.Set("sourceRoot", dir);
+    diag.Set("lang", lang);
+    diag.Set("roots", roots);
+    diag.Set("prune", prune);
+    diag.Set("out", outDir);
+    diag.Event("args parsed");
 
     // Preprocessor config: explicit --define plus -D flags scraped from EVERY --build-log (parsed once here
     // and reused for include-dir resolution below). A named-but-missing log is a silent-config trap -> warn.
@@ -420,6 +459,7 @@ static int RunCarve(string[] args)
     void Mark(string phase)
     {
         if (_timing) Console.Error.WriteLine($"  timing  : {phase,-14} {_tsw.ElapsedMilliseconds,7} ms");
+        diag.Event($"phase {phase}: {_tsw.ElapsedMilliseconds} ms"); // breadcrumb for the diagnostic package
         _tsw.Restart();
     }
     Mark("input+refscan"); // time spent gathering inputs + reference includes above
@@ -442,6 +482,7 @@ static int RunCarve(string[] args)
         foreach (var w in fe.Warnings.Take(cap)) Console.Error.WriteLine("  warn    : " + w);
         if (fe.Warnings.Count > cap) Console.Error.WriteLine($"  warn    : (+{fe.Warnings.Count - cap} more warnings)");
     }
+    foreach (var w in fe.Warnings) diag.Warn(w); // full set (uncapped) into the diagnostic package
 
     var explicitRoots = new ExplicitRootProvider(symbols: roots).Discover(graph).ToList();
     // Per-root resolution. A firmware root set is a long hand-maintained list of ISRs/exported API
@@ -671,6 +712,17 @@ static int RunCarve(string[] args)
     var pct = originalBytes > 0 ? (double)saved / originalBytes : 0;
     Console.WriteLine($"  size    : {originalBytes:N0} B -> {carvedBytes:N0} B  ({pct:P0} smaller, saved {saved:N0} B)");
 
+    // Structured stats into the diagnostic package (numbers only — no source content).
+    diag.Set("totalNodes", s.TotalNodes);
+    diag.Set("keptNodes", s.ReachedNodes);
+    diag.Set("totalFiles", s.TotalFiles);
+    diag.Set("keptFiles", s.KeptFiles);
+    diag.Set("droppedFiles", s.DroppedFiles);
+    diag.Set("originalBytes", originalBytes);
+    diag.Set("carvedBytes", carvedBytes);
+    diag.Set("rootsUnresolved", unresolvedRoots.Count);
+    diag.Set("bigFilesKeptWhole", bigFiles.Count);
+
     // --verify: compiler-free soundness gate — no KEPT function may call an in-scope function that was
     // carved out (it wouldn't link). Catches an edge our model missed (a blind spot). C/C++ only.
     var verifyFailed = false;
@@ -723,6 +775,19 @@ static int RunCarve(string[] args)
         {
             Console.Error.WriteLine($"  warn    : could not write --manifest '{manifestPath}' ({ex.GetType().Name}: {ex.Message})");
         }
+    }
+
+    // Write the shareable diagnostic package on request. The carve already succeeded; a diag write failure
+    // only warns (spec §24 — the reporting system must never be the thing that fails the run).
+    diag.Set("verifyFailed", verifyFailed);
+    diag.Set("exitCode", verifyFailed ? 3 : 0);
+    diag.Event("run complete");
+    if (diagPath is not null)
+    {
+        if (diag.TryWritePackage(diagPath, out var zp, out var derr))
+            Console.WriteLine($"  diag    : diagnostic package written -> {zp}");
+        else
+            Console.Error.WriteLine($"  warn    : could not write --diag package '{diagPath}' ({derr})");
     }
     return verifyFailed ? 3 : 0; // non-zero so --verify is usable as a gate in scripts
 }
@@ -793,6 +858,15 @@ static void RunDemo()
     Console.WriteLine($"\n  indirection tax (safe - minimal): {tax} node(s) kept only because of");
     Console.WriteLine("    unresolved function pointers / vtables. Sound carve keeps them; the");
     Console.WriteLine("    minimal set would have dropped cmd_handler and broken the image.");
+}
+
+// Ambient handle to the active run's diagnostic collector so the top-level exception handler can write a
+// failure package without threading the report object out of RunCarve. Single-threaded CLI: one run, one
+// report; set at the start of RunCarve.
+static class DiagState
+{
+    public static DiagnosticReport? Report;
+    public static string? Path;
 }
 
 sealed class CarveConfig
