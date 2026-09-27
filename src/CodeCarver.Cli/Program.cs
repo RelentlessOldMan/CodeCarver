@@ -99,8 +99,25 @@ static int RunCarve(string[] args)
     for (var i = 2; i < args.Length - 1; i++)
     {
         if (args[i] != "--config") continue;
-        var cfg = System.Text.Json.JsonSerializer.Deserialize<CarveConfig>(File.ReadAllText(args[i + 1]),
-            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true, ReadCommentHandling = System.Text.Json.JsonCommentHandling.Skip });
+        // A missing or malformed --config is a config mistake, not a crash: report it with the file name
+        // and the parser's reason, then exit 2 (usage). Previously the raw JsonException/IOException blew
+        // out as an unhandled stack trace.
+        CarveConfig? cfg;
+        try
+        {
+            cfg = System.Text.Json.JsonSerializer.Deserialize<CarveConfig>(File.ReadAllText(args[i + 1]),
+                new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true, ReadCommentHandling = System.Text.Json.JsonCommentHandling.Skip });
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            Console.Error.WriteLine($"--config '{args[i + 1]}': not valid JSON ({ex.Message})");
+            return 2;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            Console.Error.WriteLine($"--config '{args[i + 1]}': could not read ({ex.GetType().Name}: {ex.Message})");
+            return 2;
+        }
         if (cfg is null) continue;
         if (cfg.Roots is not null) roots = cfg.Roots;
         if (cfg.Lang is not null) lang = cfg.Lang.ToLowerInvariant();
@@ -176,6 +193,24 @@ static int RunCarve(string[] args)
             // flag. Fail loudly.
             Console.Error.WriteLine($"unknown or incomplete option '{args[i]}'. try: carve <dir> --roots a,b [--lang c|cpp] "
                                     + "[--prune] [--out DIR] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G]");
+            return 2;
+        }
+    }
+
+    // --out must be DISJOINT from the scanned source tree. Emitting into (or onto) the tree we just read
+    // would overwrite the user's own source — catastrophically with --prune, whose EmitPruned writes the
+    // function-stripped file straight onto dst==src. The input tree is sacred; refuse before touching a
+    // single file (checked here, before the expensive scan/parse, so the failure is instant).
+    if (outDir is not null)
+    {
+        string outFull;
+        try { outFull = Path.GetFullPath(outDir); }
+        catch (Exception ex) { Console.Error.WriteLine($"--out '{outDir}' is not a usable path ({ex.GetType().Name}: {ex.Message})"); return 2; }
+        if (OutputPath.Overlaps(dir, outFull))
+        {
+            Console.Error.WriteLine($"--out must not be the source tree or nested within it (or vice versa): "
+                + $"source '{Path.GetFullPath(dir)}' overlaps out '{outFull}'. Emitting there would overwrite your "
+                + "source. Choose an output directory outside the scanned tree.");
             return 2;
         }
     }
@@ -485,9 +520,14 @@ static int RunCarve(string[] args)
         if (!File.Exists(tracePath)) { Console.Error.WriteLine($"--trace file not found: {tracePath}"); return 2; }
         System.Text.RegularExpressions.Regex? pat = null;
         if (traceFormat is not null)
-            try { pat = new System.Text.RegularExpressions.Regex(traceFormat); }
+            // A user-supplied pattern is applied to every line of a possibly huge trace; cap each match so a
+            // pathological (catastrophic-backtracking) pattern surfaces as a clean error rather than hanging.
+            try { pat = new System.Text.RegularExpressions.Regex(traceFormat, System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(2)); }
             catch (Exception ex) { Console.Error.WriteLine($"--trace-format is not a valid regex: {ex.Message}"); return 2; }
-        var traceNames = TraceFile.FunctionNames(TraceFile.Parse(File.ReadAllText(tracePath), pat));
+        IReadOnlyCollection<string> traceNames;
+        try { traceNames = TraceFile.FunctionNames(TraceFile.Parse(File.ReadAllText(tracePath), pat)); }
+        catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
+        { Console.Error.WriteLine("--trace-format took too long to match a trace line (catastrophic backtracking?) — simplify the pattern"); return 2; }
         traceTotal = traceNames.Count;
         traceRoots = new ExplicitRootProvider(symbols: traceNames).Discover(graph).ToList();
         if (traceTotal == 0)
@@ -670,9 +710,18 @@ static int RunCarve(string[] args)
             keptFiles = plan.KeptFiles,
             droppedFiles = plan.DroppedFiles,
         };
-        File.WriteAllText(manifestPath,
-            System.Text.Json.JsonSerializer.Serialize(manifest, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
-        Console.WriteLine($"  manifest: {manifestPath}");
+        // The carve itself already succeeded (and, with --out, is on disk); a manifest write failure must
+        // not fail the whole run or mask that result. Warn and keep the normal exit code.
+        try
+        {
+            File.WriteAllText(manifestPath,
+                System.Text.Json.JsonSerializer.Serialize(manifest, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            Console.WriteLine($"  manifest: {manifestPath}");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException or System.Security.SecurityException)
+        {
+            Console.Error.WriteLine($"  warn    : could not write --manifest '{manifestPath}' ({ex.GetType().Name}: {ex.Message})");
+        }
     }
     return verifyFailed ? 3 : 0; // non-zero so --verify is usable as a gate in scripts
 }

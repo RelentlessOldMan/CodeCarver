@@ -72,6 +72,9 @@ public static class BuildSupportEmitter
                 warnings.Add($"skipped '{rel}': destination would fall outside --out");
                 continue;
             }
+            // out overlapping source would make dst==src; File.Copy onto itself throws. The CLI refuses
+            // overlapping --out, but skip defensively for direct library callers.
+            if (string.Equals(Path.GetFullPath(p), dstFull, StringComparison.OrdinalIgnoreCase)) continue;
             var dd = Path.GetDirectoryName(dst);
             if (!string.IsNullOrEmpty(dd)) Directory.CreateDirectory(dd);
             File.Copy(p, dst, overwrite: true);

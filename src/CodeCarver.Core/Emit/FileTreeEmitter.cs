@@ -32,6 +32,7 @@ public static class FileTreeEmitter
             if (!File.Exists(src)) continue; // a header/path not present on disk (e.g. synthesized) — skip
 
             var dst = Path.Combine(outDir, rel);
+            if (SameFile(src, dst)) continue; // out overlaps source — never copy a file onto itself
             var dstDir = Path.GetDirectoryName(dst);
             if (!string.IsNullOrEmpty(dstDir))
                 Directory.CreateDirectory(dstDir);
@@ -121,6 +122,10 @@ public static class FileTreeEmitter
             if (!File.Exists(src)) continue;
 
             var dst = Path.Combine(outDir, rel);
+            // CRITICAL: out overlapping source would make dst==src, and the WriteAllText below would replace
+            // the user's source with its function-stripped version. The CLI already refuses overlapping
+            // --out; this is the last line of defence for direct library callers.
+            if (SameFile(src, dst)) continue;
             var dstDir = Path.GetDirectoryName(dst);
             if (!string.IsNullOrEmpty(dstDir))
                 Directory.CreateDirectory(dstDir);
@@ -138,6 +143,20 @@ public static class FileTreeEmitter
 
         CopyUnscannedIncludes(plan, sourceRoot, outDir, written, ref bytes);
         return new EmitResult(written.Count, bytes, written);
+    }
+
+    /// <summary>Do these two paths resolve to the same file on disk? Used to refuse writing a carved file
+    /// on top of its own source when <c>--out</c> overlaps the source tree. Path case is compared
+    /// per-platform; an unresolvable path is treated as "not the same" (the copy will fail loudly instead).</summary>
+    private static bool SameFile(string a, string b)
+    {
+        try
+        {
+            return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b),
+                OperatingSystem.IsWindows() || OperatingSystem.IsMacOS()
+                    ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+        }
+        catch { return false; }
     }
 
     private static readonly Regex LocalInclude = new(
@@ -186,6 +205,7 @@ public static class FileTreeEmitter
                 if (known.Contains(trel) || !copied.Add(trel)) continue; // graph-known or already copied
 
                 var dst = Path.Combine(outDir, trel);
+                if (SameFile(target, dst)) continue; // out overlaps source — don't copy onto the original
                 var dstDir = Path.GetDirectoryName(dst);
                 if (!string.IsNullOrEmpty(dstDir)) Directory.CreateDirectory(dstDir);
                 File.Copy(target, dst, overwrite: true);

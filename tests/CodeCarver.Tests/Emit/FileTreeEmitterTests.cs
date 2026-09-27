@@ -420,4 +420,35 @@ public class FileTreeEmitterTests
             if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
         }
     }
+
+    [Fact]
+    public void EmitPruned_OutEqualsSource_DoesNotDestroySourceFile()
+    {
+        // Catastrophe guard: if a caller points --out at the source tree, EmitPruned's in-place rewrite
+        // (File.WriteAllText onto dst==src) would replace the user's source with the function-stripped
+        // version. The SameFile guard must skip such files so the original is left byte-for-byte intact.
+        // (The CLI refuses overlapping --out outright; this pins the library-level last line of defence.)
+        var srcDir = Path.Combine(Path.GetTempPath(), "codecarver-selfcopy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(srcDir);
+        try
+        {
+            const string impl = "int keep(void){return 1;}\nint dead(void){return 2;}\nint run(void){return keep();}\n";
+            var file = Path.Combine(srcDir, "impl.c");
+            File.WriteAllText(file, impl);
+
+            using var fe = new CodeCarver.Frontend.CFrontEnd();
+            var graph = fe.BuildGraph(new[] { ("impl.c", impl) });
+            var roots = new ExplicitRootProvider(symbols: new[] { "run" }).Discover(graph).ToList();
+            var plan = ReachabilityEngine.Compute(graph, roots);
+
+            // out == source: every kept file's dst resolves to its own src.
+            FileTreeEmitter.EmitPruned(plan, graph, srcDir, srcDir);
+
+            Assert.Equal(impl, File.ReadAllText(file)); // untouched — dead() NOT stripped out of the original
+        }
+        finally
+        {
+            if (Directory.Exists(srcDir)) Directory.Delete(srcDir, recursive: true);
+        }
+    }
 }
