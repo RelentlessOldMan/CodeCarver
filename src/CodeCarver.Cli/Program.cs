@@ -658,9 +658,16 @@ static int RunCarve(string[] args)
     long carvedBytes;
     if (outDir is not null)
     {
+        // Crash-safe, non-destructive emit: every step writes into a private staging dir; the real --out is
+        // replaced in ONE atomic rename only after all steps succeed. A run killed mid-emit can't leave a
+        // half-written tree, and re-emitting can't pollute a prior good --out with stale (now-dropped) files
+        // (Spec_CrashRecovery §11/§41/§61). Disposal removes staging on any handled failure/early return.
+        using var staged = StagedOutput.Begin(outDir);
+        var stageDir = staged.Dir;
+
         var res = prune
-            ? FileTreeEmitter.EmitPruned(plan, graph, dir, outDir)
-            : FileTreeEmitter.Emit(plan, dir, outDir);
+            ? FileTreeEmitter.EmitPruned(plan, graph, dir, stageDir)
+            : FileTreeEmitter.Emit(plan, dir, stageDir);
         Mark("emit");
         carvedBytes = res.BytesWritten;
         var how = prune ? "pruned (intra-file: unreached functions removed)" : "file-level (whole kept files)";
@@ -674,7 +681,7 @@ static int RunCarve(string[] args)
             var keptBig = bigFiles.Select(b => b.Rel).Where(plan.KeptFiles.Contains).ToList();
             if (keptBig.Count > 0)
             {
-                var hc = HeaderCarver.Carve(outDir, keptBig);
+                var hc = HeaderCarver.Carve(stageDir, keptBig);
                 carvedBytes -= hc.BytesBefore - hc.BytesAfter; // those files shrank on disk
                 var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
                 Console.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} #defines kept, "
@@ -689,7 +696,7 @@ static int RunCarve(string[] args)
         // board/arch variants the same way it does for source.
         if (lang is "c" or "cpp")
         {
-            var sup = BuildSupportEmitter.Copy(dir, outDir, plan.KeptFiles, excludeDirs, auxGlobs);
+            var sup = BuildSupportEmitter.Copy(dir, stageDir, plan.KeptFiles, excludeDirs, auxGlobs);
             // Support files (.ld/.s/--aux) are copied VERBATIM -- identical bytes before and after. They
             // were never in `paths` (not parsed source), so counting them only in carvedBytes skewed the
             // headline (real eval-#2 bug: a module with big .s startup printed "-122% smaller"). Add the
@@ -701,6 +708,10 @@ static int RunCarve(string[] args)
                                   + (auxGlobs.Count > 0 ? " + --aux" : "") + ") so the carved tree links");
             foreach (var w in sup.Warnings) Console.Error.WriteLine($"  warn    : {w}");
         }
+
+        // Everything staged successfully — swap it into place atomically. Only now is any prior --out
+        // touched (moved aside, then deleted once the new tree is confirmed in place).
+        staged.Promote();
     }
     else
     {
