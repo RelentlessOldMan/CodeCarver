@@ -298,9 +298,12 @@ static int RunCarve(string[] args)
     MacroTable? defines;
 
     static string SpecName(string spec) { var eq = spec.IndexOf('='); return eq < 0 ? spec : spec[..eq]; }
-    static List<string> ConsistentDefines(IReadOnlyList<CompileCommand> cmds)
+    // Split a group of compile commands into: CONSISTENT (defined in EVERY command with one value -> definitely
+    // defined) and VARYING (defined in some-but-not-all, or with conflicting values -> UNKNOWN, keep both
+    // branches even under closed-world). A name never mentioned in the group stays absent (closed-world =
+    // undefined). This is the crux of per-TU soundness with --probe (eval-#12): "absent" and "varies" differ.
+    static (List<string> Consistent, List<string> Varying) AnalyzeDefines(IReadOnlyList<CompileCommand> cmds)
     {
-        // Keep a macro only if defined in EVERY command with a single consistent value (else it varies -> unknown).
         var specsByName = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         var defCount = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var cc in cmds)
@@ -310,8 +313,14 @@ static int RunCarve(string[] args)
                 if (!specsByName.TryGetValue(name, out var set)) specsByName[name] = set = new(StringComparer.Ordinal);
                 foreach (var d in cc.Defines) if (SpecName(d) == name) set.Add(d);
             }
-        return specsByName.Where(kv => defCount[kv.Key] == cmds.Count && kv.Value.Count == 1)
-                          .Select(kv => kv.Value.First()).ToList();
+        var consistent = new List<string>();
+        var varying = new List<string>();
+        foreach (var kv in specsByName)
+        {
+            if (defCount[kv.Key] == cmds.Count && kv.Value.Count == 1) consistent.Add(kv.Value.First());
+            else varying.Add(kv.Key);   // some-but-not-all, or conflicting values
+        }
+        return (consistent, varying);
     }
     string? CmdRel(CompileCommand cc)
     {
@@ -325,10 +334,11 @@ static int RunCarve(string[] args)
         catch { return null; }
     }
 
-    // Per-file consistent define SPECS from the build log (manual --define joins the shared base below, so
-    // it is applied to every file regardless).
-    var perFileSpecs = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-    var universalSpecs = new List<string>();
+    // Per-file (consistent, varying) define sets from the build log (manual --define joins the shared base
+    // below, so it is applied to every file regardless).
+    var perFileSpecs = new Dictionary<string, (List<string> Consistent, List<string> Varying)>(StringComparer.OrdinalIgnoreCase);
+    var universalConsistent = new List<string>();
+    var universalVarying = new List<string>();
     var byFileCount = 0;
     if (buildCmds.Count > 0)
     {
@@ -340,8 +350,8 @@ static int RunCarve(string[] args)
             if (!byFile.TryGetValue(rel, out var l)) byFile[rel] = l = new List<CompileCommand>();
             l.Add(cc);
         }
-        foreach (var kv in byFile) perFileSpecs[kv.Key] = ConsistentDefines(kv.Value);
-        universalSpecs = ConsistentDefines(buildCmds);
+        foreach (var kv in byFile) perFileSpecs[kv.Key] = AnalyzeDefines(kv.Value);
+        (universalConsistent, universalVarying) = AnalyzeDefines(buildCmds);
         byFileCount = byFile.Count;
     }
 
@@ -357,12 +367,14 @@ static int RunCarve(string[] args)
         else Console.Error.WriteLine($"  warning : --probe '{probeCompiler}' could not run; ignoring it (no probe-based #ifdef resolution)");
     }
 
-    // Shared base for every file's table: the probed macros (if any) else the manual --define set. Per-file
-    // consistent build-log specs are layered on top.
-    MacroTable BuildTable(List<string> specs)
+    // Shared base for every file's table: the probed macros (if any) else the manual --define set. A group's
+    // CONSISTENT specs are defined on top; its VARYING names are marked UNKNOWN so their #ifdef branches stay
+    // live even under closed-world (--probe / --assume-defines-complete). Absent names still follow closed-world.
+    MacroTable BuildTable(List<string> consistent, List<string> varying)
     {
         var t = probeBase is not null ? probeBase.Clone() : MacroTable.FromDefines(manualDefines);
-        foreach (var s in specs) t.Define(s);
+        foreach (var s in consistent) t.Define(s);
+        foreach (var n in varying) t.MarkUnknown(n);
         return t;
     }
 
@@ -373,24 +385,26 @@ static int RunCarve(string[] args)
     var includedCFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
     var haveDefines = manualDefines.Count > 0 || probeBase is not null
-                      || universalSpecs.Count > 0 || perFileSpecs.Values.Any(v => v.Count > 0);
+                      || universalConsistent.Count > 0 || universalVarying.Count > 0
+                      || perFileSpecs.Values.Any(v => v.Consistent.Count > 0 || v.Varying.Count > 0);
     if (buildCmds.Count > 0 && haveDefines)
     {
-        var universalTable = BuildTable(universalSpecs);
-        var perFile = perFileSpecs.ToDictionary(kv => kv.Key, kv => BuildTable(kv.Value), StringComparer.OrdinalIgnoreCase);
+        var universalTable = BuildTable(universalConsistent, universalVarying);
+        var perFile = perFileSpecs.ToDictionary(kv => kv.Key, kv => BuildTable(kv.Value.Consistent, kv.Value.Varying),
+                                                StringComparer.OrdinalIgnoreCase);
         perFileDefines = f => includedCFiles.Contains(f) ? universalTable
                               : (perFile.TryGetValue(f, out var t) ? t : universalTable);
         defines = universalTable;                 // fallback (files absent from the log; non-TreeSitter paths)
-        defineSpecs = manualDefines.Concat(universalSpecs).Distinct().ToList(); // summary/manifest
+        defineSpecs = manualDefines.Concat(universalConsistent).Distinct().ToList(); // summary/manifest
 
         var naive = buildCmds.SelectMany(c => c.Defines.Select(SpecName)).Distinct().Count();
         Console.Error.WriteLine($"  build   : {buildLogs.Distinct().Count()} build-log(s), {buildCmds.Count} compile command(s), "
-            + $"{byFileCount} file(s); per-file #ifdef config (universal {universalSpecs.Count}/{naive} macro(s); "
+            + $"{byFileCount} file(s); per-file #ifdef config (universal {universalConsistent.Count}/{naive} macro(s); "
             + "the rest vary per TU -> both branches kept)" + (probeBase is not null ? " on a probed base" : ""));
     }
     else
     {
-        defines = haveDefines ? BuildTable(new List<string>()) : null; // probe/manual only, or no config at all
+        defines = haveDefines ? BuildTable(new List<string>(), new List<string>()) : null; // probe/manual only, or none
     }
 
     var exts = lang switch

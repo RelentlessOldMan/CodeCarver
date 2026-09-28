@@ -20,6 +20,32 @@ public class PreprocessorScannerTests
         Assert.Equal(expected ? Tri.True : Tri.False, tri);
     }
 
+    [Fact]
+    public void ClosedWorld_UnknownMacro_KeepsBothIfdefBranches()
+    {
+        // eval-#12: a macro that VARIES across TUs is marked UNKNOWN; even under closed-world its #ifdef
+        // branches must all stay live (contrast: an ABSENT macro under closed-world drops the #ifdef branch).
+        var unknown = new MacroTable(); unknown.MarkUnknown("FEATURE");
+        var dead = PreprocessorScanner.DeadLineMap("#ifdef FEATURE\nA\n#else\nB\n#endif\n", unknown, closedWorld: true);
+        Assert.False(dead[2]);  // #ifdef branch (A) live
+        Assert.False(dead[4]);  // #else branch (B) live
+
+        var absent = new MacroTable();
+        var dead2 = PreprocessorScanner.DeadLineMap("#ifdef FEATURE\nA\n#else\nB\n#endif\n", absent, closedWorld: true);
+        Assert.True(dead2[2]);   // absent + closed-world => #ifdef dead
+        Assert.False(dead2[4]);  // #else live
+    }
+
+    [Fact]
+    public void ClosedWorld_UnknownMacro_InIfExpression_IsUnknown()
+    {
+        var t = new MacroTable(); t.MarkUnknown("VER");
+        // VER unknown => the comparison can't resolve => Unknown (both branches kept) even closed-world.
+        Assert.Equal(Tri.Unknown, PreprocessorScanner.EvaluateCondition("VER == 1", t, closedWorld: true));
+        // an absent macro under closed-world is 0 => the == resolves to False (definite)
+        Assert.Equal(Tri.False, PreprocessorScanner.EvaluateCondition("VER == 1", new MacroTable(), closedWorld: true));
+    }
+
     [Theory]
     [InlineData("defined(Z)")]                        // absent macro: unknown in open world (a header might define it)
     [InlineData("defined(A) && defined(Z)")]          // A true but Z unknown => unknown

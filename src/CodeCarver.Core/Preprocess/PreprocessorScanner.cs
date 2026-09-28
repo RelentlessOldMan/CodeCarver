@@ -73,11 +73,12 @@ public static class PreprocessorScanner
         switch (keyword)
         {
             case "ifdef":
-                // Known-defined => True; absent => False only under closed world, else Unknown (a header may define it).
-                Push(stack, active, table.IsDefined(FirstToken(rest)) ? Tri.True : (closedWorld ? Tri.False : Tri.Unknown));
+                // Known-defined => True; explicitly-unknown (e.g. varies per TU) => Unknown even under closed
+                // world; otherwise absent => False only under closed world, else Unknown (a header may define it).
+                Push(stack, active, DefinedTri(table, FirstToken(rest), closedWorld, whenDefined: Tri.True, whenAbsent: Tri.False));
                 break;
             case "ifndef":
-                Push(stack, active, table.IsDefined(FirstToken(rest)) ? Tri.False : (closedWorld ? Tri.True : Tri.Unknown));
+                Push(stack, active, DefinedTri(table, FirstToken(rest), closedWorld, whenDefined: Tri.False, whenAbsent: Tri.True));
                 break;
             case "if":
                 Push(stack, active, EvaluateCondition(rest, table, closedWorld));
@@ -99,6 +100,16 @@ public static class PreprocessorScanner
                 table.Undef(FirstToken(rest));
                 break;
         }
+    }
+
+    /// <summary>Tri-state for an ifdef/ifndef on <paramref name="name"/>: defined → <paramref name="whenDefined"/>;
+    /// explicitly unknown → Unknown (kept, even closed-world); absent → <paramref name="whenAbsent"/> only under
+    /// closed-world, else Unknown.</summary>
+    private static Tri DefinedTri(MacroTable table, string name, bool closedWorld, Tri whenDefined, Tri whenAbsent)
+    {
+        if (table.IsDefined(name)) return whenDefined;
+        if (table.IsUnknown(name)) return Tri.Unknown;
+        return closedWorld ? whenAbsent : Tri.Unknown;
     }
 
     private static void Push(Stack<Frame> stack, bool parentActive, Tri cond)
@@ -279,6 +290,7 @@ public static class PreprocessorScanner
                 var name = Next();
                 if (paren && !Eat(")")) throw new FormatException("missing ) after defined");
                 if (_table.IsDefined(name)) return 1;
+                if (_table.IsUnknown(name)) return null;        // varies per TU -> unknown, even closed-world
                 return _closedWorld ? 0 : null; // absent: definitely-0 only if the define set is complete
             }
 
@@ -291,7 +303,7 @@ public static class PreprocessorScanner
         private long? ResolveIdentifier(string name)
         {
             var value = _table.Value(name);
-            if (value is null) return _closedWorld ? 0 : null; // undefined: 0 only under closed world
+            if (value is null) return _table.IsUnknown(name) ? null : (_closedWorld ? 0 : null); // unknown wins over closed-world
             if (TryParseNumber(value, out var num)) return num;
             if (_depth > 16) return null;
             return new ExprParser(Tokenize(value), _table, _closedWorld, _depth + 1).ParseFull();

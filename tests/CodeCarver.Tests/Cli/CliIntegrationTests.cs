@@ -428,6 +428,38 @@ public sealed class CliIntegrationTests
     }
 
     [Fact]
+    public void Carve_BuildLog_ClosedWorld_VaryingMacro_KeepsBothBranches()
+    {
+        // eval-#12: under closed-world (--assume-defines-complete, same path --probe takes), a macro that
+        // VARIES across a file's compile commands must be treated as UNKNOWN, not absent-hence-undefined —
+        // else the #ifdef branch dies. impl.c compiled BOTH with and without -DFEATURE => both feat and other
+        // must be analyzed. (--assume-defines-complete exercises the closed-world path with no compiler.)
+        var work = Path.Combine(Path.GetTempPath(), "cc-cw-" + Guid.NewGuid().ToString("N"));
+        var proj = Path.Combine(work, "proj");
+        try
+        {
+            Directory.CreateDirectory(proj);
+            File.WriteAllText(Path.Combine(proj, "main.c"), "int main(void){return 0;}\n");
+            File.WriteAllText(Path.Combine(proj, "impl.c"),
+                "#ifdef FEATURE\nint feat(void){return 1;}\n#else\nint other(void){return 2;}\n#endif\n");
+            var d = proj.Replace("\\", "/");
+            var db = Path.Combine(work, "cc.json");
+            File.WriteAllText(db,
+                "[ {\"directory\":\"" + d + "\",\"file\":\"main.c\",\"arguments\":[\"gcc\",\"-c\",\"main.c\"]}," +
+                "  {\"directory\":\"" + d + "\",\"file\":\"impl.c\",\"arguments\":[\"gcc\",\"-DFEATURE\",\"-c\",\"impl.c\"]}," +
+                "  {\"directory\":\"" + d + "\",\"file\":\"impl.c\",\"arguments\":[\"gcc\",\"-c\",\"impl.c\"]} ]");
+
+            var r = RunCli("carve", proj, "--roots", "main", "--build-log", db, "--assume-defines-complete", "--dump-spans");
+            if (r is null) return;
+            var (code, outp) = r.Value;
+            Assert.Equal(0, code);
+            Assert.Contains("feat", outp);    // #ifdef branch analyzed (would be dropped by closed-world if absent, not unknown)
+            Assert.Contains("other", outp);   // #else branch analyzed
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
     public void Carve_OutIsAFile_RefusedUpFront()
     {
         var src = MakeTree(out var work);

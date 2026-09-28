@@ -8,10 +8,23 @@ namespace CodeCarver.Core.Preprocess;
 public sealed class MacroTable
 {
     private readonly Dictionary<string, string> _macros;
+    // Names that are explicitly UNKNOWN (neither definitely-defined nor definitely-undefined) — e.g. a macro
+    // that varies across a file's compile commands. The scanner treats these as unknown even under
+    // closed-world, so their #ifdef branches are all kept (sound). Distinct from "absent", which closed-world
+    // treats as undefined.
+    private readonly HashSet<string> _unknown;
 
-    public MacroTable() => _macros = new Dictionary<string, string>(StringComparer.Ordinal);
+    public MacroTable()
+    {
+        _macros = new Dictionary<string, string>(StringComparer.Ordinal);
+        _unknown = new HashSet<string>(StringComparer.Ordinal);
+    }
 
-    private MacroTable(Dictionary<string, string> macros) => _macros = macros;
+    private MacroTable(Dictionary<string, string> macros, HashSet<string> unknown)
+    {
+        _macros = macros;
+        _unknown = unknown;
+    }
 
     /// <summary>Build from <c>-D</c>-style specs: "NAME" (defined as 1) or "NAME=VALUE".</summary>
     public static MacroTable FromDefines(IEnumerable<string> defines)
@@ -31,14 +44,26 @@ public sealed class MacroTable
 
     public void Set(string name, string value)
     {
-        if (name.Length > 0) _macros[name] = value;
+        if (name.Length == 0) return;
+        _macros[name] = value;
+        _unknown.Remove(name); // a concrete definition wins over "unknown"
     }
 
     public void Undef(string name) => _macros.Remove(name);
 
+    /// <summary>Mark a name as UNKNOWN (varies / can't be resolved) so its branches are kept even under
+    /// closed-world. No-op if the name is already concretely defined.</summary>
+    public void MarkUnknown(string name)
+    {
+        if (name.Length > 0 && !_macros.ContainsKey(name)) _unknown.Add(name);
+    }
+
     public bool IsDefined(string name) => _macros.ContainsKey(name);
+
+    public bool IsUnknown(string name) => _unknown.Contains(name);
 
     public string? Value(string name) => _macros.TryGetValue(name, out var v) ? v : null;
 
-    public MacroTable Clone() => new(new Dictionary<string, string>(_macros, StringComparer.Ordinal));
+    public MacroTable Clone() => new(new Dictionary<string, string>(_macros, StringComparer.Ordinal),
+                                     new HashSet<string>(_unknown, StringComparer.Ordinal));
 }
