@@ -396,6 +396,38 @@ public sealed class CliIntegrationTests
     }
 
     [Fact]
+    public void Carve_BuildLog_UnityIncludedC_UsesUniversalConfig()
+    {
+        // eval-#11 fix #1: impl.c is compiled standalone with -DFEATURE, but also #included by unity.c
+        // (compiled WITHOUT it). Keying per-file config by path would give impl.c only its -DFEATURE config,
+        // killing the #else (other()) that unity.c's TU actually compiles. impl.c must fall back to the
+        // universal config -> both branches analyzed -> other() is extracted (visible in --dump-spans).
+        var work = Path.Combine(Path.GetTempPath(), "cc-unity-" + Guid.NewGuid().ToString("N"));
+        var proj = Path.Combine(work, "proj");
+        try
+        {
+            Directory.CreateDirectory(proj);
+            File.WriteAllText(Path.Combine(proj, "main.c"), "int run_unity(void);\nint main(void){return run_unity();}\n");
+            File.WriteAllText(Path.Combine(proj, "unity.c"), "#include \"impl.c\"\nint run_unity(void){return other();}\n");
+            File.WriteAllText(Path.Combine(proj, "impl.c"),
+                "#ifdef FEATURE\nint feat(void){return 1;}\n#else\nint other(void){return 2;}\n#endif\n");
+            var d = proj.Replace("\\", "/");
+            var db = Path.Combine(work, "cc.json");
+            File.WriteAllText(db,
+                "[ {\"directory\":\"" + d + "\",\"file\":\"main.c\",\"arguments\":[\"gcc\",\"-c\",\"main.c\"]}," +
+                "  {\"directory\":\"" + d + "\",\"file\":\"unity.c\",\"arguments\":[\"gcc\",\"-c\",\"unity.c\"]}," +
+                "  {\"directory\":\"" + d + "\",\"file\":\"impl.c\",\"arguments\":[\"gcc\",\"-DFEATURE\",\"-c\",\"impl.c\"]} ]");
+
+            var r = RunCli("carve", proj, "--roots", "main", "--build-log", db, "--dump-spans");
+            if (r is null) return;
+            var (code, outp) = r.Value;
+            Assert.Equal(0, code);
+            Assert.Contains("other", outp);   // #else branch analyzed -> impl.c used the universal config
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
     public void Carve_OutIsAFile_RefusedUpFront()
     {
         var src = MakeTree(out var work);

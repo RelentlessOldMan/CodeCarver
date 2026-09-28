@@ -325,6 +325,11 @@ static int RunCarve(string[] args)
         catch { return null; }
     }
 
+    // Per-file consistent define SPECS from the build log (manual --define joins the shared base below, so
+    // it is applied to every file regardless).
+    var perFileSpecs = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+    var universalSpecs = new List<string>();
+    var byFileCount = 0;
     if (buildCmds.Count > 0)
     {
         var byFile = new Dictionary<string, List<CompileCommand>>(StringComparer.OrdinalIgnoreCase);
@@ -335,38 +340,57 @@ static int RunCarve(string[] args)
             if (!byFile.TryGetValue(rel, out var l)) byFile[rel] = l = new List<CompileCommand>();
             l.Add(cc);
         }
-        var universalSpecs = manualDefines.Concat(ConsistentDefines(buildCmds)).Distinct().ToList();
-        var universalTable = universalSpecs.Count > 0 ? MacroTable.FromDefines(universalSpecs) : null;
-        var perFile = new Dictionary<string, MacroTable?>(StringComparer.OrdinalIgnoreCase);
-        foreach (var kv in byFile)
-        {
-            var specs = manualDefines.Concat(ConsistentDefines(kv.Value)).Distinct().ToList();
-            perFile[kv.Key] = specs.Count > 0 ? MacroTable.FromDefines(specs) : null;
-        }
-        perFileDefines = f => perFile.TryGetValue(f, out var t) ? t : universalTable;
-        defines = universalTable; // fallback (files absent from the log; non-TreeSitter paths)
-        defineSpecs = universalSpecs; // what the summary/manifest report as the globally-applied set
+        foreach (var kv in byFile) perFileSpecs[kv.Key] = ConsistentDefines(kv.Value);
+        universalSpecs = ConsistentDefines(buildCmds);
+        byFileCount = byFile.Count;
+    }
+
+    // --probe: ask a real compiler for its PREDEFINED + target macros (plus manual --define) as a closed-world
+    // BASE. Deliberately WITHOUT the build log's per-TU -D: unioning those into one global probe would drop
+    // the #else branch a differently-configured TU compiles (the eval-#9 union bug, back under --probe —
+    // eval-#11). The per-file consistent build-log defines are layered ON TOP of this base, per file.
+    MacroTable? probeBase = null;
+    if (probeCompiler is not null)
+    {
+        probeBase = MacroProbe.Probe(probeCompiler, manualDefines.Select(d => "-D" + d));
+        if (probeBase is not null) closedWorld = true;
+        else Console.Error.WriteLine($"  warning : --probe '{probeCompiler}' could not run; ignoring it (no probe-based #ifdef resolution)");
+    }
+
+    // Shared base for every file's table: the probed macros (if any) else the manual --define set. Per-file
+    // consistent build-log specs are layered on top.
+    MacroTable BuildTable(List<string> specs)
+    {
+        var t = probeBase is not null ? probeBase.Clone() : MacroTable.FromDefines(manualDefines);
+        foreach (var s in specs) t.Define(s);
+        return t;
+    }
+
+    // A logged .c that is ALSO #included by another TU (unity/jumbo build, or "#include the .c" for a table
+    // /template) is compiled under the includer's config too — its own per-file config would be unsound
+    // (eval-#11), so fall back to the UNIVERSAL set for it. Populated after the file scan (needs the include
+    // text); consulted by the closure below.
+    var includedCFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    var haveDefines = manualDefines.Count > 0 || probeBase is not null
+                      || universalSpecs.Count > 0 || perFileSpecs.Values.Any(v => v.Count > 0);
+    if (buildCmds.Count > 0 && haveDefines)
+    {
+        var universalTable = BuildTable(universalSpecs);
+        var perFile = perFileSpecs.ToDictionary(kv => kv.Key, kv => BuildTable(kv.Value), StringComparer.OrdinalIgnoreCase);
+        perFileDefines = f => includedCFiles.Contains(f) ? universalTable
+                              : (perFile.TryGetValue(f, out var t) ? t : universalTable);
+        defines = universalTable;                 // fallback (files absent from the log; non-TreeSitter paths)
+        defineSpecs = manualDefines.Concat(universalSpecs).Distinct().ToList(); // summary/manifest
 
         var naive = buildCmds.SelectMany(c => c.Defines.Select(SpecName)).Distinct().Count();
-        var universalCount = universalSpecs.Count - manualDefines.Count;
         Console.Error.WriteLine($"  build   : {buildLogs.Distinct().Count()} build-log(s), {buildCmds.Count} compile command(s), "
-            + $"{byFile.Count} file(s); per-file #ifdef config (universal {universalCount}/{naive} macro(s); "
-            + "the rest vary per TU -> both branches kept)");
+            + $"{byFileCount} file(s); per-file #ifdef config (universal {universalSpecs.Count}/{naive} macro(s); "
+            + "the rest vary per TU -> both branches kept)" + (probeBase is not null ? " on a probed base" : ""));
     }
     else
     {
-        defines = manualDefines.Count > 0 ? MacroTable.FromDefines(manualDefines) : null;
-    }
-
-    // --probe: ask a real compiler for its complete macro set (predefined + target + -D) and resolve
-    // #ifdefs against that in closed-world mode — accurate, no "is my define list complete?" guessing.
-    // Probe is a GLOBAL closed-world table, so it supersedes the per-file map.
-    if (probeCompiler is not null)
-    {
-        var probeArgs = manualDefines.Concat(buildCmds.SelectMany(c => c.Defines)).Distinct().Select(d => "-D" + d);
-        var probed = MacroProbe.Probe(probeCompiler, probeArgs);
-        if (probed is not null) { defines = probed; closedWorld = true; perFileDefines = null; }
-        else Console.Error.WriteLine($"  warning : --probe '{probeCompiler}' could not run; ignoring it (no probe-based #ifdef resolution)");
+        defines = haveDefines ? BuildTable(new List<string>()) : null; // probe/manual only, or no config at all
     }
 
     var exts = lang switch
@@ -554,6 +578,39 @@ static int RunCarve(string[] args)
         "cmm" => new CmmFrontEnd(),
         _ => new CFrontEnd(),
     };
+
+    // eval-#11 fix #1: a logged .c that is #included by ANOTHER TU (unity/jumbo, or "#include the .c") is
+    // compiled under that includer's config too, so its own per-file define set is unsound. Detect such
+    // files (any source-extension local include whose basename matches a logged file) and route them to the
+    // universal set via includedCFiles. Over-approximate by basename = sound (universal keeps both branches).
+    if (perFileSpecs.Count > 0)
+    {
+        var srcExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++" };
+        var keysByBase = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var k in perFileSpecs.Keys)
+        {
+            var b = Path.GetFileName(k);
+            if (!keysByBase.TryGetValue(b, out var l)) keysByBase[b] = l = new List<string>();
+            l.Add(k);
+        }
+        var incRe = new System.Text.RegularExpressions.Regex("^\\s*#\\s*include\\s+\"([^\"]+)\"",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+        foreach (var (rel, text) in inputs)
+        {
+            if (text.Length == 0 || !text.Contains("#include", StringComparison.Ordinal)) continue;
+            foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
+            {
+                var incBase = Path.GetFileName(m.Groups[1].Value);
+                if (!srcExts.Any(e => incBase.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue;
+                if (keysByBase.TryGetValue(incBase, out var keys))
+                    foreach (var k in keys) if (!string.Equals(k, rel, StringComparison.OrdinalIgnoreCase)) includedCFiles.Add(k);
+            }
+        }
+        if (includedCFiles.Count > 0)
+            Console.Error.WriteLine($"  build   : {includedCFiles.Count} logged .c file(s) are #included by another TU "
+                + "-> using the universal #ifdef config for them (unity/jumbo-safe)");
+    }
+
     if (fe is TreeSitterFrontEnd tsfe)
     {
         if (parseTimeoutMs is not null) tsfe.ParseBudgetMs = parseTimeoutMs.Value;
