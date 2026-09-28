@@ -172,13 +172,21 @@ public sealed class CliIntegrationTests
         try
         {
             Directory.CreateDirectory(proj);
-            // ~1.5 MB of pure #defines -> macro-dense (>= 1 MB and >60% #define lines).
-            var regs = new System.Text.StringBuilder(1_600_000);
-            for (int i = 0; i < 60_000; i++) regs.Append("#define REG_").Append(i).Append(" 0x").Append(i.ToString("X6")).Append('\n');
+            // ~1.7 MB of pure #defines -> macro-dense (>= 1 MB and >60% #define lines). N_DEFINES is large so
+            // the "one graph node per #define" explosion is unmistakable: parsing this would add ~60k Macro
+            // nodes (the eval-#14 memory blowup); the fix must keep it whole so those nodes never exist.
+            const int N_DEFINES = 60_000;
+            var regs = new System.Text.StringBuilder(1_700_000);
+            for (int i = 0; i < N_DEFINES; i++) regs.Append("#define REG_").Append(i).Append(" 0x").Append(i.ToString("X6")).Append('\n');
             File.WriteAllText(Path.Combine(proj, "regs.h"), regs.ToString());
-            // ~1.3 MB of ordinary code -> NOT dense (mostly non-#define lines); must still be parsed.
-            var bulk = new System.Text.StringBuilder(1_400_000);
-            for (int i = 0; i < 40_000; i++) bulk.Append("int fn_").Append(i).Append("(void){ return ").Append(i).Append("; }\n");
+            // ~1.1 MB of ordinary code -> NOT dense (mostly non-#define lines); must still be parsed. Only a
+            // few thousand functions (padded to size), so a correct run's total node count stays well under
+            // the >60k it would be if regs.h had been parsed -- that gap is the regression assertion below.
+            const int N_FUNCS = 3_000;
+            var pad = new string('x', 320); // comment padding to push each line past the big-file worker floor
+            var bulk = new System.Text.StringBuilder(1_200_000);
+            for (int i = 0; i < N_FUNCS; i++)
+                bulk.Append("int fn_").Append(i).Append("(void){ return ").Append(i).Append("; } /* ").Append(pad).Append(" */\n");
             File.WriteAllText(Path.Combine(proj, "bulk.c"), bulk.ToString());
             File.WriteAllText(Path.Combine(proj, "main.c"),
                 "#include \"regs.h\"\nint run(void){return REG_1;}\nint main(void){return run();}\n");
@@ -194,6 +202,19 @@ public sealed class CliIntegrationTests
             Assert.Contains("regs.h", denseLine);
             Assert.DoesNotContain("bulk.c", denseLine);
             Assert.Contains("bulk.c", outp);                                  // present (parsed), just not dense
+
+            // THE MECHANISM ASSERTION: the eval-#14 blowup was one graph node per #define. The 'nodes : R/T'
+            // line reports total graph nodes T. bulk.c contributes ~N_FUNCS nodes; if regs.h had been parsed
+            // T would exceed N_DEFINES (~60k). Assert T is far below that -> the 60k defines became ZERO nodes
+            // (header kept whole, no explosion). This pins the actual cause, deterministically, without the
+            // flakiness of measuring RAM.
+            var nodesMatch = System.Text.RegularExpressions.Regex.Match(outp, @"nodes\s*:\s*[\d,]+/([\d,]+)\s+kept");
+            Assert.True(nodesMatch.Success, "expected a 'nodes : R/T kept' line; got:\n" + outp);
+            var totalNodes = long.Parse(nodesMatch.Groups[1].Value.Replace(",", ""));
+            Assert.True(totalNodes < 20_000,
+                $"total graph nodes = {totalNodes:N0}; expected < 20,000. A count near/above {N_DEFINES:N0} means " +
+                "the dense header was parsed (one node per #define) — the eval-#14 explosion regressed.");
+
             Assert.True(File.Exists(Path.Combine(outDir, "regs.h")));         // kept whole (via #include-closure)
             Assert.Equal(regs.ToString(), File.ReadAllText(Path.Combine(outDir, "regs.h"))); // verbatim, unmodified
         }
