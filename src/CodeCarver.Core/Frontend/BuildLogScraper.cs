@@ -139,14 +139,28 @@ public static class BuildLogScraper
 
     private static (IReadOnlyList<string> Defines, IReadOnlyList<string> Includes) ExtractFlags(List<string> args)
     {
-        var defines = new List<string>();
+        // Effective defines with LAST-WINS semantics: the compiler applies -D/-U left to right, so
+        // `-DFEATURE -UFEATURE` leaves FEATURE UNDEFINED (and `-UX -DX=1` leaves it defined). Model it with a
+        // name-keyed map: -D sets, -U removes; the map holds the net state. Ignoring -U (the old behavior)
+        // wrongly kept the #ifdef branch of a macro the build explicitly undefined (eval-#9).
+        var eff = new Dictionary<string, string?>(StringComparer.Ordinal);
         var includes = new List<string>();
+        void Define(string spec)
+        {
+            if (spec.Length == 0) return;
+            var eq = spec.IndexOf('=');
+            if (eq < 0) eff[spec] = null; else eff[spec[..eq]] = spec[(eq + 1)..];
+        }
+        void Undef(string name) { if (name.Length > 0) eff.Remove(name); }
         for (var i = 0; i < args.Count; i++)
         {
             var a = args[i];
-            if (a is "-D" or "/D") { if (i + 1 < args.Count) defines.Add(args[++i]); }
+            if (a is "-D" or "/D") { if (i + 1 < args.Count) Define(args[++i]); }
             else if (a.StartsWith("-D", StringComparison.Ordinal) || a.StartsWith("/D", StringComparison.Ordinal))
-                defines.Add(a[2..]);
+                Define(a[2..]);
+            else if (a is "-U" or "/U") { if (i + 1 < args.Count) Undef(args[++i]); }
+            else if (a.StartsWith("-U", StringComparison.Ordinal) || a.StartsWith("/U", StringComparison.Ordinal))
+                Undef(a[2..]);
             else if (a is "-I" or "/I") { if (i + 1 < args.Count) includes.Add(args[++i]); }
             // -isystem / -iquote / -idirafter DIR: the other GCC/Clang include-search forms, used heavily by
             // embedded builds for toolchain / CMSIS / HAL headers. They take the dir as the NEXT token. Feeding
@@ -156,6 +170,7 @@ public static class BuildLogScraper
             else if (a.StartsWith("-I", StringComparison.Ordinal) || a.StartsWith("/I", StringComparison.Ordinal))
                 includes.Add(a[2..]);
         }
+        var defines = eff.Select(kv => kv.Value is null ? kv.Key : $"{kv.Key}={kv.Value}").ToList();
         return (defines, includes);
     }
 
@@ -242,14 +257,24 @@ public static class BuildLogScraper
         if (pending.Length > 0) yield return pending;
     }
 
-    /// <summary>Whitespace tokenizer honouring single/double quotes.</summary>
+    /// <summary>Whitespace tokenizer honouring single/double quotes, with backslash-escaped quotes. A
+    /// compile_commands.json <c>command</c> string carries shell escaping, so <c>-DVER=\"1.0\"</c> must keep
+    /// its quotes and <c>-I\"path\"</c> must NOT become a literal-backslash dir (eval-#9). Only <c>\"</c> and
+    /// <c>\'</c> are treated as escapes; a bare <c>\</c> (Windows path separators, which live inside quotes
+    /// here) is kept literally so <c>C:\foo</c> is unharmed.</summary>
     private static List<string> Tokenize(string line)
     {
         var tokens = new List<string>();
         var cur = new System.Text.StringBuilder();
         var quote = '\0';
-        foreach (var ch in line)
+        for (var i = 0; i < line.Length; i++)
         {
+            var ch = line[i];
+            // Shell-escaped quote (\" or \'): consume the backslash and treat the quote as a NORMAL quote —
+            // it groups (so -I\"inc dir\" is one dir) and is stripped (so -DVER=\"1.0\" -> VER=1.0, and
+            // -I\"path\" -> path, not a literal-backslash/quote dir). Only quotes are unescaped; a bare
+            // backslash (Windows separators, inside quotes here) is left literal so C:\foo survives.
+            if (ch == '\\' && i + 1 < line.Length && (line[i + 1] is '"' or '\'')) ch = line[++i];
             if (quote != '\0')
             {
                 if (ch == quote) quote = '\0';

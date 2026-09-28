@@ -236,6 +236,13 @@ static int RunCarve(string[] args)
                 + "source. Choose an output directory outside the scanned tree.");
             return 2;
         }
+        // --out is an existing FILE, not a directory: refuse up front (exit 2) rather than run the whole
+        // carve and then fail at promote (eval-#9 LOW).
+        if (File.Exists(outFull))
+        {
+            Console.Error.WriteLine($"--out '{outFull}' is a file, not a directory. Choose a directory path for the carved tree.");
+            return 2;
+        }
         // Never destroy data we didn't create. The emit atomically REPLACES --out (staging is promoted over
         // it), so a --out pointing at a checkout, a home dir, or any pre-existing folder would wipe it. Only
         // proceed when --out is empty/absent, was itself produced by CodeCarver (carries the marker — the
@@ -383,9 +390,24 @@ static int RunCarve(string[] args)
         // Search dirs for non-sibling resolution: the -I/-isystem dirs from EVERY --build-log (the real build
         // finds an .inc via -I from ANOTHER subdirectory — resolving only beside the includer dropped it
         // silently and the carved tree wouldn't compile: eval-#4 BUG 1). Reuses the already-parsed buildCmds.
+        //
+        // CRITICAL: resolve each command's -I against THAT COMMAND'S working directory (compile_commands
+        // 'directory', or a text log's leading `cd`), NOT the carve root. A relative `-Icfg` from
+        // proj/src/app means proj/src/app/cfg — resolving it against the carve root would silently pick a
+        // same-named proj/cfg and emit the WRONG include, making a DB-supplied carve LESS sound than the
+        // basename fallback (eval-#9 HIGH). An absolute 'directory' (the JSON-DB norm) is used as-is; a
+        // relative or "." directory is taken under the carve root. Out-of-tree resolutions are dropped by
+        // the in-tree check in TryCand below, falling back to the (sound, warning) basename search.
         var searchDirs = new List<string>();
-        foreach (var incDir in buildCmds.SelectMany(c => c.Includes).Distinct())
-            try { var f = Path.GetFullPath(Path.Combine(dir, incDir)); if (Directory.Exists(f)) searchDirs.Add(f); } catch { }
+        foreach (var c in buildCmds)
+        {
+            string baseDir;
+            try { baseDir = Path.IsPathFullyQualified(c.Directory) ? c.Directory : Path.GetFullPath(Path.Combine(dir, c.Directory)); }
+            catch { baseDir = Path.GetFullPath(dir); }
+            foreach (var incDir in c.Includes)
+                try { var f = Path.GetFullPath(Path.Combine(baseDir, incDir)); if (Directory.Exists(f)) searchDirs.Add(f); } catch { }
+        }
+        searchDirs = searchDirs.Distinct().ToList();
 
         // Last-resort basename index of EVERY file in the tree (names only — cheap even on a huge tree),
         // built lazily on the first include that neither a sibling nor a -I dir resolves.
@@ -736,9 +758,10 @@ static int RunCarve(string[] args)
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            Console.Error.WriteLine($"  error   : the carve succeeded ({res.FilesWritten} files staged) but the final "
-                + $"swap into {outDir} failed ({ex.GetType().Name}: {ex.Message}). Your previous {outDir} is unchanged. "
-                + "This is usually a transient AV/indexer lock — retry, or use a fresh --out.");
+            Console.Error.WriteLine($"  error   : the carve succeeded ({res.FilesWritten} files staged) but writing it "
+                + $"into {outDir} failed ({ex.GetType().Name}: {ex.Message}). Your previous {outDir} is unchanged. "
+                + "Likely a process holding a file open — or a shell whose current directory is — inside "
+                + $"{outDir} (e.g. 'cd out && make'), or a transient AV/indexer lock. Close it (or use a fresh --out) and retry.");
             diag.SetFailure(ex);
             if (diagPath is not null && diag.TryWritePackage(diagPath, out var zpf, out _))
                 Console.Error.WriteLine($"  diag    : diagnostic package (with failure) written -> {zpf}");

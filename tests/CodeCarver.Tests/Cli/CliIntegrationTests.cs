@@ -329,6 +329,55 @@ public sealed class CliIntegrationTests
         finally { Cleanup(work); }
     }
 
+    [Fact]
+    public void Carve_BuildLogRelativeInclude_ResolvesAgainstEntryDirectory_NotCarveRoot()
+    {
+        // eval-#9 HIGH: a relative -I in a compile_commands.json entry must resolve against THAT entry's
+        // 'directory', not the carve root. main.c (in src/app) includes "table.inc"; the real one is in
+        // src/app/cfg (via -Icfg from directory=src/app); a same-named DECOY sits at the carve root's cfg/.
+        // Resolving -Icfg against the carve root would wrongly emit the decoy and drop the real file.
+        var work = Path.Combine(Path.GetTempPath(), "cc-idir-" + Guid.NewGuid().ToString("N"));
+        var proj = Path.Combine(work, "proj");
+        var app = Path.Combine(proj, "src", "app");
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(app, "cfg"));
+            Directory.CreateDirectory(Path.Combine(proj, "cfg"));
+            File.WriteAllText(Path.Combine(app, "main.c"), "#include \"table.inc\"\nint main(void){return 0;}\n");
+            File.WriteAllText(Path.Combine(app, "cfg", "table.inc"), "/* REAL */\n");
+            File.WriteAllText(Path.Combine(proj, "cfg", "table.inc"), "/* DECOY */\n");
+            var db = Path.Combine(work, "cc.json");
+            File.WriteAllText(db, "[ { \"directory\": \"" + app.Replace("\\", "/") +
+                "\", \"file\": \"main.c\", \"arguments\": [\"gcc\", \"-Icfg\", \"-c\", \"main.c\"] } ]");
+            var outDir = Path.Combine(work, "out");
+
+            var r = RunCli("carve", proj, "--roots", "main", "--build-log", db, "--out", outDir);
+            if (r is null) return;
+            var (code, _) = r.Value;
+            Assert.Equal(0, code);
+            Assert.True(File.Exists(Path.Combine(outDir, "src", "app", "cfg", "table.inc")));  // REAL kept
+            Assert.False(File.Exists(Path.Combine(outDir, "cfg", "table.inc")));               // DECOY not emitted
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Carve_OutIsAFile_RefusedUpFront()
+    {
+        var src = MakeTree(out var work);
+        try
+        {
+            var f = Path.Combine(work, "notadir.txt");
+            File.WriteAllText(f, "x");
+            var r = RunCli("carve", src, "--roots", "run", "--out", f);
+            if (r is null) return;
+            var (code, outp) = r.Value;
+            Assert.Equal(2, code);
+            Assert.Contains("is a file", outp);
+        }
+        finally { Cleanup(work); }
+    }
+
     private static void Cleanup(string work)
     {
         try { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); } catch { }

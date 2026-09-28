@@ -187,6 +187,37 @@ public sealed class StagedOutputTests
         finally { Cleanup(work); }
     }
 
+    [Fact]
+    public void Promote_PriorOutHasOpenFile_StillLands_ViaInPlaceFallback()
+    {
+        // eval-#9 MEDIUM: a process holding a file open in the prior --out (or a shell cwd'd there) blocks the
+        // directory move-aside. Promote must fall back to replacing contents IN PLACE so the carve still
+        // lands, instead of failing every re-carve. (Windows lock semantics; skip elsewhere.)
+        if (!OperatingSystem.IsWindows()) return;
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            using (var s1 = StagedOutput.Begin(outDir))
+            {
+                File.WriteAllText(Path.Combine(s1.Dir, "keep.c"), "old");
+                File.WriteAllText(Path.Combine(s1.Dir, "stale.c"), "x"); // dropped by the next carve
+                s1.Promote();
+            }
+            using var s2 = StagedOutput.Begin(outDir);
+            File.WriteAllText(Path.Combine(s2.Dir, "keep.c"), "new");    // only keep.c this time
+            // Hold keep.c open with write-sharing — the common "a tool/shell has something open in out" case.
+            using (var _ = new FileStream(Path.Combine(outDir, "keep.c"), FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                var ex = Record.Exception(() => s2.Promote());
+                Assert.Null(ex);                                        // must not fail the whole carve
+            }
+            Assert.Equal("new", File.ReadAllText(Path.Combine(outDir, "keep.c"))); // landed
+            Assert.False(File.Exists(Path.Combine(outDir, "stale.c")));            // stale dropped
+        }
+        finally { Cleanup(work); }
+    }
+
     private static void Cleanup(string work)
     {
         try { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); } catch { }

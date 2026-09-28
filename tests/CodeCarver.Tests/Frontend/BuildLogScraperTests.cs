@@ -202,6 +202,38 @@ public class BuildLogScraperTests
     }
 
     [Fact]
+    public void Undef_LastWins_OverDefine()
+    {
+        // The compiler applies -D/-U left-to-right; ignoring -U wrongly kept the #ifdef branch of a macro the
+        // build explicitly undefined (eval-#9). Last occurrence wins.
+        var undef = Assert.Single(BuildLogScraper.Parse("gcc -DFEATURE -UFEATURE -c a.c"));
+        Assert.DoesNotContain(undef.Defines, d => d == "FEATURE" || d.StartsWith("FEATURE="));
+        var redef = Assert.Single(BuildLogScraper.Parse("gcc -UX -DX=1 -c a.c"));
+        Assert.Contains("X=1", redef.Defines);
+        var attached = Assert.Single(BuildLogScraper.Parse("clang -DA -DB -UA -c a.c"));
+        Assert.Equal(new[] { "B" }, attached.Defines);            // A defined then undefined -> only B
+    }
+
+    [Fact]
+    public void BackslashEscapedQuote_InCommand_IsStrippedAndGroups()
+    {
+        // A shell/command-string form carries \"...\" escaping (compile_commands.json 'command', shell logs).
+        // Escaped quotes group and strip like normal quotes: -DVER=\"1.0\" -> VER=1.0 (no stray \1.0\), and
+        // -I\"inc dir\" -> one include dir "inc dir" (space grouped, no literal backslashes/quotes).
+        var c = Assert.Single(BuildLogScraper.Parse("gcc -DVER=\\\"1.0\\\" -I\\\"inc dir\\\" -c a.c"));
+        Assert.Contains("VER=1.0", c.Defines);
+        Assert.Contains("inc dir", c.Includes);
+    }
+
+    [Fact]
+    public void WindowsBackslashPaths_AreNotTreatedAsEscapes()
+    {
+        // A bare backslash (Windows separator) is NOT an escape — only \" / \' are — so C:\foo survives.
+        var c = Assert.Single(BuildLogScraper.Parse("gcc -IC:\\proj\\inc -c a.c"));
+        Assert.Contains(@"C:\proj\inc", c.Includes);
+    }
+
+    [Fact]
     public void ManifestJsonObject_IsNotMisreadAsCompileDb()
     {
         // The generator's ground-truth manifest is a JSON OBJECT ({...}), NOT a compile DB ([...]). Feeding it

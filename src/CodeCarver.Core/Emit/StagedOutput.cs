@@ -82,12 +82,33 @@ public sealed class StagedOutput : IDisposable
     public void Promote()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        string? backup = null;
-        if (Directory.Exists(_finalOut))
+        if (!Directory.Exists(_finalOut))
         {
-            backup = _finalOut + $".ccold-{_token}";
-            if (Directory.Exists(backup)) Directory.Delete(backup, recursive: true);
-            MoveWithRetry(_finalOut, backup); // move prior aside (retries transient AV/indexer locks)
+            PromoteStaging(Dir, _finalOut); // fresh out: move staging into place
+            _promoted = true;
+            return;
+        }
+
+        // A prior --out exists (the CLI has already confirmed it's a CodeCarver output — carries the marker —
+        // so replacing it is authorized). Preferred path: atomic swap — move it aside, move staging in.
+        var backup = _finalOut + $".ccold-{_token}";
+        if (Directory.Exists(backup)) TryDelete(backup);
+        try
+        {
+            MoveWithRetry(_finalOut, backup);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The prior --out cannot be moved aside: a process holds a file open in it, or a shell's working
+            // directory is inside it (very common: `cd out && make`). A directory rename is blocked by that,
+            // but overwriting individual files within it is not. Fall back to replacing its CONTENTS in place
+            // — overwrite the staged files and delete the ones the new carve dropped. Not atomic (a crash
+            // mid-replace can leave a mix), but it's only reached when the atomic swap physically can't run,
+            // and it restores the pre-atomic "just works with a shell open in the dir" behavior (eval-#9).
+            ReplaceInPlace(Dir, _finalOut);
+            TryDelete(Dir);
+            _promoted = true;
+            return;
         }
         try
         {
@@ -96,12 +117,40 @@ public sealed class StagedOutput : IDisposable
         catch
         {
             // Put the prior output back so a failed promote leaves the user exactly where they started.
-            if (backup is not null && !Directory.Exists(_finalOut))
+            if (!Directory.Exists(_finalOut))
                 try { Directory.Move(backup, _finalOut); } catch { /* best effort restore */ }
             throw;
         }
         _promoted = true;
-        if (backup is not null) TryDelete(backup); // prior output no longer needed
+        TryDelete(backup); // prior output no longer needed
+    }
+
+    /// <summary>
+    /// Replace <paramref name="dst"/>'s CONTENTS with <paramref name="src"/>'s in place (no directory move):
+    /// overwrite every staged file, then delete files/dirs <paramref name="dst"/> has that the new carve
+    /// dropped. Used only as the fallback when the prior --out can't be moved aside (a held file / cwd). A
+    /// file in <paramref name="dst"/> held with an exclusive (no-share) lock will still fail the overwrite —
+    /// that surfaces as a clean promote error, same as the pre-atomic behavior, rather than silent partial.
+    /// </summary>
+    private static void ReplaceInPlace(string src, string dst)
+    {
+        var staged = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var f in Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories))
+        {
+            var rel = Path.GetRelativePath(src, f);
+            staged.Add(rel);
+            var d = Path.Combine(dst, rel);
+            var dd = Path.GetDirectoryName(d);
+            if (!string.IsNullOrEmpty(dd)) Directory.CreateDirectory(dd);
+            File.Copy(f, d, overwrite: true);
+        }
+        foreach (var f in Directory.EnumerateFiles(dst, "*", SearchOption.AllDirectories).ToList())
+            if (!staged.Contains(Path.GetRelativePath(dst, f)))
+                try { File.Delete(f); } catch { /* stale file left behind if locked — best effort */ }
+        // Prune now-empty directories (deepest first), best effort.
+        foreach (var d in Directory.EnumerateDirectories(dst, "*", SearchOption.AllDirectories)
+                     .OrderByDescending(x => x.Length).ToList())
+            try { if (!Directory.EnumerateFileSystemEntries(d).Any()) Directory.Delete(d); } catch { }
     }
 
     /// <summary>
