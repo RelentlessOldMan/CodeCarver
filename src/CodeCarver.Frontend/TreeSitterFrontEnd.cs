@@ -174,6 +174,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// </summary>
     public Func<string, MacroTable?>? PerFileDefines { get; set; }
 
+    /// <summary>
+    /// Optional parse-progress callback, invoked once per parsed file with (filesDone, filesTotal, bytesDone,
+    /// bytesTotal). Parsing is the dominant, roughly byte-linear phase, so a caller can turn measured
+    /// throughput (bytesDone / elapsed) plus the known bytesTotal into a live, self-calibrating ETA rather
+    /// than a guess. Bytes exclude oversized/skipped files (they aren't parsed). Null (default) = no callback.
+    /// </summary>
+    public Action<int, int, long, long>? OnParseProgress { get; set; }
+
     protected TreeSitterFrontEnd(string grammarLib, string grammarFn, string defsQuery, string callsQuery)
     {
         _lang = new Language(grammarLib, grammarFn);
@@ -221,6 +229,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var keepNames = new HashSet<string>(StringComparer.Ordinal);
         var timeFiles = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null;
         var fsw = new System.Diagnostics.Stopwatch();
+
+        // Totals for a byte-linear ETA (parse dominates and scales with bytes). Only files actually parsed
+        // (non-empty; oversized ones are skipped) count toward the work total.
+        long bytesTotal = 0; var filesTotal = 0;
+        foreach (var (_, t) in inputs) if (t.Length > 0) { bytesTotal += t.Length; filesTotal++; }
+        long bytesDone = 0; var filesDone = 0;
+
         foreach (var (path, text) in inputs)
         {
             if (text.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
@@ -244,6 +259,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             }
             if (timeFiles && fsw.ElapsedMilliseconds >= 300)
                 Console.Error.WriteLine($"  slowfile: {fsw.ElapsedMilliseconds,6} ms  {path} ({text.Length:N0} B)");
+
+            bytesDone += text.Length; filesDone++;
+            OnParseProgress?.Invoke(filesDone, filesTotal, bytesDone, bytesTotal);
         }
 
         // Reference-only includes (.inc/.def generated tables): not parsed as a TU, but every symbol they

@@ -154,6 +154,12 @@ carve <dir> --roots a,b,c --prune --out o --manifest m.json   # 3. emit + a JSON
 cc -c o/*.c -Io/                          # 4. build the output (the only real guarantee)
 ```
 
+On a large tree it prints a **live, self-calibrating ETA** while parsing (the dominant phase) — e.g.
+`parsing : 22% (4,376/20,075 files, 1.2 MB/s) -- ETA ~6m 41s`. It's calculated, not guessed: measured
+throughput on this run × the known remaining source bytes, refined every few seconds (first estimate after
+a ~3 s warmup). Printed to stderr, so it never pollutes `--dump-spans`/`--manifest` output. Reachability
+and emit are a short tail after parsing; emit scales with how much is *kept*.
+
 It's built to survive a messy real tree: a file it can't read or can't parse is **skipped with a
 `warn:` line and kept whole** (never crashes the whole run), multi-GB generated headers are parsed-
 skipped (`--max-parse-bytes`), and a file that blows the parse budget is kept whole (`--parse-timeout`).

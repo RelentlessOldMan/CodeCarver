@@ -649,6 +649,26 @@ static int RunCarve(string[] args)
         Console.Error.WriteLine($"  scanning: {inputs.Count:N0} files (~{scanBytes / 1_000_000.0:N0} MB)"
                                 + (bigFiles.Count > 0 ? $" + {bigFiles.Count} big-file(s) kept whole" : "") + " -- analyzing...");
 
+    // Live, self-calibrating parse ETA for a large tree. Parsing dominates the run and scales ~linearly with
+    // bytes, so measured throughput (bytesDone/elapsed) x known remaining bytes = a real, refining estimate —
+    // not a guess. Printed to stderr ~every 3 s so it never pollutes --dump-spans / manifest stdout.
+    if (fe is TreeSitterFrontEnd tsp && (inputs.Count > 500 || scanBytes > 50_000_000))
+    {
+        var psw = System.Diagnostics.Stopwatch.StartNew();
+        var lastPrint = 0.0;                                // 0 => first ETA only after a ~3 s warmup (calibrated rate)
+        tsp.OnParseProgress = (filesDone, filesTotal, bytesDone, bytesTotal) =>
+        {
+            var el = psw.Elapsed.TotalSeconds;
+            var last = filesDone >= filesTotal;
+            if (bytesDone <= 0 || el <= 0.001) return;
+            if (!last && el - lastPrint < 3.0) return;     // warmup + throttle; always emit the final 100% line
+            lastPrint = el;
+            var rate = bytesDone / el;                     // bytes/sec, measured on THIS run
+            var etaSec = rate > 0 ? (bytesTotal - bytesDone) / rate : -1;
+            Console.Error.WriteLine($"  parsing : {100.0 * bytesDone / bytesTotal,3:N0}% "
+                + $"({filesDone:N0}/{filesTotal:N0} files, {rate / 1_000_000.0:N1} MB/s) -- ETA {FormatEta(etaSec)}");
+        };
+    }
     var graph = fe.BuildGraph(inputs, defines, closedWorld);
     Mark("build-graph");
 
@@ -1000,6 +1020,16 @@ static int RunCarve(string[] args)
             Console.Error.WriteLine($"  warn    : could not write --diag package '{diagPath}' ({derr})");
     }
     return verifyFailed ? 3 : 0; // non-zero so --verify is usable as a gate in scripts
+}
+
+// Human ETA from a seconds estimate. "?" when not yet computable (no throughput sample yet).
+static string FormatEta(double seconds)
+{
+    if (seconds < 0 || double.IsNaN(seconds) || double.IsInfinity(seconds)) return "?";
+    var s = (long)Math.Round(seconds);
+    if (s < 60) return $"~{s}s";
+    if (s < 3600) return $"~{s / 60}m {s % 60:00}s";
+    return $"~{s / 3600}h {(s % 3600) / 60:00}m";
 }
 
 static string Summarize(IReadOnlyList<string> files, int max = 12)

@@ -14,6 +14,32 @@ namespace CodeCarver.Tests.Frontend;
 /// </summary>
 public class CFrontEndTests
 {
+    [Fact]
+    public void BuildGraph_ReportsParseProgress_ForEtaCalculation()
+    {
+        // The parse-progress callback is what the CLI turns into a live, calculated ETA (measured throughput
+        // x known remaining bytes). Pin the contract: one callback per parsed file, ending at
+        // filesDone==filesTotal and bytesDone==bytesTotal (the full known work), with the totals correct.
+        var inputs = new[]
+        {
+            ("a.c", "int a(void){return 0;}\n"),
+            ("b.c", "int b(void){return a();}\n"),
+        };
+        var expectedBytes = inputs.Sum(i => (long)i.Item2.Length);
+        int calls = 0, lastFiles = 0, lastTotal = 0;
+        long lastBytes = 0, lastBytesTotal = 0;
+
+        using var fe = new CFrontEnd();
+        fe.OnParseProgress = (fd, ft, bd, bt) => { calls++; lastFiles = fd; lastTotal = ft; lastBytes = bd; lastBytesTotal = bt; };
+        fe.BuildGraph(inputs);
+
+        Assert.Equal(2, calls);                       // one report per parsed file
+        Assert.Equal(2, lastFiles);
+        Assert.Equal(2, lastTotal);
+        Assert.Equal(expectedBytes, lastBytesTotal);  // total work known up front
+        Assert.Equal(expectedBytes, lastBytes);       // all bytes accounted at completion (ETA -> 0)
+    }
+
     private const string MainC = """
         int helper(void);
 
