@@ -160,6 +160,47 @@ public sealed class CliIntegrationTests
     }
 
     [Fact]
+    public void Carve_MacroDenseHeader_AutoKeptWhole_NormalLargeFileStillParsed()
+    {
+        // eval-#14 fix: a giant register/header map (5-16 MB of #defines, transitively #included) sits UNDER
+        // --max-parse-bytes yet drives the parser to tens of GB (a graph node per #define + retained AST/text).
+        // It must be auto-detected by content and kept WHOLE (never parsed) with NO magic flag. A NORMAL large
+        // .c (mostly code) must NOT be misclassified — it's still parsed. main.c #includes the dense header and
+        // calls run; the carve must succeed, report the header on the 'dense' line, and emit it verbatim.
+        var work = Path.Combine(Path.GetTempPath(), "cc-dense-" + Guid.NewGuid().ToString("N"));
+        var proj = Path.Combine(work, "proj");
+        try
+        {
+            Directory.CreateDirectory(proj);
+            // ~1.5 MB of pure #defines -> macro-dense (>= 1 MB and >60% #define lines).
+            var regs = new System.Text.StringBuilder(1_600_000);
+            for (int i = 0; i < 60_000; i++) regs.Append("#define REG_").Append(i).Append(" 0x").Append(i.ToString("X6")).Append('\n');
+            File.WriteAllText(Path.Combine(proj, "regs.h"), regs.ToString());
+            // ~1.3 MB of ordinary code -> NOT dense (mostly non-#define lines); must still be parsed.
+            var bulk = new System.Text.StringBuilder(1_400_000);
+            for (int i = 0; i < 40_000; i++) bulk.Append("int fn_").Append(i).Append("(void){ return ").Append(i).Append("; }\n");
+            File.WriteAllText(Path.Combine(proj, "bulk.c"), bulk.ToString());
+            File.WriteAllText(Path.Combine(proj, "main.c"),
+                "#include \"regs.h\"\nint run(void){return REG_1;}\nint main(void){return run();}\n");
+            var outDir = Path.Combine(work, "out");
+
+            var r = RunCli("carve", proj, "--roots", "main,run", "--out", outDir);
+            if (r is null) return;
+            var (code, outp) = r.Value;
+            Assert.Equal(0, code);
+            // The 'dense' report line names regs.h (auto-kept-whole) but NOT bulk.c — the normal large .c is
+            // instead parsed (it shows up on a 'bigparse:' line, proving it was NOT misclassified as dense).
+            var denseLine = outp.Split('\n').FirstOrDefault(l => l.TrimStart().StartsWith("dense")) ?? "";
+            Assert.Contains("regs.h", denseLine);
+            Assert.DoesNotContain("bulk.c", denseLine);
+            Assert.Contains("bulk.c", outp);                                  // present (parsed), just not dense
+            Assert.True(File.Exists(Path.Combine(outDir, "regs.h")));         // kept whole (via #include-closure)
+            Assert.Equal(regs.ToString(), File.ReadAllText(Path.Combine(outDir, "regs.h"))); // verbatim, unmodified
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
     public void Carve_MalformedConfig_ExitsUsage()
     {
         var src = MakeTree(out var work);

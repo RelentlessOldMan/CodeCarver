@@ -77,7 +77,7 @@ Every carve is sound with just `--roots`. Each extra input lets it carve **tight
 | Audit | `--manifest m.json` | write a JSON manifest of roots, stats, kept/dropped files, byte counts |
 | Diagnostics | `--diag report.zip` | write ONE **source-free**, shareable diagnostic package (`summary.txt` + `diagnostics.json` + `manifest.txt`) describing what the tool did — version, environment, parameters, stats, warnings, phase timings, and any failure. Home paths are redacted; **no source content, ever**. Send this when a carve misbehaves on a repo you can't share. Pass a directory to get a timestamped `CodeCarver_Diagnostics_<UTC>.zip` inside it. Written on success and, automatically, on an unexpected failure |
 | Explain | `--why sym` | print the keep-chain for a symbol back to its root (or that it was carved) — debugging "why is this still here / why did this drop?" |
-| Big-file cutoff | `--max-parse-bytes N` | files larger than `N` bytes (default 20 MB) are **not parsed** — kept whole via `#include`-closure, copied verbatim. Lets a carve survive multi-GB auto-generated register headers that would otherwise blow past .NET's ~2 GB string limit and explode parser memory (C/C++/`.cmm` only) |
+| Big-file cutoff | `--max-parse-bytes N` | files larger than `N` bytes (default 20 MB) are **not parsed** — kept whole via `#include`-closure, copied verbatim. Lets a carve survive multi-GB auto-generated register headers that would otherwise blow past .NET's ~2 GB string limit and explode parser memory (C/C++/`.cmm` only). **You rarely need to touch this** — macro-dense headers *under* the cap are auto-detected (see below); it's the explicit escape hatch |
 | Carve headers | `--prune-headers` | **experimental**: strip unused `#define`s from the big kept headers above (a 1.4 GB register map → the handful of registers you use). Streaming + sound — keeps the transitive closure of needed defines, every non-`#define` line (guards, `#if`, types), all `#if`-referenced names, and token-paste (`##`) candidate families. Always build-verify (C/C++ only) |
 | Parse budget | `--parse-timeout N` | per-file parse budget in **seconds** (default 20). A file whose parse blows it is kept whole + warned — a backstop against tree-sitter's super-linear error recovery on invalid `#include` fragments stalling a run |
 | Soundness gate | `--verify` | compiler-free check: flag any **kept** function that calls an **in-scope** function the carve dropped (it wouldn't link). Exits non-zero on a violation, so it's usable as a CI/script gate (C/C++). Catches an edge the model missed — the useful check when you have no build |
@@ -163,6 +163,14 @@ and emit are a short tail after parsing; emit scales with how much is *kept*.
 It's built to survive a messy real tree: a file it can't read or can't parse is **skipped with a
 `warn:` line and kept whole** (never crashes the whole run), multi-GB generated headers are parsed-
 skipped (`--max-parse-bytes`), and a file that blows the parse budget is kept whole (`--parse-timeout`).
+
+**Macro-dense register headers are handled automatically** — no flag, no magic number. A big chip/register
+map (a few MB of almost-nothing-but-`#define`s, transitively `#include`d) sits *under* the byte cap but
+would still explode parser memory (a graph node per `#define` + retained AST). CodeCarver samples the first
+256 KB of each ≥1 MB file; if it's overwhelmingly `#define`s it's routed to the same keep-whole path as
+oversized files (no parse, stream-copied verbatim) and reported on a `dense:` line. This is sound — the
+header is kept whole regardless — and a normal large `.c` (mostly code) is unaffected and still parsed.
+
 Read the `warn:` lines — they're where the carve was uncertain. For a slow run, `CODECARVER_TIMING=1`
 prints a per-phase + slow-file breakdown to stderr.
 

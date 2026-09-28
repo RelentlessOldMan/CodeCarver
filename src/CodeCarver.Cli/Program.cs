@@ -450,9 +450,19 @@ static int RunCarve(string[] args)
     // One stat per file: capture every source file's size ONCE here (rel path -> bytes) and reuse the map
     // for big-file detection now and the final size accounting later, instead of stat'ing every file twice
     // (a full extra pass of syscalls over the whole tree — noticeable on a large/network source root).
+    // Content-aware skip: a large, macro-DENSE header (chip/register/IO definitions — thousands of
+    // #define constants) is enormously expensive to parse (giant AST + one graph node per #define + retained
+    // text) yet yields almost nothing useful, because headers are kept WHOLE anyway (never intra-file pruned).
+    // A real product tree's transitively-included register headers (5-16 MB each) sit UNDER --max-parse-bytes
+    // and drove a real run to ~20 GB / 70+ min in the parser (eval #14). So detect them by a cheap prefix
+    // sample and route them to the SAME keep-whole path as oversized files — no parse, no node explosion, no
+    // retained text, stream-copied at emit. Sound: the header is still kept whole via include-closure. This is
+    // automatic (no --max-parse-bytes tuning); the byte cap remains only as an explicit escape hatch.
+    const long AutoSkipMinBytes = 1_000_000; // only sample files this big (few of them) — cheap
     var sizeByRel = new Dictionary<string, long>(StringComparer.Ordinal);
     long originalBytes = 0;
-    var bigFiles = new List<(string Rel, long Bytes)>();
+    var bigFiles = new List<(string Rel, long Bytes)>();       // > --max-parse-bytes
+    var denseFiles = new List<(string Rel, long Bytes)>();     // macro-dense, auto-skipped
     foreach (var p in paths)
     {
         var rel = Path.GetRelativePath(dir, p).Replace('\\', '/');
@@ -461,15 +471,18 @@ static int RunCarve(string[] args)
         sizeByRel[rel] = len;
         originalBytes += len;
         if (closureLang && len > maxParseBytes) bigFiles.Add((rel, len));
+        else if (closureLang && len >= AutoSkipMinBytes && IsMacroDenseHeader(p)) denseFiles.Add((rel, len));
     }
-    var bigSet = bigFiles.Select(b => b.Rel).ToHashSet(StringComparer.Ordinal);
+    // Both populations skip the parser and are kept whole via include-closure.
+    var skipParse = new HashSet<string>(bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)),
+                                        StringComparer.Ordinal);
 
     var inputs = new List<(string Rel, string Text)>(paths.Count);
     var readErrors = 0;
     foreach (var p in paths)
     {
         var rel = Path.GetRelativePath(dir, p).Replace('\\', '/');
-        if (bigSet.Contains(rel)) { inputs.Add((rel, "")); continue; } // "" = don't read/parse; keep whole
+        if (skipParse.Contains(rel)) { inputs.Add((rel, "")); continue; } // "" = don't read/parse; keep whole
         try { inputs.Add((rel, File.ReadAllText(p))); }
         catch (Exception ex)   // an unreadable/locked/odd file must not sink the whole run
         {
@@ -647,7 +660,8 @@ static int RunCarve(string[] args)
     var scanBytes = inputs.Sum(i => (long)i.Text.Length);
     if (inputs.Count > 500 || scanBytes > 50_000_000)
         Console.Error.WriteLine($"  scanning: {inputs.Count:N0} files (~{scanBytes / 1_000_000.0:N0} MB)"
-                                + (bigFiles.Count > 0 ? $" + {bigFiles.Count} big-file(s) kept whole" : "") + " -- analyzing...");
+                                + (bigFiles.Count > 0 ? $" + {bigFiles.Count} big-file(s) kept whole" : "")
+                                + (denseFiles.Count > 0 ? $" + {denseFiles.Count} dense-header(s) kept whole" : "") + " -- analyzing...");
 
     // Live, self-calibrating parse ETA for a large tree. Parsing dominates the run and scales ~linearly with
     // bytes, so measured throughput (bytesDone/elapsed) x known remaining bytes = a real, refining estimate —
@@ -850,6 +864,9 @@ static int RunCarve(string[] args)
     if (bigFiles.Count > 0)
         Console.WriteLine($"  big     : {bigFiles.Count} file(s) > {maxParseBytes:N0} B not parsed (kept whole via #include-closure): "
                           + Summarize(bigFiles.OrderByDescending(b => b.Bytes).Select(b => $"{b.Rel} ({b.Bytes:N0} B)").ToList()));
+    if (denseFiles.Count > 0)
+        Console.WriteLine($"  dense   : {denseFiles.Count} macro-dense header(s) auto-kept-whole (skipped parse — would explode parser memory): "
+                          + Summarize(denseFiles.OrderByDescending(d => d.Bytes).Select(d => $"{d.Rel} ({d.Bytes:N0} B)").ToList()));
     if (plan.DroppedFiles.Count > 0)
         Console.WriteLine("  dropped : " + Summarize(plan.DroppedFiles));
 
@@ -876,7 +893,7 @@ static int RunCarve(string[] args)
         // --prune-headers: strip unused #defines from the giant register headers we kept whole (C/C++ only).
         if (pruneHeaders && lang is "c" or "cpp")
         {
-            var keptBig = bigFiles.Select(b => b.Rel).Where(plan.KeptFiles.Contains).ToList();
+            var keptBig = bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)).Where(plan.KeptFiles.Contains).ToList();
             if (keptBig.Count > 0)
             {
                 var hc = HeaderCarver.Carve(stageDir, keptBig);
@@ -952,6 +969,7 @@ static int RunCarve(string[] args)
     diag.Set("carvedBytes", carvedBytes);
     diag.Set("rootsUnresolved", unresolvedRoots.Count);
     diag.Set("bigFilesKeptWhole", bigFiles.Count);
+    diag.Set("denseHeadersKeptWhole", denseFiles.Count);
 
     // --verify: compiler-free soundness gate — no KEPT function may call an in-scope function that was
     // carved out (it wouldn't link). Catches an edge our model missed (a blind spot). C/C++ only.
@@ -1036,6 +1054,62 @@ static string Summarize(IReadOnlyList<string> files, int max = 12)
     => files.Count <= max
         ? string.Join(", ", files)
         : string.Join(", ", files.Take(max)) + $", … (+{files.Count - max} more)";
+
+// Cheap content probe: is this a macro-dense register/header map? Such files (5-16 MB chip headers,
+// transitively #included, thousands of #defines) sit UNDER --max-parse-bytes yet drive the parser to
+// tens of GB via a graph node per #define + retained AST/text (eval #14). We only reach here for files
+// already known to be >= AutoSkipMinBytes, so a bounded prefix read (256 KB) is negligible. Read the
+// prefix, count lines that start with `#define` vs. total non-blank/non-comment lines; if the file is
+// overwhelmingly #defines it's a register map — keep it whole (never parse). Bias to NOT skipping: a
+// normal large .c (mostly code) fails the ratio and is parsed as before. Any read error → not dense.
+static bool IsMacroDenseHeader(string path)
+{
+    const int PrefixBytes = 256 * 1024;
+    const int MinNonBlank = 50;      // ignore small files that happen to be all-defines
+    const double MinRatio = 0.60;    // >= 60% of substantive lines are #define → register map
+    try
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var sr = new StreamReader(fs, System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var buf = new char[PrefixBytes];
+        int read = sr.ReadBlock(buf, 0, buf.Length);
+        if (read <= 0) return false;
+
+        long nonBlank = 0, defines = 0;
+        int i = 0;
+        // The very last line of the prefix may be truncated mid-line; drop it so a cut-off `#defin`
+        // isn't miscounted either way. Scan line by line over the char span.
+        int lastNewline = -1;
+        for (int k = read - 1; k >= 0; k--) if (buf[k] == '\n') { lastNewline = k; break; }
+        int end = (read == PrefixBytes && lastNewline >= 0) ? lastNewline + 1 : read;
+        while (i < end)
+        {
+            int lineStart = i;
+            while (i < end && buf[i] != '\n') i++;
+            int lineEnd = i;                 // exclusive
+            if (i < end) i++;                // step past '\n'
+            // trim leading whitespace
+            int j = lineStart;
+            while (j < lineEnd && (buf[j] == ' ' || buf[j] == '\t' || buf[j] == '\r')) j++;
+            if (j >= lineEnd) continue;      // blank line
+            // skip pure comment lines (// … and /* … lines) — they're not substantive
+            if (buf[j] == '/' && j + 1 < lineEnd && (buf[j + 1] == '/' || buf[j + 1] == '*')) continue;
+            nonBlank++;
+            if (StartsWith(buf, j, lineEnd, "#define") || StartsWith(buf, j, lineEnd, "# define"))
+                defines++;
+        }
+        if (nonBlank < MinNonBlank) return false;
+        return (double)defines / nonBlank >= MinRatio;
+    }
+    catch { return false; }
+
+    static bool StartsWith(char[] b, int start, int endExcl, string word)
+    {
+        if (start + word.Length > endExcl) return false;
+        for (int k = 0; k < word.Length; k++) if (b[start + k] != word[k]) return false;
+        return true;
+    }
+}
 
 static void RunDemo()
 {
