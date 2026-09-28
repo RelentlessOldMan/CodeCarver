@@ -222,6 +222,40 @@ public sealed class CliIntegrationTests
     }
 
     [Fact]
+    public void Carve_KeptFiles_EmittedByteExact_RegardlessOfEncoding()
+    {
+        // The sound default (file-level, no --prune) copies kept files verbatim, so any encoding — Latin-1,
+        // UTF-16, a UTF-8 BOM, exotic bytes in comments — round-trips byte-for-byte. A firmware tree carries
+        // such files; the carve must never silently re-encode or corrupt them.
+        var work = Path.Combine(Path.GetTempPath(), "cc-enc-" + Guid.NewGuid().ToString("N"));
+        var proj = Path.Combine(work, "proj");
+        try
+        {
+            Directory.CreateDirectory(proj);
+            File.WriteAllText(Path.Combine(proj, "main.c"),
+                "#include \"latin1.h\"\n#include \"utf16.h\"\nint run(void){return 1;}\nint main(void){return run();}\n");
+
+            // A Latin-1 header with a non-ASCII byte in a comment (0xB0 = degree sign) — invalid UTF-8.
+            var latin1 = new byte[] { (byte)'/', (byte)'*', (byte)' ', 0xB0, (byte)'C', (byte)' ', (byte)'*', (byte)'/', (byte)'\n' };
+            File.WriteAllBytes(Path.Combine(proj, "latin1.h"), latin1);
+            // A UTF-16 LE file with BOM.
+            var utf16 = System.Text.Encoding.Unicode.GetBytes("/* utf16 header */\n");
+            var utf16WithBom = System.Text.Encoding.Unicode.GetPreamble().Concat(utf16).ToArray();
+            File.WriteAllBytes(Path.Combine(proj, "utf16.h"), utf16WithBom);
+
+            var outDir = Path.Combine(work, "out");
+            var r = RunCli("carve", proj, "--roots", "main,run", "--out", outDir);
+            if (r is null) return;
+            var (code, outp) = r.Value;
+            Assert.Equal(0, code);
+            // Byte-for-byte identical in the output (kept whole via include-closure, copied verbatim).
+            Assert.Equal(latin1, File.ReadAllBytes(Path.Combine(outDir, "latin1.h")));
+            Assert.Equal(utf16WithBom, File.ReadAllBytes(Path.Combine(outDir, "utf16.h")));
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
     public void Carve_MalformedConfig_ExitsUsage()
     {
         var src = MakeTree(out var work);

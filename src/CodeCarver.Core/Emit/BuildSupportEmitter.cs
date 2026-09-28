@@ -31,10 +31,9 @@ public static class BuildSupportEmitter
 
         var warnings = new List<string>();
         var picked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        // IgnoreInaccessible: an unreadable dir under the root (common on a network share) must be skipped,
-        // not throw mid-walk and leave a partial tree.
-        var walk = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
-        foreach (var p in Directory.EnumerateFiles(sourceRoot, "*.*", walk))
+        // SourceWalk: skip unreadable dirs (network shares) and don't recurse into directory junctions/
+        // symlinks (loop / double-copy), while still returning symlinked files.
+        foreach (var p in CodeCarver.Core.Util.SourceWalk.Files(sourceRoot))
             if (SupportExts.Any(e => p.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && Keep(p))
                 picked.Add(p);
         foreach (var glob in auxGlobs)
@@ -116,10 +115,9 @@ public static class BuildSupportEmitter
         if (glob.Length == 0 || GlobEscapesRoot(glob)) return Array.Empty<string>();
 
         var rx = GlobToRegex(glob, matchAnyDepth: !glob.Contains('/'));
-        var opts = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
         var hits = new List<string>();
         IEnumerable<string> files;
-        try { files = Directory.EnumerateFiles(root, "*", opts); }
+        try { files = CodeCarver.Core.Util.SourceWalk.Files(root); }
         catch (Exception) { return hits; }
         foreach (var f in files)
             if (rx.IsMatch(Path.GetRelativePath(root, f).Replace('\\', '/')))

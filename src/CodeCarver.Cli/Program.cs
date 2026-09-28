@@ -428,10 +428,10 @@ static int RunCarve(string[] args)
         return 2;
     }
 
-    // Recursive walk that SKIPS unreadable dirs (common on a network share) rather than throwing LATER
-    // inside the lazy enumeration and leaving a partial run (eval-#7). Reused for every AllDirectories scan.
-    var recurse = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
-    var paths = Directory.EnumerateFiles(dir, "*.*", recurse)
+    // All source-tree scans go through SourceWalk (Core): skips unreadable dirs (network shares; eval-#7)
+    // and does not recurse into directory junctions/symlinks (loop / double-scan) while still returning
+    // symlinked source FILES (dropping one would be unsound).
+    var paths = CodeCarver.Core.Util.SourceWalk.Files(dir)
         .Where(p => exts.Any(e => p.EndsWith(e, StringComparison.OrdinalIgnoreCase)))
         .Where(p => excludeDirs.Count == 0 ||
                     !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase)))
@@ -535,7 +535,7 @@ static int RunCarve(string[] args)
             if (byBase is null)
             {
                 byBase = new(StringComparer.OrdinalIgnoreCase);
-                foreach (var f in Directory.EnumerateFiles(rootFull, "*", recurse))
+                foreach (var f in CodeCarver.Core.Util.SourceWalk.Files(rootFull))
                 {
                     var bn = Path.GetFileName(f);
                     if (!byBase.TryGetValue(bn, out var l)) byBase[bn] = l = new List<string>();
@@ -729,7 +729,7 @@ static int RunCarve(string[] args)
     var asmRoots = new List<Root>();
     if (lang is "c" or "cpp")
     {
-        var asmTexts = Directory.EnumerateFiles(dir, "*.*", recurse)
+        var asmTexts = CodeCarver.Core.Util.SourceWalk.Files(dir)
             .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".s" or ".asm")
             .Where(p => excludeDirs.Count == 0 ||
                         !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase)))
@@ -747,7 +747,7 @@ static int RunCarve(string[] args)
     {
         bool Included(string p) => excludeDirs.Count == 0 ||
             !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase));
-        var linkerScripts = Directory.EnumerateFiles(dir, "*.*", recurse)
+        var linkerScripts = CodeCarver.Core.Util.SourceWalk.Files(dir)
             .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".ld" or ".lds" or ".ldscript")
             .Where(Included).Where(p => new FileInfo(p).Length <= maxParseBytes)
             .Select(File.ReadAllText).ToList();
