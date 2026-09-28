@@ -826,10 +826,15 @@ static int RunCarve(string[] args)
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            // A PromoteFailedException.Torn tells us honestly whether --out is unchanged or partially updated.
+            var torn = ex is PromoteFailedException { Torn: true };
+            var state = torn
+                ? $"{outDir} is now PARTIALLY updated — re-run, or carve to a fresh --out."
+                : $"Your previous {outDir} is unchanged.";
             Console.Error.WriteLine($"  error   : the carve succeeded ({res.FilesWritten} files staged) but writing it "
-                + $"into {outDir} failed ({ex.GetType().Name}: {ex.Message}). Your previous {outDir} is unchanged. "
-                + "Likely a process holding a file open — or a shell whose current directory is — inside "
-                + $"{outDir} (e.g. 'cd out && make'), or a transient AV/indexer lock. Close it (or use a fresh --out) and retry.");
+                + $"into {outDir} failed ({ex.GetType().Name}: {ex.Message}). {state} "
+                + "Usual cause: a process holding a file open — or a shell whose current directory is — inside "
+                + $"{outDir} (e.g. 'cd out && make'), or a transient AV/indexer lock.");
             diag.SetFailure(ex);
             if (diagPath is not null && diag.TryWritePackage(diagPath, out var zpf, out _))
                 Console.Error.WriteLine($"  diag    : diagnostic package (with failure) written -> {zpf}");

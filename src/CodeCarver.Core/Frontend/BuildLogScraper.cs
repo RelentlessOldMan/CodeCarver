@@ -41,14 +41,31 @@ public static class BuildLogScraper
         if (LooksLikeCompileDb(log)) return ParseCompileDb(log);   // compile_commands.json
 
         var results = new List<CompileCommand>();
+        // Track the working directory across lines the way the shell/make would: a standalone `cd DIR`, and
+        // GNU make's `Entering directory '...'` / `Leaving directory '...'` (from `make -w`, emitted around
+        // every recursive sub-build). Without this, a relative -I in those commands resolves against the wrong
+        // base — real `make -w` logs use Entering/Leaving everywhere (eval-#10). A `cd DIR && gcc ...` on the
+        // same line is still handled per-line by ExtractLeadingCd and overrides the tracked dir.
+        var currentDir = ".";
+        var dirStack = new Stack<string>();
         foreach (var line in JoinContinuations(log))
         {
+            var em = EnteringDir.Match(line);
+            if (em.Success) { dirStack.Push(currentDir); currentDir = em.Groups[1].Value.Trim(); continue; }
+            if (line.Contains("Leaving directory", StringComparison.Ordinal))
+            { currentDir = dirStack.Count > 0 ? dirStack.Pop() : "."; continue; }
+
             var tokens = Tokenize(line);
             if (tokens.Count == 0) continue;
 
-            var dir = ExtractLeadingCd(tokens, out var rest);
+            // Standalone `cd DIR` (no compiler on the line): update the tracked directory.
+            if (tokens[0].Equals("cd", StringComparison.Ordinal) && tokens.Count >= 2 && IndexOfCompiler(tokens) < 0)
+            { currentDir = CombineDir(currentDir, tokens[1]); continue; }
+
+            var lead = ExtractLeadingCd(tokens, out var rest);
             var ci = IndexOfCompiler(rest);
             if (ci < 0) continue;
+            var dir = lead == "." ? currentDir : CombineDir(currentDir, lead); // same-line cd, relative to tracked dir
 
             var args = rest.GetRange(ci + 1, rest.Count - ci - 1);
             var sources = args.Where(IsSourceFile).ToList();
@@ -66,6 +83,19 @@ public static class BuildLogScraper
                 });
         }
         return results;
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex EnteringDir =
+        new(@"Entering directory\s+[`'""]?(.+?)[`'""]?\s*$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>Combine a tracked base dir with a `cd`/entering target. An absolute target replaces it; a
+    /// relative one is appended (kept as a path STRING — the CLI resolves the final Directory against the
+    /// carve root, so we must not GetFullPath against this process's cwd here).</summary>
+    private static string CombineDir(string baseDir, string target)
+    {
+        if (string.IsNullOrEmpty(target) || target == ".") return baseDir;
+        if (Path.IsPathFullyQualified(target)) return target;
+        return baseDir == "." ? target : baseDir.TrimEnd('/', '\\') + "/" + target;
     }
 
     /// <summary>First non-whitespace char is <c>[</c> — a JSON array, i.e. a compile_commands.json (a text

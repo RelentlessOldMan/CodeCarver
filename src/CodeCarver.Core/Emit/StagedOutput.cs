@@ -82,6 +82,7 @@ public sealed class StagedOutput : IDisposable
     public void Promote()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        ClearReadOnlyTree(Dir); // carved output must be writable (Perforce read-only sources; in-place fallback; backup deletion)
         if (!Directory.Exists(_finalOut))
         {
             PromoteStaging(Dir, _finalOut); // fresh out: move staging into place
@@ -134,23 +135,58 @@ public sealed class StagedOutput : IDisposable
     /// </summary>
     private static void ReplaceInPlace(string src, string dst)
     {
-        var staged = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var f in Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories))
+        var files = Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories).ToList();
+        var staged = new HashSet<string>(files.Select(f => Path.GetRelativePath(src, f)), StringComparer.OrdinalIgnoreCase);
+
+        // PRE-FLIGHT: every existing destination we'll overwrite must be openable for write BEFORE we mutate
+        // anything, so a persistent lock bails with the prior tree genuinely UNCHANGED (not half-replaced —
+        // the torn tree eval-#10 flagged). ReadOnly is cleared here too (Perforce). Best-effort: a lock that
+        // appears only AFTER this check is caught in the write loop below and reported as torn.
+        foreach (var rel in staged)
         {
-            var rel = Path.GetRelativePath(src, f);
-            staged.Add(rel);
+            var d = Path.Combine(dst, rel);
+            if (!File.Exists(d)) continue;
+            ClearReadOnly(d);
+            try { using var _ = new FileStream(d, FileMode.Open, FileAccess.Write, FileShare.ReadWrite); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw new PromoteFailedException(
+                    $"a file in the output is locked ('{rel}') — output left unchanged", torn: false, ex);
+            }
+        }
+
+        // WRITE: past pre-flight this should fully succeed; a failure now is a race -> the tree is TORN.
+        foreach (var rel in staged)
+        {
             var d = Path.Combine(dst, rel);
             var dd = Path.GetDirectoryName(d);
             if (!string.IsNullOrEmpty(dd)) Directory.CreateDirectory(dd);
-            File.Copy(f, d, overwrite: true);
+            try { File.Copy(Path.Combine(src, rel), d, overwrite: true); ClearReadOnly(d); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw new PromoteFailedException(
+                    $"output is now PARTIALLY updated (writing '{rel}' failed) — re-run or use a fresh --out", torn: true, ex);
+            }
         }
+
+        // DELETE files the new carve dropped. Count any that can't be removed (held open) — leaving one is a
+        // stale/unsound tree, so surface it rather than exit 0 silently (eval-#10).
+        var staleLeft = new List<string>();
         foreach (var f in Directory.EnumerateFiles(dst, "*", SearchOption.AllDirectories).ToList())
             if (!staged.Contains(Path.GetRelativePath(dst, f)))
-                try { File.Delete(f); } catch { /* stale file left behind if locked — best effort */ }
-        // Prune now-empty directories (deepest first), best effort.
+            {
+                ClearReadOnly(f);
+                try { File.Delete(f); } catch { staleLeft.Add(Path.GetRelativePath(dst, f)); }
+            }
         foreach (var d in Directory.EnumerateDirectories(dst, "*", SearchOption.AllDirectories)
                      .OrderByDescending(x => x.Length).ToList())
             try { if (!Directory.EnumerateFileSystemEntries(d).Any()) Directory.Delete(d); } catch { }
+
+        if (staleLeft.Count > 0)
+            throw new PromoteFailedException(
+                $"output updated, but {staleLeft.Count} file(s) the carve dropped could not be removed (held open) "
+                + $"— the tree may be STALE/unsound: {string.Join(", ", staleLeft.Take(5))}"
+                + (staleLeft.Count > 5 ? ", …" : ""), torn: true);
     }
 
     /// <summary>
@@ -189,7 +225,11 @@ public sealed class StagedOutput : IDisposable
         foreach (var d in Directory.EnumerateDirectories(src, "*", SearchOption.AllDirectories))
             Directory.CreateDirectory(Path.Combine(dst, Path.GetRelativePath(src, d)));
         foreach (var f in Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories))
-            File.Copy(f, Path.Combine(dst, Path.GetRelativePath(src, f)), overwrite: true);
+        {
+            var d = Path.Combine(dst, Path.GetRelativePath(src, f));
+            File.Copy(f, d, overwrite: true);
+            ClearReadOnly(d); // keep the carved output writable/editable
+        }
     }
 
     /// <summary>Deletes the staging directory if the emit was never promoted (a handled failure/early
@@ -203,6 +243,42 @@ public sealed class StagedOutput : IDisposable
 
     private static void TryDelete(string dir)
     {
-        try { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+        // Clear ReadOnly first: Perforce-synced sources are read-only, the emitter copies them read-only, and
+        // Directory.Delete then fails on them — leaking a full .ccold/staging copy per re-carve (eval-#10).
+        try
+        {
+            if (!Directory.Exists(dir)) return;
+            ClearReadOnlyTree(dir);
+            Directory.Delete(dir, recursive: true);
+        }
+        catch { /* best effort */ }
     }
+
+    private static void ClearReadOnly(string path)
+    {
+        try
+        {
+            var a = File.GetAttributes(path);
+            if ((a & FileAttributes.ReadOnly) != 0) File.SetAttributes(path, a & ~FileAttributes.ReadOnly);
+        }
+        catch { /* best effort */ }
+    }
+
+    /// <summary>Clear the ReadOnly attribute on every file under <paramref name="dir"/>. A carved tree is
+    /// meant to be edited/built, and read-only outputs also break the in-place fallback and backup deletion.</summary>
+    private static void ClearReadOnlyTree(string dir)
+    {
+        try { foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories)) ClearReadOnly(f); }
+        catch { /* best effort */ }
+    }
+}
+
+/// <summary>Thrown when the staged tree could not be put fully into place. <see cref="Torn"/> distinguishes
+/// "output left UNCHANGED" (false — a lock was hit before/at the atomic swap, or the in-place pre-flight
+/// bailed before touching anything) from "output is now PARTIALLY updated / possibly stale" (true — an
+/// in-place write or stale-file removal failed after mutation began). Callers message accordingly.</summary>
+public sealed class PromoteFailedException : IOException
+{
+    public bool Torn { get; }
+    public PromoteFailedException(string message, bool torn, Exception? inner = null) : base(message, inner) => Torn = torn;
 }

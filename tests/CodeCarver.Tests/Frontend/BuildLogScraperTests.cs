@@ -234,6 +234,32 @@ public class BuildLogScraperTests
     }
 
     [Fact]
+    public void StandaloneCdLine_SetsDirectoryForFollowingCommands()
+    {
+        // A `cd DIR` on its own line (not `cd DIR && gcc`) must set the working dir for later commands.
+        const string log = "cd build/core\ngcc -DX -Iinc -c a.c\n";
+        var c = Assert.Single(BuildLogScraper.Parse(log));
+        Assert.Equal("build/core", c.Directory);
+        Assert.Equal("a.c", c.File);
+    }
+
+    [Fact]
+    public void MakeEnteringLeavingDirectory_TracksWorkingDir()
+    {
+        // GNU `make -w` brackets recursive sub-builds with Entering/Leaving directory lines — real logs use
+        // these everywhere; a relative -I otherwise resolves against the wrong base (eval-#10).
+        const string log = """
+            make[1]: Entering directory '/proj/src'
+            gcc -Iinc -c a.c
+            make[1]: Leaving directory '/proj/src'
+            gcc -c b.c
+            """;
+        var cmds = BuildLogScraper.Parse(log);
+        Assert.Equal("/proj/src", cmds.Single(c => c.File == "a.c").Directory);
+        Assert.Equal(".", cmds.Single(c => c.File == "b.c").Directory);   // back out after Leaving
+    }
+
+    [Fact]
     public void ManifestJsonObject_IsNotMisreadAsCompileDb()
     {
         // The generator's ground-truth manifest is a JSON OBJECT ({...}), NOT a compile DB ([...]). Feeding it

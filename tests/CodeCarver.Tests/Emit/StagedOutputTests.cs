@@ -218,6 +218,70 @@ public sealed class StagedOutputTests
         finally { Cleanup(work); }
     }
 
+    [Fact]
+    public void Promote_ReadOnlyPriorOutput_NoBackupLeak_AndOutputWritable()
+    {
+        // eval-#10 HIGH (Perforce): read-only files in the prior --out blocked backup deletion, leaking a
+        // full .ccold copy per re-carve. Now ReadOnly is cleared before deleting, and the carved output is
+        // emitted writable. (Read-only-blocks-delete is Windows behavior; skip elsewhere.)
+        if (!OperatingSystem.IsWindows()) return;
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            using (var s1 = StagedOutput.Begin(outDir)) { File.WriteAllText(Path.Combine(s1.Dir, "a.c"), "x"); s1.Promote(); }
+            File.SetAttributes(Path.Combine(outDir, "a.c"), FileAttributes.ReadOnly); // prior out read-only (Perforce-like)
+
+            using (var s2 = StagedOutput.Begin(outDir))
+            {
+                var f = Path.Combine(s2.Dir, "a.c");
+                File.WriteAllText(f, "y");
+                File.SetAttributes(f, FileAttributes.ReadOnly);   // staged file also read-only (copied from a RO source)
+                s2.Promote();
+            }
+
+            var leftover = Directory.EnumerateDirectories(work).Select(Path.GetFileName)
+                .Where(n => n!.Contains(".ccold") || n.StartsWith(".ccstaging", StringComparison.Ordinal)).ToList();
+            Assert.Empty(leftover);                                                    // no leaked backup/staging
+            Assert.Equal("y", File.ReadAllText(Path.Combine(outDir, "a.c")));          // updated
+            Assert.True((File.GetAttributes(Path.Combine(outDir, "a.c")) & FileAttributes.ReadOnly) == 0); // writable
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Promote_PriorOutHasExclusiveLock_PreflightBails_LeavesPriorUnchanged()
+    {
+        // eval-#10 MEDIUM: a no-share lock must NOT leave a torn tree. The in-place pre-flight opens every
+        // destination for write BEFORE mutating; a locked file bails with the prior output byte-for-byte
+        // unchanged and a Torn=false failure ("unchanged"), not a half-replaced tree.
+        if (!OperatingSystem.IsWindows()) return;
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            using (var s1 = StagedOutput.Begin(outDir))
+            {
+                File.WriteAllText(Path.Combine(s1.Dir, "keep.c"), "old");
+                File.WriteAllText(Path.Combine(s1.Dir, "a.c"), "aold");
+                s1.Promote();
+            }
+            using var s2 = StagedOutput.Begin(outDir);
+            File.WriteAllText(Path.Combine(s2.Dir, "keep.c"), "new");
+            File.WriteAllText(Path.Combine(s2.Dir, "a.c"), "anew");
+            // Exclusive (no-share) lock on keep.c: blocks the dir move-aside AND the in-place overwrite.
+            using (var _ = new FileStream(Path.Combine(outDir, "keep.c"), FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                var ex = Assert.Throws<PromoteFailedException>(() => s2.Promote());
+                Assert.False(ex.Torn);                                    // reported as "unchanged", not torn
+            }
+            // Pre-flight bailed before writing anything -> prior output intact.
+            Assert.Equal("old", File.ReadAllText(Path.Combine(outDir, "keep.c")));
+            Assert.Equal("aold", File.ReadAllText(Path.Combine(outDir, "a.c")));
+        }
+        finally { Cleanup(work); }
+    }
+
     private static void Cleanup(string work)
     {
         try { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); } catch { }
