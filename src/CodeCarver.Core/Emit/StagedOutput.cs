@@ -60,6 +60,11 @@ public sealed class StagedOutput : IDisposable
         var parent = Path.GetDirectoryName(finalOut)
                      ?? throw new ArgumentException($"--out '{outDir}' has no parent directory", nameof(outDir));
         Directory.CreateDirectory(parent); // the final tree's parent must exist for the promote rename
+        // Reap orphans from prior runs that were HARD-killed (Ctrl-C / power loss / OOM kill) before Dispose
+        // could clean up: a staging or backup sibling for THIS same --out. Left alone they accumulate a full
+        // tree copy each. Only our own name-prefixed siblings for this exact output are touched.
+        ReapOrphans(parent, Path.GetFileName(finalOut));
+
         var token = Guid.NewGuid().ToString("N")[..8];
         var staging = Path.Combine(parent, $".ccstaging-{Path.GetFileName(finalOut)}-{token}");
         // Extremely unlikely, but never emit onto a pre-existing dir we didn't just make.
@@ -239,6 +244,26 @@ public sealed class StagedOutput : IDisposable
         if (_disposed) return;
         _disposed = true;
         if (!_promoted) TryDelete(Dir);
+    }
+
+    /// <summary>Delete any <c>.ccstaging-&lt;name&gt;-*</c> / <c>&lt;name&gt;.ccold-*</c> siblings in
+    /// <paramref name="parent"/> left by a prior run for this exact output that was hard-killed before it
+    /// could clean up. Scoped to this output's name prefix so it can never touch unrelated files. Never throws.</summary>
+    private static void ReapOrphans(string parent, string finalName)
+    {
+        try
+        {
+            var stagingPrefix = $".ccstaging-{finalName}-";
+            var backupPrefix = $"{finalName}.ccold-";
+            foreach (var d in Directory.EnumerateDirectories(parent))
+            {
+                var name = Path.GetFileName(d);
+                if (name.StartsWith(stagingPrefix, StringComparison.Ordinal) ||
+                    name.StartsWith(backupPrefix, StringComparison.Ordinal))
+                    TryDelete(d);
+            }
+        }
+        catch { /* best effort */ }
     }
 
     private static void TryDelete(string dir)

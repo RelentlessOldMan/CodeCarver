@@ -458,7 +458,7 @@ static int RunCarve(string[] args)
     // sample and route them to the SAME keep-whole path as oversized files — no parse, no node explosion, no
     // retained text, stream-copied at emit. Sound: the header is still kept whole via include-closure. This is
     // automatic (no --max-parse-bytes tuning); the byte cap remains only as an explicit escape hatch.
-    const long AutoSkipMinBytes = 1_000_000; // only sample files this big (few of them) — cheap
+    const long AutoSkipMinBytes = CodeCarver.Core.Preprocess.MacroDensity.MinBytesToSample; // only sample big files — cheap
     var sizeByRel = new Dictionary<string, long>(StringComparer.Ordinal);
     long originalBytes = 0;
     var bigFiles = new List<(string Rel, long Bytes)>();       // > --max-parse-bytes
@@ -471,7 +471,7 @@ static int RunCarve(string[] args)
         sizeByRel[rel] = len;
         originalBytes += len;
         if (closureLang && len > maxParseBytes) bigFiles.Add((rel, len));
-        else if (closureLang && len >= AutoSkipMinBytes && IsMacroDenseHeader(p)) denseFiles.Add((rel, len));
+        else if (closureLang && len >= AutoSkipMinBytes && CodeCarver.Core.Preprocess.MacroDensity.IsMacroDenseHeader(p)) denseFiles.Add((rel, len));
     }
     // Both populations skip the parser and are kept whole via include-closure.
     var skipParse = new HashSet<string>(bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)),
@@ -880,6 +880,12 @@ static int RunCarve(string[] args)
         using var staged = StagedOutput.Begin(outDir);
         var stageDir = staged.Dir;
 
+        // Ctrl-C mid-emit skips `using` disposal, so register a handler that deletes the (unpromoted) staging
+        // dir before the process exits — no half-written tree left orphaned beside --out. Dispose is idempotent
+        // and a no-op once the emit has promoted, so this is safe regardless of when Ctrl-C lands. One-shot
+        // process, so no need to unsubscribe.
+        Console.CancelKeyPress += (_, _) => { try { staged.Dispose(); } catch { } };
+
         var res = prune
             ? FileTreeEmitter.EmitPruned(plan, graph, dir, stageDir)
             : FileTreeEmitter.Emit(plan, dir, stageDir);
@@ -1054,62 +1060,6 @@ static string Summarize(IReadOnlyList<string> files, int max = 12)
     => files.Count <= max
         ? string.Join(", ", files)
         : string.Join(", ", files.Take(max)) + $", … (+{files.Count - max} more)";
-
-// Cheap content probe: is this a macro-dense register/header map? Such files (5-16 MB chip headers,
-// transitively #included, thousands of #defines) sit UNDER --max-parse-bytes yet drive the parser to
-// tens of GB via a graph node per #define + retained AST/text (eval #14). We only reach here for files
-// already known to be >= AutoSkipMinBytes, so a bounded prefix read (256 KB) is negligible. Read the
-// prefix, count lines that start with `#define` vs. total non-blank/non-comment lines; if the file is
-// overwhelmingly #defines it's a register map — keep it whole (never parse). Bias to NOT skipping: a
-// normal large .c (mostly code) fails the ratio and is parsed as before. Any read error → not dense.
-static bool IsMacroDenseHeader(string path)
-{
-    const int PrefixBytes = 256 * 1024;
-    const int MinNonBlank = 50;      // ignore small files that happen to be all-defines
-    const double MinRatio = 0.60;    // >= 60% of substantive lines are #define → register map
-    try
-    {
-        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        using var sr = new StreamReader(fs, System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-        var buf = new char[PrefixBytes];
-        int read = sr.ReadBlock(buf, 0, buf.Length);
-        if (read <= 0) return false;
-
-        long nonBlank = 0, defines = 0;
-        int i = 0;
-        // The very last line of the prefix may be truncated mid-line; drop it so a cut-off `#defin`
-        // isn't miscounted either way. Scan line by line over the char span.
-        int lastNewline = -1;
-        for (int k = read - 1; k >= 0; k--) if (buf[k] == '\n') { lastNewline = k; break; }
-        int end = (read == PrefixBytes && lastNewline >= 0) ? lastNewline + 1 : read;
-        while (i < end)
-        {
-            int lineStart = i;
-            while (i < end && buf[i] != '\n') i++;
-            int lineEnd = i;                 // exclusive
-            if (i < end) i++;                // step past '\n'
-            // trim leading whitespace
-            int j = lineStart;
-            while (j < lineEnd && (buf[j] == ' ' || buf[j] == '\t' || buf[j] == '\r')) j++;
-            if (j >= lineEnd) continue;      // blank line
-            // skip pure comment lines (// … and /* … lines) — they're not substantive
-            if (buf[j] == '/' && j + 1 < lineEnd && (buf[j + 1] == '/' || buf[j + 1] == '*')) continue;
-            nonBlank++;
-            if (StartsWith(buf, j, lineEnd, "#define") || StartsWith(buf, j, lineEnd, "# define"))
-                defines++;
-        }
-        if (nonBlank < MinNonBlank) return false;
-        return (double)defines / nonBlank >= MinRatio;
-    }
-    catch { return false; }
-
-    static bool StartsWith(char[] b, int start, int endExcl, string word)
-    {
-        if (start + word.Length > endExcl) return false;
-        for (int k = 0; k < word.Length; k++) if (b[start + k] != word[k]) return false;
-        return true;
-    }
-}
 
 static void RunDemo()
 {

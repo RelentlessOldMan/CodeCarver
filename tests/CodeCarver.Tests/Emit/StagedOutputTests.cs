@@ -282,6 +282,57 @@ public sealed class StagedOutputTests
         finally { Cleanup(work); }
     }
 
+    [Fact]
+    public void Dispose_WithoutPromote_RemovesStaging()
+    {
+        // A handled failure / early return (or a Ctrl-C handler calling Dispose) must leave NO staging orphan.
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            string stageDir;
+            using (var staged = StagedOutput.Begin(outDir))
+            {
+                stageDir = staged.Dir;
+                File.WriteAllText(Path.Combine(staged.Dir, "a.c"), "1");
+                // no Promote() -> Dispose must clean up
+            }
+            Assert.False(Directory.Exists(stageDir));
+            Assert.False(Directory.Exists(outDir)); // never promoted
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Begin_ReapsOrphanedStagingAndBackup_FromHardKilledPriorRun()
+    {
+        // Ctrl-C / power loss skips Dispose, orphaning a `.ccstaging-out-*` (and, mid-promote, an `out.ccold-*`)
+        // sibling. The NEXT run's Begin must reap them so they don't accumulate a full tree copy each. Only
+        // OUR name-prefixed siblings for THIS --out are touched; unrelated dirs are left alone.
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            var orphanStaging = Path.Combine(work, ".ccstaging-out-deadbeef");
+            var orphanBackup = Path.Combine(work, "out.ccold-deadbeef");
+            var unrelated = Path.Combine(work, ".ccstaging-other-cafef00d"); // different --out name
+            var innocent = Path.Combine(work, "keep-me");
+            foreach (var d in new[] { orphanStaging, orphanBackup, unrelated, innocent })
+            {
+                Directory.CreateDirectory(d);
+                File.WriteAllText(Path.Combine(d, "leftover.c"), "x");
+            }
+
+            using var staged = StagedOutput.Begin(outDir);
+
+            Assert.False(Directory.Exists(orphanStaging)); // reaped (our staging for this out)
+            Assert.False(Directory.Exists(orphanBackup));  // reaped (our backup for this out)
+            Assert.True(Directory.Exists(unrelated));      // different output name -> untouched
+            Assert.True(Directory.Exists(innocent));       // arbitrary dir -> untouched
+        }
+        finally { Cleanup(work); }
+    }
+
     private static void Cleanup(string work)
     {
         try { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); } catch { }
