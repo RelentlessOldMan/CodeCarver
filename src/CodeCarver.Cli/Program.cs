@@ -286,19 +286,86 @@ static int RunCarve(string[] args)
         if (!File.Exists(bl)) { Console.Error.WriteLine($"  warn    : --build-log file not found: {bl} (skipped)"); continue; }
         buildCmds.AddRange(BuildLogScraper.Parse(File.ReadAllText(bl)));
     }
+    // Per-TU preprocessor config from the build log. A build can compile the SAME file in multiple configs;
+    // unioning all TUs' -D and applying it globally would mark a macro "defined" for a file that was compiled
+    // WITHOUT it, dropping the #else branch that TU really compiles (UNSOUND — eval-#9). Instead: resolve each
+    // command to its carve-relative file and, PER FILE, keep only the defines CONSISTENT across all of that
+    // file's commands (a macro defined in some-but-not-all -> UNKNOWN -> both branches kept). Files not
+    // individually logged use the UNIVERSAL set (consistent across EVERY command). Manual --define/--config
+    // are global user assertions applied to every file.
+    var manualDefines = defineSpecs.Distinct().ToList();
+    Func<string, MacroTable?>? perFileDefines = null;
+    MacroTable? defines;
+
+    static string SpecName(string spec) { var eq = spec.IndexOf('='); return eq < 0 ? spec : spec[..eq]; }
+    static List<string> ConsistentDefines(IReadOnlyList<CompileCommand> cmds)
+    {
+        // Keep a macro only if defined in EVERY command with a single consistent value (else it varies -> unknown).
+        var specsByName = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        var defCount = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var cc in cmds)
+            foreach (var name in cc.Defines.Select(SpecName).Distinct())
+            {
+                defCount[name] = defCount.GetValueOrDefault(name) + 1;
+                if (!specsByName.TryGetValue(name, out var set)) specsByName[name] = set = new(StringComparer.Ordinal);
+                foreach (var d in cc.Defines) if (SpecName(d) == name) set.Add(d);
+            }
+        return specsByName.Where(kv => defCount[kv.Key] == cmds.Count && kv.Value.Count == 1)
+                          .Select(kv => kv.Value.First()).ToList();
+    }
+    string? CmdRel(CompileCommand cc)
+    {
+        try
+        {
+            var bd = Path.IsPathFullyQualified(cc.Directory) ? cc.Directory : Path.GetFullPath(Path.Combine(dir, cc.Directory));
+            var abs = Path.IsPathFullyQualified(cc.File) ? cc.File : Path.GetFullPath(Path.Combine(bd, cc.File));
+            var rel = Path.GetRelativePath(dir, abs).Replace('\\', '/');
+            return rel.StartsWith("..", StringComparison.Ordinal) ? null : rel; // outside the carve tree
+        }
+        catch { return null; }
+    }
+
     if (buildCmds.Count > 0)
     {
-        defineSpecs.AddRange(buildCmds.SelectMany(c => c.Defines));
-        Console.Error.WriteLine($"  build   : {buildLogs.Distinct().Count()} build-log(s), {buildCmds.Count} compile command(s) scraped");
+        var byFile = new Dictionary<string, List<CompileCommand>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var cc in buildCmds)
+        {
+            var rel = CmdRel(cc);
+            if (rel is null) continue;
+            if (!byFile.TryGetValue(rel, out var l)) byFile[rel] = l = new List<CompileCommand>();
+            l.Add(cc);
+        }
+        var universalSpecs = manualDefines.Concat(ConsistentDefines(buildCmds)).Distinct().ToList();
+        var universalTable = universalSpecs.Count > 0 ? MacroTable.FromDefines(universalSpecs) : null;
+        var perFile = new Dictionary<string, MacroTable?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kv in byFile)
+        {
+            var specs = manualDefines.Concat(ConsistentDefines(kv.Value)).Distinct().ToList();
+            perFile[kv.Key] = specs.Count > 0 ? MacroTable.FromDefines(specs) : null;
+        }
+        perFileDefines = f => perFile.TryGetValue(f, out var t) ? t : universalTable;
+        defines = universalTable; // fallback (files absent from the log; non-TreeSitter paths)
+        defineSpecs = universalSpecs; // what the summary/manifest report as the globally-applied set
+
+        var naive = buildCmds.SelectMany(c => c.Defines.Select(SpecName)).Distinct().Count();
+        var universalCount = universalSpecs.Count - manualDefines.Count;
+        Console.Error.WriteLine($"  build   : {buildLogs.Distinct().Count()} build-log(s), {buildCmds.Count} compile command(s), "
+            + $"{byFile.Count} file(s); per-file #ifdef config (universal {universalCount}/{naive} macro(s); "
+            + "the rest vary per TU -> both branches kept)");
     }
-    var defines = defineSpecs.Count > 0 ? MacroTable.FromDefines(defineSpecs) : null;
+    else
+    {
+        defines = manualDefines.Count > 0 ? MacroTable.FromDefines(manualDefines) : null;
+    }
 
     // --probe: ask a real compiler for its complete macro set (predefined + target + -D) and resolve
     // #ifdefs against that in closed-world mode — accurate, no "is my define list complete?" guessing.
+    // Probe is a GLOBAL closed-world table, so it supersedes the per-file map.
     if (probeCompiler is not null)
     {
-        var probed = MacroProbe.Probe(probeCompiler, defineSpecs.Select(d => "-D" + d));
-        if (probed is not null) { defines = probed; closedWorld = true; }
+        var probeArgs = manualDefines.Concat(buildCmds.SelectMany(c => c.Defines)).Distinct().Select(d => "-D" + d);
+        var probed = MacroProbe.Probe(probeCompiler, probeArgs);
+        if (probed is not null) { defines = probed; closedWorld = true; perFileDefines = null; }
         else Console.Error.WriteLine($"  warning : --probe '{probeCompiler}' could not run; ignoring it (no probe-based #ifdef resolution)");
     }
 
@@ -491,6 +558,7 @@ static int RunCarve(string[] args)
     {
         if (parseTimeoutMs is not null) tsfe.ParseBudgetMs = parseTimeoutMs.Value;
         if (refIncludes.Count > 0) tsfe.ReferenceOnlyIncludes = refIncludes;
+        if (perFileDefines is not null) tsfe.PerFileDefines = perFileDefines; // per-TU #ifdef config from the build log
     }
     // Opt-in phase timing (CODECARVER_TIMING=1) to stderr — used for the performance work.
     var _tsw = System.Diagnostics.Stopwatch.StartNew();

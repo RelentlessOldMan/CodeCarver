@@ -164,6 +164,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public IReadOnlyList<(string Path, string Text)> ReferenceOnlyIncludes { get; set; }
         = Array.Empty<(string, string)>();
 
+    /// <summary>
+    /// Optional per-file preprocessor config. Given a file's path, returns the <see cref="MacroTable"/> to
+    /// resolve THAT file's <c>#ifdef</c>s against — used when a build log supplies defines that differ per
+    /// translation unit. The CLI builds this so a macro defined in only SOME of a file's compile commands is
+    /// treated as UNKNOWN for that file (both branches kept, sound), instead of unioning all TUs' defines and
+    /// dropping the <c>#else</c> branch another TU actually compiles. Null (default) → the single global
+    /// <c>defines</c> passed to <see cref="BuildGraph"/> is used for every file, as before.
+    /// </summary>
+    public Func<string, MacroTable?>? PerFileDefines { get; set; }
+
     protected TreeSitterFrontEnd(string grammarLib, string grammarFn, string defsQuery, string callsQuery)
     {
         _lang = new Language(grammarLib, grammarFn);
@@ -217,9 +227,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (timeFiles) fsw.Restart();
             try
             {
+                // Per-file #ifdef config: when a build log supplies per-TU defines, PerFileDefines yields the
+                // set consistent for THIS file (a macro defined in only SOME of a file's compile commands is
+                // omitted -> UNKNOWN -> both branches kept, sound). Falls back to the global `defines` when no
+                // per-file table exists (no build log, or a file absent from it).
+                var fileDefines = PerFileDefines?.Invoke(path) ?? defines;
                 ProcessFile(graph, path, text, fileNodeByPath, pathsByBasename,
                             functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
-                            pendingMacroRefs, pendingPastes, defines, closedWorldDefines);
+                            pendingMacroRefs, pendingPastes, fileDefines, closedWorldDefines);
                 foreach (var n in ScanKeepAttributes(text)) keepNames.Add(n);
             }
             catch (Exception ex)   // never let one pathological file sink a whole-repo carve

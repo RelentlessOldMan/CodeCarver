@@ -324,7 +324,7 @@ public sealed class CliIntegrationTests
             if (r is null) return;
             var (code, outp) = r.Value;
             Assert.Equal(0, code);
-            Assert.Contains("compile command(s) scraped", outp); // the DB was parsed + used
+            Assert.Contains("compile command(s)", outp); // the DB was parsed + used (build-log line)
         }
         finally { Cleanup(work); }
     }
@@ -357,6 +357,40 @@ public sealed class CliIntegrationTests
             Assert.Equal(0, code);
             Assert.True(File.Exists(Path.Combine(outDir, "src", "app", "cfg", "table.inc")));  // REAL kept
             Assert.False(File.Exists(Path.Combine(outDir, "cfg", "table.inc")));               // DECOY not emitted
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Carve_BuildLog_PerTuDefines_KeepsBranchAnotherTuCompiles()
+    {
+        // eval-#9 per-TU soundness: widget.c is compiled BOTH with and without -DFEATURE. A root calls
+        // fallback_impl, which lives in the #else branch (compiled by the no-FEATURE TU). Unioning defines
+        // would mark FEATURE defined globally, kill the #else, drop fallback_impl -> widget.c unreachable
+        // and dropped (unsound). Per-file config: FEATURE is inconsistent for widget.c -> UNKNOWN -> both
+        // branches kept -> fallback_impl reachable -> widget.c emitted.
+        var work = Path.Combine(Path.GetTempPath(), "cc-pertu-" + Guid.NewGuid().ToString("N"));
+        var proj = Path.Combine(work, "proj");
+        try
+        {
+            Directory.CreateDirectory(proj);
+            File.WriteAllText(Path.Combine(proj, "main.c"),
+                "int fallback_impl(void);\nint run(void){return fallback_impl();}\nint main(void){return run();}\n");
+            File.WriteAllText(Path.Combine(proj, "widget.c"),
+                "#ifdef FEATURE\nint feature_impl(void){return 1;}\n#else\nint fallback_impl(void){return 2;}\n#endif\n");
+            var d = proj.Replace("\\", "/");
+            var db = Path.Combine(work, "cc.json");
+            File.WriteAllText(db,
+                "[ {\"directory\":\"" + d + "\",\"file\":\"main.c\",\"arguments\":[\"gcc\",\"-c\",\"main.c\"]}," +
+                "  {\"directory\":\"" + d + "\",\"file\":\"widget.c\",\"arguments\":[\"gcc\",\"-DFEATURE\",\"-c\",\"widget.c\"]}," +
+                "  {\"directory\":\"" + d + "\",\"file\":\"widget.c\",\"arguments\":[\"gcc\",\"-c\",\"widget.c\"]} ]");
+            var outDir = Path.Combine(work, "out");
+
+            var r = RunCli("carve", proj, "--roots", "main", "--build-log", db, "--out", outDir);
+            if (r is null) return;
+            var (code, _) = r.Value;
+            Assert.Equal(0, code);
+            Assert.True(File.Exists(Path.Combine(outDir, "widget.c")));   // #else branch kept -> reachable
         }
         finally { Cleanup(work); }
     }
