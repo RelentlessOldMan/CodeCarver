@@ -113,6 +113,7 @@ static int RunCarve(string[] args)
     long maxParseBytes = 20_000_000; // files bigger than this (e.g. multi-GB generated register headers)
                                      // skip the parser and are kept whole via #include-closure.
     int? parseTimeoutMs = null;      // per-file parse budget backstop (ms); null = front-end default.
+    int? maxSymbolsPerFile = null;   // per-file symbol-count budget backstop; null = front-end default.
 
     // A --config JSON file supplies defaults; explicit CLI flags below override it.
     for (var i = 2; i < args.Length - 1; i++)
@@ -148,6 +149,7 @@ static int RunCarve(string[] args)
         if (cfg.Exclude is not null) excludeDirs.AddRange(cfg.Exclude);
         if (cfg.Manifest is not null) manifestPath = cfg.Manifest;
         if (cfg.MaxParseBytes is not null) maxParseBytes = cfg.MaxParseBytes.Value;
+        if (cfg.MaxSymbolsPerFile is not null) maxSymbolsPerFile = cfg.MaxSymbolsPerFile.Value;
         if (cfg.PruneHeaders is not null) pruneHeaders = cfg.PruneHeaders.Value;
     }
 
@@ -200,6 +202,14 @@ static int RunCarve(string[] args)
             if (!int.TryParse(args[++i], out var pt) || pt < 0)
             { Console.Error.WriteLine($"--parse-timeout needs a non-negative integer (seconds; 0 disables), got '{args[i]}'"); return 2; }
             parseTimeoutMs = pt * 1000;
+        }
+        else if (args[i] == "--max-symbols-per-file" && i + 1 < args.Length)
+        {
+            // The shape-agnostic node-explosion backstop: a file that would mint more than this many
+            // symbols is kept whole rather than exploded into the graph. 0 disables it.
+            if (!int.TryParse(args[++i], out var ms) || ms < 0)
+            { Console.Error.WriteLine($"--max-symbols-per-file needs a non-negative integer (0 disables), got '{args[i]}'"); return 2; }
+            maxSymbolsPerFile = ms;
         }
         else if (args[i] == "--trace" && i + 1 < args.Length)
             tracePath = args[++i];
@@ -661,6 +671,7 @@ static int RunCarve(string[] args)
     if (fe is TreeSitterFrontEnd tsfe)
     {
         if (parseTimeoutMs is not null) tsfe.ParseBudgetMs = parseTimeoutMs.Value;
+        if (maxSymbolsPerFile is not null) tsfe.PerFileSymbolBudget = maxSymbolsPerFile.Value;
         if (refIncludes.Count > 0) tsfe.ReferenceOnlyIncludes = refIncludes;
         if (perFileDefines is not null) tsfe.PerFileDefines = perFileDefines; // per-TU #ifdef config from the build log
     }
@@ -890,6 +901,10 @@ static int RunCarve(string[] args)
     if (denseFiles.Count > 0)
         Console.WriteLine($"  dense   : {denseFiles.Count} macro-dense header(s) auto-kept-whole (skipped parse — would explode parser memory): "
                           + Summarize(denseFiles.OrderByDescending(d => d.Bytes).Select(d => $"{d.Rel} ({d.Bytes:N0} B)").ToList()));
+    var budgetKept = fe is TreeSitterFrontEnd tsb ? tsb.SymbolBudgetKeptWhole : Array.Empty<(string Path, int Symbols)>();
+    if (budgetKept.Count > 0)
+        Console.WriteLine($"  budget  : {budgetKept.Count} file(s) over the per-file symbol budget auto-kept-whole (would explode the graph — a shape the dense/big skips missed): "
+                          + Summarize(budgetKept.OrderByDescending(b => b.Symbols).Select(b => $"{b.Path} ({b.Symbols:N0} symbols)").ToList()));
     if (plan.DroppedFiles.Count > 0)
         Console.WriteLine("  dropped : " + Summarize(plan.DroppedFiles));
 
@@ -999,6 +1014,7 @@ static int RunCarve(string[] args)
     diag.Set("rootsUnresolved", unresolvedRoots.Count);
     diag.Set("bigFilesKeptWhole", bigFiles.Count);
     diag.Set("denseHeadersKeptWhole", denseFiles.Count);
+    diag.Set("symbolBudgetKeptWhole", budgetKept.Count);
 
     // --verify: compiler-free soundness gate — no KEPT function may call an in-scope function that was
     // carved out (it wouldn't link). Catches an edge our model missed (a blind spot). C/C++ only.
@@ -1168,5 +1184,6 @@ sealed class CarveConfig
     public string[]? Exclude { get; set; }
     public string? Manifest { get; set; }
     public long? MaxParseBytes { get; set; }
+    public int? MaxSymbolsPerFile { get; set; }
     public bool? PruneHeaders { get; set; }
 }

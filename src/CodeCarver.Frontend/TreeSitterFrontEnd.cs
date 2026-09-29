@@ -114,6 +114,22 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public int ParseBudgetMs { get; set; } = 20_000;
     private const int BudgetMinBytes = 256 * 1024;
 
+    /// <summary>Per-file SYMBOL budget: the max number of definitions (functions + macros + types +
+    /// globals) a single file may mint into the graph. A file that would exceed it is kept WHOLE instead
+    /// of exploded into nodes/edges. This is the shape-AGNOSTIC backstop behind the content-specific
+    /// dense-header skip and the byte cap: whatever the generated shape — a register header of tens of
+    /// thousands of <c>#define</c>s that slipped the density ratio, a giant enum/inline-fn/X-macro table —
+    /// a file that mints this many symbols blows the graph's node/edge memory (the real eval-#14 ~20 GB
+    /// cause was one node per <c>#define</c>). Keeping it whole is always sound: nothing it defines is
+    /// dropped (a TU is force-rooted; a header rides #include-closure). Checked from the PARSED tree
+    /// BEFORE any node is minted, so the blow-up allocation never happens. 0 disables the budget.</summary>
+    public int PerFileSymbolBudget { get; set; } = 50_000;
+
+    private readonly List<(string Path, int Symbols)> _symbolBudgetKeptWhole = new();
+    /// <summary>Files kept whole because their definition count exceeded <see cref="PerFileSymbolBudget"/>
+    /// — surfaced so the CLI can report/diag them, distinct from parse-failure <see cref="ForceKeepFiles"/>.</summary>
+    public IReadOnlyList<(string Path, int Symbols)> SymbolBudgetKeptWhole => _symbolBudgetKeptWhole;
+
     // Scope-opening macros (`FMT_BEGIN_NAMESPACE`, `PUGI_IMPL_NS_BEGIN` → `namespace fmt {` …). tree-sitter
     // can't see through them, so a file that opens its scope with one mis-parses entirely and NO function
     // is captured — the C++ library carve can't even find its roots. We expand ONLY these (not value
@@ -221,6 +237,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     {
         _warnings.Clear();
         _forceKeepFiles.Clear();
+        _symbolBudgetKeptWhole.Clear();
         var graph = new CodeGraph();
         var (bytesTotal, filesTotal) = BuildScopeMacros(paths, read); // pre-pass: scope macros + parse work totals
 
@@ -627,6 +644,27 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
         if (tree is null) return;
         var root = tree.RootNode;
+
+        // Shape-agnostic node-explosion backstop: BEFORE minting a single node, count the definitions this
+        // file would contribute (functions/macros/types + file-scope globals). A file over PerFileSymbolBudget
+        // is kept WHOLE — the eval-#14 ~20 GB cause was one graph node per #define, and this catches ANY
+        // generated shape (huge enum / inline-fn / X-macro tables) that slips the #define-density skip, not
+        // just #define-dense ones. Sound: a TU is force-rooted (its code stays); a header rides #include-
+        // closure — nothing it defines can be dropped. Only files big enough to POSSIBLY exceed the budget are
+        // counted (a captured symbol needs >=2 bytes), so the overwhelming majority of small files pay nothing.
+        if (PerFileSymbolBudget > 0 && text.Length >= (long)PerFileSymbolBudget * 2)
+        {
+            var symbols = CountCaptures(_defs, root) + CountCaptures(_globals, root);
+            if (symbols > PerFileSymbolBudget)
+            {
+                _symbolBudgetKeptWhole.Add((path, symbols));
+                var how = IsTranslationUnit(path) ? "force-rooted, kept whole" : "kept whole via #include-closure";
+                _warnings.Add($"{path}: would mint {symbols:N0} symbols (> {PerFileSymbolBudget:N0} budget) — {how}, not carved (guards graph-memory blow-up)");
+                if (IsTranslationUnit(path)) _forceKeepFiles.Add(path);
+                return;
+            }
+        }
+
         var fileNode = fileNodeByPath[path];
         var srcLines = text.Split('\n');
 
@@ -820,6 +858,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 pendingRefs.Add((fileNode, cap.Node.Text));
             }
         }
+    }
+
+    /// <summary>Count a query's captures over the tree WITHOUT materializing them — used by the per-file
+    /// symbol budget to decide keep-whole before any node is allocated. Enumeration only (no list), so the
+    /// gate never itself allocates the explosion it exists to prevent.</summary>
+    private static int CountCaptures(Query q, TsNode root)
+    {
+        var n = 0;
+        foreach (var _ in q.Execute(root).Captures) n++;
+        return n;
     }
 
     private static void Add(Dictionary<string, List<NodeId>> map, string name, NodeId id)
