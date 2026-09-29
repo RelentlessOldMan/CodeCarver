@@ -40,3 +40,4 @@ dist/
 .mcp.json
 **/discordinator/
 
+perf-baseline.json
