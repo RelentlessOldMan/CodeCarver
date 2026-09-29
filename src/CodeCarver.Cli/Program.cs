@@ -460,6 +460,8 @@ static int RunCarve(string[] args)
     // automatic (no --max-parse-bytes tuning); the byte cap remains only as an explicit escape hatch.
     const long AutoSkipMinBytes = CodeCarver.Core.Preprocess.MacroDensity.MinBytesToSample; // only sample big files — cheap
     var sizeByRel = new Dictionary<string, long>(StringComparer.Ordinal);
+    var fullByRel = new Dictionary<string, string>(StringComparer.Ordinal); // rel -> on-disk path (for the lazy reader)
+    var parseRels = new List<string>(paths.Count);                          // every source rel, in walk order
     long originalBytes = 0;
     var bigFiles = new List<(string Rel, long Bytes)>();       // > --max-parse-bytes
     var denseFiles = new List<(string Rel, long Bytes)>();     // macro-dense, auto-skipped
@@ -469,6 +471,8 @@ static int RunCarve(string[] args)
         long len;
         try { len = new FileInfo(p).Length; } catch { len = 0; } // a vanished/locked file: size 0, still tracked
         sizeByRel[rel] = len;
+        fullByRel[rel] = p;
+        parseRels.Add(rel);
         originalBytes += len;
         if (closureLang && len > maxParseBytes) bigFiles.Add((rel, len));
         else if (closureLang && len >= AutoSkipMinBytes && CodeCarver.Core.Preprocess.MacroDensity.IsMacroDenseHeader(p)) denseFiles.Add((rel, len));
@@ -477,20 +481,30 @@ static int RunCarve(string[] args)
     var skipParse = new HashSet<string>(bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)),
                                         StringComparer.Ordinal);
 
-    var inputs = new List<(string Rel, string Text)>(paths.Count);
+    // STREAMING ingestion: instead of reading the whole tree's text into a list up front (peak memory = every
+    // source byte at once), we read each file ON DEMAND via ReadRel and release it before the next. Returns ""
+    // for a skip/keep-whole file (big/dense) — the front-end registers a File node and copies it verbatim,
+    // never parsing it. A file that can't be read is ALSO kept whole (empty text) rather than silently dropped
+    // — the sounder choice; the emitter's copy is best-effort so an unreadable kept file can't crash the emit.
+    // ReadRel may be called more than once per file (a scope-macro pre-pass, the parse pass, include scans);
+    // the OS file cache serves the re-reads, so peak memory — not I/O — is what this trades for.
     var readErrors = 0;
-    foreach (var p in paths)
+    var readWarned = new HashSet<string>(StringComparer.Ordinal);
+    string ReadRel(string rel)
     {
-        var rel = Path.GetRelativePath(dir, p).Replace('\\', '/');
-        if (skipParse.Contains(rel)) { inputs.Add((rel, "")); continue; } // "" = don't read/parse; keep whole
-        try { inputs.Add((rel, File.ReadAllText(p))); }
+        if (skipParse.Contains(rel)) return "";
+        if (!fullByRel.TryGetValue(rel, out var full)) return "";
+        try { return File.ReadAllText(full); }
         catch (Exception ex)   // an unreadable/locked/odd file must not sink the whole run
         {
-            readErrors++;
-            if (readErrors <= 12) Console.Error.WriteLine($"  warn    : could not read {rel} ({ex.GetType().Name}) — skipped");
+            if (readWarned.Add(rel))
+            {
+                readErrors++;
+                if (readErrors <= 12) Console.Error.WriteLine($"  warn    : could not read {rel} ({ex.GetType().Name}) — kept whole, not parsed");
+            }
+            return "";
         }
     }
-    if (readErrors > 12) Console.Error.WriteLine($"  warn    : (+{readErrors - 12} more unreadable files skipped)");
 
     // Reference-only includes: local #included files with a NON-source extension (.inc/.def/generated
     // tables) that are textually part of a .c but which we don't parse as C. A function/global called only
@@ -546,12 +560,17 @@ static int RunCarve(string[] args)
         }
 
         var unresolved = new HashSet<(string, string)>();
-        var queue = new Queue<(string Full, string Text)>();
-        foreach (var (rel, text) in inputs)
-            if (text.Length > 0) queue.Enqueue((Path.GetFullPath(Path.Combine(dir, rel)), text));
+        // Stream the include scan too: the queue holds PATHS, not text — each includer is read, scanned, and
+        // released before the next, so this phase also never holds the whole tree in memory. Seeds are the
+        // parsed source files (skip/keep-whole files aren't scanned for includes, matching the prior behavior).
+        var queue = new Queue<string>();
+        foreach (var rel in parseRels)
+            if (!skipParse.Contains(rel)) queue.Enqueue(fullByRel[rel]);
         while (queue.Count > 0)
         {
-            var (fromFull, text) = queue.Dequeue();
+            var fromFull = queue.Dequeue();
+            string text;
+            try { text = File.ReadAllText(fromFull); } catch { continue; }
             var fromDir = Path.GetDirectoryName(fromFull) ?? dir;
             foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
             {
@@ -592,7 +611,7 @@ static int RunCarve(string[] args)
                     if (new FileInfo(target).Length > maxParseBytes) continue;
                     var itext = File.ReadAllText(target);
                     refIncludes.Add((Path.GetRelativePath(dir, target).Replace('\\', '/'), itext));
-                    queue.Enqueue((target, itext)); // an .inc may include another
+                    queue.Enqueue(target); // an .inc may include another — re-read on dequeue (cache-hot)
                 }
             }
         }
@@ -622,8 +641,9 @@ static int RunCarve(string[] args)
         }
         var incRe = new System.Text.RegularExpressions.Regex("^\\s*#\\s*include\\s+\"([^\"]+)\"",
             System.Text.RegularExpressions.RegexOptions.Multiline);
-        foreach (var (rel, text) in inputs)
+        foreach (var rel in parseRels)
         {
+            var text = ReadRel(rel);
             if (text.Length == 0 || !text.Contains("#include", StringComparison.Ordinal)) continue;
             foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
             {
@@ -657,16 +677,18 @@ static int RunCarve(string[] args)
 
     // Sign of life for a large tree so a multi-minute analyze isn't a silent black box (and you can see
     // how far it got if it's interrupted). CODECARVER_TIMING=1 adds a per-phase + slow-file breakdown.
-    var scanBytes = inputs.Sum(i => (long)i.Text.Length);
-    if (inputs.Count > 500 || scanBytes > 50_000_000)
-        Console.Error.WriteLine($"  scanning: {inputs.Count:N0} files (~{scanBytes / 1_000_000.0:N0} MB)"
+    // Byte total from file SIZES (not held text) — the parsed files are those not skipped/oversized.
+    var scanBytes = parseRels.Where(r => !skipParse.Contains(r)).Sum(r => sizeByRel.TryGetValue(r, out var s) ? s : 0L);
+    var scanFiles = parseRels.Count(r => !skipParse.Contains(r));
+    if (scanFiles > 500 || scanBytes > 50_000_000)
+        Console.Error.WriteLine($"  scanning: {scanFiles:N0} files (~{scanBytes / 1_000_000.0:N0} MB)"
                                 + (bigFiles.Count > 0 ? $" + {bigFiles.Count} big-file(s) kept whole" : "")
                                 + (denseFiles.Count > 0 ? $" + {denseFiles.Count} dense-header(s) kept whole" : "") + " -- analyzing...");
 
     // Live, self-calibrating parse ETA for a large tree. Parsing dominates the run and scales ~linearly with
     // bytes, so measured throughput (bytesDone/elapsed) x known remaining bytes = a real, refining estimate —
     // not a guess. Printed to stderr ~every 3 s so it never pollutes --dump-spans / manifest stdout.
-    if (fe is TreeSitterFrontEnd tsp && (inputs.Count > 500 || scanBytes > 50_000_000))
+    if (fe is TreeSitterFrontEnd tsp && (scanFiles > 500 || scanBytes > 50_000_000))
     {
         var psw = System.Diagnostics.Stopwatch.StartNew();
         var lastPrint = 0.0;                                // 0 => first ETA only after a ~3 s warmup (calibrated rate)
@@ -683,8 +705,9 @@ static int RunCarve(string[] args)
                 + $"({filesDone:N0}/{filesTotal:N0} files, {rate / 1_000_000.0:N1} MB/s) -- ETA {FormatEta(etaSec)}");
         };
     }
-    var graph = fe.BuildGraph(inputs, defines, closedWorld);
+    var graph = fe.BuildGraph(parseRels, ReadRel, defines, closedWorld);
     Mark("build-graph");
+    if (readErrors > 12) Console.Error.WriteLine($"  warn    : (+{readErrors - 12} more unreadable files kept whole)");
 
     // Non-fatal diagnostics (kept-whole fragments, unresolved/ambiguous .cmm DO). Surfacing these avoids
     // the "silent 100% smaller" trap. Capped so a tree with hundreds of dynamic DOs doesn't flood output.

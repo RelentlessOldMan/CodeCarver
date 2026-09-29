@@ -22,6 +22,16 @@ public interface ICarveFrontEnd : IDisposable
                          MacroTable? defines = null, bool closedWorldDefines = false);
 
     /// <summary>
+    /// Streaming overload: the file <paramref name="paths"/> plus a <paramref name="read"/> callback that
+    /// fetches each file's text on demand (<c>""</c> for a skip/keep-whole/unreadable file). Lets a caller
+    /// carve a huge tree without holding every source byte in memory at once. <paramref name="read"/> may be
+    /// invoked more than once per path and must be idempotent. Front-ends without a streaming parser may
+    /// simply materialize (read each path once) and delegate to the tuple overload.
+    /// </summary>
+    CodeGraph BuildGraph(IReadOnlyList<string> paths, Func<string, string> read,
+                         MacroTable? defines = null, bool closedWorldDefines = false);
+
+    /// <summary>
     /// Non-fatal diagnostics from the most recent <see cref="BuildGraph"/> — a file kept whole because it
     /// looked like an #include fragment or blew a parse budget, a <c>.cmm</c> <c>DO</c> that resolved to
     /// nothing or to an ambiguous basename. Surfacing these avoids the "silent 100% smaller" trap where a

@@ -49,6 +49,11 @@ public sealed class CSharpFrontEnd : ICarveFrontEnd
     /// <inheritdoc/>
     public IReadOnlyList<string> Warnings => Array.Empty<string>();
 
+    // C# carving is file-level (Roslyn-free); the streaming overload materializes and delegates.
+    public CodeGraph BuildGraph(IReadOnlyList<string> paths, Func<string, string> read,
+                                MacroTable? defines = null, bool closedWorldDefines = false)
+        => BuildGraph(paths.Select(p => (p, read(p))), defines, closedWorldDefines);
+
     public CodeGraph BuildGraph(IEnumerable<(string Path, string Text)> files,
                                 MacroTable? defines = null, bool closedWorldDefines = false)
     {

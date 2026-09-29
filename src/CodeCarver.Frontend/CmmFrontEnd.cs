@@ -29,6 +29,12 @@ public sealed class CmmFrontEnd : ICarveFrontEnd
     /// <inheritdoc/>
     public IReadOnlyList<string> Warnings => _warnings;
 
+    // .cmm carving is file-level over PRACTICE scripts (not the huge-firmware case), so the streaming overload
+    // just materializes (reads each path once) and delegates to the tuple form.
+    public CodeGraph BuildGraph(IReadOnlyList<string> paths, Func<string, string> read,
+                                MacroTable? defines = null, bool closedWorldDefines = false)
+        => BuildGraph(paths.Select(p => (p, read(p))), defines, closedWorldDefines);
+
     public CodeGraph BuildGraph(IEnumerable<(string Path, string Text)> files,
                                 MacroTable? defines = null, bool closedWorldDefines = false)
     {

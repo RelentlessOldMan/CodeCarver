@@ -200,22 +200,40 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public CodeGraph BuildGraph(IEnumerable<(string Path, string Text)> files, MacroTable? defines = null,
                                 bool closedWorldDefines = false)
     {
+        // Compatibility overload: materialize the text once (a Dictionary) and hand the streaming core a
+        // reader over it. Used by tests and small in-memory callers; holds all text (fine at that scale).
+        var list = files as IReadOnlyCollection<(string Path, string Text)> ?? files.ToList();
+        var paths = new List<string>(list.Count);
+        var text = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (p, t) in list) { paths.Add(p); text.TryAdd(p, t); }
+        return BuildGraph(paths, p => text.TryGetValue(p, out var t) ? t : "", defines, closedWorldDefines);
+    }
+
+    /// <summary>
+    /// Streaming graph build: takes the file <paramref name="paths"/> and a <paramref name="read"/> callback
+    /// invoked to fetch each file's text on demand (returning <c>""</c> for a skip/keep-whole/unreadable file).
+    /// Each file's text is read, used, and released before the next — so peak memory is one file's text, not
+    /// the whole tree's. <paramref name="read"/> may be called more than once per path (a scope-macro pre-pass
+    /// then the parse pass); it must be idempotent and cheap to repeat (the OS file cache serves the re-read).
+    /// </summary>
+    public CodeGraph BuildGraph(IReadOnlyList<string> paths, Func<string, string> read, MacroTable? defines = null,
+                                bool closedWorldDefines = false)
+    {
         _warnings.Clear();
         _forceKeepFiles.Clear();
         var graph = new CodeGraph();
-        var inputs = files.ToList();
-        BuildScopeMacros(inputs); // scope-opening macros to expand for parsing (see field docs)
+        var (bytesTotal, filesTotal) = BuildScopeMacros(paths, read); // pre-pass: scope macros + parse work totals
 
         var fileNodeByPath = new Dictionary<string, NodeId>(StringComparer.Ordinal);
         var pathsByBasename = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var (path, _) in inputs.Concat(ReferenceOnlyIncludes)) // reference includes get File nodes
-        {                                                                // + basenames so #include resolves
+        foreach (var path in paths.Concat(ReferenceOnlyIncludes.Select(r => r.Path))) // reference includes get File nodes
+        {                                                                              // + basenames so #include resolves
             if (fileNodeByPath.ContainsKey(path)) continue;
             fileNodeByPath[path] = graph.GetOrAddNode(NodeKind.File, path);
             var bas = BaseName(path);
-            if (!pathsByBasename.TryGetValue(bas, out var list))
-                pathsByBasename[bas] = list = new List<string>();
-            list.Add(path);
+            if (!pathsByBasename.TryGetValue(bas, out var list2))
+                pathsByBasename[bas] = list2 = new List<string>();
+            list2.Add(path);
         }
 
         var functionsByName = new Dictionary<string, List<NodeId>>(StringComparer.Ordinal);
@@ -230,14 +248,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var timeFiles = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null;
         var fsw = new System.Diagnostics.Stopwatch();
 
-        // Totals for a byte-linear ETA (parse dominates and scales with bytes). Only files actually parsed
-        // (non-empty; oversized ones are skipped) count toward the work total.
-        long bytesTotal = 0; var filesTotal = 0;
-        foreach (var (_, t) in inputs) if (t.Length > 0) { bytesTotal += t.Length; filesTotal++; }
         long bytesDone = 0; var filesDone = 0;
 
-        foreach (var (path, text) in inputs)
+        foreach (var path in paths)
         {
+            var text = read(path);
             if (text.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
             if (timeFiles) fsw.Restart();
             try
@@ -363,17 +378,28 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// Value macros (numbers, attributes) are deliberately left alone — expanding them risks changing a
     /// parse that already works. Multi-line (<c>\</c>-continued) replacements are flattened to one line so
     /// expansion never shifts line numbers.</summary>
-    private void BuildScopeMacros(IReadOnlyList<(string Path, string Text)> inputs)
+    private (long BytesTotal, int FilesTotal) BuildScopeMacros(IReadOnlyList<string> paths, Func<string, string> read)
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var (_, text) in inputs)
+        var defs = new Dictionary<string, string>(StringComparer.Ordinal);
+        var fnLike = new HashSet<string>(StringComparer.Ordinal);
+        long bytesTotal = 0; var filesTotal = 0;
+
+        // Single streaming pass: read each file once and run every collector on it, so the whole tree's text
+        // is never resident at once. Also tallies the parse work totals (non-empty files/bytes) for the ETA —
+        // saving a separate pass. Each file's text is released before the next.
+        foreach (var path in paths)
         {
+            var text = read(path);
             if (text.Length == 0) continue;
+            bytesTotal += text.Length; filesTotal++;
+
             foreach (Match m in ObjectLikeDefine.Matches(text))
             {
                 var name = m.Groups[1].Value;
-                if (map.ContainsKey(name)) continue;
                 var repl = Regex.Replace(m.Groups[2].Value, @"\\\r?\n", " ").Replace("\r", " ").Replace("\n", " ").Trim();
+                if (!defs.ContainsKey(name)) defs[name] = repl;
+                if (map.ContainsKey(name)) continue;
                 if (repl.Length == 0 || repl.Length > 200) continue;
                 // Scope OPENERS/CLOSERS only: an unbalanced net brace count (`namespace fmt {` = +2, `}}` =
                 // -2) or the `namespace` keyword. A brace-BALANCED replacement is a value macro — a
@@ -384,31 +410,22 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 if (net == 0 && !repl.Contains("namespace")) continue;
                 map[name] = repl;
             }
-        }
-        _scopeMacros = map;
-        _scopeRegex = map.Count == 0 ? null
-            : new Regex(@"\b(?:" + string.Join("|", map.Keys.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
-
-        // Specifier/empty object-like macros to blank for parsing (see _blankRegex docs). Collect ALL
-        // object-like definitions (valued + valueless), seed the blank set with those that are empty or a
-        // pure specifier, then close transitively (a macro whose body is a single already-blankable macro,
-        // e.g. PUGIXML_NOEXCEPT_IF_NOT_COMPACT -> PUGIXML_NOEXCEPT -> noexcept).
-        var defs = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var (_, text) in inputs)
-        {
-            if (text.Length == 0) continue;
-            foreach (Match m in ObjectLikeDefine.Matches(text))
-            {
-                var n = m.Groups[1].Value;
-                if (!defs.ContainsKey(n))
-                    defs[n] = Regex.Replace(m.Groups[2].Value, @"\\\r?\n", " ").Replace("\r", " ").Replace("\n", " ").Trim();
-            }
             foreach (Match m in ValuelessDefine.Matches(text))
             {
                 var n = m.Groups[1].Value;
                 if (!defs.ContainsKey(n)) defs[n] = "";
             }
+            foreach (Match m in FuncLikeDefine.Matches(text)) fnLike.Add(m.Groups[1].Value);
         }
+
+        _scopeMacros = map;
+        _scopeRegex = map.Count == 0 ? null
+            : new Regex(@"\b(?:" + string.Join("|", map.Keys.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
+
+        // Specifier/empty object-like macros to blank for parsing (see _blankRegex docs). `defs` holds ALL
+        // object-like definitions (valued + valueless) gathered above; seed the blank set with those that are
+        // empty or a pure specifier, then close transitively (a macro whose body is a single already-blankable
+        // macro, e.g. PUGIXML_NOEXCEPT_IF_NOT_COMPACT -> PUGIXML_NOEXCEPT -> noexcept).
         var blank = new HashSet<string>(StringComparer.Ordinal);
         foreach (var kv in defs)
             if (kv.Value.Length == 0 || SpecifierMacroBody.IsMatch(kv.Value)) blank.Add(kv.Key);
@@ -421,11 +438,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _blankRegex = blank.Count == 0 ? null
             : new Regex(@"\b(?:" + string.Join("|", blank.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
 
-        var fnLike = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var (_, text) in inputs)
-            if (text.Length > 0)
-                foreach (Match m in FuncLikeDefine.Matches(text)) fnLike.Add(m.Groups[1].Value);
         _funcLikeMacroNames = fnLike;
+        return (bytesTotal, filesTotal);
     }
 
     /// <summary>Replace scope-opening macros with their (single-line) expansion, for parsing only. Skips

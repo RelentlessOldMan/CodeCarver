@@ -37,7 +37,11 @@ public static class FileTreeEmitter
             if (!string.IsNullOrEmpty(dstDir))
                 Directory.CreateDirectory(dstDir);
 
-            File.Copy(src, dst, overwrite: true);
+            // Best-effort: a kept file that's locked/vanished between planning and emit (rare — antivirus, a
+            // Perforce sync, a file kept-whole precisely because it was unreadable) must not crash the whole
+            // emit. Skip it (it just won't be in the output); the read-time warning already flagged it.
+            try { File.Copy(src, dst, overwrite: true); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
             bytes += new FileInfo(dst).Length;
             written.Add(rel);
         }
