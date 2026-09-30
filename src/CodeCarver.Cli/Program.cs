@@ -317,12 +317,17 @@ static int RunCarve(string[] args)
         var ver = ToolchainVersion(probeCompiler);
         if (ver is not null) diag.Set("probeCompilerVersion", ver);
     }
-    diag.Set("commandLine", "carve " + string.Join(" ", args.Skip(1)));
-    diag.Set("sourceRoot", dir);
+    // PRIVACY: the diagnostic package is meant to be shareable, so it must NOT carry the proprietary source
+    // path, output/build-log/config paths, or the root SYMBOL NAMES. Record the command line as flags with
+    // their values elided (which flags were used is the useful debug signal), classify the source root instead
+    // of storing it, and record only the ROOT COUNT — never the names. (Redact() is a further backstop for any
+    // stray path in free text like exception messages.)
+    diag.Set("commandLine", SanitizeCommandLine(args));
+    diag.Set("sourceRootKind", ClassifyRoot(dir));
     diag.Set("lang", lang);
-    diag.Set("roots", roots);
+    diag.Set("rootCount", roots.Length);
     diag.Set("prune", prune);
-    diag.Set("out", outDir);
+    diag.Set("wroteOutput", outDir is not null);
     diag.Event("args parsed");
 
     // Preprocessor config: explicit --define plus -D flags scraped from EVERY --build-log (parsed once here
@@ -796,6 +801,19 @@ static int RunCarve(string[] args)
     // regardless of any call, so a from-main closure that dropped them would ship a broken image.
     var implicitRoots = new AttributeRootProvider().Discover(graph).ToList();
 
+    // Guarded read for the root-discovery scans below. Like ReadRel, an unreadable/locked/vanished file must
+    // not sink the run: a bare File.ReadAllText inside these LAZY projections would throw mid-Discover (after
+    // the graph was already built) on a file locked between the walk and the read — routine on a live tree.
+    string SafeRead(string full)
+    {
+        try { return File.ReadAllText(full); }
+        catch (Exception ex)
+        {
+            if (readWarned.Add(full)) Console.Error.WriteLine($"  warn    : could not read {Path.GetFileName(full)} for root scan ({ex.GetType().Name}) — skipped");
+            return "";
+        }
+    }
+
     // Assembly startup (.s/.S) references C handlers by name (vector table `.word Handler`) — root them.
     var asmRoots = new List<Root>();
     if (lang is "c" or "cpp")
@@ -807,7 +825,7 @@ static int RunCarve(string[] args)
             .Where(p => new FileInfo(p).Length <= maxParseBytes)
             .ToList(); // paths only (cheap); texts are streamed one file at a time below, never all held at once
         if (asmPaths.Count > 0)
-            asmRoots = new AsmReferenceRootProvider(asmPaths.Select(File.ReadAllText)).Discover(graph).ToList();
+            asmRoots = new AsmReferenceRootProvider(asmPaths.Select(SafeRead)).Discover(graph).ToList();
     }
 
     // A symbol placed in a custom section that the linker script KEEP()s (initcall / registration
@@ -821,14 +839,16 @@ static int RunCarve(string[] args)
         var linkerScripts = CodeCarver.Core.Util.SourceWalk.Files(dir)
             .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".ld" or ".lds" or ".ldscript")
             .Where(Included).Where(p => new FileInfo(p).Length <= maxParseBytes)
-            .Select(File.ReadAllText).ToList();
+            .Select(SafeRead).ToList();
         if (linkerScripts.Count > 0)
         {
-            // Stream the tree's source text one file at a time — the provider consumes this lazily. Adding
-            // .ToList() here materialised the whole tree's text at once (~1.6 GB UTF-16 on the death corpus)
-            // and OOM'd after the graph was already built; keep it lazy.
-            var srcTexts = paths.Where(p => new FileInfo(p).Length <= maxParseBytes)
-                                .Select(File.ReadAllText);
+            // Stream the source text one file at a time — the provider consumes this lazily; a .ToList() here
+            // materialised the whole tree's text at once (~1.6 GB UTF-16 on the death corpus) and OOM'd after
+            // the graph was already built. Reuse the SAME filter + hardened, cache-hot reader as the graph
+            // scan: skip the big/dense headers (skipParse) — ReadRel returns "" for them, they carry no
+            // section attributes, and re-reading + regex-scanning them here was a second full-tree pass over
+            // exactly the multi-MB files skipParse exists to avoid (the ~20 GB / 70+ min blowup shape).
+            var srcTexts = parseRels.Where(r => !skipParse.Contains(r)).Select(ReadRel);
             sectionRoots = new LinkerSectionRootProvider(srcTexts, linkerScripts).Discover(graph).ToList();
         }
     }
@@ -1199,6 +1219,49 @@ static string Summarize(IReadOnlyList<string> files, int max = 12)
     => files.Count <= max
         ? string.Join(", ", files)
         : string.Join(", ", files.Take(max)) + $", … (+{files.Count - max} more)";
+
+// Reconstruct the command line for the diagnostic package with all VALUES elided — the source path
+// (positional), --out/--build-log/etc. paths, and the --roots symbol names must not ship. Keeps the flag
+// names and structure so a developer can see exactly what was run without any proprietary identifiers.
+// Value-carrying flags: the argument is elided (a path or a symbol list); the flag NAME is kept (which
+// options were used is the useful, non-sensitive signal).
+static string SanitizeCommandLine(string[] a)
+{
+    var valueFlags = new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+    {
+        "--roots", "--out", "--build-log", "--config", "--define", "--manifest", "--diag", "--exclude",
+        "--aux", "--report", "--probe", "--trace", "--trace-format", "--lang", "--max-parse-bytes",
+        "--parse-timeout", "--max-symbols-per-file",
+    };
+    var sb = new System.Text.StringBuilder("carve <source>");
+    for (var i = 2; i < a.Length; i++)   // a[0]="carve", a[1]=source dir (already shown as <source>)
+    {
+        var t = a[i];
+        if (t.StartsWith("--", StringComparison.Ordinal))
+        {
+            sb.Append(' ').Append(t);
+            if (valueFlags.Contains(t) && i + 1 < a.Length) { sb.Append(" <elided>"); i++; }
+        }
+        else sb.Append(" <arg>");
+    }
+    return sb.ToString();
+}
+
+// Classify the source root for diagnostics WITHOUT leaking the path: local drive (a bare drive letter isn't
+// sensitive), a UNC network share, or a WSL mount. Enough to reason about I/O behavior; nothing identifying.
+static string ClassifyRoot(string d)
+{
+    try
+    {
+        if (d.StartsWith(@"\\", StringComparison.Ordinal) || d.StartsWith("//", StringComparison.Ordinal))
+            return "UNC network share";
+        var full = System.IO.Path.GetFullPath(d);
+        if (full.StartsWith("/mnt/", StringComparison.OrdinalIgnoreCase)) return "WSL-mounted drive";
+        var root = System.IO.Path.GetPathRoot(full);
+        return string.IsNullOrEmpty(root) ? "relative path" : $"local drive {root}";
+    }
+    catch { return "unclassified"; }
+}
 
 // The compiler's own --version banner (first non-empty line) — a source-free way to tie a build/config
 // issue to a specific toolchain. Best-effort and BOUNDED: a missing binary or a hang yields null, never a

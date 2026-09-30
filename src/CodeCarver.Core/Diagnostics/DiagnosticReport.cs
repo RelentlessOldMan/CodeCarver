@@ -79,20 +79,37 @@ public sealed class DiagnosticReport
             _fields["innerException"] = $"{inner.GetType().FullName}: {inner.Message}";
     }
 
-    /// <summary>Replace the user's home-directory prefix (both separator styles) with a placeholder so a
-    /// username never ships in the package. Returns the input unchanged when it contains no home path.</summary>
+    // Matches an ABSOLUTE path token: a Windows drive path (C:\… or C:/…), a UNC share (\\server\…), or a
+    // common POSIX/WSL absolute root (/mnt/c/…, /home/…, /usr/…). Used as defense-in-depth to scrub paths
+    // that could leak from FREE TEXT we don't fully control (exception messages/stacks). Structured path and
+    // symbol fields are elided at the source (the CLI never hands raw source paths / root names to the report).
+    private static readonly System.Text.RegularExpressions.Regex AbsolutePath = new(
+        @"[A-Za-z]:[\\/][^\s""'<>|]*" +                                             // C:\... or C:/...
+        @"|\\\\[^\s""'<>|]+" +                                                       // \\server\share\...
+        @"|(?<![A-Za-z0-9])/(?:mnt|home|usr|opt|tmp|var|root|Users)(?:/[^\s""'<>|]*)?", // /mnt/c/..., /home/...
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>Scrub identifying paths from text before it ships: the user's home prefix becomes a
+    /// placeholder, and any remaining absolute-path token (a source tree at C:\…, a UNC share \\…, a WSL
+    /// /mnt/… path — anywhere, not just under home) is reduced to <c>&lt;path&gt;</c>. The CLI already elides
+    /// the structured path/name fields at the source; this catches stray paths in free text (exceptions).
+    /// Returns the input unchanged when it contains nothing to redact.</summary>
     public static string Redact(string? text)
     {
         if (string.IsNullOrEmpty(text)) return text ?? "";
+        var result = text;
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (string.IsNullOrEmpty(home)) return text;
-        var placeholder = OperatingSystem.IsWindows() ? "%USERPROFILE%" : "$HOME";
-        var result = text.Replace(home, placeholder, StringComparison.OrdinalIgnoreCase);
-        // Windows paths may appear with forward slashes after normalization; redact that form too.
-        var homeFwd = home.Replace('\\', '/');
-        if (!homeFwd.Equals(home, StringComparison.Ordinal))
-            result = result.Replace(homeFwd, placeholder, StringComparison.OrdinalIgnoreCase);
-        return result;
+        if (!string.IsNullOrEmpty(home))
+        {
+            var placeholder = OperatingSystem.IsWindows() ? "%USERPROFILE%" : "$HOME";
+            result = result.Replace(home, placeholder, StringComparison.OrdinalIgnoreCase);
+            // Windows paths may appear with forward slashes after normalization; redact that form too.
+            var homeFwd = home.Replace('\\', '/');
+            if (!homeFwd.Equals(home, StringComparison.Ordinal))
+                result = result.Replace(homeFwd, placeholder, StringComparison.OrdinalIgnoreCase);
+        }
+        // Defense in depth: strip any remaining absolute path token (outside home) that free text may carry.
+        return AbsolutePath.Replace(result, "<path>");
     }
 
     /// <summary>Human-readable overview a developer can read WITHOUT unzipping the raw artifacts.</summary>
@@ -158,7 +175,9 @@ public sealed class DiagnosticReport
         sb.AppendLine("Excluded (by design):");
         sb.AppendLine("- Source file contents (proprietary — never collected)");
         sb.AppendLine("- Environment variables, secrets, credentials");
-        sb.AppendLine("- Absolute home paths (redacted to a placeholder)");
+        sb.AppendLine("- The source-tree path, --out/--build-log/etc. paths, and root symbol names");
+        sb.AppendLine("  (elided at the source; the command line is recorded as flags-with-values-elided)");
+        sb.AppendLine("- Absolute paths anywhere (home, other drives, UNC shares, WSL) redacted to a placeholder");
         sb.AppendLine();
 
         var named = _attachments.Where(a => a.ContainsNames).Select(a => a.Name).ToList();
@@ -184,6 +203,7 @@ public sealed class DiagnosticReport
     {
         zipPath = "";
         error = null;
+        string? tmp = null;
         try
         {
             var target = ResolveZipPath(outPath);
@@ -192,7 +212,7 @@ public sealed class DiagnosticReport
 
             // Write to a temp file first, then move into place — a crash mid-write can't leave a
             // half-written .zip masquerading as a valid package.
-            var tmp = target + ".tmp";
+            tmp = target + ".tmp";
             using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
             using (var zip = new ZipArchive(fs, ZipArchiveMode.Create))
             {
@@ -203,14 +223,21 @@ public sealed class DiagnosticReport
             }
             if (File.Exists(target)) File.Delete(target);
             File.Move(tmp, target);
+            tmp = null;               // moved into place — nothing to clean up
             zipPath = target;
             return true;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
-                                      or DirectoryNotFoundException or System.Security.SecurityException)
+        // Diagnostics must NEVER be the thing that crashes the tool (spec §24): catch everything, including a
+        // malformed --diag path (ArgumentException/NotSupportedException) or a path-too-long, and report it.
+        catch (Exception ex)
         {
             error = $"{ex.GetType().Name}: {ex.Message}";
             return false;
+        }
+        finally
+        {
+            // A failed/aborted write (or a crash between the using-close and the Move) must not orphan a .tmp.
+            if (tmp is not null) try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* best effort */ }
         }
     }
 
@@ -226,7 +253,11 @@ public sealed class DiagnosticReport
 
     private static void WriteEntry(ZipArchive zip, string name, string content)
     {
-        var entry = zip.CreateEntry(name, CompressionLevel.Optimal);
+        // Entry names are fixed literals today, but Attach is public — never let a name with path separators
+        // or '..' create a zip-slip-shaped entry. Reduce to a bare file name.
+        var safe = Path.GetFileName(name);
+        if (string.IsNullOrEmpty(safe) || safe is "." or "..") safe = "attachment.txt";
+        var entry = zip.CreateEntry(safe, CompressionLevel.Optimal);
         using var w = new StreamWriter(entry.Open(), new UTF8Encoding(false));
         w.Write(content);
     }

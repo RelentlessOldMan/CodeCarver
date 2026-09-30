@@ -212,6 +212,28 @@ public sealed class DiagnosticReportTests
     }
 
     [Fact]
+    public void Redact_StripsAbsolutePaths_OutsideHome()
+    {
+        // The core leak fix: a proprietary source tree does NOT live under the home dir (the corpora are at
+        // C:\Playground\..., \\IRISH\TestHole\..., WSL /mnt/...). Home-only redaction would have shipped these
+        // verbatim from free text (e.g. exception messages). Now any absolute path token is scrubbed.
+        var drive = DiagnosticReport.Redact(@"could not find C:\Playground\firmware\src\reg.h here");
+        Assert.DoesNotContain(@"C:\Playground", drive);
+        Assert.DoesNotContain("firmware", drive);
+        Assert.Contains("<path>", drive);
+
+        var unc = DiagnosticReport.Redact(@"reading \\IRISH\TestHole\death\secret.c failed");
+        Assert.DoesNotContain("IRISH", unc);
+        Assert.DoesNotContain("secret", unc);
+
+        var wsl = DiagnosticReport.Redact("at /mnt/c/work/proprietary/main.c");
+        Assert.DoesNotContain("proprietary", wsl);
+
+        // A non-path ratio like "24/24" must NOT be mistaken for a path.
+        Assert.Equal("24/24 passed", DiagnosticReport.Redact("24/24 passed"));
+    }
+
+    [Fact]
     public void Attachment_AppearsInZip_AndManifestListsIt_NoNamesWarningWhenSafe()
     {
         var work = Path.Combine(Path.GetTempPath(), "cc-diag-" + Guid.NewGuid().ToString("N"));
