@@ -1160,8 +1160,23 @@ public static class CarveCommand
         // Opt-in extra artifacts. --diag-repro attaches an anonymized, replayable graph (safe: hashed names, no
         // source); --diag-verbose attaches a per-file keep/drop table WITH names (the manifest flags that).
         if (diagRepro)
-            diag.Attach("repro.graph.json", ReproBundle.Build(graph, plan), containsNames: false,
-                description: "anonymized dependency graph + roots + reached set (hashed names, NO source) — replayable repro");
+        {
+            // ReproBundle.Build materializes the whole anonymized graph as one JSON string. On a very large
+            // graph that can spike memory (or, in the extreme, exceed the ~2 GB string limit). Guard it: the
+            // carve itself already succeeded (and, with --out, is on disk) — a failed repro attachment must
+            // degrade to a warning + skip, never surface as "carve failed unexpectedly" and lose everything.
+            // (The proper fix if this ever bites is to stream repro straight to the zip via Utf8JsonWriter.)
+            try
+            {
+                diag.Attach("repro.graph.json", ReproBundle.Build(graph, plan), containsNames: false,
+                    description: "anonymized dependency graph + roots + reached set (hashed names, NO source) — replayable repro");
+            }
+            catch (Exception ex)   // OutOfMemory / OverflowException on a huge graph — never fatal to the run
+            {
+                err.WriteLine($"  warn    : --diag-repro skipped ({ex.GetType().Name}) — graph too large to snapshot; "
+                              + "the rest of the diagnostic package was still written");
+            }
+        }
         if (diagVerbose)
             diag.Attach("keepdrop.txt", BuildKeepDropReport(graph, plan, unresolvedRoots, bigFiles, denseFiles, budgetKept),
                 containsNames: true, description: "per-file keep/drop + keep-reason histogram (includes NAMES, not contents)");
