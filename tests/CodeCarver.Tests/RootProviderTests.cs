@@ -90,6 +90,56 @@ public class RootProviderTests
     }
 
     [Fact]
+    public void LinkerSectionRootProvider_StreamsSourcesLazily_NeverBuffersWholeTree()
+    {
+        // Regression for the death-corpus OOM: the CLI feeds this provider a file-reading sequence spanning
+        // the WHOLE tree. If the provider (or the CLI) materialises it into a List, ~100 GB of source becomes
+        // ~1.6 GB of UTF-16 strings held at once — OOM after the graph is already built. The contract is:
+        //   (a) constructing the provider reads NOTHING (no eager .ToList() of the tree), and
+        //   (b) Discover consumes the sequence exactly ONCE, lazily.
+        var b = new GraphBuilder();
+        var early = b.Func("early_init", "init.c");
+
+        var enumerations = 0;
+        System.Collections.Generic.IEnumerable<string> Sources()
+        {
+            enumerations++;
+            yield return "__attribute__((section(\".initcall1.init\"))) void early_init(void){}";
+        }
+        const string linker = "SECTIONS { .init : { KEEP(*(.initcall1.init)) } }";
+
+        var provider = new LinkerSectionRootProvider(Sources(), new[] { linker });
+        Assert.Equal(0, enumerations); // construction must not touch the source sequence
+
+        var rooted = provider.Discover(b.Graph).Select(r => r.Node).ToHashSet();
+        Assert.Contains(early, rooted);
+        Assert.Equal(1, enumerations); // consumed exactly once — streamed, not buffered or re-read
+    }
+
+    [Fact]
+    public void AsmReferenceRootProvider_StreamsAsmLazily_NeverBuffersUpFront()
+    {
+        // Same streaming contract as the linker-section provider (the .s/.asm set is smaller, but the CLI
+        // hands it a file-reading sequence too): construction reads nothing; Discover consumes it once.
+        var b = new GraphBuilder();
+        var nmi = b.Func("NMI_Handler", "app.c");
+
+        var enumerations = 0;
+        System.Collections.Generic.IEnumerable<string> Asm()
+        {
+            enumerations++;
+            yield return ".word NMI_Handler\n";
+        }
+
+        var provider = new AsmReferenceRootProvider(Asm());
+        Assert.Equal(0, enumerations);
+
+        var rooted = provider.Discover(b.Graph).Select(r => r.Node).ToHashSet();
+        Assert.Contains(nmi, rooted);
+        Assert.Equal(1, enumerations);
+    }
+
+    [Fact]
     public void LinkerSectionRootProvider_NoLinkerScript_RootsNothing()
     {
         var b = new GraphBuilder();

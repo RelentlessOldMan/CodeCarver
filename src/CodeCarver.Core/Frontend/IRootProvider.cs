@@ -75,8 +75,9 @@ public sealed class AttributeRootProvider : IRootProvider
 public sealed class AsmReferenceRootProvider : IRootProvider
 {
     private static readonly Regex Ident = new(@"[A-Za-z_]\w*", RegexOptions.Compiled);
-    private readonly IReadOnlyList<string> _asmTexts;
-    public AsmReferenceRootProvider(IEnumerable<string> asmTexts) => _asmTexts = asmTexts.ToList();
+    private readonly IEnumerable<string> _asmTexts;
+    // Consumed lazily and exactly once in Discover — do NOT materialise (see LinkerSectionRootProvider).
+    public AsmReferenceRootProvider(IEnumerable<string> asmTexts) => _asmTexts = asmTexts;
 
     public IEnumerable<Root> Discover(CodeGraph graph)
     {
@@ -119,13 +120,18 @@ public sealed class LinkerSectionRootProvider : IRootProvider
     private static readonly Regex NameAfterAttr = new(   // leading:   __attribute__ ... [type] name
         @"^\s*(?:[A-Za-z_][\w*]*[\s*]+)*?([A-Za-z_]\w*)\s*(?:[\(\[=;,]|$)", RegexOptions.Compiled);
 
-    private readonly IReadOnlyList<string> _sourceTexts;
+    private readonly IEnumerable<string> _sourceTexts;
     private readonly IReadOnlyList<string> _linkerScriptTexts;
 
     public LinkerSectionRootProvider(IEnumerable<string> sourceTexts, IEnumerable<string> linkerScriptTexts)
     {
-        _sourceTexts = sourceTexts.ToList();
-        _linkerScriptTexts = linkerScriptTexts.ToList();
+        // The source texts are consumed lazily and exactly ONCE in Discover — do NOT materialise them here.
+        // The CLI hands us a file-reading sequence spanning the whole tree; buffering it into a List was a
+        // ~1.6 GB (UTF-16) OOM on a 100 GB corpus, on top of the already-built graph. We only ever iterate
+        // it after KeptSectionMatchers confirms at least one KEEP'd section, so a tree with no linker script
+        // never reads a byte of source through this path.
+        _sourceTexts = sourceTexts;
+        _linkerScriptTexts = linkerScriptTexts.ToList(); // just the .ld/.lds files: few and small
     }
 
     public IEnumerable<Root> Discover(CodeGraph graph)

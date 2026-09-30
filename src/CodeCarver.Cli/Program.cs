@@ -763,14 +763,14 @@ static int RunCarve(string[] args)
     var asmRoots = new List<Root>();
     if (lang is "c" or "cpp")
     {
-        var asmTexts = CodeCarver.Core.Util.SourceWalk.Files(dir)
+        var asmPaths = CodeCarver.Core.Util.SourceWalk.Files(dir)
             .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".s" or ".asm")
             .Where(p => excludeDirs.Count == 0 ||
                         !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase)))
             .Where(p => new FileInfo(p).Length <= maxParseBytes)
-            .Select(File.ReadAllText).ToList();
-        if (asmTexts.Count > 0)
-            asmRoots = new AsmReferenceRootProvider(asmTexts).Discover(graph).ToList();
+            .ToList(); // paths only (cheap); texts are streamed one file at a time below, never all held at once
+        if (asmPaths.Count > 0)
+            asmRoots = new AsmReferenceRootProvider(asmPaths.Select(File.ReadAllText)).Discover(graph).ToList();
     }
 
     // A symbol placed in a custom section that the linker script KEEP()s (initcall / registration
@@ -787,8 +787,11 @@ static int RunCarve(string[] args)
             .Select(File.ReadAllText).ToList();
         if (linkerScripts.Count > 0)
         {
+            // Stream the tree's source text one file at a time — the provider consumes this lazily. Adding
+            // .ToList() here materialised the whole tree's text at once (~1.6 GB UTF-16 on the death corpus)
+            // and OOM'd after the graph was already built; keep it lazy.
             var srcTexts = paths.Where(p => new FileInfo(p).Length <= maxParseBytes)
-                                .Select(File.ReadAllText).ToList();
+                                .Select(File.ReadAllText);
             sectionRoots = new LinkerSectionRootProvider(srcTexts, linkerScripts).Discover(graph).ToList();
         }
     }
