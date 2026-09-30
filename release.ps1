@@ -72,6 +72,21 @@ if ($LASTEXITCODE -ne 0) { throw "publish failed" }
 "CodeCarver $Version`ncommit $sha`nbranch $branch`nbuilt  $(Get-Date -Format o)" |
     Set-Content -Encoding UTF8 (Join-Path $pub 'RELEASE.txt')
 
+# Ship the user-facing docs INSIDE the release, not just in the dev repo. A user who hits a problem needs
+# SUPPORT.md (how to run --diag, what the package does/doesn't contain) and USAGE.md at hand. Copy the docs
+# folder, and surface SUPPORT.md + USAGE.md at the zip root so they're impossible to miss.
+$docsSrc = Join-Path $root 'docs'
+if (Test-Path $docsSrc) {
+    Copy-Item -Recurse -Force $docsSrc (Join-Path $pub 'docs')
+    foreach ($top in @('SUPPORT.md', 'USAGE.md', 'README.md')) {
+        $p = Join-Path $docsSrc $top
+        if (Test-Path $p) { Copy-Item -Force $p (Join-Path $pub $top) }
+    }
+    Write-Host "  bundled docs/ (+ SUPPORT.md/USAGE.md at root) into the release" -ForegroundColor DarkGray
+} else {
+    Write-Host "  WARN: no docs/ folder found to bundle" -ForegroundColor Yellow
+}
+
 # --- 5. zip (only reached AFTER push is confirmed) ---
 if (-not $Output) { $Output = Join-Path $root 'dist' }
 New-Item -ItemType Directory -Force $Output | Out-Null

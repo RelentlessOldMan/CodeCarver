@@ -160,12 +160,137 @@ public sealed class DiagnosticReportTests
     }
 
     [Fact]
+    public void SetFailure_CapturesInnerException()
+    {
+        // The unhandled-exception path often wraps the real cause (e.g. a TargetInvocationException around an
+        // IOException). The diagnostic must record the INNER exception too, or the useful cause is lost.
+        var work = Path.Combine(Path.GetTempPath(), "cc-diag-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            var report = DiagnosticReport.Start();
+            var inner = new FileNotFoundException("inner-boom-marker");
+            report.SetFailure(new InvalidOperationException("outer", inner));
+
+            report.TryWritePackage(Path.Combine(work, "p.zip"), out var zipPath, out _);
+            var (_, json, _) = ReadPackage(zipPath);
+            Assert.Contains("innerException", json);
+            Assert.Contains("inner-boom-marker", json);
+            Assert.Contains("FileNotFoundException", json);
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Package_RendersNullAndListFields()
+    {
+        // Structured fields are rendered into the human summary: a null value shows as "(none)" (not blank or
+        // a crash) and a collection (e.g. the root set) is joined, so the summary is readable for support.
+        var work = Path.Combine(Path.GetTempPath(), "cc-diag-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            var report = DiagnosticReport.Start();
+            report.Set("buildLog", null);
+            report.Set("roots", new[] { "main", "USART1_IRQHandler" });
+            report.TryWritePackage(Path.Combine(work, "p.zip"), out var zipPath, out _);
+
+            var (summary, _, _) = ReadPackage(zipPath);
+            Assert.Contains("(none)", summary);                    // null field rendered safely
+            Assert.Contains("main, USART1_IRQHandler", summary);   // list field joined
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
     public void Redact_ReplacesHome_LeavesOtherTextAlone()
     {
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         Assert.Equal("hello world", DiagnosticReport.Redact("hello world"));
         var red = DiagnosticReport.Redact(Path.Combine(home, "x"));
         Assert.DoesNotContain(home, red);
+    }
+
+    [Fact]
+    public void Attachment_AppearsInZip_AndManifestListsIt_NoNamesWarningWhenSafe()
+    {
+        var work = Path.Combine(Path.GetTempPath(), "cc-diag-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            var report = DiagnosticReport.Start();
+            report.Attach("repro.graph.json", "{\"anon\":true}", containsNames: false, description: "anonymized graph");
+            report.TryWritePackage(Path.Combine(work, "p.zip"), out var zipPath, out _);
+
+            using var zip = ZipFile.OpenRead(zipPath);
+            var entry = zip.GetEntry("repro.graph.json");
+            Assert.NotNull(entry);
+            using (var r = new StreamReader(entry!.Open())) Assert.Contains("\"anon\":true", r.ReadToEnd());
+
+            var (_, _, manifest) = ReadPackage(zipPath);
+            Assert.Contains("repro.graph.json", manifest);
+            Assert.Contains("anonymized graph", manifest);
+            Assert.DoesNotContain("INCLUDES NAMES", manifest); // safe attachment -> no names warning
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Attachment_WithNames_ManifestWarnsProminently()
+    {
+        var work = Path.Combine(Path.GetTempPath(), "cc-diag-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            var report = DiagnosticReport.Start();
+            report.Attach("keepdrop.txt", "kept: driver.c", containsNames: true, description: "keep/drop table");
+            report.TryWritePackage(Path.Combine(work, "p.zip"), out var zipPath, out _);
+
+            var (_, _, manifest) = ReadPackage(zipPath);
+            Assert.Contains("INCLUDES NAMES", manifest);   // the recipient is warned before sharing
+            Assert.Contains("keepdrop.txt", manifest);
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Attachment_ContentIsRedacted_LikeEverythingElse()
+    {
+        var work = Path.Combine(Path.GetTempPath(), "cc-diag-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            var report = DiagnosticReport.Start();
+            report.Attach("keepdrop.txt", $"kept: {Path.Combine(home, "proj", "a.c")}", containsNames: true);
+            report.TryWritePackage(Path.Combine(work, "p.zip"), out var zipPath, out _);
+
+            using var zip = ZipFile.OpenRead(zipPath);
+            using var r = new StreamReader(zip.GetEntry("keepdrop.txt")!.Open());
+            var content = r.ReadToEnd();
+            Assert.DoesNotContain(home, content);   // home path (username) redacted inside the attachment too
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Attachment_SameName_Overwrites_NoDuplicateEntry()
+    {
+        var work = Path.Combine(Path.GetTempPath(), "cc-diag-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            var report = DiagnosticReport.Start();
+            report.Attach("a.txt", "first");
+            report.Attach("a.txt", "second");   // replaces the first
+            report.TryWritePackage(Path.Combine(work, "p.zip"), out var zipPath, out _);
+
+            using var zip = ZipFile.OpenRead(zipPath);
+            Assert.Equal(1, zip.Entries.Count(e => e.Name == "a.txt"));
+            using var r = new StreamReader(zip.GetEntry("a.txt")!.Open());
+            Assert.Equal("second", r.ReadToEnd());
+        }
+        finally { Cleanup(work); }
     }
 
     private static void Cleanup(string work)

@@ -31,6 +31,12 @@ public sealed class DiagnosticReport
     private readonly List<(long Ms, string Message)> _events = new();
     private readonly List<string> _warnings = new();
     private readonly Dictionary<string, object?> _fields = new(StringComparer.Ordinal);
+    private readonly List<Attachment> _attachments = new();
+
+    /// <summary>An extra artifact carried inside the package beyond the core three. <see cref="ContainsNames"/>
+    /// flags an artifact that carries file/symbol NAMES (never file CONTENTS) so the manifest can warn the
+    /// recipient before they share it.</summary>
+    private readonly record struct Attachment(string Name, string Content, bool ContainsNames, string Description);
 
     public DiagnosticReport(string sessionId, DateTimeOffset startedUtc)
     {
@@ -50,6 +56,16 @@ public sealed class DiagnosticReport
 
     /// <summary>Add or overwrite a structured field (version, lang, roots, stats, …).</summary>
     public void Set(string key, object? value) => _fields[key] = value;
+
+    /// <summary>Attach an extra artifact to the package (e.g. an anonymized repro graph, or an opt-in
+    /// verbose keep/drop table). Content is redacted like everything else. <paramref name="containsNames"/>
+    /// = true marks that this artifact carries file/symbol NAMES (never file CONTENTS) so the manifest warns
+    /// the recipient before they share it. Re-attaching the same name overwrites the earlier one.</summary>
+    public void Attach(string name, string content, bool containsNames = false, string description = "")
+    {
+        _attachments.RemoveAll(a => string.Equals(a.Name, name, StringComparison.OrdinalIgnoreCase));
+        _attachments.Add(new Attachment(name, content, containsNames, description));
+    }
 
     /// <summary>Record the failure that ended the run (for the unhandled-exception path). Type + message +
     /// stack are safe to include; they describe the tool, not the user's source.</summary>
@@ -122,25 +138,40 @@ public sealed class DiagnosticReport
     }
 
     /// <summary>Self-describing list of what the package contains and — importantly — what it EXCLUDES,
-    /// so the recipient can trust it carries no source or secrets.</summary>
-    public string BuildManifestText() =>
-        $"""
-        CodeCarver Diagnostic Package
-        DiagnosticFormatVersion: {FormatVersion}
-        Session: {SessionId}
-        Created (UTC): {DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss}
+    /// so the recipient can trust it carries no source or secrets. Extra attachments are listed too, and if
+    /// any of them carries NAMES (an opt-in verbose artifact) that is called out prominently.</summary>
+    public string BuildManifestText()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("CodeCarver Diagnostic Package");
+        sb.AppendLine($"DiagnosticFormatVersion: {FormatVersion}");
+        sb.AppendLine($"Session: {SessionId}");
+        sb.AppendLine($"Created (UTC): {DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss}");
+        sb.AppendLine();
+        sb.AppendLine("Included:");
+        sb.AppendLine("- summary.txt        (human-readable overview)");
+        sb.AppendLine("- diagnostics.json   (structured snapshot)");
+        sb.AppendLine("- manifest.txt       (this file)");
+        foreach (var a in _attachments)
+            sb.AppendLine($"- {a.Name,-18} ({(string.IsNullOrEmpty(a.Description) ? "extra artifact" : a.Description)})");
+        sb.AppendLine();
+        sb.AppendLine("Excluded (by design):");
+        sb.AppendLine("- Source file contents (proprietary — never collected)");
+        sb.AppendLine("- Environment variables, secrets, credentials");
+        sb.AppendLine("- Absolute home paths (redacted to a placeholder)");
+        sb.AppendLine();
 
-        Included:
-        - summary.txt        (human-readable overview)
-        - diagnostics.json   (structured snapshot)
-        - manifest.txt       (this file)
-
-        Excluded (by design):
-        - Source file contents (proprietary — never collected)
-        - Environment variables, secrets, credentials
-        - Absolute home paths (redacted to a placeholder)
-
-        """;
+        var named = _attachments.Where(a => a.ContainsNames).Select(a => a.Name).ToList();
+        if (named.Count > 0)
+        {
+            sb.AppendLine("NOTE — THIS PACKAGE INCLUDES NAMES:");
+            sb.AppendLine($"  {string.Join(", ", named)} carr{(named.Count == 1 ? "ies" : "y")} file/symbol NAMES");
+            sb.AppendLine("  (never file CONTENTS), included at your request (--diag-verbose) to aid debugging.");
+            sb.AppendLine("  Review before sharing if identifiers are sensitive; omit --diag-verbose to exclude them.");
+            sb.AppendLine();
+        }
+        return sb.ToString();
+    }
 
     /// <summary>
     /// Write the package to <paramref name="outPath"/>. If that is an existing directory (or ends with a
@@ -168,6 +199,7 @@ public sealed class DiagnosticReport
                 WriteEntry(zip, "summary.txt", BuildSummaryText());
                 WriteEntry(zip, "diagnostics.json", BuildDiagnosticsJson());
                 WriteEntry(zip, "manifest.txt", BuildManifestText());
+                foreach (var a in _attachments) WriteEntry(zip, a.Name, Redact(a.Content));
             }
             if (File.Exists(target)) File.Delete(target);
             File.Move(tmp, target);

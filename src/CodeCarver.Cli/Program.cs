@@ -26,13 +26,19 @@ switch (cmd)
         catch (Exception ex)
         {
             Console.Error.WriteLine($"carve failed unexpectedly: {ex.GetType().Name}: {ex.Message}");
-            if (DiagState.Report is { } rpt && DiagState.Path is { } dp)
+            // Auto-diagnose ANY unhandled crash, even without --diag: a one-time failure shouldn't force the
+            // user to reproduce it just to capture a report. Write to the user's --diag path if given, else a
+            // default temp path. Source-free, so it's always safe to auto-write and safe to share.
+            if (DiagState.Report is { } rpt)
             {
                 rpt.SetFailure(ex);
+                var dp = DiagState.Path ?? DiagState.DefaultPath
+                         ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(), "CodeCarver_crash.zip");
                 if (rpt.TryWritePackage(dp, out var zp, out var derr))
-                    Console.Error.WriteLine($"  diag    : diagnostic package (with failure) written -> {zp}");
+                    Console.Error.WriteLine($"  diag    : diagnostic package written -> {zp}\n"
+                        + "            it contains no source (only what the tool did) — send this file to report the bug.");
                 else
-                    Console.Error.WriteLine($"  warn    : could not write --diag package '{dp}' ({derr})");
+                    Console.Error.WriteLine($"  warn    : could not write diagnostic package ({derr})");
             }
             return 1;
         }
@@ -106,6 +112,8 @@ static int RunCarve(string[] args)
     var closedWorld = false;
     string? manifestPath = null;
     string? diagPath = null;       // --diag: write ONE source-free, shareable diagnostic .zip for this run
+    var diagRepro = false;         // --diag-repro: also attach an anonymized, replayable graph snapshot
+    var diagVerbose = false;       // --diag-verbose: also attach a per-file keep/drop table (includes NAMES)
     var clean = false;             // --clean: permit replacing a non-empty --out we didn't create
     var excludeDirs = new List<string>();
     var auxGlobs = new List<string>();   // extra build files to copy verbatim into --out (Makefiles, .cmd, …)
@@ -182,6 +190,10 @@ static int RunCarve(string[] args)
             manifestPath = args[++i];
         else if (args[i] == "--diag" && i + 1 < args.Length)
             diagPath = args[++i];
+        else if (args[i] == "--diag-repro")
+            diagRepro = true;
+        else if (args[i] == "--diag-verbose")
+            diagVerbose = true;
         else if (args[i] == "--clean")
             clean = true;
         else if (args[i] == "--exclude" && i + 1 < args.Length)
@@ -225,7 +237,8 @@ static int RunCarve(string[] args)
             // --prun) just didn't apply and the carve looked fine -- exactly the silent-mistake class the evals
             // flag. Fail loudly.
             Console.Error.WriteLine($"unknown or incomplete option '{args[i]}'. try: carve <dir> --roots a,b [--lang c|cpp] "
-                                    + "[--prune] [--out DIR] [--clean] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G] [--diag Z]");
+                                    + "[--prune] [--out DIR] [--clean] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G] "
+                                    + "[--diag Z] [--diag-repro] [--diag-verbose]");
             return 2;
         }
     }
@@ -276,10 +289,31 @@ static int RunCarve(string[] args)
     var diag = DiagnosticReport.Start();
     DiagState.Report = diag;
     DiagState.Path = diagPath;
+    // Default landing spot for an auto-written package (unhandled crash, or --diag-repro/--diag-verbose used
+    // without an explicit --diag path). Session-stamped so concurrent runs don't collide.
+    DiagState.DefaultPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"CodeCarver_diag_{diag.SessionId}.zip");
     diag.Set("codecarverVersion", Version());
     diag.Set("os", System.Runtime.InteropServices.RuntimeInformation.OSDescription);
     diag.Set("runtime", System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription);
     diag.Set("processArch", System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.ToString());
+    // System capacity — source-free numbers that matter for the failures we actually see (the 90 GB OOM
+    // class): core count, memory available to the process, and free/total space on the source volume.
+    diag.Set("cpuCores", Environment.ProcessorCount);
+    try { diag.Set("totalMemoryBytes", GC.GetGCMemoryInfo().TotalAvailableMemoryBytes); } catch { /* best effort */ }
+    try
+    {
+        var drive = new DriveInfo(System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(dir))!);
+        diag.Set("sourceDriveFreeBytes", drive.AvailableFreeSpace);
+        diag.Set("sourceDriveTotalBytes", drive.TotalSize);
+    }
+    catch { /* a network share / odd root may refuse — omit rather than fail */ }
+    // Toolchain identity (source-free): the compiler's own --version banner, so a build/config issue can be
+    // tied to a specific toolchain. Only when a compiler was named (--probe); never runs an unknown binary.
+    if (probeCompiler is not null)
+    {
+        var ver = ToolchainVersion(probeCompiler);
+        if (ver is not null) diag.Set("probeCompilerVersion", ver);
+    }
     diag.Set("commandLine", "carve " + string.Join(" ", args.Skip(1)));
     diag.Set("sourceRoot", dir);
     diag.Set("lang", lang);
@@ -1078,12 +1112,25 @@ static int RunCarve(string[] args)
     diag.Set("verifyFailed", verifyFailed);
     diag.Set("exitCode", verifyFailed ? 3 : 0);
     diag.Event("run complete");
-    if (diagPath is not null)
+
+    // Opt-in extra artifacts. --diag-repro attaches an anonymized, replayable graph (safe: hashed names, no
+    // source); --diag-verbose attaches a per-file keep/drop table WITH names (the manifest flags that).
+    if (diagRepro)
+        diag.Attach("repro.graph.json", ReproBundle.Build(graph, plan), containsNames: false,
+            description: "anonymized dependency graph + roots + reached set (hashed names, NO source) — replayable repro");
+    if (diagVerbose)
+        diag.Attach("keepdrop.txt", BuildKeepDropReport(graph, plan, unresolvedRoots, bigFiles, denseFiles, budgetKept),
+            containsNames: true, description: "per-file keep/drop + keep-reason histogram (includes NAMES, not contents)");
+
+    // Write the package when --diag gave a path, OR an attachment-producing flag was used (then land it at
+    // the default temp path so the user still gets the file they asked for).
+    var effectiveDiagPath = diagPath ?? ((diagRepro || diagVerbose) ? DiagState.DefaultPath : null);
+    if (effectiveDiagPath is not null)
     {
-        if (diag.TryWritePackage(diagPath, out var zp, out var derr))
+        if (diag.TryWritePackage(effectiveDiagPath, out var zp, out var derr))
             Console.WriteLine($"  diag    : diagnostic package written -> {zp}");
         else
-            Console.Error.WriteLine($"  warn    : could not write --diag package '{diagPath}' ({derr})");
+            Console.Error.WriteLine($"  warn    : could not write diag package '{effectiveDiagPath}' ({derr})");
     }
     return verifyFailed ? 3 : 0; // non-zero so --verify is usable as a gate in scripts
 }
@@ -1102,6 +1149,77 @@ static string Summarize(IReadOnlyList<string> files, int max = 12)
     => files.Count <= max
         ? string.Join(", ", files)
         : string.Join(", ", files.Take(max)) + $", … (+{files.Count - max} more)";
+
+// The compiler's own --version banner (first non-empty line) — a source-free way to tie a build/config
+// issue to a specific toolchain. Best-effort and BOUNDED: a missing binary or a hang yields null, never a
+// crash or a stuck process (5 s cap, then killed). Only ever run on a compiler the user explicitly named.
+static string? ToolchainVersion(string compiler)
+{
+    try
+    {
+        var exe = File.Exists(compiler) ? Path.GetFullPath(compiler) : compiler; // resolve relative; bare name hits PATH
+        var psi = new System.Diagnostics.ProcessStartInfo(exe)
+        { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        psi.ArgumentList.Add("--version");
+        using var p = System.Diagnostics.Process.Start(psi);
+        if (p is null) return null;
+        var outp = p.StandardOutput.ReadToEnd();
+        var errp = p.StandardError.ReadToEnd();
+        if (!p.WaitForExit(5000)) { try { p.Kill(entireProcessTree: true); } catch { /* ignore */ } return null; }
+        var text = string.IsNullOrWhiteSpace(outp) ? errp : outp; // some toolchains print --version to stderr
+        return text.Split('\n').FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim();
+    }
+    catch { return null; }
+}
+
+// --diag-verbose artifact: a per-file keep/drop table + keep-reason histogram. Contains real file/symbol
+// NAMES (never file contents) — the package manifest flags that. Deterministically ordered so two runs over
+// the same carve produce identical text.
+static string BuildKeepDropReport(
+    CodeGraph graph, CarvePlan plan, IReadOnlyList<string> unresolvedRoots,
+    IReadOnlyList<(string Rel, long Bytes)> bigFiles, IReadOnlyList<(string Rel, long Bytes)> denseFiles,
+    IReadOnlyList<(string Path, int Symbols)> budgetKept)
+{
+    var sb = new System.Text.StringBuilder();
+    sb.AppendLine("CodeCarver keep/drop detail  (NAMES included; NO file contents)");
+    sb.AppendLine();
+
+    var hist = new SortedDictionary<string, int>(StringComparer.Ordinal);
+    foreach (var id in plan.ReachedNodes)
+    {
+        var r = plan.Why.TryGetValue(id, out var kr) ? kr : default;
+        var key = r.IsRoot ? $"ROOT[{r.AsRoot}]" : (r.ViaEdge is { } e ? $"via {e}" : "via ?");
+        hist[key] = hist.TryGetValue(key, out var c) ? c + 1 : 1;
+    }
+    sb.AppendLine($"== Why kept — histogram over {plan.ReachedNodes.Count} kept node(s) ==");
+    foreach (var kv in hist) sb.AppendLine($"  {kv.Value,7}  {kv.Key}");
+    sb.AppendLine();
+
+    sb.AppendLine($"== Roots: {unresolvedRoots.Count} unresolved ==");
+    foreach (var u in unresolvedRoots) sb.AppendLine($"  UNRESOLVED  {u}");
+    sb.AppendLine();
+
+    var perFile = new SortedDictionary<string, int>(StringComparer.Ordinal);
+    foreach (var id in plan.ReachedNodes)
+        if (graph.GetNode(id).FilePath is { } f)
+            perFile[f] = perFile.TryGetValue(f, out var c) ? c + 1 : 1;
+    sb.AppendLine($"== Kept files ({plan.KeptFiles.Count}) — kept-node count ==");
+    foreach (var f in plan.KeptFiles) sb.AppendLine($"  {(perFile.TryGetValue(f, out var c) ? c : 0),6}  {f}");
+    sb.AppendLine();
+
+    sb.AppendLine($"== Dropped files ({plan.DroppedFiles.Count}) ==");
+    foreach (var f in plan.DroppedFiles) sb.AppendLine($"  {f}");
+    sb.AppendLine();
+
+    if (bigFiles.Count + denseFiles.Count + budgetKept.Count > 0)
+    {
+        sb.AppendLine("== Kept whole (not intra-file carved) ==");
+        foreach (var (rel, bytes) in bigFiles) sb.AppendLine($"  big    {bytes,12:N0} B  {rel}");
+        foreach (var (rel, bytes) in denseFiles) sb.AppendLine($"  dense  {bytes,12:N0} B  {rel}");
+        foreach (var (path, syms) in budgetKept) sb.AppendLine($"  budget {syms,10} sym  {path}");
+    }
+    return sb.ToString();
+}
 
 static void RunDemo()
 {
@@ -1173,6 +1291,9 @@ static class DiagState
 {
     public static DiagnosticReport? Report;
     public static string? Path;
+    /// <summary>Where an auto-written package lands when the user gave no --diag path (unhandled crash, or
+    /// --diag-repro/--diag-verbose used alone). Session-stamped; set at the start of RunCarve.</summary>
+    public static string? DefaultPath;
 }
 
 sealed class CarveConfig
