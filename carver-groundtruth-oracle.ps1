@@ -1,23 +1,28 @@
 # carver-groundtruth-oracle.ps1
-# Ground-truth SOUNDNESS + PRECISION oracle for CodeCarver, driven by a CodeSpawner corpus's v1 manifest
-# (the vendored tools\codespawner\codespawner.exe emits <out>-manifest.json: _meta + a `symbols` map whose
-# `edges` are the true call graph). Because the generator KNOWS the call graph, a carve becomes a pass/fail
-# assertion with no compiler: carve to a chosen root, and CodeCarver MUST keep every function transitively
-# reachable from it (soundness); anything extra is measured (precision). This is the strongest correctness
-# test we can run without a real build, and it works at 100 GB scale (giant register headers carry no call
-# edges, so we skip them via -MaxParseBytes to bound memory - correctness of the func chain is unaffected).
+# Ground-truth SOUNDNESS + PRECISION + GRADED-reduction oracle for CodeCarver, driven by a CodeSpawner corpus's
+# v1 manifest (<out>-manifest.json: _meta + a `symbols` map whose `edges` are the true call graph, plus the
+# v1 additions `_meta.roots`, per-symbol `indirectEdges`, and `_meta.indirectTruthSha`). Because the generator
+# KNOWS the call graph, a carve becomes a pass/fail assertion with no compiler: carve to the declared root(s),
+# and CodeCarver MUST keep every function transitively reachable over (edges UNION indirectEdges) -- SOUNDNESS;
+# anything extra is measured -- PRECISION; and the reachable fraction must land on the --oracle-reachable-frac
+# dial -- GRADED. This is the strongest correctness test we can run without a real build, and it scales to
+# 100 GB (giant register headers carry no call edges, so we skip them via -MaxParseBytes to bound memory).
 #
-# Generate a corpus first (see docs/USAGE.md in the CodeSpawner repo):
-#   tools\codespawner\codespawner.exe gen --out <tree> --scale 0.01 --giant-headers 0 --cfiles 30
-# Then:
-#   ./carver-groundtruth-oracle.ps1 -Corpus <tree>
-#   ./carver-groundtruth-oracle.ps1 -Corpus <tree> -Manifest <tree>-manifest.json -Root func_100
+# The correctness corpora live in TestHole (small, ~200 KB each), reproducible from their recipes there:
+#   ./carver-groundtruth-oracle.ps1 -Corpus \\IRISH\TestHole\carve_r25    # graded target auto-derived (0.25)
+#   ./carver-groundtruth-oracle.ps1 -Corpus C:\Playground\TestHole\carve_r75
+#   ./carver-groundtruth-oracle.ps1 -Corpus <tree> -Root func_0 -ExpectedReachableFrac 0.5
+# NOTE: these graded corpora need CodeSpawner >= 1.0.8 to (re)generate (the --oracle-* knobs, indirectEdges,
+# reachable-frac dial). The exe VENDORED in this repo is 1.0.3 and CANNOT produce them -- regenerate from the
+# TestHole recipes with a 1.0.8 generator, or re-vendor 1.0.8 first.
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$Corpus,
   [string]$Manifest,
-  [string]$Root,                     # default: a symbol at the middle of the chain (tests precision, not just soundness)
+  [string]$Root,                     # default: the corpus's _meta.roots; else chain-middle (legacy)
   [long]$MaxParseBytes = 50000,      # skip big/giant headers (no call edges) so a 100 GB tree fits in memory
+  [double]$ExpectedReachableFrac = -1, # graded-dial target; <0 = auto-derive from a carve_r<NN> corpus name
+  [double]$GradedTolerance = 0.10,   # |observed - expected| allowed (dead subgraphs quantize the dial ~+/-0.06)
   [string]$CliDll
 )
 $ErrorActionPreference = 'Stop'
@@ -176,22 +181,43 @@ if ($taxTargets.Count -gt 0) {
 #     `<sorted indirectEdges> GS(0x1D) <sorted roots(dedup,ordinal-sort,RS-joined)>`, both always emitted;
 #     sha256 hex of that byte string.
 if ($m._meta.indirectTruthSha) {
-  # TODO(wire when corpus ships): recompute the canonical digest here and assert -eq $m._meta.indirectTruthSha,
-  # exit 1 on mismatch. Cross-check the recompute against the exe's shipped selftest golden vector FIRST so
-  # the two implementations are proven identical (same gate that locked prevTruthSha 7de5e47).
-  Write-Host ("indirectTruthSha present ({0}) -- read-side verify STUB (not yet recomputed)" -f $m._meta.indirectTruthSha) -ForegroundColor DarkYellow
+  # STILL A STUB -- and deliberately so. Wiring a recompute needs two things the local checkout does NOT yet
+  # have: (1) the exe's shipped digest-selftest GOLDEN VECTOR to prove our canonical-form impl byte-matches
+  # theirs (the same gate that locked prevTruthSha 7de5e47), and (2) the matching generator to reproduce it.
+  # The vendored codespawner.exe here is 1.0.3; this corpus was made with 1.0.8 -- the vendored exe predates
+  # indirectEdges/roots/indirectTruthSha entirely and manifest-schema.md does not document the canonical form.
+  # Guessing the byte layout (US/RS/GS order, sort, dedup) would make a MISMATCH indistinguishable from real
+  # drift -- worse than an honest skip. BLOCKED ON SPAWNER: re-vendor 1.0.8 + ship the schema-doc canonical
+  # form + the golden vector, THEN recompute here and assert -eq (exit 1 on mismatch).
+  Write-Host ("indirectTruthSha present ({0}..) -- read-side verify BLOCKED (need 1.0.8 re-vendor + golden vector)" -f $m._meta.indirectTruthSha.Substring(0,12)) -ForegroundColor DarkYellow
 }
 
-# (d) GRADED reduction -- if the corpus declares its intended reachable fraction (the --oracle-reachable-frac
-#     dial), report observed vs declared. Field name TBD with Spawner; guarded so it's inert until it exists.
-$declaredFrac = $m._meta.reachableFraction   # placeholder name -- confirm with Spawner when the dial ships
-if ($null -ne $declaredFrac) {
+# (d) GRADED reduction -- the --oracle-reachable-frac dial. CodeSpawner 1.0.8 does NOT emit an explicit
+#     _meta.reachableFraction field; the fraction is IMPLICIT (a fixed reachable core diluted by dead
+#     subgraphs). So we take the target from -ExpectedReachableFrac, else auto-derive it from a
+#     `carve_r<NN>` corpus name (r75 -> 0.75), and assert observed within tolerance. The dial is approximate
+#     by construction (dead subgraphs come in discrete chunks -> ~+/-0.06), so the default tolerance is loose
+#     enough not to false-trip yet tight enough to catch "kept everything" / "kept nothing".
+$gradedFail = $false
+$expFrac = $ExpectedReachableFrac
+if ($expFrac -lt 0) {
+  $leaf = (Split-Path (Resolve-Path $Corpus) -Leaf)
+  if ($leaf -match 'r(\d{1,3})$') { $expFrac = [double]$matches[1] / 100.0 }
+}
+if ($expFrac -ge 0) {
   $total = @($syms.PSObject.Properties.Name).Count
   $actualFrac = if ($total -gt 0) { [double]$reach.Count / $total } else { 0 }
-  Write-Host ("GRADED     : declared reachable-fraction {0:P0}, observed {1:P0}" -f [double]$declaredFrac, $actualFrac) -ForegroundColor Cyan
-  # TODO(wire): assert [math]::Abs($actualFrac - $declaredFrac) within an agreed tolerance; exit 1 if outside.
+  $delta = [math]::Abs($actualFrac - $expFrac)
+  if ($delta -le $GradedTolerance) {
+    Write-Host ("GRADED     : PASS - reachable {0}/{1} = {2:P0} within {3:P0} of target {4:P0}" -f $reach.Count, $total, $actualFrac, $GradedTolerance, $expFrac) -ForegroundColor Green
+  } else {
+    Write-Host ("GRADED     : FAIL - reachable {0}/{1} = {2:P0}, target {3:P0}, off by {4:P0} (> tol {5:P0})" -f $reach.Count, $total, $actualFrac, $expFrac, $delta, $GradedTolerance) -ForegroundColor Red
+    $gradedFail = $true
+  }
+} else {
+  Write-Host "GRADED     : SKIP - no -ExpectedReachableFrac and corpus name is not carve_r<NN>" -ForegroundColor DarkGray
 }
 # =========================================================================================================
 
 Remove-Item $ccManifest -Force -ErrorAction SilentlyContinue
-if ($missing.Count -ne 0) { exit 1 }
+if ($missing.Count -ne 0 -or $gradedFail) { exit 1 }
