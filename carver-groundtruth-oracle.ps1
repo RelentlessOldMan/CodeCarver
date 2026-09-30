@@ -12,9 +12,9 @@
 #   ./carver-groundtruth-oracle.ps1 -Corpus \\IRISH\TestHole\carve_r25    # graded target auto-derived (0.25)
 #   ./carver-groundtruth-oracle.ps1 -Corpus C:\Playground\TestHole\carve_r75
 #   ./carver-groundtruth-oracle.ps1 -Corpus <tree> -Root func_0 -ExpectedReachableFrac 0.5
-# NOTE: these graded corpora need CodeSpawner >= 1.0.8 to (re)generate (the --oracle-* knobs, indirectEdges,
-# reachable-frac dial). The exe VENDORED in this repo is 1.0.3 and CANNOT produce them -- regenerate from the
-# TestHole recipes with a 1.0.8 generator, or re-vendor 1.0.8 first.
+# NOTE: these graded corpora need CodeSpawner >= 1.0.9 to (re)generate (the --oracle-* knobs, indirectEdges,
+# reachable-frac dial, indirectTruthSha). The exe vendored in this repo (tools\codespawner) is 1.0.9; the
+# indirectTruthSha read-side verify self-tests against the shipped golden vector before trusting a recompute.
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$Corpus,
@@ -65,8 +65,8 @@ foreach ($p in $syms.PSObject.Properties) {
   $defFile = ($p.Value.def -replace ':\d+$','')
   $defBase[$p.Name] = [System.IO.Path]::GetFileName($defFile)
   # @($null).Count is 1 for an absent property, so filter to real edge names before counting.
-  $edges = @($p.Value.edges) | Where-Object { $_ }
-  if ($edges.Count -gt 0) {
+  $edges = @($p.Value.edges | Where-Object { $_ })   # wrap the PIPELINE OUTPUT: `@($x)|?{}` unwraps a lone hit
+  if ($edges.Count -gt 0) {                          # back to a scalar (null .Count) -> the edge silently drops.
     $lst = New-Object System.Collections.Generic.List[string]
     foreach ($e in $edges) { $lst.Add([string]$e) }
     $calls[$p.Name] = $lst
@@ -74,8 +74,8 @@ foreach ($p in $syms.PSObject.Properties) {
   # v1 corpus (additive, agreed 2026-09-30): per-symbol indirectEdges = fnptr/vector-table/init_array targets.
   # Absent on today's linear-chain manifest, so $indirect stays empty and the closure below is call-graph-only
   # exactly as before -- this parse is forward-compat, not a behavior change until Spawner ships the field.
-  $ie = @($p.Value.indirectEdges) | Where-Object { $_ }
-  if ($ie.Count -gt 0) {
+  $ie = @($p.Value.indirectEdges | Where-Object { $_ })   # same @() gotcha: every symbol here has exactly ONE
+  if ($ie.Count -gt 0) {                                   # indirect edge, so the lone-hit unwrap dropped ALL of them.
     $ilst = New-Object System.Collections.Generic.List[object]
     foreach ($e in $ie) { $ilst.Add($e) }
     $indirect[$p.Name] = $ilst
@@ -118,6 +118,14 @@ while ($q.Count -gt 0) {
     }
   }
 }
+# Direct-only closure = the reachable CORE the --oracle-reachable-frac dial targets. Per manifest-schema.md the
+# dial fraction is |BFS(roots) over EDGES| / |symbols| -- indirect targets are a separate SOUNDNESS concern, not
+# part of the dial. (Spawner's cited dial values 0.246/0.478/0.696 are these direct-only fractions.) Kept apart
+# from $reach so GRADED asserts the dial while SOUNDNESS/TAX use the wider edges-UNION-indirect set above.
+$reachDirect = @{}; $qd = New-Object System.Collections.Queue
+foreach ($r in $rootList) { if (-not $reachDirect.ContainsKey($r)) { $reachDirect[$r] = $true; [void]$qd.Enqueue($r) } }
+while ($qd.Count -gt 0) { $c = $qd.Dequeue(); if ($calls.ContainsKey($c)) { foreach ($n in $calls[$c]) { if (-not $reachDirect.ContainsKey($n)) { $reachDirect[$n] = $true; [void]$qd.Enqueue($n) } } } }
+
 $expectedFiles = @{}; foreach ($s in $reach.Keys) { $expectedFiles[$defBase[$s]] = $true }
 Write-Host ("roots {0} => {1} functions transitively reachable (direct+indirect); expect {2} def-files kept" -f ($rootList -join ','), $reach.Count, $expectedFiles.Count)
 
@@ -180,16 +188,44 @@ if ($taxTargets.Count -gt 0) {
 #     bools as 0/1); dedup + ordinal-sort each population; RS(0x1E) between records; sections
 #     `<sorted indirectEdges> GS(0x1D) <sorted roots(dedup,ordinal-sort,RS-joined)>`, both always emitted;
 #     sha256 hex of that byte string.
+$digestFail = $false
 if ($m._meta.indirectTruthSha) {
-  # STILL A STUB -- and deliberately so. Wiring a recompute needs two things the local checkout does NOT yet
-  # have: (1) the exe's shipped digest-selftest GOLDEN VECTOR to prove our canonical-form impl byte-matches
-  # theirs (the same gate that locked prevTruthSha 7de5e47), and (2) the matching generator to reproduce it.
-  # The vendored codespawner.exe here is 1.0.3; this corpus was made with 1.0.8 -- the vendored exe predates
-  # indirectEdges/roots/indirectTruthSha entirely and manifest-schema.md does not document the canonical form.
-  # Guessing the byte layout (US/RS/GS order, sort, dedup) would make a MISMATCH indistinguishable from real
-  # drift -- worse than an honest skip. BLOCKED ON SPAWNER: re-vendor 1.0.8 + ship the schema-doc canonical
-  # form + the golden vector, THEN recompute here and assert -eq (exit 1 on mismatch).
-  Write-Host ("indirectTruthSha present ({0}..) -- read-side verify BLOCKED (need 1.0.8 re-vendor + golden vector)" -f $m._meta.indirectTruthSha.Substring(0,12)) -ForegroundColor DarkYellow
+  # WIRED (CodeSpawner 1.0.9). Canonical byte-form (manifest-schema.md, locked 3-way): per edge
+  # `source US target US via US dispatched US resolved` (US=0x1F, bools 0/1); dedup + ORDINAL-sort each
+  # population; each record trailed by RS(0x1E); digest = sha256( indirectSection GS(0x1D) rootsSection ),
+  # lowercase hex. roots section = the dedup+ordinal-sorted _meta.roots, same RS-trailed framing.
+  $US=[char]0x1f; $RS=[char]0x1e; $GS=[char]0x1d
+  function Compute-IndirectDigest([string[]]$records, [string[]]$roots) {
+    $recs=[System.Collections.Generic.List[string]]::new(); foreach($x in ($records|Select-Object -Unique)){$recs.Add([string]$x)}; $recs.Sort([System.StringComparer]::Ordinal)
+    $rts=[System.Collections.Generic.List[string]]::new(); foreach($x in ($roots|Select-Object -Unique)){$rts.Add([string]$x)}; $rts.Sort([System.StringComparer]::Ordinal)
+    $sb=New-Object System.Text.StringBuilder
+    foreach($r in $recs){ [void]$sb.Append($r); [void]$sb.Append($RS) }
+    [void]$sb.Append($GS)
+    foreach($r in $rts){ [void]$sb.Append($r); [void]$sb.Append($RS) }
+    (([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($sb.ToString())))|ForEach-Object{$_.ToString('x2')}) -join ''
+  }
+  # SELF-TEST against the frozen golden vector FIRST (schema-doc fixture) -- proves our byte-form matches the
+  # generator's before we trust a recompute on real data (the gate that locked prevTruthSha).
+  $goldRecords = @(
+    ("func_0","itgt_0","fnptr","1","1" -join $US),
+    ("func_0","iext_1","vector-table","0","0" -join $US),
+    ("func_1","itgt_0","init_array","1","1" -join $US))
+  $gold = Compute-IndirectDigest $goldRecords @("func_0")
+  $goldWant = "fa9432bd75cd97b7d0a509f885f964b86b8ef41d449cc8c23b1b79df1aa1572f"
+  if ($gold -ne $goldWant) {
+    Write-Host ("indirectTruthSha: SELF-TEST FAILED (got {0}.. want {1}..) -- digest impl drifted from the generator; NOT trusting recompute" -f $gold.Substring(0,12), $goldWant.Substring(0,12)) -ForegroundColor Red
+    $digestFail = $true
+  } else {
+    # Recompute over THIS manifest's indirect edges + roots and assert equality.
+    $records = foreach($p in $syms.PSObject.Properties){ foreach($e in (@($p.Value.indirectEdges)|Where-Object{$_})){ ($p.Name,[string]$e.target,[string]$e.via,([int][bool]$e.dispatched),([int][bool]$e.resolved) -join $US) } }
+    $recompute = Compute-IndirectDigest @($records) @($m._meta.roots)
+    if ($recompute -eq $m._meta.indirectTruthSha) {
+      Write-Host ("DIGEST     : PASS - indirectTruthSha {0}.. reproduced ({1} edge(s); self-test OK)" -f $recompute.Substring(0,12), @($records).Count) -ForegroundColor Green
+    } else {
+      Write-Host ("DIGEST     : FAIL - recompute {0}.. != stored {1}.. (indirect-edge ground truth drifted)" -f $recompute.Substring(0,12), $m._meta.indirectTruthSha.Substring(0,12)) -ForegroundColor Red
+      $digestFail = $true
+    }
+  }
 }
 
 # (d) GRADED reduction -- the --oracle-reachable-frac dial. CodeSpawner 1.0.8 does NOT emit an explicit
@@ -206,12 +242,12 @@ if ($expFrac -lt 0) {
 }
 if ($expFrac -ge 0) {
   $total = @($syms.PSObject.Properties.Name).Count
-  $actualFrac = if ($total -gt 0) { [double]$reach.Count / $total } else { 0 }
+  $actualFrac = if ($total -gt 0) { [double]$reachDirect.Count / $total } else { 0 }
   $delta = [math]::Abs($actualFrac - $expFrac)
   if ($delta -le $GradedTolerance) {
-    Write-Host ("GRADED     : PASS - reachable {0}/{1} = {2:P0} within {3:P0} of target {4:P0}" -f $reach.Count, $total, $actualFrac, $GradedTolerance, $expFrac) -ForegroundColor Green
+    Write-Host ("GRADED     : PASS - reachable(direct) {0}/{1} = {2:P0} within {3:P0} of target {4:P0}" -f $reachDirect.Count, $total, $actualFrac, $GradedTolerance, $expFrac) -ForegroundColor Green
   } else {
-    Write-Host ("GRADED     : FAIL - reachable {0}/{1} = {2:P0}, target {3:P0}, off by {4:P0} (> tol {5:P0})" -f $reach.Count, $total, $actualFrac, $expFrac, $delta, $GradedTolerance) -ForegroundColor Red
+    Write-Host ("GRADED     : FAIL - reachable(direct) {0}/{1} = {2:P0}, target {3:P0}, off by {4:P0} (> tol {5:P0})" -f $reachDirect.Count, $total, $actualFrac, $expFrac, $delta, $GradedTolerance) -ForegroundColor Red
     $gradedFail = $true
   }
 } else {
@@ -220,4 +256,4 @@ if ($expFrac -ge 0) {
 # =========================================================================================================
 
 Remove-Item $ccManifest -Force -ErrorAction SilentlyContinue
-if ($missing.Count -ne 0 -or $gradedFail) { exit 1 }
+if ($missing.Count -ne 0 -or $gradedFail -or $digestFail) { exit 1 }

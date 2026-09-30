@@ -1,6 +1,6 @@
 ﻿CodeSpawner generator vendored into this repo.
 
-generatorVersion : 1.0.3
+generatorVersion : 1.0.9
 manifestVersion  : 1
 vendoredFrom     : C:\Playground\CodeSpawner
 note             : Vendored, not a submodule. Re-run scripts\vendor-codespawner.ps1 to bump.
