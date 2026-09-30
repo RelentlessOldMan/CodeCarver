@@ -23,6 +23,9 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\CodeCarver.Core\CodeCarver.Core.csproj" />
     <ProjectReference Include="..\..\src\CodeCarver.Frontend\CodeCarver.Frontend.csproj" />
+    <!-- Reference the CLI so RunCarve (via CarveCommand.Run) can be driven IN-PROCESS — coverlet only
+         instruments in-process code, so the spawn-a-process CLI integration tests don't measure it. -->
+    <ProjectReference Include="..\..\src\CodeCarver.Cli\CodeCarver.Cli.csproj" />
   </ItemGroup>
 
 </Project>
