@@ -333,6 +333,78 @@ public sealed class StagedOutputTests
         finally { Cleanup(work); }
     }
 
+    [Fact]
+    public void Promote_InPlaceFallback_UndeletableStaleFile_SurfacesTornError()
+    {
+        // eval-#10: when the in-place fallback runs and a file the new carve DROPPED cannot be removed (held
+        // open without delete-share), the tree is left STALE/unsound. That must be surfaced as a torn failure
+        // — NOT a silent exit 0 that hands back an output still carrying the dropped file.
+        if (!OperatingSystem.IsWindows()) return; // relies on Windows open-handle-blocks-delete/rename semantics
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            using (var s1 = StagedOutput.Begin(outDir))
+            {
+                File.WriteAllText(Path.Combine(s1.Dir, "keep.c"), "old");
+                File.WriteAllText(Path.Combine(s1.Dir, "stale.c"), "gone-next-carve"); // dropped by the re-carve
+                s1.Promote();
+            }
+
+            using var s2 = StagedOutput.Begin(outDir);
+            File.WriteAllText(Path.Combine(s2.Dir, "keep.c"), "new");   // only keep.c this time
+            // keep.c held write-shared -> blocks the dir move-aside so the in-place fallback runs, but still
+            // lets the in-place overwrite of keep.c succeed. stale.c held WITHOUT delete-share -> its removal
+            // fails, so it lingers as a stale file the carve meant to drop.
+            using (var _hk = new FileStream(Path.Combine(outDir, "keep.c"), FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var _hs = new FileStream(Path.Combine(outDir, "stale.c"), FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                var ex = Assert.Throws<PromoteFailedException>(() => s2.Promote());
+                Assert.True(ex.Torn);                                   // "possibly stale/unsound", not "unchanged"
+                Assert.Contains("stale", ex.Message, StringComparison.OrdinalIgnoreCase);
+            }
+            Assert.Equal("new", File.ReadAllText(Path.Combine(outDir, "keep.c"))); // the update did land
+            Assert.True(File.Exists(Path.Combine(outDir, "stale.c")));             // dropped file could NOT be removed
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Promote_FreshOut_RenameBlocked_CopyFallbackPreservesNestedSubdirs()
+    {
+        // When the staging->final rename is blocked (AV/indexer holding a just-written file) the copy fallback
+        // must reproduce the FULL tree, including nested subdirectories — a carved source tree is not flat.
+        if (!OperatingSystem.IsWindows()) return; // sharing-violation-on-rename is Windows-specific
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            using var staged = StagedOutput.Begin(outDir);
+            var subDir = Path.Combine(staged.Dir, "drivers", "uart");
+            Directory.CreateDirectory(subDir);
+            File.WriteAllText(Path.Combine(subDir, "uart.c"), "nested");
+            var locked = Path.Combine(staged.Dir, "top.c");
+            File.WriteAllText(locked, "root");
+            using (var _ = new FileStream(locked, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                staged.Promote(); // rename blocked -> copy fallback (CopyTree recreates subdirs)
+            }
+            Assert.True(File.Exists(Path.Combine(outDir, "top.c")));
+            Assert.Equal("nested", File.ReadAllText(Path.Combine(outDir, "drivers", "uart", "uart.c")));
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void IsCodeCarverOutput_MalformedPath_ReturnsFalse_DoesNotThrow()
+    {
+        // The "is this dir safe to atomically replace?" probe must be crash-proof: a malformed path is simply
+        // "not one of ours" (false), never an exception that aborts the run before it can refuse to wipe.
+        var bad = "bad\0path";   // embedded NUL -> Path.Combine throws internally -> caught -> false
+        var ex = Record.Exception(() => Assert.False(StagedOutput.IsCodeCarverOutput(bad)));
+        Assert.Null(ex);
+    }
+
     private static void Cleanup(string work)
     {
         try { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); } catch { }

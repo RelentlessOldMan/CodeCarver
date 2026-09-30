@@ -30,6 +30,16 @@ public class MacroProbeTests
     }
 
     [Fact]
+    public void Probe_MissingCompiler_ReturnsNull_NotThrowOrEmptyTable()
+    {
+        // Contract (environment-independent): if the compiler can't be run, Probe returns null so the caller
+        // does NOT enable closed-world. Returning an EMPTY table instead would be a silent soundness bug —
+        // under closed-world every macro would look undefined and real branches would be dropped.
+        var table = MacroProbe.Probe("cc-nonexistent-compiler-zzz-" + Guid.NewGuid().ToString("N"));
+        Assert.Null(table);
+    }
+
+    [Fact]
     public void Probe_HonoursDashD_AndDrivesClosedWorldResolution()
     {
         var gcc = Gcc();
