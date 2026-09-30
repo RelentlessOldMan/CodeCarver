@@ -9,6 +9,47 @@ The one invariant: **a carve must still build and still boot.** File-level carvi
 the sound default; `--prune` (intra-file) is the aggressive tier where the size win — and the bugs —
 live. Never trade soundness for size: when unsure, CodeCarver keeps more, and so should you.
 
+---
+
+## Quick start — the first buildable carve (do this first)
+
+Two passes, cheapest first. `--out` is now a **complete buildable project** (keep-by-default: reachable
+code + its include closure + *every* non-code file — Makefiles, linker scripts, startup asm, data, configs
+— passed through verbatim; the only omissions are code the carve proved dead). So there's no scaffolding to
+hand-copy — carve, then build the `--out` dir directly.
+
+**Pass 1 — dry run (analysis only, seconds, zero risk):**
+```
+carve <REPO>\<image-subtree> --roots <ROOTS> --lang <LANG> --exclude <EXCLUDE> \
+      --build-log make-n.log --strict-roots --report r.txt
+```
+- `--build-log` from a real `make -n` of THIS image — pins the exact `-D`/`-I` so the carve's `#ifdef`
+  view matches the compiler's. **The single most important flag**; without it the config is guessing.
+- `--strict-roots` — a typo'd/renamed root fails the run loudly instead of silently carving it away.
+- Read `r.txt` (the three-bucket report): confirm **nothing load-bearing is under "REMOVED — dead code"**,
+  and eyeball the "KEPT — infrastructure" bucket. This report is also how you answer "what's the 54.5 GB?"
+  from the eval-#15 data request — it's size-by-category, code vs dead vs infra, per file.
+
+**Pass 2 — real carve + build:**
+```
+carve <REPO>\<image-subtree> --roots <ROOTS> --lang <LANG> --exclude <EXCLUDE> \
+      --build-log make-n.log --strict-roots --out out\ --report r.txt --manifest m.json
+<BUILD>   pointed at out\      # your real toolchain / TRACE32 flow
+<SIZE>    on out\ vs the original
+```
+- **File-level (NO `--prune`)** — the safe floor. Prove it *builds+boots* first; tighten with `--prune`
+  only once file-level is green. Start with **one image/subtree**, not the whole repo — one authoritative
+  "builds + boots + smaller" datapoint beats a broad sweep and iterates faster.
+- `--out` must be a fresh dir OUTSIDE the tree.
+
+**Bring back (source stays on the box — all of this is source-free):** the counts + before/after `<SIZE>`
+from `r.txt`; on any failure, `--diag <zip>` (or `--diag-repro` for a replayable anonymized graph). The
+likely first hiccup is a **linker `undefined reference`** — that's the valuable signal (an edge static
+analysis missed: a symbol reached only via a macro, inline asm, or an unresolved table). Send the symbol
+name (or the repro) and it's directly diagnosable.
+
+The rest of this doc is the deeper runbook (roots enumeration, soundness gates, hammering matrix, oracles).
+
 Fill these in once:
 
 | blank | what it is | how to find it |
@@ -17,7 +58,7 @@ Fill these in once:
 | `<ROOTS>` | entry symbols the image truly needs | see **Roots** below — this is the whole game |
 | `<LANG>` | `c` or `cpp` | `cpp` if any `.cpp/.cc/.hpp` in the build |
 | `<EXCLUDE>` | dirs NOT in this image | tests, host tools, **other board/chip variants**, bootloader-vs-app |
-| `<AUX>` | linker/startup files to copy verbatim | `*.ld,*.lds,*.s,*.S,*.icf` globs |
+| `<AUX>` | *(usually unneeded now)* force-copy a file from an `--exclude`'d dir | keep-by-default already passes through ALL non-code files; `--aux` only pulls one back in from a pruned variant folder |
 | `<BUILD>` | your real build command | the make/cmake/TRACE32 invocation that produces the image |
 | `<SIZE>` | image-size probe | `arm-none-eabi-size`, or `.bin` byte count |
 
@@ -116,10 +157,11 @@ oracle asserts traced ⊆ kept, so the whole path is exercised locally today.)
 ## 4. The authoritative test — build the carved image and compare size
 
 ```
-carve <REPO> --roots <ROOTS> --lang <LANG> --exclude <EXCLUDE> --aux <AUX> \
-      --build-log build.log --prune --out out/ --manifest m.json
+# File-level FIRST (the safe floor — should build+boot). Add --prune only after this is green.
+carve <REPO> --roots <ROOTS> --lang <LANG> --exclude <EXCLUDE> \
+      --build-log build.log --out out/ --report r.txt --manifest m.json
 # then build out/ with YOUR toolchain / TRACE32 flow:
-<BUILD>            # pointed at out/
+<BUILD>            # pointed at out/  (keep-by-default already copied all build scaffolding)
 <SIZE>             # image size of the carved build
 ```
 
