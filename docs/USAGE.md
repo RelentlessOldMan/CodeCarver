@@ -72,9 +72,10 @@ Every carve is sound with just `--roots`. Each extra input lets it carve **tight
 | Complete-config | `--assume-defines-complete` | closed-world without probing: trust the supplied defines as complete |
 | Write output | `--out DIR` | emit the carved tree. Written atomically (staged, then swapped into place) so a crash mid-emit can't leave a half-written tree. `--out` must be **outside** the source tree; a **non-empty** `--out` that CodeCarver didn't create is refused (so it can't wipe a checkout or your own files) — re-carving a prior CodeCarver output is seamless |
 | Replace output | `--clean` | permit replacing a non-empty `--out` CodeCarver did **not** create (explicit opt-in to overwrite its contents) |
-| Aux build files | `--aux "Makefile,*.cmd"` | extra non-source files to copy verbatim into `--out` (Makefiles, TI `.cmd` linker files, …) on top of the linker scripts + startup assembly copied automatically |
+| Force-include | `--aux "board/*.ld"` | force-copy specific files into `--out` **even when under an `--exclude`'d directory**. Rarely needed now — keep-by-default already passes through every non-code file (see below); `--aux` only pulls a file back in from a pruned variant folder |
 | Aggressive prune | `--prune` | intra-file function/table removal (C/C++ only; other languages carve file-level) |
-| Audit | `--manifest m.json` | write a JSON manifest of roots, stats, kept/dropped files, byte counts |
+| Carve report | `--report r.txt` | write the three-bucket carve report: **KEPT — required to build** (reachable code + its `#include` closure), **REMOVED — dead code** (files the carve proved unreachable), **KEPT — infrastructure** (every non-code file, passed through verbatim, grouped by kind). Paths only, no file contents. Works with or without `--out` |
+| Audit | `--manifest m.json` | write a JSON manifest of roots, stats, kept/dropped files, byte counts, and the infrastructure passthrough list |
 | Diagnostics | `--diag report.zip` | write ONE **source-free**, shareable diagnostic package (`summary.txt` + `diagnostics.json` + `manifest.txt`) describing what the tool did — version, environment (incl. CPU/RAM/free disk), parameters, stats, warnings, phase timings, and any failure. Home paths are redacted; **no source content, ever**. Send this when a carve misbehaves on a repo you can't share. Pass a directory to get a timestamped `CodeCarver_Diagnostics_<UTC>.zip` inside it. Written on success — and, **even without this flag**, automatically to a temp path on an unexpected crash (the path is printed) |
 | Repro bundle | `--diag-repro` | also attach `repro.graph.json`: the dependency graph the carve ran over with **every name/path replaced by an opaque token** (no source, no real identifiers, no reverse mapping). Lets a developer *replay* your carve and reproduce a wrong keep/drop with none of your IP. Safe to share |
 | Verbose diag | `--diag-verbose` | also attach `keepdrop.txt`: per-file keep/drop + keep-reason histogram + unresolved roots. **Includes file/symbol NAMES** (still never file *contents*); the manifest flags this. Omit if identifiers are sensitive. (`--diag-repro`/`--diag-verbose` used without `--diag` write to a temp path.) |
@@ -83,6 +84,24 @@ Every carve is sound with just `--roots`. Each extra input lets it carve **tight
 | Carve headers | `--prune-headers` | **experimental**: strip unused `#define`s from the big kept headers above (a 1.4 GB register map → the handful of registers you use). Streaming + sound — keeps the transitive closure of needed defines, every non-`#define` line (guards, `#if`, types), all `#if`-referenced names, and token-paste (`##`) candidate families. Always build-verify (C/C++ only) |
 | Parse budget | `--parse-timeout N` | per-file parse budget in **seconds** (default 20). A file whose parse blows it is kept whole + warned — a backstop against tree-sitter's super-linear error recovery on invalid `#include` fragments stalling a run |
 | Soundness gate | `--verify` | compiler-free check: flag any **kept** function that calls an **in-scope** function the carve dropped (it wouldn't link). Exits non-zero on a violation, so it's usable as a CI/script gate (C/C++). Catches an edge the model missed — the useful check when you have no build |
+
+### Output is a complete, buildable project (keep-by-default)
+
+`--out` is not just the carved C — it's a **whole project you can build**. After emitting the reachable
+code and its `#include` closure, CodeCarver copies **every other file in the tree verbatim**: Makefiles /
+CMake, linker scripts and scatter/`.cmd` files, startup assembly, device trees, register and data tables,
+TRACE32 `.cmm`, prebuilt `.a`/`.o`, board configs — anything that isn't a translation unit the carve
+modelled. The rule is **evidence-based removal only**: the *only* files left out are (1) the code already
+emitted and (2) code files the carve **proved unreachable** (dead translation units / unreferenced
+headers). Everything else is kept, because a file the tool didn't model is a file it can't prove you don't
+need to build.
+
+The knob for trimming is `--exclude DIR` (drop board/arch variants you don't build, or large non-build
+trees like `docs`, VCS metadata); `--aux GLOB` forces a specific file back in from an excluded folder.
+
+Because passthrough files are copied byte-for-byte, the headline **size reduction reflects only the code
+carve** (dead code removed) — the untouched infrastructure is delta-neutral. Use `--report` to see exactly
+what landed in each of the three buckets.
 
 ### Config file
 

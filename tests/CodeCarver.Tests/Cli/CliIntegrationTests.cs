@@ -446,13 +446,26 @@ public sealed class CliIntegrationTests
             File.WriteAllText(db, "[ { \"directory\": \"" + app.Replace("\\", "/") +
                 "\", \"file\": \"main.c\", \"arguments\": [\"gcc\", \"-Icfg\", \"-c\", \"main.c\"] } ]");
             var outDir = Path.Combine(work, "out");
+            var report = Path.Combine(work, "report.txt");
 
-            var r = RunCli("carve", proj, "--roots", "main", "--build-log", db, "--out", outDir);
+            var r = RunCli("carve", proj, "--roots", "main", "--build-log", db, "--out", outDir, "--report", report);
             if (r is null) return;
             var (code, _) = r.Value;
             Assert.Equal(0, code);
             Assert.True(File.Exists(Path.Combine(outDir, "src", "app", "cfg", "table.inc")));  // REAL kept
-            Assert.False(File.Exists(Path.Combine(outDir, "cfg", "table.inc")));               // DECOY not emitted
+
+            // Keep-by-default makes --out a complete buildable project, so the DECOY (a real file the carve
+            // didn't resolve as the include) is ALSO copied — but as passthrough INFRASTRUCTURE, not as the
+            // resolved include. Resolution correctness (eval-#9 HIGH: -Icfg resolves against the entry's
+            // 'directory', picking src/app/cfg, not the carve-root decoy) now shows in WHICH BUCKET each lands:
+            // the REAL one is required-to-build (include closure); the decoy is infrastructure-only.
+            var rpt = File.ReadAllText(report);
+            var infraIdx = rpt.IndexOf("== KEPT - infrastructure", StringComparison.Ordinal);
+            Assert.True(infraIdx > 0, "report should have an infrastructure section");
+            var buildRequired = rpt.Substring(0, infraIdx);
+            var infrastructure = rpt.Substring(infraIdx);
+            Assert.Contains("\n    src/app/cfg/table.inc", buildRequired);  // REAL resolved as the include (build-required)
+            Assert.Contains("\n    cfg/table.inc", infrastructure);         // DECOY only passed through (infrastructure)
         }
         finally { Cleanup(work); }
     }

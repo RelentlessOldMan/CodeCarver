@@ -116,7 +116,8 @@ static int RunCarve(string[] args)
     var diagVerbose = false;       // --diag-verbose: also attach a per-file keep/drop table (includes NAMES)
     var clean = false;             // --clean: permit replacing a non-empty --out we didn't create
     var excludeDirs = new List<string>();
-    var auxGlobs = new List<string>();   // extra build files to copy verbatim into --out (Makefiles, .cmd, …)
+    var auxGlobs = new List<string>();   // force-copy files even from --exclude'd dirs (keep-by-default handles the rest)
+    string? reportPath = null;           // --report: write the three-bucket carve report (kept/removed/infra)
     string? probeCompiler = null;
     long maxParseBytes = 20_000_000; // files bigger than this (e.g. multi-GB generated register headers)
                                      // skip the parser and are kept whole via #include-closure.
@@ -200,6 +201,8 @@ static int RunCarve(string[] args)
             excludeDirs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         else if (args[i] == "--aux" && i + 1 < args.Length)
             auxGlobs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        else if (args[i] == "--report" && i + 1 < args.Length)
+            reportPath = args[++i];
         else if (args[i] == "--probe" && i + 1 < args.Length)
             probeCompiler = args[++i];
         else if (args[i] == "--max-parse-bytes" && i + 1 < args.Length)
@@ -238,7 +241,7 @@ static int RunCarve(string[] args)
             // flag. Fail loudly.
             Console.Error.WriteLine($"unknown or incomplete option '{args[i]}'. try: carve <dir> --roots a,b [--lang c|cpp] "
                                     + "[--prune] [--out DIR] [--clean] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G] "
-                                    + "[--diag Z] [--diag-repro] [--diag-verbose]");
+                                    + "[--report F] [--diag Z] [--diag-repro] [--diag-verbose]");
             return 2;
         }
     }
@@ -946,6 +949,12 @@ static int RunCarve(string[] args)
         Console.WriteLine("  dropped : " + Summarize(plan.DroppedFiles));
 
     long carvedBytes;
+    // Three-bucket accounting for the carve report: what's required to build (kept code + include closure),
+    // and what non-code infrastructure was passed through verbatim. Removed-dead-code is plan.DroppedFiles.
+    IReadOnlyList<string> buildRequiredFiles = plan.KeptFiles;   // refined to res.Written when we emit
+    IReadOnlyList<string> infraFiles = Array.Empty<string>();
+    long infraBytes = 0;
+    var infraEnumerated = false;                                 // false in analysis-only unless --report walks
     if (outDir is not null)
     {
         // Crash-safe, non-destructive emit: every step writes into a private staging dir; the real --out is
@@ -966,6 +975,7 @@ static int RunCarve(string[] args)
             : FileTreeEmitter.Emit(plan, dir, stageDir);
         Mark("emit");
         carvedBytes = res.BytesWritten;
+        buildRequiredFiles = res.Written;   // kept code + its include closure = the build-required bucket
         var how = prune ? "pruned (intra-file: unreached functions removed)" : "file-level (whole kept files)";
         Console.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{how}]");
         if (prune)
@@ -986,24 +996,24 @@ static int RunCarve(string[] args)
             }
         }
 
-        // Build-support files: an embedded image also needs its linker script(s) and startup assembly to
-        // link — they aren't C translation units, so the carve never modelled them, but the emitted tree
-        // won't build without them. Copy them verbatim (plus any --aux globs). Generic; --exclude prunes
-        // board/arch variants the same way it does for source.
-        if (lang is "c" or "cpp")
-        {
-            var sup = BuildSupportEmitter.Copy(dir, stageDir, plan.KeptFiles, excludeDirs, auxGlobs);
-            // Support files (.ld/.s/--aux) are copied VERBATIM -- identical bytes before and after. They
-            // were never in `paths` (not parsed source), so counting them only in carvedBytes skewed the
-            // headline (real eval-#2 bug: a module with big .s startup printed "-122% smaller"). Add the
-            // SAME bytes to originalBytes so they're delta-neutral and the % reflects the real source carve.
-            carvedBytes += sup.Bytes;
-            originalBytes += sup.Bytes;
-            if (sup.Count > 0)
-                Console.WriteLine($"  support : {sup.Count} build file(s) copied verbatim (linker scripts + startup assembly"
-                                  + (auxGlobs.Count > 0 ? " + --aux" : "") + ") so the carved tree links");
-            foreach (var w in sup.Warnings) Console.Error.WriteLine($"  warn    : {w}");
-        }
+        // Keep-by-default: --out must be a COMPLETE, buildable project, not just the carved C. Everything the
+        // carve DIDN'T model as dead code — Makefiles/CMake, linker scripts, scatter/.cmd files, startup
+        // assembly, device trees, register/data tables, .cmm, prebuilt .a/.o, board configs — is copied
+        // verbatim. The ONLY omissions are the code already emitted above and the code files the carve proved
+        // unreachable (plan.DroppedFiles). Evidence-based removal only; --exclude trims variants/non-build trees.
+        var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, plan.DroppedFiles, excludeDirs, auxGlobs);
+        infraFiles = infra.Files;
+        infraBytes = infra.Bytes;
+        infraEnumerated = true;
+        // Passed-through files are copied VERBATIM -- identical bytes before and after, and were never in
+        // `paths` (not parsed source). Add the SAME bytes to BOTH sides so they're delta-neutral and the
+        // headline % reflects only the real code carve (dead-code removal), not the untouched infrastructure.
+        carvedBytes += infra.Bytes;
+        originalBytes += infra.Bytes;
+        if (infra.Count > 0)
+            Console.WriteLine($"  passthru: {infra.Count:N0} non-code file(s) copied verbatim ({infra.Bytes:N0} B) "
+                              + "so --out is a complete buildable project (build files, linker scripts, asm, data, configs)");
+        foreach (var w in infra.Warnings) Console.Error.WriteLine($"  warn    : {w}");
 
         // Everything staged successfully — swap it into place atomically. Only now is any prior --out
         // touched (moved aside, then deleted once the new tree is confirmed in place). Promote retries
@@ -1039,6 +1049,50 @@ static int RunCarve(string[] args)
     var saved = originalBytes - carvedBytes;
     var pct = originalBytes > 0 ? (double)saved / originalBytes : 0;
     Console.WriteLine($"  size    : {originalBytes:N0} B -> {carvedBytes:N0} B  ({pct:P0} smaller, saved {saved:N0} B)");
+
+    // Carve report — the three buckets: KEPT (required to build) / REMOVED (dead code) / KEPT (infrastructure).
+    // Always print a one-line summary; write the full per-file breakdown to --report. In analysis-only mode
+    // (no --out) we only walk the tree to enumerate infrastructure when a report was actually requested, so a
+    // plain stats run pays nothing extra.
+    if (reportPath is not null && !infraEnumerated)
+    {
+        var cls = InfrastructureEmitter.Classify(dir, plan.KeptFiles, plan.DroppedFiles, excludeDirs, auxGlobs);
+        infraFiles = cls.Files;
+        infraBytes = cls.Bytes;
+        infraEnumerated = true;
+    }
+    if (infraEnumerated)
+        Console.WriteLine($"  buckets : {buildRequiredFiles.Count:N0} required-to-build + {infraFiles.Count:N0} infrastructure kept, "
+                          + $"{plan.DroppedFiles.Count:N0} dead-code file(s) removed");
+    else
+        Console.WriteLine($"  buckets : {buildRequiredFiles.Count:N0} required-to-build, {plan.DroppedFiles.Count:N0} dead-code file(s) removed "
+                          + "(pass --out or --report to also enumerate infrastructure)");
+    if (reportPath is not null)
+    {
+        // originalBytes/carvedBytes include the passthrough bytes only when we actually emitted (--out); back
+        // them out so the report's code-size line is the pure code carve.
+        var infraInTotals = outDir is not null ? infraBytes : 0;
+        var report = CarveReport.Render(new CarveReport.Inputs(
+            SourceRoot: dir,
+            Roots: roots,
+            BuildRequired: buildRequiredFiles,
+            KeptCode: plan.KeptFiles,
+            RemovedDeadCode: plan.DroppedFiles,
+            Infrastructure: infraFiles,
+            ExcludedDirs: excludeDirs,
+            CodeBytesBefore: originalBytes - infraInTotals,
+            CodeBytesAfter: carvedBytes - infraInTotals,
+            InfraBytes: infraBytes));
+        try
+        {
+            File.WriteAllText(reportPath, report);
+            Console.WriteLine($"  report  : written -> {reportPath}");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException or System.Security.SecurityException)
+        {
+            Console.Error.WriteLine($"  warn    : could not write --report '{reportPath}' ({ex.GetType().Name}: {ex.Message})");
+        }
+    }
 
     // Structured stats into the diagnostic package (numbers only — no source content).
     diag.Set("totalNodes", s.TotalNodes);
@@ -1092,6 +1146,7 @@ static int RunCarve(string[] args)
             },
             keptFiles = plan.KeptFiles,
             droppedFiles = plan.DroppedFiles,
+            infrastructureFiles = infraFiles,   // non-code passed through verbatim (empty if not enumerated)
         };
         // The carve itself already succeeded (and, with --out, is on disk); a manifest write failure must
         // not fail the whole run or mask that result. Warn and keep the normal exit code.
