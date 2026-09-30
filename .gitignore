@@ -41,3 +41,7 @@ dist/
 **/discordinator/
 
 perf-baseline.json
+
+# Test coverage output (coverlet / VSTest)
+TestResults/
+**/TestResults/

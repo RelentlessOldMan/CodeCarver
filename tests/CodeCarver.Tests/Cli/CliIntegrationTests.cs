@@ -471,6 +471,34 @@ public sealed class CliIntegrationTests
     }
 
     [Fact]
+    public void Carve_Report_AnalysisOnly_ShowsCodeBuckets_NotFakeInfrastructure()
+    {
+        // --report WITHOUT --out: the report must show the carve DECISION (reachable code vs dead code) and
+        // state that infrastructure is enumerated only when emitting -- never mislabel a Makefile as infra.
+        var work = Path.Combine(Path.GetTempPath(), "cc-rep-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(work);
+            File.WriteAllText(Path.Combine(work, "main.c"), "int helper(void);\nint main(void){return helper();}\n");
+            File.WriteAllText(Path.Combine(work, "helper.c"), "int helper(void){return 1;}\n");
+            File.WriteAllText(Path.Combine(work, "dead.c"), "int nope(void){return 9;}\n");
+            File.WriteAllText(Path.Combine(work, "Makefile"), "all:\n\tgcc main.c\n");
+            var report = Path.Combine(work, "r.txt");
+
+            var r = RunCli("carve", work, "--roots", "main", "--report", report);
+            if (r is null) return;
+            var (code, _) = r.Value;
+            Assert.Equal(0, code);
+            var rpt = File.ReadAllText(report);
+            Assert.Contains("analysis-only", rpt);        // scoped honestly
+            Assert.Contains("dead.c", rpt);               // dead-code bucket present
+            Assert.Contains("not enumerated", rpt);       // infra not faked
+            Assert.DoesNotContain("Makefile", rpt);       // infra NOT listed without --out
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
     public void Carve_BuildLog_PerTuDefines_KeepsBranchAnotherTuCompiles()
     {
         // eval-#9 per-TU soundness: widget.c is compiled BOTH with and without -DFEATURE. A root calls

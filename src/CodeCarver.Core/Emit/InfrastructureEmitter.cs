@@ -63,27 +63,6 @@ public static class InfrastructureEmitter
         return new InfraEmitResult(count, bytes, files, warnings);
     }
 
-    /// <summary>Enumerate — WITHOUT copying — the same non-code files <see cref="Copy"/> would pass through,
-    /// with their total bytes. Used to build the carve report in analysis-only mode (no <c>--out</c>).</summary>
-    public static InfraEmitResult Classify(
-        string sourceRoot,
-        IReadOnlyCollection<string> alreadyEmittedRel,
-        IReadOnlyCollection<string> droppedCodeFilesRel,
-        IReadOnlyList<string> excludeDirs,
-        IReadOnlyList<string> auxGlobs)
-    {
-        var warnings = new List<string>();
-        var files = new List<string>();
-        long bytes = 0;
-        foreach (var (rel, full) in Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, warnings))
-        {
-            files.Add(rel);
-            try { bytes += new FileInfo(full).Length; } catch { /* vanished/locked — count as 0 */ }
-        }
-        files.Sort(StringComparer.Ordinal);
-        return new InfraEmitResult(files.Count, bytes, files, warnings);
-    }
-
     /// <summary>The shared keep-by-default selection: every file under <paramref name="sourceRoot"/> that is
     /// neither already-emitted nor modelled-dead code, honoring <c>--exclude</c> (overridable per-file by
     /// <c>--aux</c>). Yields (relPath, fullPath); appends any --aux glob warnings to <paramref name="warnings"/>.</summary>

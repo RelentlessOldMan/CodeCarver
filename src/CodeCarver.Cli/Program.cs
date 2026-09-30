@@ -1051,27 +1051,21 @@ static int RunCarve(string[] args)
     Console.WriteLine($"  size    : {originalBytes:N0} B -> {carvedBytes:N0} B  ({pct:P0} smaller, saved {saved:N0} B)");
 
     // Carve report — the three buckets: KEPT (required to build) / REMOVED (dead code) / KEPT (infrastructure).
-    // Always print a one-line summary; write the full per-file breakdown to --report. In analysis-only mode
-    // (no --out) we only walk the tree to enumerate infrastructure when a report was actually requested, so a
-    // plain stats run pays nothing extra.
-    if (reportPath is not null && !infraEnumerated)
-    {
-        var cls = InfrastructureEmitter.Classify(dir, plan.KeptFiles, plan.DroppedFiles, excludeDirs, auxGlobs);
-        infraFiles = cls.Files;
-        infraBytes = cls.Bytes;
-        infraEnumerated = true;
-    }
+    // Infrastructure and the include-closure split of "required to build" are only KNOWN once the tree is
+    // emitted (the closure is discovered during emit; infra is what emit passed through). So without --out the
+    // report is honestly scoped to the carve DECISION (reachable code vs dead code) rather than guessing and
+    // mislabelling build-required includes as infrastructure.
     if (infraEnumerated)
         Console.WriteLine($"  buckets : {buildRequiredFiles.Count:N0} required-to-build + {infraFiles.Count:N0} infrastructure kept, "
                           + $"{plan.DroppedFiles.Count:N0} dead-code file(s) removed");
     else
-        Console.WriteLine($"  buckets : {buildRequiredFiles.Count:N0} required-to-build, {plan.DroppedFiles.Count:N0} dead-code file(s) removed "
-                          + "(pass --out or --report to also enumerate infrastructure)");
+        Console.WriteLine($"  buckets : {plan.KeptFiles.Count:N0} reachable-code + {plan.DroppedFiles.Count:N0} dead-code file(s) "
+                          + "(pass --out to enumerate infrastructure + include closure)");
     if (reportPath is not null)
     {
         // originalBytes/carvedBytes include the passthrough bytes only when we actually emitted (--out); back
         // them out so the report's code-size line is the pure code carve.
-        var infraInTotals = outDir is not null ? infraBytes : 0;
+        var infraInTotals = infraEnumerated ? infraBytes : 0;
         var report = CarveReport.Render(new CarveReport.Inputs(
             SourceRoot: dir,
             Roots: roots,
@@ -1082,7 +1076,8 @@ static int RunCarve(string[] args)
             ExcludedDirs: excludeDirs,
             CodeBytesBefore: originalBytes - infraInTotals,
             CodeBytesAfter: carvedBytes - infraInTotals,
-            InfraBytes: infraBytes));
+            InfraBytes: infraBytes,
+            InfraEnumerated: infraEnumerated));
         try
         {
             File.WriteAllText(reportPath, report);

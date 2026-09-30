@@ -81,23 +81,40 @@ public sealed class InfrastructureEmitterTests
     }
 
     [Fact]
-    public void Classify_ListsSameFiles_WithoutWriting()
+    public void Copy_AuxGlob_NoMatch_Warns_And_RootEscape_Refused()
     {
+        var root = NewTree();
+        var outDir = Path.Combine(Path.GetTempPath(), "cc-infra-warn-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var res = InfrastructureEmitter.Copy(root, outDir,
+                Array.Empty<string>(), Array.Empty<string>(),
+                excludeDirs: Array.Empty<string>(),
+                auxGlobs: new[] { "*.nomatch", "../escape/*.ld" });
+
+            Assert.Contains(res.Warnings, w => w.Contains("*.nomatch"));          // no-match glob warns
+            Assert.Contains(res.Warnings, w => w.Contains("refused"));            // root-escape glob refused
+            // Nothing outside --out was written; the normal infra still copied.
+            Assert.True(File.Exists(Path.Combine(outDir, "flash.ld")));
+        }
+        finally { Cleanup(root); Cleanup(outDir); }
+    }
+
+    [Fact]
+    public void Copy_OutEqualsSource_DoesNotCopyOntoItself()
+    {
+        // Belt-and-braces: if a caller points --out at the source tree, every dst resolves to its own src;
+        // the SameFile guard must skip each so no file is copied onto itself (and nothing is corrupted).
         var root = NewTree();
         try
         {
-            var cls = InfrastructureEmitter.Classify(root,
-                alreadyEmittedRel: new[] { "keep.c" },
-                droppedCodeFilesRel: new[] { "drop.c" },
-                excludeDirs: Array.Empty<string>(),
-                auxGlobs: Array.Empty<string>());
+            var before = File.ReadAllText(Path.Combine(root, "Makefile"));
+            var res = InfrastructureEmitter.Copy(root, root,   // out == source
+                Array.Empty<string>(), Array.Empty<string>(),
+                excludeDirs: Array.Empty<string>(), auxGlobs: Array.Empty<string>());
 
-            Assert.Equal(5, cls.Count);
-            Assert.Contains("Makefile", cls.Files);
-            Assert.Contains("board/variant.ld", cls.Files);
-            Assert.DoesNotContain("keep.c", cls.Files);   // already emitted
-            Assert.DoesNotContain("drop.c", cls.Files);   // dead code
-            Assert.True(cls.Bytes > 0);
+            Assert.Equal(0, res.Count);   // everything skipped (dst == src)
+            Assert.Equal(before, File.ReadAllText(Path.Combine(root, "Makefile")));  // untouched
         }
         finally { Cleanup(root); }
     }
