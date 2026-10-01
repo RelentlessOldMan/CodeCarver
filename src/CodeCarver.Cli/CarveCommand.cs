@@ -91,7 +91,8 @@ public static class CarveCommand
         var clean = false;             // --clean: permit replacing a non-empty --out we didn't create
         var excludeDirs = new List<string>();
         var auxGlobs = new List<string>();   // force-copy files even from --exclude'd dirs (keep-by-default handles the rest)
-        string? reportPath = null;           // --report: write the three-bucket carve report (kept/removed/infra)
+        var pruneGarbage = true;             // default-on: drop provable non-inputs (VCS/scratch/editor/coverage); --keep-garbage disables
+        string? reportPath = null;           // --report: write the carve report (build-required/infra/dead-code/garbage)
         string? probeCompiler = null;
         long maxParseBytes = 20_000_000; // files bigger than this (e.g. multi-GB generated register headers)
                                          // skip the parser and are kept whole via #include-closure.
@@ -134,6 +135,7 @@ public static class CarveCommand
             if (cfg.MaxParseBytes is not null) maxParseBytes = cfg.MaxParseBytes.Value;
             if (cfg.MaxSymbolsPerFile is not null) maxSymbolsPerFile = cfg.MaxSymbolsPerFile.Value;
             if (cfg.PruneHeaders is not null) pruneHeaders = cfg.PruneHeaders.Value;
+            if (cfg.KeepGarbage is not null) pruneGarbage = !cfg.KeepGarbage.Value;
         }
 
         for (var i = 2; i < args.Length; i++)
@@ -175,6 +177,8 @@ public static class CarveCommand
                 excludeDirs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
             else if (args[i] == "--aux" && i + 1 < args.Length)
                 auxGlobs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+            else if (args[i] == "--keep-garbage")
+                pruneGarbage = false;
             else if (args[i] == "--report" && i + 1 < args.Length)
                 reportPath = args[++i];
             else if (args[i] == "--probe" && i + 1 < args.Length)
@@ -215,7 +219,7 @@ public static class CarveCommand
                 // flag. Fail loudly.
                 err.WriteLine($"unknown or incomplete option '{args[i]}'. try: carve <dir> --roots a,b [--lang c|cpp] "
                                         + "[--prune] [--out DIR] [--clean] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G] "
-                                        + "[--report F] [--diag Z] [--diag-repro] [--diag-verbose]");
+                                        + "[--keep-garbage] [--report F] [--diag Z] [--diag-repro] [--diag-verbose]");
                 return 2;
             }
         }
@@ -947,7 +951,9 @@ public static class CarveCommand
         // and what non-code infrastructure was passed through verbatim. Removed-dead-code is plan.DroppedFiles.
         IReadOnlyList<string> buildRequiredFiles = plan.KeptFiles;   // refined to res.Written when we emit
         IReadOnlyList<string> infraFiles = Array.Empty<string>();
+        IReadOnlyList<string> garbageFiles = Array.Empty<string>();  // dropped as non-input (VCS/scratch/editor/coverage)
         long infraBytes = 0;
+        long garbageBytes = 0;
         var infraEnumerated = false;                                 // false in analysis-only unless --report walks
         if (outDir is not null)
         {
@@ -995,9 +1001,11 @@ public static class CarveCommand
             // assembly, device trees, register/data tables, .cmm, prebuilt .a/.o, board configs — is copied
             // verbatim. The ONLY omissions are the code already emitted above and the code files the carve proved
             // unreachable (plan.DroppedFiles). Evidence-based removal only; --exclude trims variants/non-build trees.
-            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, plan.DroppedFiles, excludeDirs, auxGlobs);
+            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, plan.DroppedFiles, excludeDirs, auxGlobs, pruneGarbage);
             infraFiles = infra.Files;
             infraBytes = infra.Bytes;
+            garbageFiles = infra.Garbage;
+            garbageBytes = infra.GarbageBytes;
             infraEnumerated = true;
             // Passed-through files are copied VERBATIM -- identical bytes before and after, and were never in
             // `paths` (not parsed source). Add the SAME bytes to BOTH sides so they're delta-neutral and the
@@ -1007,6 +1015,9 @@ public static class CarveCommand
             if (infra.Count > 0)
                 @out.WriteLine($"  passthru: {infra.Count:N0} non-code file(s) copied verbatim ({infra.Bytes:N0} B) "
                                   + "so --out is a complete buildable project (build files, linker scripts, asm, data, configs)");
+            if (infra.Garbage.Count > 0)
+                @out.WriteLine($"  garbage : {infra.Garbage.Count:N0} file(s) NOT copied ({infra.GarbageBytes:N0} B) "
+                                  + "- VCS/scratch/editor/coverage, not a build/run input (--keep-garbage to keep them)");
             foreach (var w in infra.Warnings) err.WriteLine($"  warn    : {w}");
 
             // Everything staged successfully — swap it into place atomically. Only now is any prior --out
@@ -1051,7 +1062,8 @@ public static class CarveCommand
         // mislabelling build-required includes as infrastructure.
         if (infraEnumerated)
             @out.WriteLine($"  buckets : {buildRequiredFiles.Count:N0} required-to-build + {infraFiles.Count:N0} infrastructure kept, "
-                              + $"{plan.DroppedFiles.Count:N0} dead-code file(s) removed");
+                              + $"{plan.DroppedFiles.Count:N0} dead-code"
+                              + (garbageFiles.Count > 0 ? $" + {garbageFiles.Count:N0} garbage" : "") + " file(s) removed");
         else
             @out.WriteLine($"  buckets : {plan.KeptFiles.Count:N0} reachable-code + {plan.DroppedFiles.Count:N0} dead-code file(s) "
                               + "(pass --out to enumerate infrastructure + include closure)");
@@ -1071,7 +1083,9 @@ public static class CarveCommand
                 CodeBytesBefore: originalBytes - infraInTotals,
                 CodeBytesAfter: carvedBytes - infraInTotals,
                 InfraBytes: infraBytes,
-                InfraEnumerated: infraEnumerated));
+                InfraEnumerated: infraEnumerated,
+                RemovedGarbage: garbageFiles,
+                GarbageBytes: garbageBytes));
             try
             {
                 File.WriteAllText(reportPath, report);
@@ -1091,6 +1105,8 @@ public static class CarveCommand
         diag.Set("droppedFiles", s.DroppedFiles);
         diag.Set("originalBytes", originalBytes);
         diag.Set("carvedBytes", carvedBytes);
+        diag.Set("garbageFilesRemoved", garbageFiles.Count);
+        diag.Set("garbageBytesRemoved", garbageBytes);
         diag.Set("rootsUnresolved", unresolvedRoots.Count);
         diag.Set("bigFilesKeptWhole", bigFiles.Count);
         diag.Set("denseHeadersKeptWhole", denseFiles.Count);
@@ -1136,6 +1152,7 @@ public static class CarveCommand
                 keptFiles = plan.KeptFiles,
                 droppedFiles = plan.DroppedFiles,
                 infrastructureFiles = infraFiles,   // non-code passed through verbatim (empty if not enumerated)
+                removedGarbageFiles = garbageFiles, // dropped as non-input: VCS/scratch/editor/coverage (empty if not enumerated)
             };
             // The carve itself already succeeded (and, with --out, is on disk); a manifest write failure must
             // not fail the whole run or mask that result. Warn and keep the normal exit code.
@@ -1350,4 +1367,5 @@ sealed class CarveConfig
     public long? MaxParseBytes { get; set; }
     public int? MaxSymbolsPerFile { get; set; }
     public bool? PruneHeaders { get; set; }
+    public bool? KeepGarbage { get; set; }
 }

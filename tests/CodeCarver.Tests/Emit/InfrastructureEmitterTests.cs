@@ -100,6 +100,88 @@ public sealed class InfrastructureEmitterTests
         finally { Cleanup(root); Cleanup(outDir); }
     }
 
+    private static void AddGarbage(string root)
+    {
+        Directory.CreateDirectory(Path.Combine(root, ".git"));
+        File.WriteAllText(Path.Combine(root, ".git", "config"), "[core]\n");   // VCS metadata
+        File.WriteAllText(Path.Combine(root, "keep.c.bak"), "old\n");          // editor backup
+        File.WriteAllText(Path.Combine(root, "build.log"), "log\n");           // build log
+        Directory.CreateDirectory(Path.Combine(root, "obj"));
+        File.WriteAllText(Path.Combine(root, "obj", "keep.d"), "keep.o: keep.c\n"); // make depfile
+    }
+
+    [Fact]
+    public void Copy_PrunesGarbage_ByDefault_IntoGarbageBucket_NotCopied()
+    {
+        var root = NewTree();
+        AddGarbage(root);
+        var outDir = Path.Combine(Path.GetTempPath(), "cc-infra-gb-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var res = InfrastructureEmitter.Copy(root, outDir,
+                alreadyEmittedRel: new[] { "keep.c" }, droppedCodeFilesRel: new[] { "drop.c" },
+                excludeDirs: Array.Empty<string>(), auxGlobs: Array.Empty<string>());  // pruneGarbage defaults true
+
+            // Garbage not written:
+            Assert.False(File.Exists(Path.Combine(outDir, ".git", "config")));
+            Assert.False(File.Exists(Path.Combine(outDir, "keep.c.bak")));
+            Assert.False(File.Exists(Path.Combine(outDir, "build.log")));
+            Assert.False(File.Exists(Path.Combine(outDir, "obj", "keep.d")));
+            // Real infra still written:
+            Assert.True(File.Exists(Path.Combine(outDir, "Makefile")));
+            // Reported in the garbage bucket (not the kept Files bucket), with bytes:
+            Assert.Contains(".git/config", res.Garbage);
+            Assert.Contains("keep.c.bak", res.Garbage);
+            Assert.Contains("build.log", res.Garbage);
+            Assert.Contains("obj/keep.d", res.Garbage);
+            Assert.DoesNotContain(res.Files, f => f == "build.log");
+            Assert.True(res.GarbageBytes > 0);
+        }
+        finally { Cleanup(root); Cleanup(outDir); }
+    }
+
+    [Fact]
+    public void Copy_KeepGarbageOff_KeepsEverything_LikeBefore()
+    {
+        var root = NewTree();
+        AddGarbage(root);
+        var outDir = Path.Combine(Path.GetTempPath(), "cc-infra-kg-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var res = InfrastructureEmitter.Copy(root, outDir,
+                Array.Empty<string>(), Array.Empty<string>(),
+                excludeDirs: Array.Empty<string>(), auxGlobs: Array.Empty<string>(),
+                pruneGarbage: false);
+
+            Assert.True(File.Exists(Path.Combine(outDir, ".git", "config")));
+            Assert.True(File.Exists(Path.Combine(outDir, "build.log")));
+            Assert.Empty(res.Garbage);
+            Assert.Equal(0, res.GarbageBytes);
+        }
+        finally { Cleanup(root); Cleanup(outDir); }
+    }
+
+    [Fact]
+    public void Copy_Aux_ForcesGarbageBack_InSpiteOfPruning()
+    {
+        var root = NewTree();
+        AddGarbage(root);
+        var outDir = Path.Combine(Path.GetTempPath(), "cc-infra-auxgb-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            // A project that genuinely ships a build.log it needs: --aux forces it back even with pruning on.
+            var res = InfrastructureEmitter.Copy(root, outDir,
+                Array.Empty<string>(), Array.Empty<string>(),
+                excludeDirs: Array.Empty<string>(), auxGlobs: new[] { "build.log" });
+
+            Assert.True(File.Exists(Path.Combine(outDir, "build.log")));   // forced back in
+            Assert.DoesNotContain("build.log", res.Garbage);               // not counted as garbage
+            Assert.Contains("build.log", res.Files);                       // kept
+            Assert.False(File.Exists(Path.Combine(outDir, "keep.c.bak"))); // other garbage still pruned
+        }
+        finally { Cleanup(root); Cleanup(outDir); }
+    }
+
     [Fact]
     public void Copy_OutEqualsSource_DoesNotCopyOntoItself()
     {

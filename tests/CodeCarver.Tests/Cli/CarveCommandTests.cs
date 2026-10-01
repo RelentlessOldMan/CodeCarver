@@ -259,6 +259,66 @@ public sealed class CarveCommandTests
         finally { Cleanup(src); }
     }
 
+    private static void AddGarbage(string src)
+    {
+        Directory.CreateDirectory(Path.Combine(src, ".git"));
+        File.WriteAllText(Path.Combine(src, ".git", "config"), "[core]\n");
+        File.WriteAllText(Path.Combine(src, "main.c.bak"), "stale\n");
+    }
+
+    [Fact]
+    public void Run_PrunesGarbageByDefault_ReportsIt_StillBuildable()
+    {
+        var src = NewTree(out var outDir);
+        AddGarbage(src);
+        var man = Path.Combine(Directory.GetParent(src)!.FullName, "m.json");
+        try
+        {
+            var (code, o, _) = Run("carve", src, "--roots", "main", "--out", outDir, "--manifest", man);
+            Assert.Equal(0, code);
+            // Garbage not copied; real infra still there.
+            Assert.False(File.Exists(Path.Combine(outDir, ".git", "config")));
+            Assert.False(File.Exists(Path.Combine(outDir, "main.c.bak")));
+            Assert.True(File.Exists(Path.Combine(outDir, "Makefile")));
+            // Console + manifest surface it.
+            Assert.Contains("garbage", o);
+            var json = File.ReadAllText(man);
+            Assert.Contains("removedGarbageFiles", json);
+            Assert.Contains(".git/config", json);
+        }
+        finally { Cleanup(src); }
+    }
+
+    [Fact]
+    public void Run_KeepGarbage_KeepsEverything()
+    {
+        var src = NewTree(out var outDir);
+        AddGarbage(src);
+        try
+        {
+            var (code, _, _) = Run("carve", src, "--roots", "main", "--out", outDir, "--keep-garbage");
+            Assert.Equal(0, code);
+            Assert.True(File.Exists(Path.Combine(outDir, ".git", "config")));   // kept when disabled
+            Assert.True(File.Exists(Path.Combine(outDir, "main.c.bak")));
+        }
+        finally { Cleanup(src); }
+    }
+
+    [Fact]
+    public void Run_Aux_ForcesOneGarbageFileBack()
+    {
+        var src = NewTree(out var outDir);
+        AddGarbage(src);
+        try
+        {
+            var (code, _, _) = Run("carve", src, "--roots", "main", "--out", outDir, "--aux", "main.c.bak");
+            Assert.Equal(0, code);
+            Assert.True(File.Exists(Path.Combine(outDir, "main.c.bak")));       // forced back
+            Assert.False(File.Exists(Path.Combine(outDir, ".git", "config"))); // rest still pruned
+        }
+        finally { Cleanup(src); }
+    }
+
     [Fact]
     public void Run_DiagRepro_AttachesAnonymizedGraph_NoRealNames()
     {

@@ -20,7 +20,8 @@ public sealed class CarveReportTests
             Infrastructure: new[] { "Makefile", "flash.ld", "board/variant.ld", "data.bin" },
             ExcludedDirs: new[] { "tests" },
             CodeBytesBefore: 900, CodeBytesAfter: 500, InfraBytes: 200,
-            InfraEnumerated: true));
+            InfraEnumerated: true,
+            RemovedGarbage: System.Array.Empty<string>(), GarbageBytes: 0));
 
         // Bucket section headers carry the counts (no alignment padding to depend on).
         Assert.Contains("== KEPT - required to build (3) ==", text);
@@ -57,7 +58,8 @@ public sealed class CarveReportTests
             Infrastructure: System.Array.Empty<string>(),
             ExcludedDirs: System.Array.Empty<string>(),
             CodeBytesBefore: 100, CodeBytesAfter: 60, InfraBytes: 0,
-            InfraEnumerated: false));
+            InfraEnumerated: false,
+            RemovedGarbage: System.Array.Empty<string>(), GarbageBytes: 0));
 
         Assert.Contains("analysis-only", text);
         Assert.Contains("not enumerated", text);
@@ -80,7 +82,8 @@ public sealed class CarveReportTests
             Infrastructure: System.Array.Empty<string>(),
             ExcludedDirs: System.Array.Empty<string>(),
             CodeBytesBefore: 10, CodeBytesAfter: 10, InfraBytes: 0,
-            InfraEnumerated: true));
+            InfraEnumerated: true,
+            RemovedGarbage: System.Array.Empty<string>(), GarbageBytes: 0));
 
         Assert.Contains("KEPT but NOT WRITTEN", text);
         Assert.Contains("gone.c", text);
@@ -105,8 +108,41 @@ public sealed class CarveReportTests
             System.Array.Empty<string>(), System.Array.Empty<string>(),
             System.Array.Empty<string>(),
             new[] { file },
-            System.Array.Empty<string>(), 0, 0, 1, InfraEnumerated: true));
+            System.Array.Empty<string>(), 0, 0, 1, InfraEnumerated: true,
+            RemovedGarbage: System.Array.Empty<string>(), GarbageBytes: 0));
         Assert.Contains(hint, text);
+    }
+
+    [Fact]
+    public void Render_ShowsGarbageBucket_And_RoleGroupedInfra_And_OutputReview()
+    {
+        var text = CarveReport.Render(new CarveReport.Inputs(
+            SourceRoot: "/src",
+            Roots: new[] { "main" },
+            BuildRequired: new[] { "main.c" },
+            KeptCode: new[] { "main.c" },
+            RemovedDeadCode: System.Array.Empty<string>(),
+            Infrastructure: new[] { "Makefile", "flash.ld", "cfg/board.json", "lib/libfoo.a", "README.md" },
+            ExcludedDirs: System.Array.Empty<string>(),
+            CodeBytesBefore: 100, CodeBytesAfter: 100, InfraBytes: 500,
+            InfraEnumerated: true,
+            RemovedGarbage: new[] { ".git/config", "src/main.c.bak", "build.log" }, GarbageBytes: 2048));
+
+        // Garbage bucket: summary line, section, and the files, plus how to restore.
+        Assert.Contains("REMOVED - garbage", text);
+        Assert.Contains(".git/config", text);
+        Assert.Contains("src/main.c.bak", text);
+        Assert.Contains("--keep-garbage", text);
+        Assert.Contains("2,048 B", text);   // garbage byte total surfaced
+
+        // Infra grouped by build ROLE.
+        Assert.Contains("build system & toolchain", text);        // Makefile + flash.ld
+        Assert.Contains("data / resources", text);                // board.json + libfoo.a
+        Assert.Contains("other", text);                           // README.md
+
+        // The prebuilt .a is flagged for review (may be a vendored prebuilt or a stray output).
+        Assert.Contains("REVIEW - look like build outputs", text);
+        Assert.Contains("lib/libfoo.a", text);
     }
 
     [Fact]
@@ -117,7 +153,8 @@ public sealed class CarveReportTests
             new[] { "b.c", "a.c" }, new[] { "b.c", "a.c" },
             new[] { "z.c", "a.c" },
             new[] { "b.mk", "a.ld" },
-            System.Array.Empty<string>(), 10, 5, 1, InfraEnumerated: true);
+            System.Array.Empty<string>(), 10, 5, 1, InfraEnumerated: true,
+            RemovedGarbage: new[] { ".git/config", "x.bak" }, GarbageBytes: 42);
         Assert.Equal(CarveReport.Render(inputs), CarveReport.Render(inputs));
     }
 }

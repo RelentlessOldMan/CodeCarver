@@ -1,9 +1,11 @@
 namespace CodeCarver.Core.Emit;
 
 /// <summary>Outcome of the keep-by-default infrastructure pass: how many non-code files were passed
-/// through verbatim, their total bytes, the relative paths (sorted), and any warnings.</summary>
+/// through verbatim, their total bytes, the relative paths (sorted), any warnings, and the files dropped as
+/// garbage (VCS/scratch/editor/coverage — see <see cref="InfraClassifier.IsGarbage"/>) with their byte total.</summary>
 public readonly record struct InfraEmitResult(
-    int Count, long Bytes, IReadOnlyList<string> Files, IReadOnlyList<string> Warnings);
+    int Count, long Bytes, IReadOnlyList<string> Files, IReadOnlyList<string> Warnings,
+    IReadOnlyList<string> Garbage, long GarbageBytes);
 
 /// <summary>
 /// The keep-by-default pass that makes <c>--out</c> a COMPLETE, buildable project rather than just the
@@ -15,10 +17,13 @@ public readonly record struct InfraEmitResult(
 /// "known" build extensions always misses something and the emitted tree won't link.
 ///
 /// The rule is EVIDENCE-BASED REMOVAL ONLY: a file is omitted only when we can prove we don't need it —
-/// it is either (a) already emitted (kept code + its include closure) or (b) a code file the carve
-/// modelled and found unreachable (<paramref name="droppedCodeFilesRel"/>, dead translation units /
-/// unreferenced headers). Everything else is kept. The result is a superset that builds; <c>--exclude</c>
-/// is the knob for trimming board/arch variants or large non-build trees (docs, VCS metadata).
+/// it is either (a) already emitted (kept code + its include closure), (b) a code file the carve modelled
+/// and found unreachable (<c>droppedCodeFilesRel</c>, dead translation units / unreferenced headers), or
+/// (c) GARBAGE — a file that cannot be a build/run input by universal convention (VCS metadata, compiler/IDE
+/// scratch, dep/coverage artifacts, editor/OS junk, logs/temp; see <see cref="InfraClassifier.IsGarbage"/>),
+/// dropped by default unless <c>pruneGarbage</c> is false or <c>--aux</c> forces a specific file back.
+/// Everything else is kept. The result is a superset that builds; <c>--exclude</c> is the knob for trimming
+/// board/arch variants or large non-build trees.
 ///
 /// Write-safety mirrors the other emitters: confined under <c>--out</c>, never copies a file onto its own
 /// source, and best-effort on a locked/vanished file (warn, skip) so one bad file can't sink the emit.
@@ -30,16 +35,28 @@ public static class InfrastructureEmitter
         IReadOnlyCollection<string> alreadyEmittedRel,
         IReadOnlyCollection<string> droppedCodeFilesRel,
         IReadOnlyList<string> excludeDirs,
-        IReadOnlyList<string> auxGlobs)
+        IReadOnlyList<string> auxGlobs,
+        bool pruneGarbage = true)
     {
         var warnings = new List<string>();
         var outFull = Path.GetFullPath(outDir);
         var files = new List<string>();
+        var garbage = new List<string>();
         long bytes = 0;
+        long garbageBytes = 0;
         var count = 0;
 
-        foreach (var (rel, full) in Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, warnings))
+        foreach (var (rel, full, isGarbage) in Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, pruneGarbage, warnings))
         {
+            // Garbage (VCS/scratch/editor/coverage) is the ONLY thing dropped without evidence from the carve, and
+            // only when pruneGarbage is on and --aux didn't force it back. Record it (for the report) and skip the
+            // copy. One stat for the byte total — bounded by the walk we're already doing.
+            if (isGarbage)
+            {
+                try { garbageBytes += new FileInfo(full).Length; } catch { /* vanished/locked: count the file, skip bytes */ }
+                garbage.Add(rel);
+                continue;
+            }
             var dst = Path.Combine(outDir, rel);
             var dstFull = Path.GetFullPath(dst);
             // Belt-and-braces: NEVER write outside --out, whatever the rel path resolved to.
@@ -60,18 +77,22 @@ public static class InfrastructureEmitter
             count++;
         }
         files.Sort(StringComparer.Ordinal);
-        return new InfraEmitResult(count, bytes, files, warnings);
+        garbage.Sort(StringComparer.Ordinal);
+        return new InfraEmitResult(count, bytes, files, warnings, garbage, garbageBytes);
     }
 
     /// <summary>The shared keep-by-default selection: every file under <paramref name="sourceRoot"/> that is
     /// neither already-emitted nor modelled-dead code, honoring <c>--exclude</c> (overridable per-file by
-    /// <c>--aux</c>). Yields (relPath, fullPath); appends any --aux glob warnings to <paramref name="warnings"/>.</summary>
-    private static IEnumerable<(string Rel, string Full)> Select(
+    /// <c>--aux</c>). Yields (relPath, fullPath, isGarbage); the Garbage flag marks a provable non-input
+    /// (<see cref="InfraClassifier.IsGarbage"/>) that <c>--aux</c> did NOT force back, when
+    /// <paramref name="pruneGarbage"/> is on. Appends any --aux glob warnings to <paramref name="warnings"/>.</summary>
+    private static IEnumerable<(string Rel, string Full, bool Garbage)> Select(
         string sourceRoot,
         IReadOnlyCollection<string> alreadyEmittedRel,
         IReadOnlyCollection<string> droppedCodeFilesRel,
         IReadOnlyList<string> excludeDirs,
         IReadOnlyList<string> auxGlobs,
+        bool pruneGarbage,
         List<string> warnings)
     {
         var skip = new HashSet<string>(alreadyEmittedRel, StringComparer.OrdinalIgnoreCase);
@@ -109,9 +130,13 @@ public static class InfrastructureEmitter
         {
             var rel = Path.GetRelativePath(sourceRoot, p).Replace('\\', '/');
             if (skip.Contains(rel)) continue;      // already emitted (kept code + include closure)
-            if (dropped.Contains(rel)) continue;   // modelled dead code — the ONLY thing we deliberately remove
-            if (!forced.Contains(rel) && !Included(rel)) continue; // --exclude prunes (unless --aux forces it back)
-            yield return (rel, Path.GetFullPath(p));
+            if (dropped.Contains(rel)) continue;   // modelled dead code — removed on carve evidence
+            var isForced = forced.Contains(rel);
+            if (!isForced && !Included(rel)) continue; // --exclude prunes (unless --aux forces it back)
+            // Garbage is dropped only on CONVENTION (never a build/run input), only when enabled, and never when
+            // --aux explicitly forced the file back in.
+            var garbage = pruneGarbage && !isForced && InfraClassifier.IsGarbage(rel);
+            yield return (rel, Path.GetFullPath(p), garbage);
         }
     }
 }

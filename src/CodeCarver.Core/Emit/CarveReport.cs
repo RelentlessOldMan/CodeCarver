@@ -4,13 +4,16 @@ namespace CodeCarver.Core.Emit;
 
 /// <summary>
 /// The carve report: a source-free (paths only, no file contents), deterministic account of what the
-/// carve did to every file, in the three buckets a reviewer actually needs to trust the result —
+/// carve did to every file, in the buckets a reviewer actually needs to trust the result —
 ///   1. KEPT — required to build: the reachable code and the include closure it pulls in;
 ///   2. REMOVED — not needed to build: code files the carve modelled and proved unreachable (dead);
 ///   3. KEPT — infrastructure / non-code: everything else, passed through verbatim so <c>--out</c> is a
-///      complete buildable project (build files, linker scripts, startup asm, data tables, configs, …).
-/// Bucket 3 is grouped by extension so an over- or under-keep is easy to eyeball. Rendering is stable
-/// (ordinal sort) so two runs over the same carve produce byte-identical reports.
+///      complete buildable project (build files, linker scripts, startup asm, data tables, configs, …);
+///   4. REMOVED — garbage: files that cannot be a build/run input by universal convention (VCS metadata,
+///      compiler/IDE scratch, dep/coverage artifacts, editor/OS junk, logs/temp).
+/// Bucket 3 is grouped by build ROLE (build-system / data+resources / other) then by extension, so an over-
+/// or under-keep — and anything that looks like a stray build output — is easy to eyeball. Rendering is
+/// stable (ordinal sort) so two runs over the same carve produce byte-identical reports.
 ///
 /// Bucket 3 (and the include-closure split of bucket 1) is only known once the tree is actually emitted:
 /// the include closure is discovered during emit, and infrastructure is what emit passed through. So in
@@ -29,7 +32,9 @@ public static class CarveReport
         IReadOnlyList<string> Infrastructure,  // InfrastructureEmitter.Files (emit only)
         IReadOnlyList<string> ExcludedDirs,
         long CodeBytesBefore, long CodeBytesAfter, long InfraBytes,
-        bool InfraEnumerated);                 // true once --out emitted (closure + infra are real)
+        bool InfraEnumerated,                  // true once --out emitted (closure + infra are real)
+        IReadOnlyList<string> RemovedGarbage,  // InfrastructureEmitter.Garbage — VCS/scratch/editor/coverage (emit only)
+        long GarbageBytes);
 
     public static string Render(Inputs x)
     {
@@ -76,12 +81,16 @@ public static class CarveReport
             sb.AppendLine($"  KEPT - infrastructure    : {x.Infrastructure.Count,7} file(s)  (non-code, passed through verbatim)");
         else
             sb.AppendLine($"  KEPT - infrastructure    :   (n/a) file(s)  (pass --out to enumerate; every non-code file is passed through)");
+        if (x.InfraEnumerated && x.RemovedGarbage.Count > 0)
+            sb.AppendLine($"  REMOVED - garbage        : {x.RemovedGarbage.Count,7} file(s)  (VCS/scratch/editor/coverage - not a build/run input)");
         if (keptAbsent.Count > 0)
             sb.AppendLine($"  NOTE                     : {keptAbsent.Count,7} kept file(s) were NOT written (absent/locked on disk) - listed below");
         sb.AppendLine($"  code size                : {x.CodeBytesBefore:N0} B -> {x.CodeBytesAfter:N0} B "
                       + $"({pct:P0} smaller, saved {codeSaved:N0} B by dropping dead code)");
         if (x.InfraEnumerated)
             sb.AppendLine($"  infrastructure size      : {x.InfraBytes:N0} B (unchanged - copied verbatim)");
+        if (x.InfraEnumerated && x.RemovedGarbage.Count > 0)
+            sb.AppendLine($"  garbage not copied       : {x.GarbageBytes:N0} B (excluded from the code-carve % above)");
         sb.AppendLine();
 
         var buildTitle = x.InfraEnumerated
@@ -116,19 +125,52 @@ public static class CarveReport
         }
 
         sb.AppendLine($"== KEPT - infrastructure / other, not code ({x.Infrastructure.Count}) ==");
-        // Group by extension so a reviewer can see at a glance WHAT kind of non-code was kept.
-        var byExt = new SortedDictionary<string, List<string>>(StringComparer.Ordinal);
-        foreach (var f in x.Infrastructure)
+        // Group by build ROLE first (what's there to build vs data/resources vs everything else), then by
+        // extension within each role, so a reviewer sees the build/run/other split at a glance.
+        foreach (var (role, title) in new[]
+                 {
+                     (InfraRole.BuildSystem, "build system & toolchain (make/cmake/linker/asm/project) - needed to build"),
+                     (InfraRole.Data,        "data / resources (config, tables, device trees, prebuilt binaries) - may be needed to run"),
+                     (InfraRole.Other,       "other (docs, images, unknown) - kept for safety"),
+                 })
         {
-            var ext = Path.GetExtension(f);
-            var key = string.IsNullOrEmpty(ext) ? "(no extension)" : ext.ToLowerInvariant();
-            if (!byExt.TryGetValue(key, out var l)) byExt[key] = l = new List<string>();
-            l.Add(f);
+            var inRole = x.Infrastructure.Where(f => InfraClassifier.RoleOf(f) == role).ToList();
+            if (inRole.Count == 0) continue;
+            sb.AppendLine($"  == {title} ({inRole.Count}) ==");
+            var byExt = new SortedDictionary<string, List<string>>(StringComparer.Ordinal);
+            foreach (var f in inRole)
+            {
+                var ext = Path.GetExtension(f);
+                var key = string.IsNullOrEmpty(ext) ? "(no extension)" : ext.ToLowerInvariant();
+                if (!byExt.TryGetValue(key, out var l)) byExt[key] = l = new List<string>();
+                l.Add(f);
+            }
+            foreach (var kv in byExt)
+            {
+                sb.AppendLine($"    -- {kv.Key} ({kv.Value.Count}) {DescribeExt(kv.Key)} --");
+                foreach (var f in kv.Value.OrderBy(f => f, StringComparer.Ordinal)) sb.AppendLine($"      {f}");
+            }
         }
-        foreach (var kv in byExt)
+
+        // Review note: kept files that LOOK like build outputs / prebuilt binaries. We keep them (they may be
+        // vendored and load-bearing) but a user whose tree checks in a build/obj dir can --exclude it to trim.
+        var outputs = x.Infrastructure.Where(InfraClassifier.LooksLikeBuildOutput)
+                                      .OrderBy(f => f, StringComparer.Ordinal).ToList();
+        if (outputs.Count > 0)
         {
-            sb.AppendLine($"  -- {kv.Key} ({kv.Value.Count}) {DescribeExt(kv.Key)} --");
-            foreach (var f in kv.Value.OrderBy(f => f, StringComparer.Ordinal)) sb.AppendLine($"    {f}");
+            sb.AppendLine();
+            sb.AppendLine($"== REVIEW - look like build outputs / prebuilt binaries ({outputs.Count}) ==");
+            sb.AppendLine("  (kept - may be vendored prebuilts the build links; if they are generated, --exclude their dir)");
+            foreach (var f in outputs) sb.AppendLine($"    {f}");
+        }
+
+        if (x.RemovedGarbage.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine($"== REMOVED - garbage, not a build/run input ({x.RemovedGarbage.Count}) ==");
+            sb.AppendLine("  (VCS metadata, compiler/IDE scratch, dep/coverage artifacts, editor/OS junk, logs/temp; "
+                          + "restore all with --keep-garbage or one with --aux)");
+            foreach (var f in x.RemovedGarbage.OrderBy(f => f, StringComparer.Ordinal)) sb.AppendLine($"    {f}");
         }
         return sb.ToString();
     }

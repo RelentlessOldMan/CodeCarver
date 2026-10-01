@@ -464,8 +464,11 @@ public sealed class CliIntegrationTests
             Assert.True(infraIdx > 0, "report should have an infrastructure section");
             var buildRequired = rpt.Substring(0, infraIdx);
             var infrastructure = rpt.Substring(infraIdx);
-            Assert.Contains("\n    src/app/cfg/table.inc", buildRequired);  // REAL resolved as the include (build-required)
-            Assert.Contains("\n    cfg/table.inc", infrastructure);         // DECOY only passed through (infrastructure)
+            // Indent-independent (infra is now role-grouped): the REAL include is in the build-required half; the
+            // DECOY (bare cfg/table.inc) is in the infrastructure half and the REAL path is NOT.
+            Assert.Contains("src/app/cfg/table.inc", buildRequired);         // REAL resolved as the include (build-required)
+            Assert.Contains("cfg/table.inc", infrastructure);               // DECOY passed through (infrastructure)
+            Assert.DoesNotContain("src/app/cfg/table.inc", infrastructure); // the REAL one is NOT in infrastructure
         }
         finally { Cleanup(work); }
     }

@@ -72,9 +72,10 @@ Every carve is sound with just `--roots`. Each extra input lets it carve **tight
 | Complete-config | `--assume-defines-complete` | closed-world without probing: trust the supplied defines as complete |
 | Write output | `--out DIR` | emit the carved tree. Written atomically (staged, then swapped into place) so a crash mid-emit can't leave a half-written tree. `--out` must be **outside** the source tree; a **non-empty** `--out` that CodeCarver didn't create is refused (so it can't wipe a checkout or your own files) — re-carving a prior CodeCarver output is seamless |
 | Replace output | `--clean` | permit replacing a non-empty `--out` CodeCarver did **not** create (explicit opt-in to overwrite its contents) |
-| Force-include | `--aux "board/*.ld"` | force-copy specific files into `--out` **even when under an `--exclude`'d directory**. Rarely needed now — keep-by-default already passes through every non-code file (see below); `--aux` only pulls a file back in from a pruned variant folder |
+| Force-include | `--aux "board/*.ld"` | force-copy specific files into `--out` **even when under an `--exclude`'d directory, or classified as garbage**. Rarely needed now — keep-by-default already passes through every non-code file (see below); `--aux` only pulls a file back in from a pruned variant folder or restores a single garbage-classified file |
+| Keep garbage | `--keep-garbage` | **disable** the default garbage pruning. By default `--out` drops files that can't be a build/run input by universal convention (VCS metadata like `.git`, compiler/IDE scratch like `CMakeFiles`/`__pycache__`, dep/coverage artifacts `.d`/`.gcda`, editor/OS junk `*.bak`/`.DS_Store`, logs/temp). Pass this to copy them too |
 | Aggressive prune | `--prune` | intra-file function/table removal (C/C++ only; other languages carve file-level) |
-| Carve report | `--report r.txt` | write the three-bucket carve report: **KEPT — required to build** (reachable code + its `#include` closure), **REMOVED — dead code** (files the carve proved unreachable), **KEPT — infrastructure** (every non-code file, passed through verbatim, grouped by kind). Paths only, no file contents. Works with or without `--out` |
+| Carve report | `--report r.txt` | write the carve report: **KEPT — required to build** (reachable code + its `#include` closure), **REMOVED — dead code** (files the carve proved unreachable), **KEPT — infrastructure** (every other non-code file, passed through verbatim, grouped by build **role** — build-system / data+resources / other), and **REMOVED — garbage** (VCS/scratch/editor/coverage). Also flags kept files that **look like build outputs** (`.o`/`.a`/`bin`…) for review. Paths only, no file contents. Works with or without `--out` |
 | Audit | `--manifest m.json` | write a JSON manifest of roots, stats, kept/dropped files, byte counts, and the infrastructure passthrough list |
 | Diagnostics | `--diag report.zip` | write ONE **source-free**, shareable diagnostic package (`summary.txt` + `diagnostics.json` + `manifest.txt`) describing what the tool did — version, environment (incl. CPU/RAM/free disk), parameters, stats, warnings, phase timings, and any failure. Home paths are redacted; **no source content, ever**. Send this when a carve misbehaves on a repo you can't share. Pass a directory to get a timestamped `CodeCarver_Diagnostics_<UTC>.zip` inside it. Written on success — and, **even without this flag**, automatically to a temp path on an unexpected crash (the path is printed) |
 | Repro bundle | `--diag-repro` | also attach `repro.graph.json`: the dependency graph the carve ran over with **every name/path replaced by an opaque token** (no source, no real identifiers, no reverse mapping). Lets a developer *replay* your carve and reproduce a wrong keep/drop with none of your IP. Safe to share |
@@ -91,17 +92,24 @@ Every carve is sound with just `--roots`. Each extra input lets it carve **tight
 code and its `#include` closure, CodeCarver copies **every other file in the tree verbatim**: Makefiles /
 CMake, linker scripts and scatter/`.cmd` files, startup assembly, device trees, register and data tables,
 TRACE32 `.cmm`, prebuilt `.a`/`.o`, board configs — anything that isn't a translation unit the carve
-modelled. The rule is **evidence-based removal only**: the *only* files left out are (1) the code already
-emitted and (2) code files the carve **proved unreachable** (dead translation units / unreferenced
-headers). Everything else is kept, because a file the tool didn't model is a file it can't prove you don't
-need to build.
+modelled. The rule is **evidence-based removal only**: the files left out are (1) the code already
+emitted, (2) code files the carve **proved unreachable** (dead translation units / unreferenced headers),
+and (3) **garbage** — files that cannot be a build/run input *by universal convention* (VCS metadata,
+compiler/IDE scratch, dep/coverage artifacts, editor/OS junk, logs/temp). Everything else is kept, because
+a file the tool didn't model is a file it can't prove you don't need to build.
 
-The knob for trimming is `--exclude DIR` (drop board/arch variants you don't build, or large non-build
-trees like `docs`, VCS metadata); `--aux GLOB` forces a specific file back in from an excluded folder.
+Garbage pruning is deliberately **conservative**: ambiguous binaries that *could* be vendored prebuilts the
+build links (`.o`, `.a`, `.so`, `.lib`, `bin/`, `build/`) are **not** auto-dropped — they're kept and
+flagged in the report's "look like build outputs" section so you can `--exclude` them if they're generated.
+Disable garbage pruning entirely with `--keep-garbage`, or restore one file with `--aux`.
+
+The knob for trimming the rest is `--exclude DIR` (drop board/arch variants you don't build, or large
+non-build trees like `docs`); `--aux GLOB` forces a specific file back in from an excluded folder or the
+garbage set.
 
 Because passthrough files are copied byte-for-byte, the headline **size reduction reflects only the code
-carve** (dead code removed) — the untouched infrastructure is delta-neutral. Use `--report` to see exactly
-what landed in each of the three buckets.
+carve** (dead code removed) — the untouched infrastructure is delta-neutral, and dropped garbage is reported
+separately (not folded into the headline %). Use `--report` to see exactly what landed in each bucket.
 
 ### Config file
 
