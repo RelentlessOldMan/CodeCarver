@@ -218,6 +218,23 @@ so `buildFileTraces: ["build.trace"]` just works. **Run it from the repo root** 
 carve root (absolute-path opens always resolve). `fatrace -c` or a `bpftrace` openat probe work too. A build on
 Linux targeting embedded is the usual case; a Windows build is the ProcMon recipe above.
 
+**Linux — the RUN trace — strace (if you launch the run) or fatrace (if you don't):**
+```
+# a) you start the run/loader yourself:
+strace -f -e trace=open,openat -o run.trace -- ./run-or-flash-tool <args>     # -> runFileTraces
+
+# b) the run is launched by something you don't control (daemon/debugger) — attach by PID:
+strace -f -p <pid> -e trace=open,openat -o run.trace                          # Ctrl+C to stop
+
+# c) system-wide during the run window (no PID needed), with fatrace:
+fatrace > run.fatrace        # run the session, then Ctrl+C
+```
+strace options (a)/(b) use quoted paths, so they feed `runFileTraces` as-is. `fatrace` lines look like
+`comm(pid): R /abs/path`, so set a format regex that grabs from the first slash to end of line:
+`"fileTraceFormat": "(?<path>/.*)$"`. (On a desktop/host
+build the "run" is just your program; for embedded-on-hardware the loader runs on the *host*, so trace the host
+loader process — same recipe.)
+
 > Not a function trace — these record *files*, which is the whole point: they catch the orchestration + data layer
 > a function trace can't see. Over-capturing (writes, directory scans, un-exercised paths) is harmless: it only
 > ever keeps more, and the report shows you exactly what each trace touched.
