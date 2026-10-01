@@ -164,8 +164,10 @@ change, not a code change.
 
 > **File-access traces** (`buildFileTraces` / `runFileTraces`) are the embedded companion to this: instead of
 > *which functions ran*, they capture *which files the OS opened* during a build / a flash-run. That's how you
-> pin the TRACE32 loader layer (`.cmm` scripts, loaded binaries, data) that no function trace can see. See
-> `docs/USAGE.md` → Traces.
+> pin the TRACE32 loader layer (`.cmm` scripts, loaded binaries, data) that no function trace can see. **Capture
+> the run trace with Process Monitor** while your TRACE32 flash/debug session runs (filter Path to the repo,
+> export CSV → `runFileTraces`), and the **build trace** with ProcMon (Windows) or `strace -f -e trace=openat`
+> (Linux) → `buildFileTraces`. Step-by-step recipes: `docs/USAGE.md` → *Capturing a file-access trace*.
 
 ## 4. The authoritative test — build the carved image and compare size
 

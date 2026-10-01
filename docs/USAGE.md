@@ -181,13 +181,46 @@ they never silently drop what they didn't see (a trace only proves what *that* r
   all work; set `fileTraceFormat` only for an unusual format.
 
   ```jsonc
-  // in carve.json — Windows: Process Monitor, filter Path to your repo, export each capture to CSV:
+  // in carve.json
   "buildFileTraces": ["build.csv"],
   "runFileTraces":   ["flash.csv"]
   ```
   ```
   carve repo/ --config carve.json --out o/ --report r.txt
   ```
+
+#### Capturing a file-access trace
+
+The extractor is tolerant and the "under the carve root + file exists" filter drops noise, so you don't have to
+produce a clean list — a raw capture works. Any capture tool that records opened paths is fine; the common ones:
+
+**Windows — the RUN trace (TRACE32 flash/debug session) — Process Monitor (Sysinternals ProcMon), GUI:**
+1. Launch `Procmon.exe`. Press **Ctrl+E** to stop the initial capture, **Ctrl+X** to clear.
+2. **Ctrl+L** (Filter) → add `Path` **begins with** `C:\path\to\repo` → **Include** (optionally also `Operation` **is** `ReadFile` → Include, to shrink it). Apply.
+3. **Ctrl+E** to start capturing, then **run your TRACE32 flash/run session** end to end, then **Ctrl+E** to stop.
+4. **File → Save** → *Events displayed using current filter* → format **CSV** → `flash.csv`. Put it in `runFileTraces`.
+
+**Windows — the BUILD trace — ProcMon from the command line (scriptable):**
+```
+Procmon.exe /AcceptEula /Quiet /Minimized /BackingFile C:\caps\build.pml
+<your build>                                   # e.g. make / cmake --build / the IDE build
+Procmon.exe /Terminate
+Procmon.exe /OpenLog C:\caps\build.pml /SaveAs C:\caps\build.csv   # -> buildFileTraces
+```
+(The same GUI steps as above also work for the build — just build instead of flashing between the Ctrl+E's.)
+
+**Linux — the BUILD trace — strace:**
+```
+strace -f -e trace=open,openat -o build.trace -- make <target>
+```
+`-f` follows the compiler/sub-make forks; the reader parses strace's `openat(AT_FDCWD, "path", …)` lines directly,
+so `buildFileTraces: ["build.trace"]` just works. **Run it from the repo root** so relative opens resolve under the
+carve root (absolute-path opens always resolve). `fatrace -c` or a `bpftrace` openat probe work too. A build on
+Linux targeting embedded is the usual case; a Windows build is the ProcMon recipe above.
+
+> Not a function trace — these record *files*, which is the whole point: they catch the orchestration + data layer
+> a function trace can't see. Over-capturing (writes, directory scans, un-exercised paths) is harmless: it only
+> ever keeps more, and the report shows you exactly what each trace touched.
 
 ### Languages
 
