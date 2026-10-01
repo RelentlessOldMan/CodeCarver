@@ -167,11 +167,13 @@ public static class CarveCommand
           //   example: "traceFormat": "^\\S+\\s+(?<fn>[A-Za-z_][A-Za-z0-9_]*)"
           "traceFormat": "",
 
-          // ===================== file-access traces (COMING SOON) =====================
-          // Lists of files actually opened during the build / the run (ProcMon on Windows, strace on Linux).
-          // The run trace catches the loader/CMM/binary/data layer a function trace can't see. NOT yet wired:
-          // setting any of these is an ERROR on this build (never a silent no-op), so leave them empty for now.
-
+          // ===================== file-access traces (the embedded "run closure") =====================
+          // Lists of files the OS actually OPENED under the repo during a real build / run (ProcMon on Windows,
+          // strace -e trace=openat on Linux, fs_usage on macOS). The run trace catches the loader/CMM/binary/data
+          // layer a function trace can't see and static analysis can't resolve (&var paths). Observed files are
+          // kept (code files become roots); the report flags kept-but-UNobserved infra as drop-candidates. One
+          // entry per capture file; the extractor is tolerant (quoted paths / plain list), filtered to this repo.
+          //   example: "runFileTraces": ["flash-session.procmon.csv"]
           "buildFileTraces": [],   // files opened WHILE building
           "runFileTraces": [],     // files opened WHILE running/flashing
           "fileTraceFormat": "",   // optional regex for a non-default file-trace line (named group 'path')
@@ -365,6 +367,12 @@ public static class CarveCommand
                 traceList.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
             else if (args[i] == "--trace-format" && i + 1 < args.Length)
                 traceFormat = args[++i];
+            else if (args[i] == "--build-file-trace" && i + 1 < args.Length)
+                buildFileTraces.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+            else if (args[i] == "--run-file-trace" && i + 1 < args.Length)
+                runFileTraces.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+            else if (args[i] == "--file-trace-format" && i + 1 < args.Length)
+                fileTraceFormat = args[++i];
             else if (args[i] == "--ignore-missing-inputs")
                 ignoreMissingInputs = true;
             else if (args[i] == "--dump-spans")
@@ -384,23 +392,15 @@ public static class CarveCommand
             }
         }
 
-        // Phase-2 input slots (file-access traces) are in the config template for discoverability but not wired
-        // yet. If a config actually SET them, fail loudly — never silently ignore an input the user believes is
-        // in effect (exactly the silent-config trap the evals flag).
-        if (buildFileTraces.Count > 0 || runFileTraces.Count > 0 || fileTraceFormat is not null)
+        // Fail-fast input check: every INPUT file referenced (build logs, function traces, file-access traces)
+        // must exist before we do any work, so a scripted multi-stage carve stops on a typo'd path instead of
+        // silently carving with less config than intended. Outputs (--out/--report/--manifest), dir/glob knobs
+        // (--exclude/--aux) and the PATH-resolved --probe tool are deliberately NOT checked here.
+        // --ignore-missing-inputs (or the config's "ignoreMissingInputs": true) downgrades this to a per-file
+        // warning and drops the missing entries.
         {
-            err.WriteLine("buildFileTraces / runFileTraces / fileTraceFormat are not supported in this build yet "
-                + "(observed file-access traces are the next feature). Remove them from the config, or update CodeCarver.");
-            return 2;
-        }
-
-        // Fail-fast input check: every INPUT file referenced (build logs, function traces) must exist before we do
-        // any work, so a scripted multi-stage carve stops on a typo'd path instead of silently carving with less
-        // config than intended. Outputs (--out/--report/--manifest), dir/glob knobs (--exclude/--aux) and the
-        // PATH-resolved --probe tool are deliberately NOT checked here. --ignore-missing-inputs (or the config's
-        // "ignoreMissingInputs": true) downgrades this to a per-file warning and drops the missing entries.
-        {
-            var inputFiles = buildLogs.Concat(traceList).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var inputFiles = buildLogs.Concat(traceList).Concat(buildFileTraces).Concat(runFileTraces)
+                                      .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             var missing = inputFiles.Where(f => !File.Exists(f)).ToList();
             if (missing.Count > 0)
             {
@@ -412,8 +412,11 @@ public static class CarveCommand
                     return 2;
                 }
                 foreach (var m in missing) err.WriteLine($"  warn    : input file not found, skipping: {m}");
-                buildLogs.RemoveAll(f => missing.Contains(f, StringComparer.OrdinalIgnoreCase));
-                traceList.RemoveAll(f => missing.Contains(f, StringComparer.OrdinalIgnoreCase));
+                bool IsMissing(string f) => missing.Contains(f, StringComparer.OrdinalIgnoreCase);
+                buildLogs.RemoveAll(IsMissing);
+                traceList.RemoveAll(IsMissing);
+                buildFileTraces.RemoveAll(IsMissing);
+                runFileTraces.RemoveAll(IsMissing);
             }
         }
 
@@ -1063,8 +1066,63 @@ public static class CarveCommand
                 err.WriteLine("  warn    : --trace produced 0 function names (does --trace-format have a named 'fn' group?)");
         }
 
+        // File-access traces: the files the OS actually opened under the repo during a real build/run. The OS
+        // reports the CONCRETE path regardless of how it was computed, so this captures the loader/orchestration +
+        // data layer (CMM scripts, loaded binaries, data tables) that a function trace can't see and static
+        // analysis can't resolve (&var paths). Every candidate path is mapped to a carve-relative file and kept
+        // only if it is UNDER the carve root and exists — that selective filter turns a tolerant extraction
+        // (ProcMon CSV / strace / plain list) into "repo files genuinely touched", dropping all the process-name /
+        // out-of-tree noise. Observed CODE files become file-level roots (keep the file + its closure); the whole
+        // observed set is threaded into the emitter (never garbage-prune an observed file) and the report
+        // (attribution + flag the kept-but-unobserved infra as drop-candidates).
+        var observedRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var fileTraceRoots = new List<Root>();
+        var observedExternalSrc = 0;   // source-like files read OUTSIDE the carve root (a real missing dependency)
+        if (buildFileTraces.Count + runFileTraces.Count > 0)
+        {
+            System.Text.RegularExpressions.Regex? fpat = null;
+            if (fileTraceFormat is not null)
+                try { fpat = new System.Text.RegularExpressions.Regex(fileTraceFormat, System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(2)); }
+                catch (Exception ex) { err.WriteLine($"--file-trace-format is not a valid regex: {ex.Message}"); return 2; }
+
+            var rootFull = Path.GetFullPath(dir);
+            void Ingest(List<string> traces)
+            {
+                foreach (var tp in traces)
+                {
+                    if (!File.Exists(tp)) continue; // defensive; missing ones were already handled up front
+                    string content;
+                    try { content = File.ReadAllText(tp); }
+                    catch (Exception ex) { err.WriteLine($"  warn    : could not read file-trace {Path.GetFileName(tp)} ({ex.GetType().Name}) — skipped"); continue; }
+                    IReadOnlyCollection<string> cands;
+                    try { cands = FileAccessTrace.Paths(content, fpat); }
+                    catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
+                    { err.WriteLine("--file-trace-format took too long to match a line (catastrophic backtracking?) — simplify the pattern"); cands = Array.Empty<string>(); }
+                    foreach (var cand in cands)
+                    {
+                        string full;
+                        try { full = Path.IsPathFullyQualified(cand) ? Path.GetFullPath(cand) : Path.GetFullPath(Path.Combine(rootFull, cand)); }
+                        catch { continue; } // not a usable path token (noise)
+                        if (full.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase) && File.Exists(full))
+                            observedRel.Add(Path.GetRelativePath(rootFull, full).Replace('\\', '/'));
+                        else if (exts.Any(e => cand.EndsWith(e, StringComparison.OrdinalIgnoreCase)))
+                            observedExternalSrc++; // a real source file, but outside the carve root — slice is missing it
+                    }
+                }
+            }
+            Ingest(buildFileTraces);
+            Ingest(runFileTraces);
+
+            var observedCode = observedRel.Where(r => exts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase))).ToList();
+            if (observedCode.Count > 0)
+                fileTraceRoots = new ExplicitRootProvider(files: observedCode).Discover(graph).ToList();
+            err.WriteLine($"  files   : {observedRel.Count} observed in-tree from {buildFileTraces.Count} build + {runFileTraces.Count} run file-trace(s)"
+                + $" ({observedCode.Count} code rooted)"
+                + (observedExternalSrc > 0 ? $"; {observedExternalSrc} source file(s) read OUTSIDE the carve root (missing dependency?)" : ""));
+        }
+
         var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots)
-                                   .Concat(ctorRoots).Concat(forceKeepRoots).Concat(traceRoots).ToList();
+                                   .Concat(ctorRoots).Concat(forceKeepRoots).Concat(traceRoots).Concat(fileTraceRoots).ToList();
         if (rootSet.Count == 0)
         {
             err.WriteLine("no roots to carve from: name entry symbols with --roots");
@@ -1198,7 +1256,7 @@ public static class CarveCommand
             // assembly, device trees, register/data tables, .cmm, prebuilt .a/.o, board configs — is copied
             // verbatim. The ONLY omissions are the code already emitted above and the code files the carve proved
             // unreachable (plan.DroppedFiles). Evidence-based removal only; --exclude trims variants/non-build trees.
-            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, plan.DroppedFiles, excludeDirs, auxGlobs, pruneGarbage);
+            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, plan.DroppedFiles, excludeDirs, auxGlobs, pruneGarbage, observedRel);
             infraFiles = infra.Files;
             infraBytes = infra.Bytes;
             garbageFiles = infra.Garbage;
@@ -1282,7 +1340,8 @@ public static class CarveCommand
                 InfraBytes: infraBytes,
                 InfraEnumerated: infraEnumerated,
                 RemovedGarbage: garbageFiles,
-                GarbageBytes: garbageBytes));
+                GarbageBytes: garbageBytes,
+                Observed: observedRel.ToList()));
             try
             {
                 File.WriteAllText(reportPath, report);
@@ -1304,6 +1363,7 @@ public static class CarveCommand
         diag.Set("carvedBytes", carvedBytes);
         diag.Set("garbageFilesRemoved", garbageFiles.Count);
         diag.Set("garbageBytesRemoved", garbageBytes);
+        diag.Set("observedFiles", observedRel.Count);
         diag.Set("rootsUnresolved", unresolvedRoots.Count);
         diag.Set("bigFilesKeptWhole", bigFiles.Count);
         diag.Set("denseHeadersKeptWhole", denseFiles.Count);
@@ -1350,6 +1410,7 @@ public static class CarveCommand
                 droppedFiles = plan.DroppedFiles,
                 infrastructureFiles = infraFiles,   // non-code passed through verbatim (empty if not enumerated)
                 removedGarbageFiles = garbageFiles, // dropped as non-input: VCS/scratch/editor/coverage (empty if not enumerated)
+                observedFiles = observedRel.OrderBy(f => f, StringComparer.Ordinal).ToArray(), // opened during a real build/run (file-trace)
             };
             // The carve itself already succeeded (and, with --out, is on disk); a manifest write failure must
             // not fail the whole run or mask that result. Warn and keep the normal exit code.
@@ -1435,6 +1496,7 @@ public static class CarveCommand
             "--roots", "--out", "--build-log", "--config", "--define", "--manifest", "--diag", "--exclude",
             "--aux", "--report", "--probe", "--trace", "--trace-format", "--lang", "--max-parse-bytes",
             "--parse-timeout", "--max-symbols-per-file",
+            "--build-file-trace", "--run-file-trace", "--file-trace-format",
         };
         var sb = new System.Text.StringBuilder("carve <source>");
         for (var i = 2; i < a.Length; i++)   // a[0]="carve", a[1]=source dir (already shown as <source>)

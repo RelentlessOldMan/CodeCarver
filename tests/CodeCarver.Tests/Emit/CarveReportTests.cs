@@ -146,6 +146,29 @@ public sealed class CarveReportTests
     }
 
     [Fact]
+    public void Render_FileTraceObserved_TagsAndSummarizes()
+    {
+        var text = CarveReport.Render(new CarveReport.Inputs(
+            SourceRoot: "/src",
+            Roots: new[] { "main" },
+            BuildRequired: new[] { "main.c" },
+            KeptCode: new[] { "main.c" },
+            RemovedDeadCode: System.Array.Empty<string>(),
+            Infrastructure: new[] { "flash.ld", "data/tab.bin", "notes.md" },
+            ExcludedDirs: System.Array.Empty<string>(),
+            CodeBytesBefore: 10, CodeBytesAfter: 10, InfraBytes: 30,
+            InfraEnumerated: true,
+            RemovedGarbage: System.Array.Empty<string>(), GarbageBytes: 0,
+            Observed: new[] { "flash.ld", "data/tab.bin" }));   // the run touched 2 of the 3 infra files
+
+        Assert.Contains("file-trace: 2 of 3 observed", text);          // attribution summary
+        Assert.Contains("1 NOT observed", text);                       // the drop-candidate count
+        Assert.Contains("flash.ld  [observed]", text);                 // observed files tagged
+        Assert.Contains("data/tab.bin  [observed]", text);
+        Assert.DoesNotContain("notes.md  [observed]", text);           // unobserved file NOT tagged
+    }
+
+    [Fact]
     public void Render_IsDeterministic()
     {
         var inputs = new CarveReport.Inputs(

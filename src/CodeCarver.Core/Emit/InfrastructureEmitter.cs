@@ -36,7 +36,8 @@ public static class InfrastructureEmitter
         IReadOnlyCollection<string> droppedCodeFilesRel,
         IReadOnlyList<string> excludeDirs,
         IReadOnlyList<string> auxGlobs,
-        bool pruneGarbage = true)
+        bool pruneGarbage = true,
+        IReadOnlyCollection<string>? observed = null)
     {
         var warnings = new List<string>();
         var outFull = Path.GetFullPath(outDir);
@@ -46,7 +47,7 @@ public static class InfrastructureEmitter
         long garbageBytes = 0;
         var count = 0;
 
-        foreach (var (rel, full, isGarbage) in Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, pruneGarbage, warnings))
+        foreach (var (rel, full, isGarbage) in Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, pruneGarbage, observed, warnings))
         {
             // Garbage (VCS/scratch/editor/coverage) is the ONLY thing dropped without evidence from the carve, and
             // only when pruneGarbage is on and --aux didn't force it back. Record it (for the report) and skip the
@@ -93,10 +94,13 @@ public static class InfrastructureEmitter
         IReadOnlyList<string> excludeDirs,
         IReadOnlyList<string> auxGlobs,
         bool pruneGarbage,
+        IReadOnlyCollection<string>? observed,
         List<string> warnings)
     {
         var skip = new HashSet<string>(alreadyEmittedRel, StringComparer.OrdinalIgnoreCase);
         var dropped = new HashSet<string>(droppedCodeFilesRel, StringComparer.OrdinalIgnoreCase);
+        // A file a real build/run was observed to OPEN is evidence it's used — never prune it as "garbage".
+        var observedSet = new HashSet<string>(observed ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
 
         // --exclude matches DIRECTORY segments (not the file's own name): a rel path a/b/c.mk is excluded
         // when 'a' or 'b' is an excluded dir. Mirrors the source/asm/linker scans in the CLI.
@@ -133,9 +137,9 @@ public static class InfrastructureEmitter
             if (dropped.Contains(rel)) continue;   // modelled dead code — removed on carve evidence
             var isForced = forced.Contains(rel);
             if (!isForced && !Included(rel)) continue; // --exclude prunes (unless --aux forces it back)
-            // Garbage is dropped only on CONVENTION (never a build/run input), only when enabled, and never when
-            // --aux explicitly forced the file back in.
-            var garbage = pruneGarbage && !isForced && InfraClassifier.IsGarbage(rel);
+            // Garbage is dropped only on CONVENTION (never a build/run input), only when enabled, never when --aux
+            // forced the file back in, and never when a trace OBSERVED the file being opened (hard evidence it's used).
+            var garbage = pruneGarbage && !isForced && !observedSet.Contains(rel) && InfraClassifier.IsGarbage(rel);
             yield return (rel, Path.GetFullPath(p), garbage);
         }
     }

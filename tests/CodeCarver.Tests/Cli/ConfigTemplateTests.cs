@@ -132,19 +132,22 @@ public sealed class ConfigTemplateTests
     }
 
     [Fact]
-    public void Config_Phase2FileTrace_Set_ErrorsLoudly_NotSilentlyIgnored()
+    public void Config_RunFileTrace_Consumed()
     {
-        var work = Path.Combine(Path.GetTempPath(), "cc-cfgp2-" + Guid.NewGuid().ToString("N"));
+        var work = Path.Combine(Path.GetTempPath(), "cc-cfgft-" + Guid.NewGuid().ToString("N"));
         var src = Path.Combine(work, "src");
         Directory.CreateDirectory(src);
         File.WriteAllText(Path.Combine(src, "main.c"), "int main(void){return 0;}\n");
+        File.WriteAllText(Path.Combine(src, "flash.ld"), "MEMORY{}\n");
+        var trace = Path.Combine(work, "run.csv");
+        File.WriteAllText(trace, "flash.ld\nmain.c\n");
         var cfg = Path.Combine(work, "carve.json");
         try
         {
-            File.WriteAllText(cfg, "{ \"roots\": [\"main\"], \"runFileTraces\": [\"run.csv\"] }");
+            File.WriteAllText(cfg, "{ \"roots\": [\"main\"], \"runFileTraces\": [\"" + trace.Replace("\\", "/") + "\"] }");
             var (code, _, err) = Run("carve", src, "--config", cfg);
-            Assert.Equal(2, code);
-            Assert.Contains("not supported in this build", err);
+            Assert.Equal(0, code);                       // file-trace is now implemented, not an error
+            Assert.Contains("observed in-tree", err);    // the summary line
         }
         finally { try { Directory.Delete(work, true); } catch { } }
     }

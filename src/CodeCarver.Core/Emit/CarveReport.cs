@@ -34,7 +34,8 @@ public static class CarveReport
         long CodeBytesBefore, long CodeBytesAfter, long InfraBytes,
         bool InfraEnumerated,                  // true once --out emitted (closure + infra are real)
         IReadOnlyList<string> RemovedGarbage,  // InfrastructureEmitter.Garbage — VCS/scratch/editor/coverage (emit only)
-        long GarbageBytes);
+        long GarbageBytes,
+        IReadOnlyList<string>? Observed = null);// files a build/run file-trace observed being opened (attribution)
 
     public static string Render(Inputs x)
     {
@@ -124,7 +125,14 @@ public static class CarveReport
             return sb.ToString();
         }
 
+        var observedSet = new HashSet<string>(x.Observed ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
         sb.AppendLine($"== KEPT - infrastructure / other, not code ({x.Infrastructure.Count}) ==");
+        if (observedSet.Count > 0)
+        {
+            var observedInfra = x.Infrastructure.Count(observedSet.Contains);
+            sb.AppendLine($"  (file-trace: {observedInfra} of {x.Infrastructure.Count} observed being opened; "
+                + $"{x.Infrastructure.Count - observedInfra} NOT observed - candidates to drop if the trace(s) covered a full build+run)");
+        }
         // Group by build ROLE first (what's there to build vs data/resources vs everything else), then by
         // extension within each role, so a reviewer sees the build/run/other split at a glance.
         foreach (var (role, title) in new[]
@@ -148,7 +156,8 @@ public static class CarveReport
             foreach (var kv in byExt)
             {
                 sb.AppendLine($"    -- {kv.Key} ({kv.Value.Count}) {DescribeExt(kv.Key)} --");
-                foreach (var f in kv.Value.OrderBy(f => f, StringComparer.Ordinal)) sb.AppendLine($"      {f}");
+                foreach (var f in kv.Value.OrderBy(f => f, StringComparer.Ordinal))
+                    sb.AppendLine($"      {f}{(observedSet.Contains(f) ? "  [observed]" : "")}");
             }
         }
 

@@ -320,6 +320,59 @@ public sealed class CarveCommandTests
     }
 
     [Fact]
+    public void Run_RunFileTrace_RootsObservedCodeFile_KeepsOtherwiseDeadFile()
+    {
+        // dead.c is unreachable from main, so a normal carve drops it. A run file-trace that shows it was
+        // actually opened roots it (file-level) -> it's kept. This is the "observe what's used" tightener.
+        var src = NewTree(out var outDir);
+        var trace = Path.Combine(Directory.GetParent(src)!.FullName, "run.txt");
+        File.WriteAllText(trace, "dead.c\n");   // plain path-per-line, relative to the carve root
+        try
+        {
+            var (code, _, err) = Run("carve", src, "--roots", "main", "--out", outDir, "--run-file-trace", trace);
+            Assert.Equal(0, code);
+            Assert.True(File.Exists(Path.Combine(outDir, "dead.c")));   // rooted via the trace, not dropped
+            Assert.Contains("observed in-tree", err);
+        }
+        finally { Cleanup(src); }
+    }
+
+    [Fact]
+    public void Run_FileTrace_ObservedFile_IsNotPrunedAsGarbage()
+    {
+        var src = NewTree(out var outDir);
+        AddGarbage(src);   // adds .git/config and main.c.bak
+        var trace = Path.Combine(Directory.GetParent(src)!.FullName, "run.txt");
+        File.WriteAllText(trace, "main.c.bak\n");   // the run actually read this "backup" -> it's not garbage
+        try
+        {
+            var (code, _, _) = Run("carve", src, "--roots", "main", "--out", outDir, "--run-file-trace", trace);
+            Assert.Equal(0, code);
+            Assert.True(File.Exists(Path.Combine(outDir, "main.c.bak")));    // observed -> kept despite .bak
+            Assert.False(File.Exists(Path.Combine(outDir, ".git", "config"))); // unobserved garbage still pruned
+        }
+        finally { Cleanup(src); }
+    }
+
+    [Fact]
+    public void Run_FileTrace_Manifest_ListsObservedFiles()
+    {
+        var src = NewTree(out var outDir);
+        var trace = Path.Combine(Directory.GetParent(src)!.FullName, "run.txt");
+        var man = Path.Combine(Directory.GetParent(src)!.FullName, "m.json");
+        File.WriteAllText(trace, "flash.ld\nmain.c\n");
+        try
+        {
+            var (code, _, _) = Run("carve", src, "--roots", "main", "--out", outDir, "--run-file-trace", trace, "--manifest", man);
+            Assert.Equal(0, code);
+            var json = File.ReadAllText(man);
+            Assert.Contains("observedFiles", json);
+            Assert.Contains("flash.ld", json);
+        }
+        finally { Cleanup(src); }
+    }
+
+    [Fact]
     public void Run_DiagRepro_AttachesAnonymizedGraph_NoRealNames()
     {
         var src = NewTree(out _);
