@@ -62,6 +62,34 @@ public static class CarveCommand
     }
 
     /// <summary>
+    /// `init [path]` — write the annotated TOML config template (the redesigned config; see redesign-spec-v2).
+    /// Defaults to <c>carve.toml</c>. Refuses to overwrite an existing file (so you can't clobber an edited
+    /// config). This is the one-liner that bootstraps a carve: write it, fill it in, then
+    /// <c>carve &lt;source-dir&gt; --config carve.toml</c>.
+    /// </summary>
+    public static int Init(string[] args, TextWriter @out, TextWriter err)
+    {
+        var path = args.Length > 1 && !args[1].StartsWith('-') ? args[1] : "carve.toml";
+        if (File.Exists(path))
+        {
+            err.WriteLine($"'{path}' already exists — refusing to overwrite. Delete it or choose another path.");
+            return 2;
+        }
+        try
+        {
+            File.WriteAllText(path, ConfigLoader.Template);
+            @out.WriteLine($"wrote {path}");
+            @out.WriteLine($"edit it, then run:  carve <source-dir> --config {path}");
+            return 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException or System.Security.SecurityException)
+        {
+            err.WriteLine($"could not write '{path}' ({ex.GetType().Name}: {ex.Message})");
+            return 2;
+        }
+    }
+
+    /// <summary>
     /// `emit-config [path]` — write the annotated JSON config template (every feedable input, blank by default,
     /// with fill-in examples, ordered most-common first). With a path it writes the file; with none it prints to
     /// stdout. This is how a user discovers what can be fed in without memorizing flags: generate it, fill in the

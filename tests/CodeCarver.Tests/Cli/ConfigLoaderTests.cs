@@ -122,6 +122,27 @@ public sealed class ConfigLoaderTests
     }
 
     [Fact]
+    public void Init_WritesTemplate_ThatParsesClean_AndRefusesOverwrite()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cc-init-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "carve.toml");
+        try
+        {
+            var so = new StringWriter(); var se = new StringWriter();
+            Assert.Equal(0, CarveCommand.Init(new[] { "init", path }, so, se));
+            Assert.True(File.Exists(path));
+            // The written file is a valid config.
+            Assert.Empty(ConfigLoader.Load(path).Errors);
+            // Refuses to clobber an existing (possibly edited) config.
+            var se2 = new StringWriter();
+            Assert.Equal(2, CarveCommand.Init(new[] { "init", path }, new StringWriter(), se2));
+            Assert.Contains("already exists", se2.ToString());
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Fact]
     public void MalformedToml_IsError_NotCrash()
     {
         var r = Parse("[common\nentryPoints = ");   // broken

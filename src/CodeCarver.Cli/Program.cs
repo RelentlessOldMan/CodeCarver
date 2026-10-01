@@ -18,9 +18,12 @@ switch (cmd)
         return CarveCommand.Run(args, Console.Out, Console.Error);
     case "scan-log":
         return RunScanLog(args);
+    case "init":
+        // Write the annotated TOML config template (the redesigned config).
+        return CarveCommand.Init(args, Console.Out, Console.Error);
     case "emit-config":
     case "init-config":
-        // Write (or print) the annotated config template so the user can discover every feedable input.
+        // Legacy: the old JSON config template (removed once the TOML cutover lands).
         return CarveCommand.EmitConfig(args, Console.Out, Console.Error);
     case "--version":
     case "version":
