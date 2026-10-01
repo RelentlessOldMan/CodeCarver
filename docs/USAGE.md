@@ -149,9 +149,9 @@ they never silently drop what they didn't see (a trace only proves what *that* r
 - **Function trace** (`--trace FILE`, repeatable; `--trace-format REGEX` with a named `fn` group): the functions
   a run executed become roots, covering dynamic dispatch (function pointers, vtables) static analysis
   over-approximates.
-- **File-access trace** (`--build-file-trace FILE` / `--run-file-trace FILE`, repeatable; `--file-trace-format
-  REGEX` with a named `path` group): the **files the OS actually opened** under the repo. Capture it two ways and
-  feed both:
+- **File-access trace** (**config-only** — `buildFileTraces` / `runFileTraces`, and `fileTraceFormat` for an
+  unusual format): the **files the OS actually opened** under the repo. These are a set-once-per-repo input, so
+  they live in the `--config` file rather than adding command-line flags. Capture two ways and list both:
   - **build trace** — ProcMon/strace *while building* → the exact compile/link inputs.
   - **run trace** — ProcMon *while flashing/running* → the loader/orchestration layer (TRACE32 `.cmm` scripts,
     the binaries and data they load) that a function trace can't see and that static analysis can't resolve
@@ -160,11 +160,15 @@ they never silently drop what they didn't see (a trace only proves what *that* r
   Observed **code** files become roots (keep the file + its closure); every observed file is kept (never pruned as
   garbage), and the report tags observed infrastructure and flags the **kept-but-unobserved** files as drop
   candidates. The reader is format-tolerant — ProcMon CSV, `strace -e trace=openat`, or a plain path-per-line list
-  all work; pass `--file-trace-format` only for an unusual format.
+  all work; set `fileTraceFormat` only for an unusual format.
 
+  ```jsonc
+  // in carve.json — Windows: Process Monitor, filter Path to your repo, export each capture to CSV:
+  "buildFileTraces": ["build.csv"],
+  "runFileTraces":   ["flash.csv"]
   ```
-  # Windows: Process Monitor, filter Path to your repo, export CSV; then:
-  carve repo/ --roots main --out o/ --build-file-trace build.csv --run-file-trace flash.csv --report r.txt
+  ```
+  carve repo/ --config carve.json --out o/ --report r.txt
   ```
 
 ### Languages

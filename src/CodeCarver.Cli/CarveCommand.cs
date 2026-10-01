@@ -216,8 +216,8 @@ public static class CarveCommand
         var traceList = new List<string>(); // runtime function trace(s): functions a real run executed (roots + soundness oracle)
         string? traceFormat = null;    // optional regex (named 'fn'/'file'/'line') for a non-default trace format
         var ignoreMissingInputs = false;    // --ignore-missing-inputs / config: warn+skip a missing input file instead of fail-fast
-        // Phase-2 input slots: present in the --emit-config template so every feedable input is discoverable, but
-        // the file-access-trace readers aren't built yet. A config that SETS them errors loudly (never a silent no-op).
+        // File-access traces are CONFIG-ONLY (no CLI flag): they're a set-it-once-per-repo input, so they live in
+        // the --config file (buildFileTraces[]/runFileTraces[]/fileTraceFormat) rather than adding more args.
         var buildFileTraces = new List<string>();
         var runFileTraces = new List<string>();
         string? fileTraceFormat = null;
@@ -367,12 +367,6 @@ public static class CarveCommand
                 traceList.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
             else if (args[i] == "--trace-format" && i + 1 < args.Length)
                 traceFormat = args[++i];
-            else if (args[i] == "--build-file-trace" && i + 1 < args.Length)
-                buildFileTraces.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-            else if (args[i] == "--run-file-trace" && i + 1 < args.Length)
-                runFileTraces.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-            else if (args[i] == "--file-trace-format" && i + 1 < args.Length)
-                fileTraceFormat = args[++i];
             else if (args[i] == "--ignore-missing-inputs")
                 ignoreMissingInputs = true;
             else if (args[i] == "--dump-spans")
@@ -1496,7 +1490,6 @@ public static class CarveCommand
             "--roots", "--out", "--build-log", "--config", "--define", "--manifest", "--diag", "--exclude",
             "--aux", "--report", "--probe", "--trace", "--trace-format", "--lang", "--max-parse-bytes",
             "--parse-timeout", "--max-symbols-per-file",
-            "--build-file-trace", "--run-file-trace", "--file-trace-format",
         };
         var sb = new System.Text.StringBuilder("carve <source>");
         for (var i = 2; i < a.Length; i++)   // a[0]="carve", a[1]=source dir (already shown as <source>)
