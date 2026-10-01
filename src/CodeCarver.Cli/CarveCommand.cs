@@ -227,222 +227,92 @@ public static class CarveCommand
 
     static int RunCore(string[] args, TextWriter @out, TextWriter err)
     {
+        // carve <source-dir> --config carve.toml [--stage <name>] [--why <symbol>]
         if (args.Length < 2 || !Directory.Exists(args[1]))
         {
-            err.WriteLine("usage: carve <dir> --roots sym1,sym2");
+            err.WriteLine("usage: carve <source-dir> --config carve.toml [--stage <name>] [--why <symbol>]");
+            err.WriteLine("       run 'init' to write an annotated carve.toml.");
             return 2;
         }
         var dir = args[1];
 
-        var roots = Array.Empty<string>();
-        string? outDir = null;
-        var prune = false;
-        var pruneHeaders = false;
-        var verify = false;
-        var strictRoots = false;
-        var dumpSpans = false;
-        string? whySymbol = null;
-        var traceList = new List<string>(); // runtime function trace(s): functions a real run executed (roots + soundness oracle)
-        string? traceFormat = null;    // optional regex (named 'fn'/'file'/'line') for a non-default trace format
-        var ignoreMissingInputs = false;    // --ignore-missing-inputs / config: warn+skip a missing input file instead of fail-fast
-        // File-access traces are CONFIG-ONLY (no CLI flag): they're a set-it-once-per-repo input, so they live in
-        // the --config file (buildFileTraces[]/runFileTraces[]/fileTraceFormat) rather than adding more args.
-        var buildFileTraces = new List<string>();
-        var runFileTraces = new List<string>();
-        string? fileTraceFormat = null;
-        var lang = "c";
-        var defineSpecs = new List<string>();
-        var buildLogs = new List<string>();   // repeatable: the written log AND the stdout capture can differ
-        var closedWorld = false;
-        string? manifestPath = null;
-        string? diagPath = null;       // --diag: write ONE source-free, shareable diagnostic .zip for this run
-        var diagRepro = false;         // --diag-repro: also attach an anonymized, replayable graph snapshot
-        var diagVerbose = false;       // --diag-verbose: also attach a per-file keep/drop table (includes NAMES)
-        var clean = false;             // --clean: permit replacing a non-empty --out we didn't create
-        var excludeDirs = new List<string>();
-        var auxGlobs = new List<string>();   // force-copy files even from --exclude'd dirs (keep-by-default handles the rest)
-        var pruneGarbage = true;             // default-on: drop provable non-inputs (VCS/scratch/editor/coverage); --keep-garbage disables
-        string? reportPath = null;           // --report: write the carve report (build-required/infra/dead-code/garbage)
-        string? probeCompiler = null;
-        long maxParseBytes = 20_000_000; // files bigger than this (e.g. multi-GB generated register headers)
-                                         // skip the parser and are kept whole via #include-closure.
-        int? parseTimeoutMs = null;      // per-file parse budget backstop (ms); null = front-end default.
-        int? maxSymbolsPerFile = null;   // per-file symbol-count budget backstop; null = front-end default.
-
-        // A --config JSON file supplies defaults; explicit CLI flags below override it.
-        for (var i = 2; i < args.Length - 1; i++)
-        {
-            if (args[i] != "--config") continue;
-            // A missing or malformed --config is a config mistake, not a crash: report it with the file name
-            // and the parser's reason, then exit 2 (usage). Previously the raw JsonException/IOException blew
-            // out as an unhandled stack trace.
-            CarveConfig? cfg;
-            try
-            {
-                cfg = System.Text.Json.JsonSerializer.Deserialize<CarveConfig>(File.ReadAllText(args[i + 1]),
-                    new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true, ReadCommentHandling = System.Text.Json.JsonCommentHandling.Skip });
-            }
-            catch (System.Text.Json.JsonException ex)
-            {
-                err.WriteLine($"--config '{args[i + 1]}': not valid JSON ({ex.Message})");
-                return 2;
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
-            {
-                err.WriteLine($"--config '{args[i + 1]}': could not read ({ex.GetType().Name}: {ex.Message})");
-                return 2;
-            }
-            if (cfg is null) continue;
-            // A BLANK string in the template ("out": "", "traceFormat": "", ...) means "not set" — the user left
-            // the slot empty. Treat blank/whitespace as unset for every string field, and drop blank entries from
-            // arrays, so emitting the template and running it as-is behaves exactly like passing no config at all
-            // (otherwise "out":"" would look like a bad --out path, and "fileTraceFormat":"" would trip the
-            // Phase-2 guard). Explicit CLI flags still override whatever survives here.
-            static IEnumerable<string> NonBlank(IEnumerable<string>? xs)
-                => (xs ?? Array.Empty<string>()).Where(s => !string.IsNullOrWhiteSpace(s));
-            if (cfg.Roots is not null) roots = NonBlank(cfg.Roots).ToArray();
-            if (!string.IsNullOrWhiteSpace(cfg.Lang)) lang = cfg.Lang.ToLowerInvariant();
-            if (!string.IsNullOrWhiteSpace(cfg.Out)) outDir = cfg.Out;
-            if (cfg.Prune is not null) prune = cfg.Prune.Value;
-            defineSpecs.AddRange(NonBlank(cfg.Defines));
-            if (!string.IsNullOrWhiteSpace(cfg.BuildLog)) buildLogs.Add(cfg.BuildLog);
-            if (cfg.AssumeDefinesComplete is not null) closedWorld = cfg.AssumeDefinesComplete.Value;
-            excludeDirs.AddRange(NonBlank(cfg.Exclude));
-            if (!string.IsNullOrWhiteSpace(cfg.Manifest)) manifestPath = cfg.Manifest;
-            if (cfg.MaxParseBytes is not null) maxParseBytes = cfg.MaxParseBytes.Value;
-            if (cfg.MaxSymbolsPerFile is not null) maxSymbolsPerFile = cfg.MaxSymbolsPerFile.Value;
-            if (cfg.ParseTimeout is >= 0) parseTimeoutMs = cfg.ParseTimeout.Value * 1000; // seconds -> ms (0 disables)
-            if (cfg.PruneHeaders is not null) pruneHeaders = cfg.PruneHeaders.Value;
-            if (cfg.KeepGarbage is not null) pruneGarbage = !cfg.KeepGarbage.Value;
-            buildLogs.AddRange(NonBlank(cfg.BuildLogs));
-            auxGlobs.AddRange(NonBlank(cfg.Aux));
-            if (!string.IsNullOrWhiteSpace(cfg.Report)) reportPath = cfg.Report;
-            if (!string.IsNullOrWhiteSpace(cfg.Probe)) probeCompiler = cfg.Probe;
-            traceList.AddRange(NonBlank(cfg.Traces));
-            if (!string.IsNullOrWhiteSpace(cfg.TraceFormat)) traceFormat = cfg.TraceFormat;
-            if (cfg.IgnoreMissingInputs is not null) ignoreMissingInputs = cfg.IgnoreMissingInputs.Value;
-            buildFileTraces.AddRange(NonBlank(cfg.BuildFileTraces));
-            runFileTraces.AddRange(NonBlank(cfg.RunFileTraces));
-            if (!string.IsNullOrWhiteSpace(cfg.FileTraceFormat)) fileTraceFormat = cfg.FileTraceFormat;
-        }
-
-        // The CLI carries only the OPERATIONAL surface: the carve verbs, the output targets, and behavior/diag
-        // toggles you flip per run. Every INPUT and TUNING knob (build logs, defines, excludes, aux, probe,
-        // traces, file traces, parse budgets, assume-complete, prune-headers, keep-garbage) lives in the --config
-        // file instead — one place, discoverable via `emit-config`, so the command line stays short. CLI still
-        // OVERRIDES the config for the flags that remain.
+        string? configPath = null, stageName = null, whySymbol = null;
         for (var i = 2; i < args.Length; i++)
         {
-            if (args[i] == "--config") { i++; continue; } // already loaded above
-            if (args[i] == "--roots" && i + 1 < args.Length)
-                roots = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            else if (args[i] == "--out" && i + 1 < args.Length)
-                outDir = args[++i];
-            else if (args[i] == "--lang" && i + 1 < args.Length)
-                lang = args[++i].ToLowerInvariant();
-            else if (args[i] == "--report" && i + 1 < args.Length)
-                reportPath = args[++i];
-            else if (args[i] == "--manifest" && i + 1 < args.Length)
-                manifestPath = args[++i];
-            else if (args[i] == "--prune")
-                prune = true;
-            else if (args[i] == "--verify")
-                verify = true;
-            else if (args[i] == "--strict-roots")
-                strictRoots = true;
-            else if (args[i] == "--clean")
-                clean = true;
-            else if (args[i] == "--ignore-missing-inputs")
-                ignoreMissingInputs = true;
-            else if (args[i] == "--diag" && i + 1 < args.Length)
-                diagPath = args[++i];
-            else if (args[i] == "--diag-repro")
-                diagRepro = true;
-            else if (args[i] == "--diag-verbose")
-                diagVerbose = true;
-            else if (args[i] == "--dump-spans")
-                dumpSpans = true;
-            else if (args[i] == "--why" && i + 1 < args.Length)
-                whySymbol = args[++i];
+            if (args[i] == "--config" && i + 1 < args.Length) configPath = args[++i];
+            else if (args[i] == "--stage" && i + 1 < args.Length) stageName = args[++i];
+            else if (args[i] == "--why" && i + 1 < args.Length) whySymbol = args[++i];
             else
             {
-                // Unknown or incomplete option. Fail loudly (a silently-ignored typo'd flag is exactly the
-                // silent-mistake class the evals flag). Inputs/tuning moved to --config, so point there.
-                err.WriteLine($"unknown or incomplete option '{args[i]}'. CLI flags: carve <dir> [--config F] [--roots a,b] "
-                                        + "[--lang c|cpp] [--out DIR] [--report F] [--manifest F] [--prune] [--verify] [--strict-roots] "
-                                        + "[--clean] [--ignore-missing-inputs] [--diag Z] [--diag-repro] [--diag-verbose] [--dump-spans] [--why S]. "
-                                        + "Inputs & tuning (build logs, defines, excludes, probe, traces, parse budgets, ...) go in the "
-                                        + "--config file: run 'emit-config <file>' for an annotated template.");
+                err.WriteLine($"unknown or incomplete option '{args[i]}'. usage: carve <source-dir> --config carve.toml "
+                    + "[--stage <name>] [--why <symbol>].  Everything else lives in the config — run 'init' for a template.");
                 return 2;
             }
         }
+        if (configPath is null) { err.WriteLine("carve needs --config <carve.toml>. Run 'init' to create one."); return 2; }
 
-        // Fail-fast input check: every INPUT file referenced (build logs, function traces, file-access traces)
-        // must exist before we do any work, so a scripted multi-stage carve stops on a typo'd path instead of
-        // silently carving with less config than intended. Outputs (--out/--report/--manifest), dir/glob knobs
-        // (--exclude/--aux) and the PATH-resolved --probe tool are deliberately NOT checked here.
-        // --ignore-missing-inputs (or the config's "ignoreMissingInputs": true) downgrades this to a per-file
-        // warning and drops the missing entries.
+        // Load + validate the TOML config, then resolve it (union selected builds/runs, derive world, pick stages).
+        var loaded = ConfigLoader.Load(configPath);
+        foreach (var w in loaded.Warnings) err.WriteLine($"  warn    : {w}");
+        if (loaded.Config is null) { foreach (var e in loaded.Errors) err.WriteLine(e); return 2; }
+        var resolution = CarveResolver.Resolve(loaded.Config, stageName);
+        if (resolution.Carve is null) { foreach (var e in resolution.Errors) err.WriteLine(e); return 2; }
+        var cv = resolution.Carve;
+
+        // Resolved config -> engine inputs.
+        var roots = cv.EntryPoints.ToArray();
+        var lang = cv.Languages[0];
+        if (cv.Languages.Count > 1)
+            err.WriteLine($"  note    : languages [{string.Join(", ", cv.Languages)}] given; carving '{lang}' this build "
+                + "(C+C++ single-graph merge is a later phase).");
+        var defineSpecs = cv.Defines.ToList();
+        var buildLogs = cv.BuildLogs.ToList();
+        var closedWorld = cv.ClosedWorld;
+        var excludeDirs = cv.ExcludeDirectories.ToList();
+        var auxGlobs = cv.ForceKeepFiles.ToList();          // forceKeepFiles
+        var probeCompiler = cv.Compilers.Count > 0 ? cv.Compilers[0] : null;
+        var traceList = cv.RunTraceLogs.ToList();           // function-execution trace(s)
+        var buildFileTraces = cv.BuildTraceFiles.ToList();
+        var runFileTraces = cv.RunTraceFiles.ToList();
+        var outputDirectory = cv.OutputDirectory;
+
+        // Fixed, auto-handled settings (no longer user-facing flags).
+        var pruneGarbage = true;        // auto-exclude provable non-inputs; forceKeepFiles un-drops
+        var strictRoots = true;         // a missing NAMED entry point always fails (soundness check always runs below)
+        string? traceFormat = null;     // standard trace-log format only (no regex knob)
+        string? fileTraceFormat = null; // file-access traces auto-detect
+        long maxParseBytes = 20_000_000;
+        int? parseTimeoutMs = null;
+        int? maxSymbolsPerFile = null;
+        var dumpSpans = false;
+        string? diagPath = null;        // no --diag flag; crash auto-diag still works via DiagState
+        // Per-stage; declared here for the diag snapshot, set inside the emit loop.
+        var prune = false;
+        var pruneHeaders = false;
+
+        // Fail fast if any referenced INPUT file is missing (a typo'd path must not carve with less than intended).
         {
             var inputFiles = buildLogs.Concat(traceList).Concat(buildFileTraces).Concat(runFileTraces)
                                       .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             var missing = inputFiles.Where(f => !File.Exists(f)).ToList();
             if (missing.Count > 0)
             {
-                if (!ignoreMissingInputs)
-                {
-                    err.WriteLine($"missing {missing.Count} input file(s) — fix the path(s), or pass --ignore-missing-inputs "
-                        + "(or set \"ignoreMissingInputs\": true in the config) to warn and continue:");
-                    foreach (var m in missing) err.WriteLine($"  not found: {m}");
-                    return 2;
-                }
-                foreach (var m in missing) err.WriteLine($"  warn    : input file not found, skipping: {m}");
-                bool IsMissing(string f) => missing.Contains(f, StringComparer.OrdinalIgnoreCase);
-                buildLogs.RemoveAll(IsMissing);
-                traceList.RemoveAll(IsMissing);
-                buildFileTraces.RemoveAll(IsMissing);
-                runFileTraces.RemoveAll(IsMissing);
+                err.WriteLine($"missing {missing.Count} input file(s) referenced in the config — fix the path(s):");
+                foreach (var m in missing) err.WriteLine($"  not found: {m}");
+                return 2;
             }
         }
 
-        // --out must be DISJOINT from the scanned source tree. Emitting into (or onto) the tree we just read
-        // would overwrite the user's own source — catastrophically with --prune, whose EmitPruned writes the
-        // function-stripped file straight onto dst==src. The input tree is sacred; refuse before touching a
-        // single file (checked here, before the expensive scan/parse, so the failure is instant).
-        if (outDir is not null)
-        {
-            string outFull;
-            try { outFull = Path.GetFullPath(outDir); }
-            catch (Exception ex) { err.WriteLine($"--out '{outDir}' is not a usable path ({ex.GetType().Name}: {ex.Message})"); return 2; }
-            if (OutputPath.Overlaps(dir, outFull))
-            {
-                err.WriteLine($"--out must not be the source tree or nested within it (or vice versa): "
-                    + $"source '{Path.GetFullPath(dir)}' overlaps out '{outFull}'. Emitting there would overwrite your "
-                    + "source. Choose an output directory outside the scanned tree.");
-                return 2;
-            }
-            // --out is an existing FILE, not a directory: refuse up front (exit 2) rather than run the whole
-            // carve and then fail at promote (eval-#9 LOW).
-            if (File.Exists(outFull))
-            {
-                err.WriteLine($"--out '{outFull}' is a file, not a directory. Choose a directory path for the carved tree.");
-                return 2;
-            }
-            // Never destroy data we didn't create. The emit atomically REPLACES --out (staging is promoted over
-            // it), so a --out pointing at a checkout, a home dir, or any pre-existing folder would wipe it. Only
-            // proceed when --out is empty/absent, was itself produced by CodeCarver (carries the marker — the
-            // normal re-carve case), or --clean explicitly authorizes replacing arbitrary contents.
-            bool outNonEmpty;
-            try { outNonEmpty = Directory.Exists(outFull) && Directory.EnumerateFileSystemEntries(outFull).Any(); }
-            catch (Exception ex) { err.WriteLine($"--out '{outFull}' is not accessible ({ex.GetType().Name}: {ex.Message})"); return 2; }
-            if (outNonEmpty && !clean && !StagedOutput.IsCodeCarverOutput(outFull))
-            {
-                err.WriteLine($"--out '{outFull}' is not empty and was not created by CodeCarver — refusing to "
-                    + "overwrite it (it could be a checkout, a home directory, or your own files). Choose an empty or new "
-                    + "directory, or pass --clean to replace its contents.");
-                return 2;
-            }
-        }
+        // outputDirectory must be OUTSIDE the source tree (we write a complete tree there, atomically). Also exclude
+        // any 'codecarver' dir from the source scan so a prior in-tree output never re-ingests.
+        string outputFull;
+        try { outputFull = Path.GetFullPath(outputDirectory); }
+        catch (Exception ex) { err.WriteLine($"outputDirectory '{outputDirectory}' is not a usable path ({ex.GetType().Name}: {ex.Message})"); return 2; }
+        if (OutputPath.Overlaps(dir, outputFull))
+        { err.WriteLine($"outputDirectory must be OUTSIDE the source tree (source '{Path.GetFullPath(dir)}' overlaps '{outputFull}')."); return 2; }
+        if (File.Exists(outputFull))
+        { err.WriteLine($"outputDirectory '{outputFull}' is a file, not a directory."); return 2; }
+        if (!excludeDirs.Contains("codecarver", StringComparer.OrdinalIgnoreCase)) excludeDirs.Add("codecarver");
 
         // Diagnostic collector for this run: a source-free snapshot (version/env/params/stats/warnings/timings)
         // written to ONE shareable .zip on request via --diag, or automatically on an unhandled failure (the
@@ -485,8 +355,8 @@ public static class CarveCommand
         diag.Set("sourceRootKind", ClassifyRoot(dir));
         diag.Set("lang", lang);
         diag.Set("rootCount", roots.Length);
-        diag.Set("prune", prune);
-        diag.Set("wroteOutput", outDir is not null);
+        diag.Set("closedWorld", closedWorld);
+        diag.Set("stageCount", cv.Stages.Count);
         diag.Event("args parsed");
 
         // Preprocessor config: explicit --define plus -D flags scraped from EVERY --build-log (parsed once here
@@ -1186,178 +1056,10 @@ public static class CarveCommand
         if (plan.DroppedFiles.Count > 0)
             @out.WriteLine("  dropped : " + Summarize(plan.DroppedFiles));
 
-        long carvedBytes;
-        // Three-bucket accounting for the carve report: what's required to build (kept code + include closure),
-        // and what non-code infrastructure was passed through verbatim. Removed-dead-code is plan.DroppedFiles.
-        IReadOnlyList<string> buildRequiredFiles = plan.KeptFiles;   // refined to res.Written when we emit
-        IReadOnlyList<string> infraFiles = Array.Empty<string>();
-        IReadOnlyList<string> garbageFiles = Array.Empty<string>();  // dropped as non-input (VCS/scratch/editor/coverage)
-        long infraBytes = 0;
-        long garbageBytes = 0;
-        var infraEnumerated = false;                                 // false in analysis-only unless --report walks
-        if (outDir is not null)
-        {
-            // Crash-safe, non-destructive emit: every step writes into a private staging dir; the real --out is
-            // replaced in ONE atomic rename only after all steps succeed. A run killed mid-emit can't leave a
-            // half-written tree, and re-emitting can't pollute a prior good --out with stale (now-dropped) files
-            // (Spec_CrashRecovery §11/§41/§61). Disposal removes staging on any handled failure/early return.
-            using var staged = StagedOutput.Begin(outDir);
-            var stageDir = staged.Dir;
-
-            // Ctrl-C mid-emit skips `using` disposal, so register a handler that deletes the (unpromoted) staging
-            // dir before the process exits — no half-written tree left orphaned beside --out. Dispose is idempotent
-            // and a no-op once the emit has promoted, so this is safe regardless of when Ctrl-C lands. One-shot
-            // process, so no need to unsubscribe.
-            Console.CancelKeyPress += (_, _) => { try { staged.Dispose(); } catch { } };
-
-            var res = prune
-                ? FileTreeEmitter.EmitPruned(plan, graph, dir, stageDir)
-                : FileTreeEmitter.Emit(plan, dir, stageDir);
-            Mark("emit");
-            carvedBytes = res.BytesWritten;
-            buildRequiredFiles = res.Written;   // kept code + its include closure = the build-required bucket
-            var how = prune ? "pruned (intra-file: unreached functions removed)" : "file-level (whole kept files)";
-            @out.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{how}]");
-            if (prune)
-                @out.WriteLine("  note    : --prune is EXPERIMENTAL — always build-verify. File-level (omit --prune) is the sound default.");
-
-            // --prune-headers: strip unused #defines from the giant register headers we kept whole (C/C++ only).
-            if (pruneHeaders && lang is "c" or "cpp")
-            {
-                var keptBig = bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)).Where(plan.KeptFiles.Contains).ToList();
-                if (keptBig.Count > 0)
-                {
-                    var hc = HeaderCarver.Carve(stageDir, keptBig);
-                    carvedBytes -= hc.BytesBefore - hc.BytesAfter; // those files shrank on disk
-                    var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
-                    @out.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} #defines kept, "
-                                      + $"{hc.DefinesDropped:N0} dropped; {hc.BytesBefore:N0} B -> {hc.BytesAfter:N0} B ({hpct:P0} smaller)");
-                    @out.WriteLine("  note    : --prune-headers is EXPERIMENTAL (drops unused #defines from kept headers) — always build-verify.");
-                }
-            }
-
-            // Keep-by-default: --out must be a COMPLETE, buildable project, not just the carved C. Everything the
-            // carve DIDN'T model as dead code — Makefiles/CMake, linker scripts, scatter/.cmd files, startup
-            // assembly, device trees, register/data tables, .cmm, prebuilt .a/.o, board configs — is copied
-            // verbatim. The ONLY omissions are the code already emitted above and the code files the carve proved
-            // unreachable (plan.DroppedFiles). Evidence-based removal only; --exclude trims variants/non-build trees.
-            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, plan.DroppedFiles, excludeDirs, auxGlobs, pruneGarbage, observedRel);
-            infraFiles = infra.Files;
-            infraBytes = infra.Bytes;
-            garbageFiles = infra.Garbage;
-            garbageBytes = infra.GarbageBytes;
-            infraEnumerated = true;
-            // Passed-through files are copied VERBATIM -- identical bytes before and after, and were never in
-            // `paths` (not parsed source). Add the SAME bytes to BOTH sides so they're delta-neutral and the
-            // headline % reflects only the real code carve (dead-code removal), not the untouched infrastructure.
-            carvedBytes += infra.Bytes;
-            originalBytes += infra.Bytes;
-            if (infra.Count > 0)
-                @out.WriteLine($"  passthru: {infra.Count:N0} non-code file(s) copied verbatim ({infra.Bytes:N0} B) "
-                                  + "so --out is a complete buildable project (build files, linker scripts, asm, data, configs)");
-            if (infra.Garbage.Count > 0)
-                @out.WriteLine($"  garbage : {infra.Garbage.Count:N0} file(s) NOT copied ({infra.GarbageBytes:N0} B) "
-                                  + "- VCS/scratch/editor/coverage, not a build/run input (--keep-garbage to keep them)");
-            foreach (var w in infra.Warnings) err.WriteLine($"  warn    : {w}");
-
-            // Everything staged successfully — swap it into place atomically. Only now is any prior --out
-            // touched (moved aside, then deleted once the new tree is confirmed in place). Promote retries
-            // transient AV/indexer rename locks and falls back to copy; if it STILL fails, the carve itself
-            // succeeded and the prior --out is left intact — say so clearly rather than an opaque crash.
-            try
-            {
-                staged.Promote();
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                // A PromoteFailedException.Torn tells us honestly whether --out is unchanged or partially updated.
-                var torn = ex is PromoteFailedException { Torn: true };
-                var state = torn
-                    ? $"{outDir} is now PARTIALLY updated — re-run, or carve to a fresh --out."
-                    : $"Your previous {outDir} is unchanged.";
-                err.WriteLine($"  error   : the carve succeeded ({res.FilesWritten} files staged) but writing it "
-                    + $"into {outDir} failed ({ex.GetType().Name}: {ex.Message}). {state} "
-                    + "Usual cause: a process holding a file open — or a shell whose current directory is — inside "
-                    + $"{outDir} (e.g. 'cd out && make'), or a transient AV/indexer lock.");
-                diag.SetFailure(ex);
-                if (diagPath is not null && diag.TryWritePackage(diagPath, out var zpf, out _))
-                    err.WriteLine($"  diag    : diagnostic package (with failure) written -> {zpf}");
-                return 1;
-            }
-        }
-        else
-        {
-            carvedBytes = plan.KeptFiles.Sum(f => sizeByRel.TryGetValue(f, out var b) ? b : 0);
-            @out.WriteLine("  (analysis only — pass --out <dir> [--prune] to write the carved tree)");
-        }
-
-        var saved = originalBytes - carvedBytes;
-        var pct = originalBytes > 0 ? (double)saved / originalBytes : 0;
-        @out.WriteLine($"  size    : {originalBytes:N0} B -> {carvedBytes:N0} B  ({pct:P0} smaller, saved {saved:N0} B)");
-
-        // Carve report — the three buckets: KEPT (required to build) / REMOVED (dead code) / KEPT (infrastructure).
-        // Infrastructure and the include-closure split of "required to build" are only KNOWN once the tree is
-        // emitted (the closure is discovered during emit; infra is what emit passed through). So without --out the
-        // report is honestly scoped to the carve DECISION (reachable code vs dead code) rather than guessing and
-        // mislabelling build-required includes as infrastructure.
-        if (infraEnumerated)
-            @out.WriteLine($"  buckets : {buildRequiredFiles.Count:N0} required-to-build + {infraFiles.Count:N0} infrastructure kept, "
-                              + $"{plan.DroppedFiles.Count:N0} dead-code"
-                              + (garbageFiles.Count > 0 ? $" + {garbageFiles.Count:N0} garbage" : "") + " file(s) removed");
-        else
-            @out.WriteLine($"  buckets : {plan.KeptFiles.Count:N0} reachable-code + {plan.DroppedFiles.Count:N0} dead-code file(s) "
-                              + "(pass --out to enumerate infrastructure + include closure)");
-        if (reportPath is not null)
-        {
-            // originalBytes/carvedBytes include the passthrough bytes only when we actually emitted (--out); back
-            // them out so the report's code-size line is the pure code carve.
-            var infraInTotals = infraEnumerated ? infraBytes : 0;
-            var report = CarveReport.Render(new CarveReport.Inputs(
-                SourceRoot: dir,
-                Roots: roots,
-                BuildRequired: buildRequiredFiles,
-                KeptCode: plan.KeptFiles,
-                RemovedDeadCode: plan.DroppedFiles,
-                Infrastructure: infraFiles,
-                ExcludedDirs: excludeDirs,
-                CodeBytesBefore: originalBytes - infraInTotals,
-                CodeBytesAfter: carvedBytes - infraInTotals,
-                InfraBytes: infraBytes,
-                InfraEnumerated: infraEnumerated,
-                RemovedGarbage: garbageFiles,
-                GarbageBytes: garbageBytes,
-                Observed: observedRel.ToList()));
-            try
-            {
-                File.WriteAllText(reportPath, report);
-                @out.WriteLine($"  report  : written -> {reportPath}");
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException or System.Security.SecurityException)
-            {
-                err.WriteLine($"  warn    : could not write --report '{reportPath}' ({ex.GetType().Name}: {ex.Message})");
-            }
-        }
-
-        // Structured stats into the diagnostic package (numbers only — no source content).
-        diag.Set("totalNodes", s.TotalNodes);
-        diag.Set("keptNodes", s.ReachedNodes);
-        diag.Set("totalFiles", s.TotalFiles);
-        diag.Set("keptFiles", s.KeptFiles);
-        diag.Set("droppedFiles", s.DroppedFiles);
-        diag.Set("originalBytes", originalBytes);
-        diag.Set("carvedBytes", carvedBytes);
-        diag.Set("garbageFilesRemoved", garbageFiles.Count);
-        diag.Set("garbageBytesRemoved", garbageBytes);
-        diag.Set("observedFiles", observedRel.Count);
-        diag.Set("rootsUnresolved", unresolvedRoots.Count);
-        diag.Set("bigFilesKeptWhole", bigFiles.Count);
-        diag.Set("denseHeadersKeptWhole", denseFiles.Count);
-        diag.Set("symbolBudgetKeptWhole", budgetKept.Count);
-
-        // --verify: compiler-free soundness gate — no KEPT function may call an in-scope function that was
-        // carved out (it wouldn't link). Catches an edge our model missed (a blind spot). C/C++ only.
+        // --- Soundness check (plan-based; identical for every stage): a KEPT fn must not call an in-scope DROPPED
+        // fn (it wouldn't link). Always on now; folded into the normal output + each stage's report. ---
         var verifyFailed = false;
-        if (verify && fe is TreeSitterFrontEnd tsv)
+        if (fe is TreeSitterFrontEnd tsv)
         {
             var violations = SoundnessCheck.KeptCallingDropped(graph, plan, tsv.CallSites);
             if (violations.Count == 0)
@@ -1366,92 +1068,136 @@ public static class CarveCommand
             {
                 verifyFailed = true;
                 @out.WriteLine($"  verify  : {violations.Count} UNSOUND call(s) — a kept function calls an in-scope function that was carved out:");
-                foreach (var v in violations.Take(20))
-                    @out.WriteLine($"            {v.Caller}() -> {v.Callee}()  [{v.File}]");
+                foreach (var v in violations.Take(20)) @out.WriteLine($"            {v.Caller}() -> {v.Callee}()  [{v.File}]");
                 if (violations.Count > 20) @out.WriteLine($"            (+{violations.Count - 20} more)");
             }
         }
-        else if (verify)
-            @out.WriteLine($"  verify  : (not available for --lang {lang}; C/C++ only)");
+        else
+            @out.WriteLine($"  verify  : (soundness check is C/C++ only; skipped for language '{lang}')");
+        @out.WriteLine($"  world   : {cv.WorldReason}");
 
-        if (manifestPath is not null)
+        void WriteArtifact(string path, string content, string what)
         {
-            var manifest = new
-            {
-                codecarverVersion = Version(),   // exactly which build produced this carve (git commit stamped)
-                root = dir,
-                roots,
-                lang,
-                defines = defineSpecs.Distinct().ToArray(),
-                closedWorld,
-                pruned = prune,
-                stats = new
-                {
-                    s.TotalNodes, s.ReachedNodes, s.DroppedNodes,
-                    s.TotalFiles, s.KeptFiles, s.DroppedFiles,
-                    originalBytes, carvedBytes, savedBytes = saved,
-                },
-                keptFiles = plan.KeptFiles,
-                droppedFiles = plan.DroppedFiles,
-                infrastructureFiles = infraFiles,   // non-code passed through verbatim (empty if not enumerated)
-                removedGarbageFiles = garbageFiles, // dropped as non-input: VCS/scratch/editor/coverage (empty if not enumerated)
-                observedFiles = observedRel.OrderBy(f => f, StringComparer.Ordinal).ToArray(), // opened during a real build/run (file-trace)
-            };
-            // The carve itself already succeeded (and, with --out, is on disk); a manifest write failure must
-            // not fail the whole run or mask that result. Warn and keep the normal exit code.
-            try
-            {
-                File.WriteAllText(manifestPath,
-                    System.Text.Json.JsonSerializer.Serialize(manifest, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
-                @out.WriteLine($"  manifest: {manifestPath}");
-            }
+            try { File.WriteAllText(path, content); @out.WriteLine($"  {what,-8}: {path}"); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException or System.Security.SecurityException)
-            {
-                err.WriteLine($"  warn    : could not write --manifest '{manifestPath}' ({ex.GetType().Name}: {ex.Message})");
-            }
+            { err.WriteLine($"  warn    : could not write {what} '{path}' ({ex.GetType().Name}: {ex.Message})"); }
         }
 
-        // Write the shareable diagnostic package on request. The carve already succeeded; a diag write failure
-        // only warns (spec §24 — the reporting system must never be the thing that fails the run).
+        // --- Emit each stage. The graph + reachability plan are SHARED across stages; only the emit granularity
+        // (carveSourceFileContents / carveHeaderFileContents) and the output subdir differ. Each stage writes a
+        // complete buildable project under <outputDirectory>/[<stage>/]carved plus report/manifest/resolved-config
+        // under the sibling codecarver/. ---
+        var originalCodeBytes = originalBytes;  // code-only base; do NOT mutate across stages
+        var configText = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
+        foreach (var stage in cv.Stages)
+        {
+            prune = stage.CarveSourceFileContents;
+            pruneHeaders = stage.CarveHeaderFileContents;
+            var baseDir = stage.Name.Length == 0 ? outputDirectory : Path.Combine(outputDirectory, stage.Name);
+            var outDir = Path.Combine(baseDir, "carved");
+            var ccDir = Path.Combine(baseDir, "codecarver");
+            @out.WriteLine($"  stage   : {(stage.Name.Length == 0 ? "(single)" : stage.Name)}  "
+                + $"[source-contents={(prune ? "carved" : "whole")}, header-contents={(pruneHeaders ? "carved" : "whole")}]");
+
+            // Crash-safe: stage into a private dir, promote atomically only after every step succeeds.
+            using var staged = StagedOutput.Begin(outDir);
+            var stageDir = staged.Dir;
+            Console.CancelKeyPress += (_, _) => { try { staged.Dispose(); } catch { } };
+
+            var res = prune ? FileTreeEmitter.EmitPruned(plan, graph, dir, stageDir) : FileTreeEmitter.Emit(plan, dir, stageDir);
+            var carvedBytes = res.BytesWritten;
+            var buildRequiredFiles = res.Written;
+            @out.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{(prune ? "intra-file (unused functions removed)" : "file-level (whole kept files)")}]");
+            if (prune) @out.WriteLine("  note    : carveSourceFileContents is EXPERIMENTAL — always build-verify.");
+
+            if (pruneHeaders && lang is "c" or "cpp")
+            {
+                var keptBig = bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)).Where(plan.KeptFiles.Contains).ToList();
+                if (keptBig.Count > 0)
+                {
+                    var hc = HeaderCarver.Carve(stageDir, keptBig);
+                    carvedBytes -= hc.BytesBefore - hc.BytesAfter;
+                    var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
+                    @out.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} kept, {hc.DefinesDropped:N0} dropped; "
+                        + $"{hc.BytesBefore:N0} B -> {hc.BytesAfter:N0} B ({hpct:P0} smaller)");
+                }
+            }
+
+            // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
+            // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
+            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, plan.DroppedFiles, excludeDirs, auxGlobs, pruneGarbage, observedRel);
+            carvedBytes += infra.Bytes;
+            var origTotal = originalCodeBytes + infra.Bytes;   // delta-neutral passthrough (both sides)
+            if (infra.Count > 0)
+                @out.WriteLine($"  passthru: {infra.Count:N0} non-code file(s) copied verbatim ({infra.Bytes:N0} B) — complete buildable project");
+            if (infra.Garbage.Count > 0)
+                @out.WriteLine($"  excluded: {infra.Garbage.Count:N0} non-input file(s) NOT copied ({infra.GarbageBytes:N0} B) — VCS/scratch/editor (forceKeepFiles to keep)");
+            foreach (var w in infra.Warnings) err.WriteLine($"  warn    : {w}");
+
+            try { staged.Promote(); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                var torn = ex is PromoteFailedException { Torn: true };
+                err.WriteLine($"  error   : carve succeeded ({res.FilesWritten} files staged) but writing {outDir} failed "
+                    + $"({ex.GetType().Name}: {ex.Message}). " + (torn ? $"{outDir} is PARTIALLY updated — re-run." : $"{outDir} is unchanged.")
+                    + " Usual cause: a process holding a file open inside it, or a transient AV/indexer lock.");
+                diag.SetFailure(ex);
+                return 1;
+            }
+
+            var saved = origTotal - carvedBytes;
+            var pct = origTotal > 0 ? (double)saved / origTotal : 0;
+            @out.WriteLine($"  size    : {origTotal:N0} B -> {carvedBytes:N0} B  ({pct:P0} smaller, saved {saved:N0} B)");
+            @out.WriteLine($"  buckets : {buildRequiredFiles.Count:N0} required-to-build + {infra.Count:N0} infrastructure kept, "
+                + $"{plan.DroppedFiles.Count:N0} dead-code" + (infra.Garbage.Count > 0 ? $" + {infra.Garbage.Count:N0} auto-excluded" : "") + " file(s) removed");
+
+            // Always write report + manifest + resolved-config into codecarver/.
+            Directory.CreateDirectory(ccDir);
+            var report = CarveReport.Render(new CarveReport.Inputs(
+                SourceRoot: dir, Roots: roots, BuildRequired: buildRequiredFiles, KeptCode: plan.KeptFiles,
+                RemovedDeadCode: plan.DroppedFiles, Infrastructure: infra.Files, ExcludedDirs: excludeDirs,
+                CodeBytesBefore: origTotal - infra.Bytes, CodeBytesAfter: carvedBytes - infra.Bytes,
+                InfraBytes: infra.Bytes, InfraEnumerated: true, RemovedGarbage: infra.Garbage, GarbageBytes: infra.GarbageBytes,
+                Observed: observedRel.ToList()));
+            WriteArtifact(Path.Combine(ccDir, "report.txt"), report, "report");
+
+            var manifest = new
+            {
+                codecarverVersion = Version(), root = dir, roots, lang,
+                defines = defineSpecs.Distinct().ToArray(), closedWorld,
+                stage = stage.Name, carveSourceFileContents = prune, carveHeaderFileContents = pruneHeaders,
+                stats = new { s.TotalNodes, s.ReachedNodes, s.DroppedNodes, s.TotalFiles, s.KeptFiles, s.DroppedFiles,
+                    originalBytes = origTotal, carvedBytes, savedBytes = saved },
+                keptFiles = plan.KeptFiles, droppedFiles = plan.DroppedFiles,
+                infrastructureFiles = infra.Files, removedGarbageFiles = infra.Garbage,
+                observedFiles = observedRel.OrderBy(f => f, StringComparer.Ordinal).ToArray(),
+            };
+            WriteArtifact(Path.Combine(ccDir, "manifest.json"),
+                System.Text.Json.JsonSerializer.Serialize(manifest, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), "manifest");
+            WriteArtifact(Path.Combine(ccDir, "resolved-config.toml"),
+                $"# CodeCarver resolved config — stage '{stage.Name}'\n# {cv.WorldReason}\n"
+                + $"# entryPoints={roots.Length}  languages={string.Join(",", cv.Languages)}  buildLogs={buildLogs.Count}  "
+                + $"runTraceFiles={runFileTraces.Count}  runTraceLogs={traceList.Count}\n\n{configText}", "config");
+        }
+        Mark("emit");
+
+        // --- Diagnostic stats (once; numbers only — feeds an auto-written crash package). ---
+        diag.Set("totalNodes", s.TotalNodes);
+        diag.Set("keptNodes", s.ReachedNodes);
+        diag.Set("totalFiles", s.TotalFiles);
+        diag.Set("keptFiles", s.KeptFiles);
+        diag.Set("droppedFiles", s.DroppedFiles);
+        diag.Set("observedFiles", observedRel.Count);
+        diag.Set("rootsUnresolved", unresolvedRoots.Count);
+        diag.Set("bigFilesKeptWhole", bigFiles.Count);
+        diag.Set("denseHeadersKeptWhole", denseFiles.Count);
+        diag.Set("symbolBudgetKeptWhole", budgetKept.Count);
+        diag.Set("stages", cv.Stages.Count);
         diag.Set("verifyFailed", verifyFailed);
         diag.Set("exitCode", verifyFailed ? 3 : 0);
         diag.Event("run complete");
 
-        // Opt-in extra artifacts. --diag-repro attaches an anonymized, replayable graph (safe: hashed names, no
-        // source); --diag-verbose attaches a per-file keep/drop table WITH names (the manifest flags that).
-        if (diagRepro)
-        {
-            // ReproBundle.Build materializes the whole anonymized graph as one JSON string. On a very large
-            // graph that can spike memory (or, in the extreme, exceed the ~2 GB string limit). Guard it: the
-            // carve itself already succeeded (and, with --out, is on disk) — a failed repro attachment must
-            // degrade to a warning + skip, never surface as "carve failed unexpectedly" and lose everything.
-            // (The proper fix if this ever bites is to stream repro straight to the zip via Utf8JsonWriter.)
-            try
-            {
-                diag.Attach("repro.graph.json", ReproBundle.Build(graph, plan), containsNames: false,
-                    description: "anonymized dependency graph + roots + reached set (hashed names, NO source) — replayable repro");
-            }
-            catch (Exception ex)   // OutOfMemory / OverflowException on a huge graph — never fatal to the run
-            {
-                err.WriteLine($"  warn    : --diag-repro skipped ({ex.GetType().Name}) — graph too large to snapshot; "
-                              + "the rest of the diagnostic package was still written");
-            }
-        }
-        if (diagVerbose)
-            diag.Attach("keepdrop.txt", BuildKeepDropReport(graph, plan, unresolvedRoots, bigFiles, denseFiles, budgetKept),
-                containsNames: true, description: "per-file keep/drop + keep-reason histogram (includes NAMES, not contents)");
-
-        // Write the package when --diag gave a path, OR an attachment-producing flag was used (then land it at
-        // the default temp path so the user still gets the file they asked for).
-        var effectiveDiagPath = diagPath ?? ((diagRepro || diagVerbose) ? DiagState.DefaultPath : null);
-        if (effectiveDiagPath is not null)
-        {
-            if (diag.TryWritePackage(effectiveDiagPath, out var zp, out var derr))
-                @out.WriteLine($"  diag    : diagnostic package written -> {zp}");
-            else
-                err.WriteLine($"  warn    : could not write diag package '{effectiveDiagPath}' ({derr})");
-        }
-        return verifyFailed ? 3 : 0; // non-zero so --verify is usable as a gate in scripts
+        return verifyFailed ? 3 : 0; // non-zero so the soundness check is usable as a CI gate
     }
 
     // Human ETA from a seconds estimate. "?" when not yet computable (no throughput sample yet).
