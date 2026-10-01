@@ -38,13 +38,16 @@ New-Item -ItemType Directory -Force $oA, $oB | Out-Null
 $mA = Join-Path $work 'a.json'; $mB = Join-Path $work 'b.json'
 
 function CarveTo([string]$repo, [string]$out, [string]$man) {
-    $a = @('carve', $repo, '--roots', $Roots, '--lang', $Lang, '--out', $out, '--manifest', $man)
-    if ($Exclude)      { $a += @('--exclude', $Exclude) }
+    # Inputs/tuning are config-only now; write a per-call --config and keep only the operational flags on the CLI.
+    $cfg = @{ parseTimeout = $ParseTimeout }       # 0 = disabled (see param note): isolate path from timing
+    if ($Exclude)      { $cfg.exclude = @($Exclude -split ',') }
+    if ($PruneHeaders) { $cfg.pruneHeaders = $true }
+    if ($BuildLog)     { $cfg.buildLogs = @($BuildLog) }
+    if ($Defines)      { $cfg.defines = @($Defines -split ',') }
+    $cfgPath = "$out.cfg.json"
+    $cfg | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $cfgPath
+    $a = @('carve', $repo, '--roots', $Roots, '--lang', $Lang, '--out', $out, '--manifest', $man, '--config', $cfgPath)
     if ($Prune)        { $a += '--prune' }
-    if ($PruneHeaders) { $a += '--prune-headers' }
-    if ($BuildLog)     { $a += @('--build-log', $BuildLog) }
-    if ($Defines)      { $a += @('--define', $Defines) }
-    $a += @('--parse-timeout', "$ParseTimeout")   # 0 = disabled (see param note): isolate path from timing
     $sw = [Diagnostics.Stopwatch]::StartNew()
     & dotnet $cli @a 2>&1 | Select-String 'nodes|files|size|verify|warn' | ForEach-Object { Write-Host "    $_" }
     $sw.Stop()

@@ -193,7 +193,9 @@ public sealed class CarveCommandTests
         try
         {
             File.WriteAllText(log, "gcc -DFEATURE=1 -Iinc -c main.c\ngcc -c helper.c\n");
-            var (code, _, err) = Run("carve", src, "--roots", "main", "--build-log", log);
+            var cfg = Path.Combine(Directory.GetParent(src)!.FullName, "c.json");
+            File.WriteAllText(cfg, "{ \"buildLogs\": [\"" + log.Replace("\\", "/") + "\"] }");  // inputs are config-only now
+            var (code, _, err) = Run("carve", src, "--roots", "main", "--config", cfg);
             Assert.Equal(0, code);
             Assert.Contains("compile command", err);   // the build summary line
         }
@@ -296,7 +298,9 @@ public sealed class CarveCommandTests
         AddGarbage(src);
         try
         {
-            var (code, _, _) = Run("carve", src, "--roots", "main", "--out", outDir, "--keep-garbage");
+            var cfg = Path.Combine(Directory.GetParent(src)!.FullName, "c.json");
+            File.WriteAllText(cfg, "{ \"keepGarbage\": true }");   // config-only now
+            var (code, _, _) = Run("carve", src, "--roots", "main", "--out", outDir, "--config", cfg);
             Assert.Equal(0, code);
             Assert.True(File.Exists(Path.Combine(outDir, ".git", "config")));   // kept when disabled
             Assert.True(File.Exists(Path.Combine(outDir, "main.c.bak")));
@@ -311,7 +315,9 @@ public sealed class CarveCommandTests
         AddGarbage(src);
         try
         {
-            var (code, _, _) = Run("carve", src, "--roots", "main", "--out", outDir, "--aux", "main.c.bak");
+            var cfg = Path.Combine(Directory.GetParent(src)!.FullName, "c.json");
+            File.WriteAllText(cfg, "{ \"aux\": [\"main.c.bak\"] }");   // config-only now
+            var (code, _, _) = Run("carve", src, "--roots", "main", "--out", outDir, "--config", cfg);
             Assert.Equal(0, code);
             Assert.True(File.Exists(Path.Combine(outDir, "main.c.bak")));       // forced back
             Assert.False(File.Exists(Path.Combine(outDir, ".git", "config"))); // rest still pruned

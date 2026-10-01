@@ -70,7 +70,11 @@ foreach ($r in $repos) {
   Write-Host ("carving {0} ..." -f $r.name) -NoNewline
   $out = Join-Path $env:TEMP ("ccbr-" + $r.name.Replace('\','_') + "-" + [guid]::NewGuid().ToString('N').Substring(0,8))
   $ca = @('carve', $dir, '--roots', $r.roots, '--lang', 'c', '--prune', '--out', $out)
-  if ($r.exclude) { $ca += @('--exclude', $r.exclude) }
+  if ($r.exclude) {   # --exclude is config-only now
+    $cfgPath = "$out.cfg.json"
+    @{ exclude = @($r.exclude -split ',') } | ConvertTo-Json | Set-Content -Encoding utf8 $cfgPath
+    $ca += @('--config', $cfgPath)
+  }
   $o = (& dotnet $dll @ca 2>&1 | Out-String)
 
   $orig = 0; $carved = 0; $pct = 0; $files = 0

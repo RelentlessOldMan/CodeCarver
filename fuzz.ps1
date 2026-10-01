@@ -61,10 +61,12 @@ if ($baseline.Count -eq 0) {
     exit 2
 }
 
-# 2. Carve + prune + emit.
+# 2. Carve + prune + emit. (--exclude is config-only now.)
 Write-Host "carving..."
+$fuzzCfg = Join-Path $env:TEMP 'codecarver-fuzz.cfg.json'
+@{ exclude = @($Exclude -split ',') } | ConvertTo-Json | Set-Content -Encoding utf8 $fuzzCfg
 dotnet run --project src/CodeCarver.Cli -c Release -- carve $Repo --lang $Lang --roots $Roots `
-    --prune --out $out --exclude $Exclude 2>&1 | Select-String 'emitted|none of|support' | ForEach-Object { "  $_" }
+    --prune --out $out --config $fuzzCfg 2>&1 | Select-String 'emitted|none of|support' | ForEach-Object { "  $_" }
 
 # 3. Re-compile the carved version of each baseline-passing file; a regression is a carve bug.
 $carvedIncs = @($Inc | ForEach-Object { Join-Path $out $_ }) + $out

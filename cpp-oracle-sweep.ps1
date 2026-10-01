@@ -23,13 +23,14 @@ $sh  = ToWsl (Join-Path $root 'wsl-cpp-oracle.sh')
 $drv = ToWsl (Join-Path $root 'oracle')
 $ow  = ToWsl $o
 
-# repo | carve input (rel to .corpus) | roots | driver | INC (rel to carved out) | EXCLUDE regex | extra carve flags
+# repo | carve input (rel to .corpus) | roots | driver | INC (rel to carved out) | EXCLUDE regex | per-case config
+# (inputs/tuning are config-only now: 'cfg' is written to a temp --config per case)
 $cases = @(
-  @{ n='tinyxml2'; in='tinyxml2';            roots='LoadFile,SaveFile,Parse,Print,Accept';       drv='tinyxml2_driver.cpp'; inc='';         excl='';           flags=@() },
-  @{ n='pugixml';  in='pugixml\src';         roots='load_file,load_string,load_buffer,save';     drv='pugixml_driver.cpp';  inc='';         excl='';           flags=@() },
-  @{ n='simdjson'; in='simdjson\singleheader';roots='parse,iterate,load,load_many';              drv='simdjson_driver.cpp'; inc='';         excl='';           flags=@() },
-  @{ n='fmt';      in='fmt';                 roots='vformat,vformat_to,vprint,report_error';     drv='fmt_driver.cpp';      inc='/include'; excl='fmt\.cc|fmt-c'; flags=@('--exclude','test,doc,support') },
-  @{ n='json';     in='json\single_include'; roots='parse,dump';                                 drv='json_driver.cpp';     inc='';         excl='';           flags=@('--prune-headers') }
+  @{ n='tinyxml2'; in='tinyxml2';            roots='LoadFile,SaveFile,Parse,Print,Accept';       drv='tinyxml2_driver.cpp'; inc='';         excl='';           cfg=@{} },
+  @{ n='pugixml';  in='pugixml\src';         roots='load_file,load_string,load_buffer,save';     drv='pugixml_driver.cpp';  inc='';         excl='';           cfg=@{} },
+  @{ n='simdjson'; in='simdjson\singleheader';roots='parse,iterate,load,load_many';              drv='simdjson_driver.cpp'; inc='';         excl='';           cfg=@{} },
+  @{ n='fmt';      in='fmt';                 roots='vformat,vformat_to,vprint,report_error';     drv='fmt_driver.cpp';      inc='/include'; excl='fmt\.cc|fmt-c'; cfg=@{ exclude=@('test','doc','support') } },
+  @{ n='json';     in='json\single_include'; roots='parse,dump';                                 drv='json_driver.cpp';     inc='';         excl='';           cfg=@{ pruneHeaders=$true } }
 )
 
 # The native calls below merge stderr (2>&1) for display. Under $ErrorActionPreference='Stop' a native
@@ -43,7 +44,13 @@ foreach ($t in $cases) {
     if (-not (Test-Path $inPath)) { Write-Host ("SKIP {0} (not under .corpus)" -f $t.n) -ForegroundColor DarkGray; continue }
     $outPath = Join-Path $o $t.n
     Write-Host ("=== {0} ===" -f $t.n) -ForegroundColor Cyan
-    & dotnet $cli carve $inPath --lang cpp --roots $t.roots @($t.flags) --prune --out $outPath 2>&1 |
+    $carveArgs = @('carve', $inPath, '--lang', 'cpp', '--roots', $t.roots, '--prune', '--out', $outPath)
+    if ($t.cfg.Count -gt 0) {
+        $cfgPath = "$outPath.cfg.json"
+        $t.cfg | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $cfgPath
+        $carveArgs += @('--config', $cfgPath)
+    }
+    & dotnet $cli @carveArgs 2>&1 |
         Select-String 'nodes|files|UNRESOLVED' | ForEach-Object { Write-Host "  $_" }
     $env:INC = "-I$ow/$($t.n)$($t.inc)"
     if ($t.excl) { $env:EXCLUDE = $t.excl } else { Remove-Item Env:\EXCLUDE -ErrorAction SilentlyContinue }

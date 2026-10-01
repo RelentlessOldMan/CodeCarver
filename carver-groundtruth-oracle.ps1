@@ -137,7 +137,10 @@ Write-Host "== carving (this may take minutes on a 100 GB tree) ==" -ForegroundC
 # the invocation and gate on the exit code instead (a known PS 5.1 hazard).
 $ErrorActionPreference = 'Continue'
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-& dotnet $CliDll carve $Corpus --roots $Root --lang c --max-parse-bytes $MaxParseBytes --manifest $ccManifest 2>&1 |
+# --max-parse-bytes is config-only now.
+$gtCfg = Join-Path (Split-Path $ccManifest) 'gt-oracle.cfg.json'
+@{ maxParseBytes = $MaxParseBytes } | ConvertTo-Json | Set-Content -Encoding utf8 $gtCfg
+& dotnet $CliDll carve $Corpus --roots $Root --lang c --config $gtCfg --manifest $ccManifest 2>&1 |
   Select-String 'nodes|files|size|scanning|warn' | ForEach-Object { "  " + $_.Line }
 $carveExit = $LASTEXITCODE
 $sw.Stop()

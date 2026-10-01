@@ -52,6 +52,17 @@ public sealed class CliIntegrationTests
         return (p.ExitCode, so + se);
     }
 
+    /// <summary>Inputs (build logs, defines, ...) are config-only now; write a minimal --config and return its path.</summary>
+    private static string WriteConfig(string dir, string json)
+    {
+        var p = Path.Combine(dir, "carve.cfg.json");
+        File.WriteAllText(p, json);
+        return p;
+    }
+
+    private static string BuildLogConfig(string dir, string log, string extra = "")
+        => WriteConfig(dir, "{ \"buildLogs\": [\"" + log.Replace("\\", "/") + "\"]" + extra + " }");
+
     /// <summary>A minimal C tree with a real entry (run -> keep) and a dead function. Returns the src dir.</summary>
     private static string MakeTree(out string work)
     {
@@ -145,16 +156,19 @@ public sealed class CliIntegrationTests
     }
 
     [Fact]
-    public void Carve_MaxParseBytesInvalid_ExitsUsage()
+    public void Carve_RemovedInputFlagOnCli_RejectedWithConfigHint()
     {
+        // Input/tuning flags (build logs, defines, excludes, probe, traces, parse budgets, ...) moved to --config.
+        // Passing one on the CLI must fail loudly and point the user at the config / emit-config, not silently ignore.
         var src = MakeTree(out var work);
         try
         {
-            var r = RunCli("carve", src, "--roots", "run", "--max-parse-bytes", "notanumber");
+            var r = RunCli("carve", src, "--roots", "run", "--build-log", "x.log");
             if (r is null) return;
             var (code, outp) = r.Value;
             Assert.Equal(2, code);
-            Assert.Contains("--max-parse-bytes", outp);
+            Assert.Contains("--config", outp);
+            Assert.Contains("emit-config", outp);
         }
         finally { Cleanup(work); }
     }
@@ -416,7 +430,7 @@ public sealed class CliIntegrationTests
                 "\", \"file\": \"" + main.Replace("\\", "/") +
                 "\", \"command\": \"gcc -DFEATURE_X -I. -c main.c\" } ]");
 
-            var r = RunCli("carve", src, "--roots", "run", "--build-log", db);
+            var r = RunCli("carve", src, "--roots", "run", "--config", BuildLogConfig(work, db));
             if (r is null) return;
             var (code, outp) = r.Value;
             Assert.Equal(0, code);
@@ -448,7 +462,7 @@ public sealed class CliIntegrationTests
             var outDir = Path.Combine(work, "out");
             var report = Path.Combine(work, "report.txt");
 
-            var r = RunCli("carve", proj, "--roots", "main", "--build-log", db, "--out", outDir, "--report", report);
+            var r = RunCli("carve", proj, "--roots", "main", "--config", BuildLogConfig(work, db), "--out", outDir, "--report", report);
             if (r is null) return;
             var (code, _) = r.Value;
             Assert.Equal(0, code);
@@ -526,7 +540,7 @@ public sealed class CliIntegrationTests
                 "  {\"directory\":\"" + d + "\",\"file\":\"widget.c\",\"arguments\":[\"gcc\",\"-c\",\"widget.c\"]} ]");
             var outDir = Path.Combine(work, "out");
 
-            var r = RunCli("carve", proj, "--roots", "main", "--build-log", db, "--out", outDir);
+            var r = RunCli("carve", proj, "--roots", "main", "--config", BuildLogConfig(work, db), "--out", outDir);
             if (r is null) return;
             var (code, _) = r.Value;
             Assert.Equal(0, code);
@@ -558,7 +572,7 @@ public sealed class CliIntegrationTests
                 "  {\"directory\":\"" + d + "\",\"file\":\"unity.c\",\"arguments\":[\"gcc\",\"-c\",\"unity.c\"]}," +
                 "  {\"directory\":\"" + d + "\",\"file\":\"impl.c\",\"arguments\":[\"gcc\",\"-DFEATURE\",\"-c\",\"impl.c\"]} ]");
 
-            var r = RunCli("carve", proj, "--roots", "main", "--build-log", db, "--dump-spans");
+            var r = RunCli("carve", proj, "--roots", "main", "--config", BuildLogConfig(work, db), "--dump-spans");
             if (r is null) return;
             var (code, outp) = r.Value;
             Assert.Equal(0, code);
@@ -589,7 +603,7 @@ public sealed class CliIntegrationTests
                 "  {\"directory\":\"" + d + "\",\"file\":\"impl.c\",\"arguments\":[\"gcc\",\"-DFEATURE\",\"-c\",\"impl.c\"]}," +
                 "  {\"directory\":\"" + d + "\",\"file\":\"impl.c\",\"arguments\":[\"gcc\",\"-c\",\"impl.c\"]} ]");
 
-            var r = RunCli("carve", proj, "--roots", "main", "--build-log", db, "--assume-defines-complete", "--dump-spans");
+            var r = RunCli("carve", proj, "--roots", "main", "--config", BuildLogConfig(work, db, ", \"assumeDefinesComplete\": true"), "--dump-spans");
             if (r is null) return;
             var (code, outp) = r.Value;
             Assert.Equal(0, code);

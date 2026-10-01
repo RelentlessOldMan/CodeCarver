@@ -22,11 +22,15 @@ $RunBuild = $false                               # set $true once BuildCmd/SizeC
 $ErrorActionPreference = 'Stop'
 $cli = Join-Path $PSScriptRoot '..\src\CodeCarver.Cli\bin\Release\net8.0\CodeCarver.Cli.dll'
 if (-not (Test-Path $cli)) { throw "build the CLI first: dotnet build -c Release  (missing $cli)" }
-# --strict-roots: a typo'd ISR/API name among a curated root list fails the run instead of silently
-# carving the real symbol away (see WORKREPO.md 0). Drop it only if you accept unresolved roots.
-$common = @('--roots', $Roots, '--lang', $Lang, '--exclude', $Exclude, '--aux', $Aux, '--strict-roots')
-if ($BuildLog) { $common += @('--build-log', $BuildLog) }
-if ($Defines)  { $common += @('--define', $Defines) }
+# Inputs (exclude / aux / build log / defines) are config-only now -> write a --config file. --strict-roots
+# stays a CLI toggle: a typo'd ISR/API name among a curated root list fails the run instead of silently carving
+# the real symbol away (see WORKREPO.md 0). Drop it only if you accept unresolved roots.
+$cfg = @{ exclude = @($Exclude -split ','); aux = @($Aux -split ',') }
+if ($BuildLog) { $cfg.buildLogs = @($BuildLog) }
+if ($Defines)  { $cfg.defines  = @($Defines -split ',') }
+$cfgPath = Join-Path $env:TEMP 'codecarver-embedded-arm.cfg.json'
+$cfg | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $cfgPath
+$common = @('--roots', $Roots, '--lang', $Lang, '--config', $cfgPath, '--strict-roots')
 
 function Carve([string[]]$extra) { & dotnet $cli carve $Repo @common @extra 2>&1 }
 

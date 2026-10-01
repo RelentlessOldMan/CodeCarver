@@ -60,31 +60,49 @@ Every carve is sound with just `--roots`. Each extra input lets it carve **tight
 > files) is kept too: those includes aren't parsed as C, but every symbol they name is retained and the
 > file is copied into the output. This is the sound over-approximation; it never drops these.
 
+**The command line is short on purpose.** It carries the carve verbs, the output targets, and behaviour/diag
+toggles you flip per run. **Every input and tuning knob lives in the `--config` file** (run `emit-config` for an
+annotated template) — one place, so the CLI doesn't sprawl. A CLI flag that remains still *overrides* the config.
+
+**CLI flags (operational):**
+
 | Input | Flag | Effect |
 |---|---|---|
-| Entry symbols | `--roots a,b,c` | *(required)* what to keep |
-| Language | `--lang c` \| `cpp` \| `csharp` | picks the front-end + file extensions (default `c`) |
-| Config file | `--config carve.json` | load any of these options from JSON (CLI flags override it) |
-| Skip directories | `--exclude tests,vendor` | don't scan those dirs (avoids over-keeping via test-file name clashes) |
-| Config macros | `--define X=1,Y` | resolve `#ifdef`s → drop dead-branch code |
-| Build log | `--build-log build.txt` | scrape real per-file `-D` flags from a build log (see `scan-log`) |
-| Probe compiler | `--probe cc` | run `cc -dM -E` for the compiler's **complete** macro set (predefined + target + `-D`) and resolve `#ifdef`s closed-world against it — accurate, no "is my define list complete?" guess |
-| Complete-config | `--assume-defines-complete` | closed-world without probing: trust the supplied defines as complete |
-| Write output | `--out DIR` | emit the carved tree. Written atomically (staged, then swapped into place) so a crash mid-emit can't leave a half-written tree. `--out` must be **outside** the source tree; a **non-empty** `--out` that CodeCarver didn't create is refused (so it can't wipe a checkout or your own files) — re-carving a prior CodeCarver output is seamless |
-| Replace output | `--clean` | permit replacing a non-empty `--out` CodeCarver did **not** create (explicit opt-in to overwrite its contents) |
-| Force-include | `--aux "board/*.ld"` | force-copy specific files into `--out` **even when under an `--exclude`'d directory, or classified as garbage**. Rarely needed now — keep-by-default already passes through every non-code file (see below); `--aux` only pulls a file back in from a pruned variant folder or restores a single garbage-classified file |
-| Keep garbage | `--keep-garbage` | **disable** the default garbage pruning. By default `--out` drops files that can't be a build/run input by universal convention (VCS metadata like `.git`, compiler/IDE scratch like `CMakeFiles`/`__pycache__`, dep/coverage artifacts `.d`/`.gcda`, editor/OS junk `*.bak`/`.DS_Store`, logs/temp). Pass this to copy them too |
-| Aggressive prune | `--prune` | intra-file function/table removal (C/C++ only; other languages carve file-level) |
-| Carve report | `--report r.txt` | write the carve report: **KEPT — required to build** (reachable code + its `#include` closure), **REMOVED — dead code** (files the carve proved unreachable), **KEPT — infrastructure** (every other non-code file, passed through verbatim, grouped by build **role** — build-system / data+resources / other), and **REMOVED — garbage** (VCS/scratch/editor/coverage). Also flags kept files that **look like build outputs** (`.o`/`.a`/`bin`…) for review. Paths only, no file contents. Works with or without `--out` |
-| Audit | `--manifest m.json` | write a JSON manifest of roots, stats, kept/dropped files, byte counts, and the infrastructure passthrough list |
-| Diagnostics | `--diag report.zip` | write ONE **source-free**, shareable diagnostic package (`summary.txt` + `diagnostics.json` + `manifest.txt`) describing what the tool did — version, environment (incl. CPU/RAM/free disk), parameters, stats, warnings, phase timings, and any failure. Home paths are redacted; **no source content, ever**. Send this when a carve misbehaves on a repo you can't share. Pass a directory to get a timestamped `CodeCarver_Diagnostics_<UTC>.zip` inside it. Written on success — and, **even without this flag**, automatically to a temp path on an unexpected crash (the path is printed) |
-| Repro bundle | `--diag-repro` | also attach `repro.graph.json`: the dependency graph the carve ran over with **every name/path replaced by an opaque token** (no source, no real identifiers, no reverse mapping). Lets a developer *replay* your carve and reproduce a wrong keep/drop with none of your IP. Safe to share |
-| Verbose diag | `--diag-verbose` | also attach `keepdrop.txt`: per-file keep/drop + keep-reason histogram + unresolved roots. **Includes file/symbol NAMES** (still never file *contents*); the manifest flags this. Omit if identifiers are sensitive. (`--diag-repro`/`--diag-verbose` used without `--diag` write to a temp path.) |
-| Explain | `--why sym` | print the keep-chain for a symbol back to its root (or that it was carved) — debugging "why is this still here / why did this drop?" |
-| Big-file cutoff | `--max-parse-bytes N` | files larger than `N` bytes (default 20 MB) are **not parsed** — kept whole via `#include`-closure, copied verbatim. Lets a carve survive multi-GB auto-generated register headers that would otherwise blow past .NET's ~2 GB string limit and explode parser memory (C/C++/`.cmm` only). **You rarely need to touch this** — macro-dense headers *under* the cap are auto-detected (see below); it's the explicit escape hatch |
-| Carve headers | `--prune-headers` | **experimental**: strip unused `#define`s from the big kept headers above (a 1.4 GB register map → the handful of registers you use). Streaming + sound — keeps the transitive closure of needed defines, every non-`#define` line (guards, `#if`, types), all `#if`-referenced names, and token-paste (`##`) candidate families. Always build-verify (C/C++ only) |
-| Parse budget | `--parse-timeout N` | per-file parse budget in **seconds** (default 20). A file whose parse blows it is kept whole + warned — a backstop against tree-sitter's super-linear error recovery on invalid `#include` fragments stalling a run |
-| Soundness gate | `--verify` | compiler-free check: flag any **kept** function that calls an **in-scope** function the carve dropped (it wouldn't link). Exits non-zero on a violation, so it's usable as a CI/script gate (C/C++). Catches an edge the model missed — the useful check when you have no build |
+| Entry symbols | `--roots a,b,c` | *(required unless in config)* what to keep |
+| Language | `--lang c` \| `cpp` \| `csharp` \| `cmm` | picks the front-end + file extensions (default `c`) |
+| Config file | `--config carve.json` | **where all inputs/tuning live** (see the config table below). `emit-config <file>` writes an annotated template |
+| Write output | `--out DIR` | emit the carved tree. Written atomically (staged, then swapped) so a crash mid-emit can't leave a half-written tree. Must be **outside** the source tree; a **non-empty** `--out` CodeCarver didn't create is refused (re-carving a prior CodeCarver output is seamless) |
+| Replace output | `--clean` | permit replacing a non-empty `--out` CodeCarver did **not** create |
+| Carve report | `--report r.txt` | write the carve report (KEPT–required-to-build / REMOVED–dead-code / KEPT–infrastructure grouped by role / REMOVED–garbage; flags look-like-build-outputs). Paths only, no contents. Works with or without `--out` |
+| Audit | `--manifest m.json` | JSON manifest of roots, stats, and the kept/dropped/infra/garbage/observed file lists |
+| Aggressive prune | `--prune` | intra-file function/table removal (C/C++ only; other languages carve file-level). Always build-verify |
+| Soundness gate | `--verify` | compiler-free check: flag any **kept** function that calls an **in-scope** dropped function. Non-zero exit on a violation (CI gate; C/C++) |
+| Strict roots | `--strict-roots` | fail the run if any requested root is unresolved (a typo'd ISR/API name would otherwise silently carve the real symbol away) |
+| Lenient inputs | `--ignore-missing-inputs` | a missing input file in the config warns + is skipped instead of failing fast |
+| Explain | `--why sym` | print the keep-chain for a symbol back to its root (or that it was carved) |
+| Dump spans | `--dump-spans` | list every symbol's KEEP/drop decision (debugging) |
+| Diagnostics | `--diag report.zip` | ONE **source-free**, shareable diagnostic package (version, env, params, stats, warnings, timings, any failure). Home paths redacted; **no source ever**. Also auto-written to a temp path on an unexpected crash |
+| Repro bundle | `--diag-repro` | also attach `repro.graph.json`: the graph with **every name/path replaced by an opaque token** — replay a wrong keep/drop with none of your IP |
+| Verbose diag | `--diag-verbose` | also attach `keepdrop.txt`: per-file keep/drop + keep-reason histogram. **Includes NAMES** (never contents); the manifest flags this |
+
+**Config keys (inputs & tuning — JSON only; `emit-config` documents each inline):**
+
+| Key | Was | Effect |
+|---|---|---|
+| `roots`, `lang`, `out`, `report`, `manifest`, `prune` | — | the CLI flags above can also be set here |
+| `exclude: ["tests","vendor"]` | `--exclude` | don't scan those dirs (avoids over-keeping via name clashes) |
+| `defines: ["X=1","Y"]` | `--define` | resolve `#ifdef`s → drop dead-branch code |
+| `buildLogs: ["build.txt","build.console.txt"]` | `--build-log` | scrape real per-file `-D`/`-I` flags from build log(s) + console capture (see `scan-log`) |
+| `probe: "cc"` | `--probe` | run `cc -dM -E` for the compiler's **complete** macro set → closed-world `#ifdef` resolution |
+| `assumeDefinesComplete: true` | `--assume-defines-complete` | closed-world without probing: trust the supplied defines as complete |
+| `aux: ["board/*.ld"]` | `--aux` | force-keep files even under an `exclude`'d dir or classified as garbage |
+| `keepGarbage: true` | `--keep-garbage` | disable default garbage pruning (VCS/scratch/editor/coverage) |
+| `traces: ["run.trace"]`, `traceFormat` | `--trace` | function-execution trace(s) → roots (dynamic dispatch) |
+| `buildFileTraces`, `runFileTraces`, `fileTraceFormat` | *(new)* | observed file-access traces (build + run) — see the Traces section |
+| `maxParseBytes: 20000000` | `--max-parse-bytes` | files bigger than this are kept whole via `#include`-closure, not parsed (multi-GB register headers). Rarely needed — dense headers under the cap are auto-detected |
+| `pruneHeaders: true` | `--prune-headers` | **experimental**: strip unused `#define`s from big kept headers. Always build-verify (C/C++) |
+| `parseTimeout: 20` | `--parse-timeout` | per-file parse budget in **seconds** (0 disables); a file that blows it is kept whole + warned |
+| `maxSymbolsPerFile`, `ignoreMissingInputs` | — | node-explosion backstop; lenient-inputs (also a CLI toggle) |
 
 ### Output is a complete, buildable project (keep-by-default)
 

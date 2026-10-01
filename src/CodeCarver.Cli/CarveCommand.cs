@@ -189,9 +189,10 @@ public static class CarveCommand
           // false = fail fast if any input file above is missing; true = warn and keep going.
           "ignoreMissingInputs": false,
 
-          // Byte / symbol-count backstops for pathological generated files. null = sensible defaults.
+          // Byte / symbol-count / time backstops for pathological generated files. null = sensible defaults.
           "maxParseBytes": null,
-          "maxSymbolsPerFile": null
+          "maxSymbolsPerFile": null,
+          "parseTimeout": null       // per-file parse budget in SECONDS (0 disables)
         }
 
         """;
@@ -282,6 +283,7 @@ public static class CarveCommand
             if (!string.IsNullOrWhiteSpace(cfg.Manifest)) manifestPath = cfg.Manifest;
             if (cfg.MaxParseBytes is not null) maxParseBytes = cfg.MaxParseBytes.Value;
             if (cfg.MaxSymbolsPerFile is not null) maxSymbolsPerFile = cfg.MaxSymbolsPerFile.Value;
+            if (cfg.ParseTimeout is >= 0) parseTimeoutMs = cfg.ParseTimeout.Value * 1000; // seconds -> ms (0 disables)
             if (cfg.PruneHeaders is not null) pruneHeaders = cfg.PruneHeaders.Value;
             if (cfg.KeepGarbage is not null) pruneGarbage = !cfg.KeepGarbage.Value;
             buildLogs.AddRange(NonBlank(cfg.BuildLogs));
@@ -296,6 +298,11 @@ public static class CarveCommand
             if (!string.IsNullOrWhiteSpace(cfg.FileTraceFormat)) fileTraceFormat = cfg.FileTraceFormat;
         }
 
+        // The CLI carries only the OPERATIONAL surface: the carve verbs, the output targets, and behavior/diag
+        // toggles you flip per run. Every INPUT and TUNING knob (build logs, defines, excludes, aux, probe,
+        // traces, file traces, parse budgets, assume-complete, prune-headers, keep-garbage) lives in the --config
+        // file instead — one place, discoverable via `emit-config`, so the command line stays short. CLI still
+        // OVERRIDES the config for the flags that remain.
         for (var i = 2; i < args.Length; i++)
         {
             if (args[i] == "--config") { i++; continue; } // already loaded above
@@ -303,85 +310,41 @@ public static class CarveCommand
                 roots = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             else if (args[i] == "--out" && i + 1 < args.Length)
                 outDir = args[++i];
+            else if (args[i] == "--lang" && i + 1 < args.Length)
+                lang = args[++i].ToLowerInvariant();
+            else if (args[i] == "--report" && i + 1 < args.Length)
+                reportPath = args[++i];
+            else if (args[i] == "--manifest" && i + 1 < args.Length)
+                manifestPath = args[++i];
             else if (args[i] == "--prune")
                 prune = true;
-            else if (args[i] == "--prune-headers")
-                pruneHeaders = true;
             else if (args[i] == "--verify")
                 verify = true;
             else if (args[i] == "--strict-roots")
                 strictRoots = true;
-            else if (args[i] == "--lang" && i + 1 < args.Length)
-                lang = args[++i].ToLowerInvariant();
-            else if (args[i] == "--define" && i + 1 < args.Length)
-                defineSpecs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-            else if (args[i] == "--build-log" && i + 1 < args.Length)
-                // Repeatable AND comma-separated: --build-log a.log --build-log b.log, or --build-log a.log,b.log.
-                // Union all of them (the written log and the stdout capture often differ; both carry real flags).
-                buildLogs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-            else if (args[i] == "--assume-defines-complete")
-                closedWorld = true;
-            else if (args[i] == "--manifest" && i + 1 < args.Length)
-                manifestPath = args[++i];
+            else if (args[i] == "--clean")
+                clean = true;
+            else if (args[i] == "--ignore-missing-inputs")
+                ignoreMissingInputs = true;
             else if (args[i] == "--diag" && i + 1 < args.Length)
                 diagPath = args[++i];
             else if (args[i] == "--diag-repro")
                 diagRepro = true;
             else if (args[i] == "--diag-verbose")
                 diagVerbose = true;
-            else if (args[i] == "--clean")
-                clean = true;
-            else if (args[i] == "--exclude" && i + 1 < args.Length)
-                excludeDirs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-            else if (args[i] == "--aux" && i + 1 < args.Length)
-                auxGlobs.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-            else if (args[i] == "--keep-garbage")
-                pruneGarbage = false;
-            else if (args[i] == "--report" && i + 1 < args.Length)
-                reportPath = args[++i];
-            else if (args[i] == "--probe" && i + 1 < args.Length)
-                probeCompiler = args[++i];
-            else if (args[i] == "--max-parse-bytes" && i + 1 < args.Length)
-            {
-                // Validate: a typo'd value silently became 0/negative -> every file "too big" -> kept whole ->
-                // nothing parsed -> misleading "roots not found". Fail clearly instead.
-                if (!long.TryParse(args[++i], out maxParseBytes) || maxParseBytes < 0)
-                { err.WriteLine($"--max-parse-bytes needs a non-negative integer (bytes), got '{args[i]}'"); return 2; }
-            }
-            else if (args[i] == "--parse-timeout" && i + 1 < args.Length)
-            {
-                if (!int.TryParse(args[++i], out var pt) || pt < 0)
-                { err.WriteLine($"--parse-timeout needs a non-negative integer (seconds; 0 disables), got '{args[i]}'"); return 2; }
-                parseTimeoutMs = pt * 1000;
-            }
-            else if (args[i] == "--max-symbols-per-file" && i + 1 < args.Length)
-            {
-                // The shape-agnostic node-explosion backstop: a file that would mint more than this many
-                // symbols is kept whole rather than exploded into the graph. 0 disables it.
-                if (!int.TryParse(args[++i], out var ms) || ms < 0)
-                { err.WriteLine($"--max-symbols-per-file needs a non-negative integer (0 disables), got '{args[i]}'"); return 2; }
-                maxSymbolsPerFile = ms;
-            }
-            else if (args[i] == "--trace" && i + 1 < args.Length)
-                // Repeatable AND comma-separated, like --build-log: union all function traces.
-                traceList.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-            else if (args[i] == "--trace-format" && i + 1 < args.Length)
-                traceFormat = args[++i];
-            else if (args[i] == "--ignore-missing-inputs")
-                ignoreMissingInputs = true;
             else if (args[i] == "--dump-spans")
                 dumpSpans = true;
             else if (args[i] == "--why" && i + 1 < args.Length)
                 whySymbol = args[++i];
             else
             {
-                // Unknown or incomplete option. Previously ignored silently, so a typo'd flag (e.g. --strict-root,
-                // --prun) just didn't apply and the carve looked fine -- exactly the silent-mistake class the evals
-                // flag. Fail loudly.
-                err.WriteLine($"unknown or incomplete option '{args[i]}'. try: carve <dir> --roots a,b [--lang c|cpp] "
-                                        + "[--prune] [--out DIR] [--clean] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G] "
-                                        + "[--keep-garbage] [--report F] [--config F] [--ignore-missing-inputs] [--diag Z] [--diag-repro] [--diag-verbose]. "
-                                        + "Tip: 'emit-config <file>' writes an annotated config template with every input.");
+                // Unknown or incomplete option. Fail loudly (a silently-ignored typo'd flag is exactly the
+                // silent-mistake class the evals flag). Inputs/tuning moved to --config, so point there.
+                err.WriteLine($"unknown or incomplete option '{args[i]}'. CLI flags: carve <dir> [--config F] [--roots a,b] "
+                                        + "[--lang c|cpp] [--out DIR] [--report F] [--manifest F] [--prune] [--verify] [--strict-roots] "
+                                        + "[--clean] [--ignore-missing-inputs] [--diag Z] [--diag-repro] [--diag-verbose] [--dump-spans] [--why S]. "
+                                        + "Inputs & tuning (build logs, defines, excludes, probe, traces, parse budgets, ...) go in the "
+                                        + "--config file: run 'emit-config <file>' for an annotated template.");
                 return 2;
             }
         }
@@ -1487,9 +1450,9 @@ public static class CarveCommand
     {
         var valueFlags = new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
         {
-            "--roots", "--out", "--build-log", "--config", "--define", "--manifest", "--diag", "--exclude",
-            "--aux", "--report", "--probe", "--trace", "--trace-format", "--lang", "--max-parse-bytes",
-            "--parse-timeout", "--max-symbols-per-file",
+            // Only the value-carrying flags the CLI still accepts (inputs/tuning moved to --config, whose path is
+            // elided too). The config FILE's contents are never read into the diag package, so no values leak.
+            "--roots", "--out", "--config", "--manifest", "--diag", "--report", "--lang", "--why",
         };
         var sb = new System.Text.StringBuilder("carve <source>");
         for (var i = 2; i < a.Length; i++)   // a[0]="carve", a[1]=source dir (already shown as <source>)
@@ -1627,6 +1590,7 @@ sealed class CarveConfig
     public string? TraceFormat { get; set; }
     public long? MaxParseBytes { get; set; }
     public int? MaxSymbolsPerFile { get; set; }
+    public int? ParseTimeout { get; set; }           // per-file parse budget, SECONDS (0 disables)
     public bool? PruneHeaders { get; set; }
     public bool? KeepGarbage { get; set; }
     public bool? IgnoreMissingInputs { get; set; }
