@@ -18,12 +18,16 @@ switch (cmd)
         return CarveCommand.Run(args, Console.Out, Console.Error);
     case "scan-log":
         return RunScanLog(args);
+    case "emit-config":
+    case "init-config":
+        // Write (or print) the annotated config template so the user can discover every feedable input.
+        return CarveCommand.EmitConfig(args, Console.Out, Console.Error);
     case "--version":
     case "version":
         Console.WriteLine($"CodeCarver {CarveCommand.Version()}");
         return 0;
     default:
-        Console.Error.WriteLine($"unknown command '{cmd}'. try: carve <dir> --roots a,b | demo | version");
+        Console.Error.WriteLine($"unknown command '{cmd}'. try: carve <dir> --roots a,b | emit-config <file> | demo | version");
         return 2;
 }
 

@@ -111,16 +111,34 @@ Because passthrough files are copied byte-for-byte, the headline **size reductio
 carve** (dead code removed) — the untouched infrastructure is delta-neutral, and dropped garbage is reported
 separately (not folded into the headline %). Use `--report` to see exactly what landed in each bucket.
 
-### Config file
+### Config file — put the inputs in JSON, keep the command line short
 
-```json
-{ "roots": ["main"], "lang": "c", "exclude": ["tests"], "prune": true,
-  "defines": ["USE_LINUX"], "assumeDefinesComplete": false }
+Rather than remember a dozen flags, put every input in one JSON file. Generate an **annotated template**
+with every feedable slot (blank by default, with fill-in examples, ordered most-common first):
+
 ```
+carve emit-config carve.json     # write the template  (or: emit-config  -> prints to stdout)
+```
+
+Fill in the files you have, delete the rest, and run:
 
 ```
 carve src/ --config carve.json          # everything from the file
-carve src/ --config carve.json --out o/ # ...plus a CLI override
+carve src/ --config carve.json --out o/ # ...any CLI flag OVERRIDES the file, so one config drives many stages
+```
+
+Key points:
+- **Comments and trailing commas are allowed**; the template documents each field inline.
+- **Arrays take as many entries as you like** — multiple build logs, multiple traces, etc. (one per line). A
+  blank string or empty array means "not set", so emitting the template and running it as-is is a no-op carve.
+- **Fail-fast by default:** every referenced *input* file (build logs, traces) is checked up front; a missing
+  one stops the run with the full list. Set `"ignoreMissingInputs": true` (or pass `--ignore-missing-inputs`)
+  to downgrade that to a warning and continue — handy for a shared config across machines.
+
+```json
+{ "roots": ["main"], "lang": "c", "exclude": ["tests"], "prune": true,
+  "defines": ["USE_LINUX"], "buildLogs": ["build.log", "build.console.txt"],
+  "report": "carve-report.txt", "ignoreMissingInputs": false }
 ```
 
 ### Languages

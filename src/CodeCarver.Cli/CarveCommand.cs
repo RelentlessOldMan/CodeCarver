@@ -61,6 +61,139 @@ public static class CarveCommand
         return string.IsNullOrEmpty(info) ? "0.1.0" : info;
     }
 
+    /// <summary>
+    /// `emit-config [path]` — write the annotated JSON config template (every feedable input, blank by default,
+    /// with fill-in examples, ordered most-common first). With a path it writes the file; with none it prints to
+    /// stdout. This is how a user discovers what can be fed in without memorizing flags: generate it, fill in the
+    /// files they have, and `carve <repo> --config <file>`.
+    /// </summary>
+    public static int EmitConfig(string[] args, TextWriter @out, TextWriter err)
+    {
+        var template = EmitConfigTemplate();
+        var path = args.Length > 1 && !args[1].StartsWith('-') ? args[1] : null;
+        if (path is null) { @out.Write(template); return 0; }
+        try
+        {
+            File.WriteAllText(path, template);
+            @out.WriteLine($"wrote config template -> {path}");
+            @out.WriteLine($"fill in the files/options you have, then run:  carve <repo> --config {path}");
+            return 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException or System.Security.SecurityException)
+        {
+            err.WriteLine($"could not write '{path}' ({ex.GetType().Name}: {ex.Message})");
+            return 2;
+        }
+    }
+
+    // The annotated --config template. Comments and trailing commas are legal (the config parser skips them), so
+    // this doubles as the documentation of every input. Kept in sync with CarveConfig by a drift test.
+    public static string EmitConfigTemplate() =>
+        """
+        {
+          // CodeCarver config. Fill in the files/options you have; delete what you don't. Run with:
+          //     carve <repo> --config carve.json
+          // Any CLI flag you also pass OVERRIDES the value here, so ONE config can drive many carve stages in a
+          // script (vary just --roots/--out per stage). Comments and trailing commas are allowed. Every array
+          // takes as many entries as you like -- one file per line.
+
+          // ===================== almost always set =====================
+
+          // Entry symbols to keep. The carve keeps these and everything they transitively reach.
+          //   example: "roots": ["main", "Reset_Handler", "USART1_IRQHandler"]
+          "roots": [],
+
+          // Source language: "c" | "cpp" | "csharp" | "cmm".
+          "lang": "c",
+
+          // Output dir for the carved, COMPLETE buildable project. "" = analysis only (nothing written).
+          //   example: "out": "D:/carved/myimage"
+          "out": "",
+
+          // ===================== make the carve match your real build =====================
+
+          // Build log file(s) and/or captured console output -- scraped for the real per-file -D/-I flags. The
+          // written log and the stdout capture often differ, so list BOTH; add one line per file.
+          //   example:
+          //   "buildLogs": [
+          //     "logs/build.log",
+          //     "logs/build.console.txt"
+          //   ]
+          "buildLogs": [],
+
+          // Extra preprocessor defines applied to every file (on top of the build log).
+          //   example: "defines": ["NDEBUG", "BOARD=3", "USE_HAL=1"]
+          "defines": [],
+
+          // ===================== trimming =====================
+
+          // Directories to drop entirely (board/arch variants you don't build, big non-build trees).
+          //   example: "exclude": ["boards/other_soc", "docs", "third_party/unused"]
+          "exclude": [],
+
+          // Globs to FORCE-keep even if under an excluded dir or classified as garbage.
+          //   example: "aux": ["boards/other_soc/flash.ld", "prebuilt/*.a"]
+          "aux": [],
+
+          // true = also keep VCS/scratch/editor/coverage files. Default false = drop them (they can't be inputs).
+          "keepGarbage": false,
+
+          // ===================== reports / outputs =====================
+
+          // Human-readable carve report (what was kept/removed/infrastructure/garbage, grouped and explained).
+          //   example: "report": "carve-report.txt"
+          "report": "",
+
+          // Machine-readable JSON manifest (roots, stats, and the kept/dropped/infra/garbage file lists).
+          //   example: "manifest": "carve-manifest.json"
+          "manifest": "",
+
+          // ===================== accuracy boosters (optional) =====================
+
+          // A compiler to probe for its FULL predefined macro set (predefined + target + your -D) for exact
+          // #ifdef resolution. A bare name is looked up on PATH.
+          //   example: "probe": "arm-none-eabi-gcc"
+          "probe": "",
+
+          // Trust the supplied defines as COMPLETE (closed-world #ifdef resolution) without probing.
+          "assumeDefinesComplete": false,
+
+          // Function-execution trace(s) from a real run -- their functions become roots, capturing dynamic
+          // dispatch static analysis can't see. One entry per trace file.
+          //   example: "traces": ["run1.trace", "run2.trace"]
+          "traces": [],
+
+          // Optional regex for a non-default function-trace line format (named group 'fn').
+          //   example: "traceFormat": "^\\S+\\s+(?<fn>[A-Za-z_][A-Za-z0-9_]*)"
+          "traceFormat": "",
+
+          // ===================== file-access traces (COMING SOON) =====================
+          // Lists of files actually opened during the build / the run (ProcMon on Windows, strace on Linux).
+          // The run trace catches the loader/CMM/binary/data layer a function trace can't see. NOT yet wired:
+          // setting any of these is an ERROR on this build (never a silent no-op), so leave them empty for now.
+
+          "buildFileTraces": [],   // files opened WHILE building
+          "runFileTraces": [],     // files opened WHILE running/flashing
+          "fileTraceFormat": "",   // optional regex for a non-default file-trace line (named group 'path')
+
+          // ===================== experimental / rarely needed =====================
+
+          // Intra-file carving: remove unreached functions WITHIN a file (C/C++ only). Always build-verify.
+          "prune": false,
+
+          // Strip unused #defines from big kept headers (C/C++ only). Always build-verify.
+          "pruneHeaders": false,
+
+          // false = fail fast if any input file above is missing; true = warn and keep going.
+          "ignoreMissingInputs": false,
+
+          // Byte / symbol-count backstops for pathological generated files. null = sensible defaults.
+          "maxParseBytes": null,
+          "maxSymbolsPerFile": null
+        }
+
+        """;
+
     static int RunCore(string[] args, TextWriter @out, TextWriter err)
     {
         if (args.Length < 2 || !Directory.Exists(args[1]))
@@ -78,8 +211,14 @@ public static class CarveCommand
         var strictRoots = false;
         var dumpSpans = false;
         string? whySymbol = null;
-        string? tracePath = null;      // runtime trace: functions a real run executed (roots + soundness oracle)
+        var traceList = new List<string>(); // runtime function trace(s): functions a real run executed (roots + soundness oracle)
         string? traceFormat = null;    // optional regex (named 'fn'/'file'/'line') for a non-default trace format
+        var ignoreMissingInputs = false;    // --ignore-missing-inputs / config: warn+skip a missing input file instead of fail-fast
+        // Phase-2 input slots: present in the --emit-config template so every feedable input is discoverable, but
+        // the file-access-trace readers aren't built yet. A config that SETS them errors loudly (never a silent no-op).
+        var buildFileTraces = new List<string>();
+        var runFileTraces = new List<string>();
+        string? fileTraceFormat = null;
         var lang = "c";
         var defineSpecs = new List<string>();
         var buildLogs = new List<string>();   // repeatable: the written log AND the stdout capture can differ
@@ -123,19 +262,36 @@ public static class CarveCommand
                 return 2;
             }
             if (cfg is null) continue;
-            if (cfg.Roots is not null) roots = cfg.Roots;
-            if (cfg.Lang is not null) lang = cfg.Lang.ToLowerInvariant();
-            if (cfg.Out is not null) outDir = cfg.Out;
+            // A BLANK string in the template ("out": "", "traceFormat": "", ...) means "not set" — the user left
+            // the slot empty. Treat blank/whitespace as unset for every string field, and drop blank entries from
+            // arrays, so emitting the template and running it as-is behaves exactly like passing no config at all
+            // (otherwise "out":"" would look like a bad --out path, and "fileTraceFormat":"" would trip the
+            // Phase-2 guard). Explicit CLI flags still override whatever survives here.
+            static IEnumerable<string> NonBlank(IEnumerable<string>? xs)
+                => (xs ?? Array.Empty<string>()).Where(s => !string.IsNullOrWhiteSpace(s));
+            if (cfg.Roots is not null) roots = NonBlank(cfg.Roots).ToArray();
+            if (!string.IsNullOrWhiteSpace(cfg.Lang)) lang = cfg.Lang.ToLowerInvariant();
+            if (!string.IsNullOrWhiteSpace(cfg.Out)) outDir = cfg.Out;
             if (cfg.Prune is not null) prune = cfg.Prune.Value;
-            if (cfg.Defines is not null) defineSpecs.AddRange(cfg.Defines);
-            if (cfg.BuildLog is not null) buildLogs.Add(cfg.BuildLog);
+            defineSpecs.AddRange(NonBlank(cfg.Defines));
+            if (!string.IsNullOrWhiteSpace(cfg.BuildLog)) buildLogs.Add(cfg.BuildLog);
             if (cfg.AssumeDefinesComplete is not null) closedWorld = cfg.AssumeDefinesComplete.Value;
-            if (cfg.Exclude is not null) excludeDirs.AddRange(cfg.Exclude);
-            if (cfg.Manifest is not null) manifestPath = cfg.Manifest;
+            excludeDirs.AddRange(NonBlank(cfg.Exclude));
+            if (!string.IsNullOrWhiteSpace(cfg.Manifest)) manifestPath = cfg.Manifest;
             if (cfg.MaxParseBytes is not null) maxParseBytes = cfg.MaxParseBytes.Value;
             if (cfg.MaxSymbolsPerFile is not null) maxSymbolsPerFile = cfg.MaxSymbolsPerFile.Value;
             if (cfg.PruneHeaders is not null) pruneHeaders = cfg.PruneHeaders.Value;
             if (cfg.KeepGarbage is not null) pruneGarbage = !cfg.KeepGarbage.Value;
+            buildLogs.AddRange(NonBlank(cfg.BuildLogs));
+            auxGlobs.AddRange(NonBlank(cfg.Aux));
+            if (!string.IsNullOrWhiteSpace(cfg.Report)) reportPath = cfg.Report;
+            if (!string.IsNullOrWhiteSpace(cfg.Probe)) probeCompiler = cfg.Probe;
+            traceList.AddRange(NonBlank(cfg.Traces));
+            if (!string.IsNullOrWhiteSpace(cfg.TraceFormat)) traceFormat = cfg.TraceFormat;
+            if (cfg.IgnoreMissingInputs is not null) ignoreMissingInputs = cfg.IgnoreMissingInputs.Value;
+            buildFileTraces.AddRange(NonBlank(cfg.BuildFileTraces));
+            runFileTraces.AddRange(NonBlank(cfg.RunFileTraces));
+            if (!string.IsNullOrWhiteSpace(cfg.FileTraceFormat)) fileTraceFormat = cfg.FileTraceFormat;
         }
 
         for (var i = 2; i < args.Length; i++)
@@ -205,9 +361,12 @@ public static class CarveCommand
                 maxSymbolsPerFile = ms;
             }
             else if (args[i] == "--trace" && i + 1 < args.Length)
-                tracePath = args[++i];
+                // Repeatable AND comma-separated, like --build-log: union all function traces.
+                traceList.AddRange(args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
             else if (args[i] == "--trace-format" && i + 1 < args.Length)
                 traceFormat = args[++i];
+            else if (args[i] == "--ignore-missing-inputs")
+                ignoreMissingInputs = true;
             else if (args[i] == "--dump-spans")
                 dumpSpans = true;
             else if (args[i] == "--why" && i + 1 < args.Length)
@@ -219,8 +378,42 @@ public static class CarveCommand
                 // flag. Fail loudly.
                 err.WriteLine($"unknown or incomplete option '{args[i]}'. try: carve <dir> --roots a,b [--lang c|cpp] "
                                         + "[--prune] [--out DIR] [--clean] [--strict-roots] [--build-log F] [--define X] [--exclude D] [--aux G] "
-                                        + "[--keep-garbage] [--report F] [--diag Z] [--diag-repro] [--diag-verbose]");
+                                        + "[--keep-garbage] [--report F] [--config F] [--ignore-missing-inputs] [--diag Z] [--diag-repro] [--diag-verbose]. "
+                                        + "Tip: 'emit-config <file>' writes an annotated config template with every input.");
                 return 2;
+            }
+        }
+
+        // Phase-2 input slots (file-access traces) are in the config template for discoverability but not wired
+        // yet. If a config actually SET them, fail loudly — never silently ignore an input the user believes is
+        // in effect (exactly the silent-config trap the evals flag).
+        if (buildFileTraces.Count > 0 || runFileTraces.Count > 0 || fileTraceFormat is not null)
+        {
+            err.WriteLine("buildFileTraces / runFileTraces / fileTraceFormat are not supported in this build yet "
+                + "(observed file-access traces are the next feature). Remove them from the config, or update CodeCarver.");
+            return 2;
+        }
+
+        // Fail-fast input check: every INPUT file referenced (build logs, function traces) must exist before we do
+        // any work, so a scripted multi-stage carve stops on a typo'd path instead of silently carving with less
+        // config than intended. Outputs (--out/--report/--manifest), dir/glob knobs (--exclude/--aux) and the
+        // PATH-resolved --probe tool are deliberately NOT checked here. --ignore-missing-inputs (or the config's
+        // "ignoreMissingInputs": true) downgrades this to a per-file warning and drops the missing entries.
+        {
+            var inputFiles = buildLogs.Concat(traceList).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var missing = inputFiles.Where(f => !File.Exists(f)).ToList();
+            if (missing.Count > 0)
+            {
+                if (!ignoreMissingInputs)
+                {
+                    err.WriteLine($"missing {missing.Count} input file(s) — fix the path(s), or pass --ignore-missing-inputs "
+                        + "(or set \"ignoreMissingInputs\": true in the config) to warn and continue:");
+                    foreach (var m in missing) err.WriteLine($"  not found: {m}");
+                    return 2;
+                }
+                foreach (var m in missing) err.WriteLine($"  warn    : input file not found, skipping: {m}");
+                buildLogs.RemoveAll(f => missing.Contains(f, StringComparer.OrdinalIgnoreCase));
+                traceList.RemoveAll(f => missing.Contains(f, StringComparer.OrdinalIgnoreCase));
             }
         }
 
@@ -847,19 +1040,23 @@ public static class CarveCommand
         // instead the summary reports how many resolved in-scope.
         var traceRoots = new List<Root>();
         var traceTotal = 0;
-        if (tracePath is not null)
+        if (traceList.Count > 0)
         {
-            if (!File.Exists(tracePath)) { err.WriteLine($"--trace file not found: {tracePath}"); return 2; }
             System.Text.RegularExpressions.Regex? pat = null;
             if (traceFormat is not null)
                 // A user-supplied pattern is applied to every line of a possibly huge trace; cap each match so a
                 // pathological (catastrophic-backtracking) pattern surfaces as a clean error rather than hanging.
                 try { pat = new System.Text.RegularExpressions.Regex(traceFormat, System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(2)); }
                 catch (Exception ex) { err.WriteLine($"--trace-format is not a valid regex: {ex.Message}"); return 2; }
-            IReadOnlyCollection<string> traceNames;
-            try { traceNames = TraceFile.FunctionNames(TraceFile.Parse(File.ReadAllText(tracePath), pat)); }
-            catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
-            { err.WriteLine("--trace-format took too long to match a trace line (catastrophic backtracking?) — simplify the pattern"); return 2; }
+            // Union the function names across every trace (the files were validated/pruned up front).
+            var traceNames = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var tp in traceList)
+            {
+                if (!File.Exists(tp)) continue; // defensive; missing ones were already handled
+                try { foreach (var n in TraceFile.FunctionNames(TraceFile.Parse(File.ReadAllText(tp), pat))) traceNames.Add(n); }
+                catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
+                { err.WriteLine("--trace-format took too long to match a trace line (catastrophic backtracking?) — simplify the pattern"); return 2; }
+            }
             traceTotal = traceNames.Count;
             traceRoots = new ExplicitRootProvider(symbols: traceNames).Discover(graph).ToList();
             if (traceTotal == 0)
@@ -922,10 +1119,10 @@ public static class CarveCommand
         if (sectionRoots.Count > 0)
             @out.WriteLine($"  section : {sectionRoots.Count} symbol(s) in linker KEEP()'d section(s) auto-kept: "
                               + Summarize(sectionRoots.Select(r => r.Note ?? r.Node.ToString()).Distinct().ToList()));
-        if (tracePath is not null)
+        if (traceList.Count > 0)
         {
             var traceResolved = traceRoots.Select(r => r.Note).Where(n => n is not null).Distinct().Count();
-            @out.WriteLine($"  trace   : {traceTotal} function(s) from {Path.GetFileName(tracePath)} rooted; {traceResolved} resolved in-scope"
+            @out.WriteLine($"  trace   : {traceTotal} function(s) from {traceList.Count} trace(s) rooted; {traceResolved} resolved in-scope"
                               + (traceTotal > traceResolved ? $", {traceTotal - traceResolved} not found (external/inlined/not captured)" : ""));
         }
         if (defines is not null)
@@ -1353,6 +1550,9 @@ static class DiagState
     public static string? DefaultPath;
 }
 
+// The JSON --config schema. Every input/option CodeCarver can take lives here so one annotated file (see
+// `emit-config`) can drive many carve runs; any CLI flag passed alongside OVERRIDES the value here. Array-typed
+// fields take as many entries as you have. Kept in sync with the emit-config template by a drift test.
 sealed class CarveConfig
 {
     public string[]? Roots { get; set; }
@@ -1360,12 +1560,24 @@ sealed class CarveConfig
     public string? Out { get; set; }
     public bool? Prune { get; set; }
     public string[]? Defines { get; set; }
-    public string? BuildLog { get; set; }
+    public string? BuildLog { get; set; }           // back-compat single; prefer BuildLogs
+    public string[]? BuildLogs { get; set; }
     public bool? AssumeDefinesComplete { get; set; }
     public string[]? Exclude { get; set; }
+    public string[]? Aux { get; set; }
     public string? Manifest { get; set; }
+    public string? Report { get; set; }
+    public string? Probe { get; set; }
+    public string[]? Traces { get; set; }           // function-execution traces
+    public string? TraceFormat { get; set; }
     public long? MaxParseBytes { get; set; }
     public int? MaxSymbolsPerFile { get; set; }
     public bool? PruneHeaders { get; set; }
     public bool? KeepGarbage { get; set; }
+    public bool? IgnoreMissingInputs { get; set; }
+    // Phase 2 (observed file-access traces) — accepted by the schema so they're discoverable in the template;
+    // setting any of them errors on a build that doesn't implement them yet (no silent no-op).
+    public string[]? BuildFileTraces { get; set; }
+    public string[]? RunFileTraces { get; set; }
+    public string? FileTraceFormat { get; set; }
 }
