@@ -23,8 +23,8 @@ minimal slice that still **builds, links, and runs**.
 > Status: **working for C, C++, C#, and TRACE32 `.cmm`.** Tree-sitter front-end, deterministic reachability engine,
 > `#ifdef` resolution, build-log scraping, and an emitter that does both **file-level** and
 > **intra-file** carving (unused functions *and* data tables). Scales to **multi-GB auto-generated
-> headers** — files past `--max-parse-bytes` skip the parser and are kept whole via `#include`-closure,
-> so a 1.4 GB register header ingests in a second instead of exhausting memory; `--prune-headers` then
+> headers** — files past `maxParseBytes` skip the parser and are kept whole via `#include`-closure,
+> so a 1.4 GB register header ingests in a second instead of exhausting memory; `pruneHeaders` then
 > streams it down to just the `#define`s you transitively use (a 45 MB / 1M-define header → a few hundred
 > bytes, in one test). Carve → prune → **compile-clean** is
 > verified on 20+ real repos (cJSON, SQLite, Lua, zlib, mongoose, mimalloc, monocypher, tiny-regex-c,

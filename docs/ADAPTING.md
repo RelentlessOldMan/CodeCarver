@@ -74,16 +74,17 @@ permanent regression test.
 
 Given a profile, a session will typically:
 
-1. **Translate it to flags / a config file.** The profile maps directly:
+1. **Translate it to a `carve.json`.** Inputs live in the config (`carve emit-config carve.json`); only
+   `roots`/`lang`/`out` have CLI twins. The profile maps directly:
 
-   | Profile says | Becomes |
+   | Profile says | Becomes (config key) |
    |---|---|
-   | Entry points | `--roots a,b,c` |
-   | Feature macros | `--define X=1,Y` (or `--build-log` / `--probe cc`) |
-   | Language | `--lang c` \| `cpp` \| `csharp` \| `cmm` |
-   | Dirs to ignore | `--exclude tests,generated` |
-   | Complete macro set | `--assume-defines-complete` |
-   | All of it | a `carve.json` (see `docs/USAGE.md`) |
+   | Entry points | `roots: ["a","b","c"]` (or `--roots a,b,c`) |
+   | Feature macros | `defines: ["X=1","Y"]` (or `buildLogs` / `probe`) |
+   | Language | `lang: "c"` \| `"cpp"` \| `"csharp"` \| `"cmm"` |
+   | Dirs to ignore | `exclude: ["tests","generated"]` |
+   | Complete macro set | `assumeDefinesComplete: true` |
+   | All of it | one `carve.json` (see `docs/USAGE.md`) |
 
 2. **Find a public analogue** — an open-source repo with the same shapes — and add it to the corpus so
    the "compile everything" harness exercises it.

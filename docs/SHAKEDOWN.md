@@ -25,10 +25,11 @@ commit is stamped into the build, so cite this exact string in any report (it al
 summary and is written to each `--manifest` as `codecarverVersion`). `-dirty` means the built tree had
 uncommitted changes; a clean pulled build won't show it. Rebuild after a `git pull` so the stamp updates.
 
-Pick your inputs:
+Inputs live in a `--config` file (`carve emit-config carve.json` writes an annotated template); the CLI
+carries only operational flags. Pick your inputs:
 - **roots** — the entry symbols a build actually needs (ISRs, `main`, exported API, task entry points).
-- **--lang** — `c` or `cpp` (default `c`).
-- **--exclude** — test/vendor/third-party dirs, and any *other* build variant (e.g. a second board's
+- **lang** — `c` or `cpp` (default `c`). (CLI `--roots`/`--lang` also work and override the config.)
+- **exclude** (config) — test/vendor/third-party dirs, and any *other* build variant (e.g. a second board's
   startup) so name collisions don't over-keep.
 
 ---
@@ -36,7 +37,8 @@ Pick your inputs:
 ## 1. Smoke test
 
 ```
-carve <repo> --roots <syms> --lang <c|cpp> --exclude tests,vendor
+carve emit-config carve.json   # then fill in roots, lang, exclude: ["tests","vendor"], ...
+carve <repo> --config carve.json
 ```
 
 Expect a summary: `roots`, `nodes`, `files`, `size`, and `implicit:`/`asm:`/`section:` lines for
@@ -50,7 +52,7 @@ auto-kept embedded roots. **Red flags right here:**
 ## 2. The soundness loop (no compiler needed)
 
 ```
-carve <repo> --roots <syms> --prune --verify
+carve <repo> --config carve.json --prune --verify
 ```
 
 `--verify` is a compiler-free gate: it flags any **kept** function that calls an **in-scope** function
@@ -62,7 +64,7 @@ violation it prints is a concrete bug — note the `caller -> callee` pair and r
 The ultimate check is your own build pointed at the carved tree:
 
 ```
-carve <repo> --roots <syms> --prune --out out/ --manifest m.json
+carve <repo> --config carve.json --prune --out out/ --manifest m.json
 # then build `out/` with YOUR toolchain/build system (make, cmake, TRACE32 flow, arm-none-eabi-gcc, …)
 ```
 
@@ -82,10 +84,10 @@ Vary one axis at a time and re-run steps 2–3. Each cell is a chance to break i
 | Axis | Values to try |
 |---|---|
 | roots | one symbol · your full entry set · an obscure/rarely-used API · an ISR-only set |
-| prune | *(off — file level)* · `--prune` · `--prune` + `--prune-headers` |
-| config | none · `--define X=1,Y` · `--build-log build.log` (from `make -n`) · `--probe <cc>` |
-| exclude | none · exclude tests/vendor · exclude other board/arch variants |
-| limits | default · `--max-parse-bytes 5000000` · `--parse-timeout 5` |
+| prune | *(off — file level)* · `--prune` · `--prune` + `pruneHeaders` (config) |
+| config | none · `defines: ["X=1","Y"]` · `buildLogs: ["build.log"]` (from `make -n`) · `probe: "<cc>"` |
+| exclude | none · `exclude: ["tests","vendor"]` · exclude other board/arch variants |
+| limits | default · `maxParseBytes: 5000000` · `parseTimeout: 5` |
 
 High-yield shapes to aim at (these are where past bugs came from): heavy macros, macro-opened namespaces
 (`FMT_BEGIN_NAMESPACE`-style), computed-goto interpreters, `try`/`catch` wrapped in macros, generated
@@ -124,8 +126,8 @@ INC="-I. -Isrc" LIBS="-lm" bash wsl-map-oracle.sh <repoDirUnderMntC> cc_kept.txt
 ```
 
 **Match the configs.** The oracle build and the carve must use the *same* `-D` flags, or you get false
-mismatches (e.g. a repo's name-mangling macros). Feed the carve the real config (`--build-log` /
-`--define` / `--probe`) so both see the same world.
+mismatches (e.g. a repo's name-mangling macros). Feed the carve the real config (`buildLogs` / `defines` /
+`probe`) so both see the same world.
 
 **Two caveats on the nm comparison.** (1) `wsl-map-oracle.sh` compiles with `-fvisibility=hidden` so the
 linker's kept set is *reachable-from-roots*, not *every exported symbol* — otherwise a public API that
@@ -156,7 +158,7 @@ The script excludes `*test*`/`*demo*` units (and any `EXCLUDE=<regex>`, e.g. C++
 links with `--gc-sections`, and prints undefined references / compile errors. Note: header-only
 template libraries (e.g. fmt) carry their bodies in headers, so file-level carving can't shrink them —
 the meaningful C++ oracle targets are single-unit libraries with a `.cpp` (tinyxml2, pugixml),
-amalgamations (simdjson), or a header compiled under `--prune-headers` (nlohmann/json).
+amalgamations (simdjson), or a header compiled under `pruneHeaders` (nlohmann/json).
 
 **Whole-corpus sweep (one command):** `./cpp-oracle-sweep.ps1` carves every present C++ corpus repo and
 runs the oracle against each with a committed driver (`oracle/<name>_driver.cpp`). This is how the

@@ -70,8 +70,8 @@ with `./check.ps1 -Big` once the ARM toolchain + corpus are fetched.
 - **Test harnesses over-keep.** Carving a repo *including* its own test driver (e.g. tinyxml2's
   `xmltest.cpp`) can surface a dropped symbol: the driver is pulled in by a virtual-dispatch name
   collision, then references API it doesn't reach. This is the sound over-approximation biting a file
-  you'd normally `--exclude`; the *library* files carve clean. Real carves name real entry points and
-  exclude tests.
+  you'd normally `exclude` (config); the *library* files carve clean. Real carves name real entry points
+  and exclude tests.
 - **`0 baseline`** means the repo doesn't compile standalone here (needs its own generated headers or a
   config, e.g. mbedtls/PSA). Not a carve bug — just not fuzzable without its build system.
 - Every corpus repo is **pinned to a commit SHA** in `fetch-corpus.ps1` (a commit is immutable, so a

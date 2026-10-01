@@ -13,33 +13,40 @@ live. Never trade soundness for size: when unsure, CodeCarver keeps more, and so
 
 ## Quick start — the first buildable carve (do this first)
 
-Two passes, cheapest first. `--out` is now a **complete buildable project** (keep-by-default: reachable
-code + its include closure + *every* non-code file — Makefiles, linker scripts, startup asm, data, configs
-— passed through verbatim; the only omissions are code the carve proved dead). So there's no scaffolding to
-hand-copy — carve, then build the `--out` dir directly.
+**Inputs live in a config file.** Generate the annotated template once, fill in what you have, and the
+command line stays short (`--config` + a couple of operational flags). `--out` is a **complete buildable
+project** (keep-by-default: reachable code + its include closure + *every* non-code file — Makefiles, linker
+scripts, startup asm, data, configs — passed through verbatim; the only omissions are code the carve proved
+dead, and garbage like `.git`). So there's no scaffolding to hand-copy — carve, then build the `--out` dir.
+
+**Step 0 — make the config (once):**
+```
+carve emit-config carve.json
+```
+Then edit `carve.json` — at minimum `roots`, `lang`, `exclude`, and `buildLogs`:
+- `buildLogs` — a real `make -n` of THIS image (and the build's console capture). Pins the exact `-D`/`-I`
+  so the carve's `#ifdef` view matches the compiler's. **The single most important input**; without it the
+  config is guessing. List both the written log and the stdout capture — they often differ.
+- `exclude` — dirs NOT in this image (tests, host tools, **other board/chip variants**, bootloader-vs-app).
+- `roots`/`lang` can go in the config too, or stay on the CLI (below). CLI overrides the config.
 
 **Pass 1 — dry run (analysis only, seconds, zero risk):**
 ```
-carve <REPO>\<image-subtree> --roots <ROOTS> --lang <LANG> --exclude <EXCLUDE> \
-      --build-log make-n.log --strict-roots --report r.txt
+carve <REPO>\<image-subtree> --config carve.json --strict-roots --report r.txt
 ```
-- `--build-log` from a real `make -n` of THIS image — pins the exact `-D`/`-I` so the carve's `#ifdef`
-  view matches the compiler's. **The single most important flag**; without it the config is guessing.
 - `--strict-roots` — a typo'd/renamed root fails the run loudly instead of silently carving it away.
-- Read `r.txt` (the three-bucket report): confirm **nothing load-bearing is under "REMOVED — dead code"**,
-  and eyeball the "KEPT — infrastructure" bucket. This report is also how you answer "what's the 54.5 GB?"
-  from the eval-#15 data request — it's size-by-category, code vs dead vs infra, per file.
+- Read `r.txt` (the report): confirm **nothing load-bearing is under "REMOVED — dead code"**, eyeball the
+  role-grouped "KEPT — infrastructure" bucket, and check "REMOVED — garbage". This is size-by-category
+  (code vs dead vs infra vs garbage), per file.
 
 **Pass 2 — real carve + build:**
 ```
-carve <REPO>\<image-subtree> --roots <ROOTS> --lang <LANG> --exclude <EXCLUDE> \
-      --build-log make-n.log --strict-roots --out out\ --report r.txt --manifest m.json
+carve <REPO>\<image-subtree> --config carve.json --strict-roots --out out\ --report r.txt --manifest m.json
 <BUILD>   pointed at out\      # your real toolchain / TRACE32 flow
 <SIZE>    on out\ vs the original
 ```
-- **File-level (NO `--prune`)** — the safe floor. Prove it *builds+boots* first; tighten with `--prune`
-  only once file-level is green. Start with **one image/subtree**, not the whole repo — one authoritative
-  "builds + boots + smaller" datapoint beats a broad sweep and iterates faster.
+- **File-level (NO `--prune`)** — the safe floor. Prove it *builds+boots* first; tighten with `prune` in the
+  config only once file-level is green. Start with **one image/subtree**, not the whole repo.
 - `--out` must be a fresh dir OUTSIDE the tree.
 
 **Bring back (source stays on the box — all of this is source-free):** the counts + before/after `<SIZE>`
@@ -50,15 +57,15 @@ name (or the repro) and it's directly diagnosable.
 
 The rest of this doc is the deeper runbook (roots enumeration, soundness gates, hammering matrix, oracles).
 
-Fill these in once:
+Fill these in once (CLI blanks + `carve.json` keys):
 
-| blank | what it is | how to find it |
+| blank / key | what it is | how to find it |
 |---|---|---|
-| `<REPO>` | firmware source root | — |
-| `<ROOTS>` | entry symbols the image truly needs | see **Roots** below — this is the whole game |
-| `<LANG>` | `c` or `cpp` | `cpp` if any `.cpp/.cc/.hpp` in the build |
-| `<EXCLUDE>` | dirs NOT in this image | tests, host tools, **other board/chip variants**, bootloader-vs-app |
-| `<AUX>` | *(usually unneeded now)* force-copy a file from an `--exclude`'d dir | keep-by-default already passes through ALL non-code files; `--aux` only pulls one back in from a pruned variant folder |
+| `<REPO>` (CLI) | firmware source root | — |
+| `roots` (config) | entry symbols the image truly needs | see **Roots** below — this is the whole game |
+| `lang` (config) | `c` or `cpp` | `cpp` if any `.cpp/.cc/.hpp` in the build |
+| `exclude` (config) | dirs NOT in this image | tests, host tools, **other board/chip variants**, bootloader-vs-app |
+| `aux` (config) | *(usually unneeded)* force-copy a file from an `exclude`'d dir or the garbage set | keep-by-default already passes through ALL non-code files |
 | `<BUILD>` | your real build command | the make/cmake/TRACE32 invocation that produces the image |
 | `<SIZE>` | image-size probe | `arm-none-eabi-size`, or `.bin` byte count |
 
@@ -78,9 +85,9 @@ wrong. Enumerate:
   ISRs/ctors you have. If an ISR isn't showing up, name it explicitly in `<ROOTS>`.
 - **Exported API** the image exposes (bootloader→app entry, TRACE32-poked functions, DFU/comms
   handlers, calibration hooks). Anything invoked from *outside* the C call graph is a root.
-- **Symbols referenced only from a linker `KEEP()`** or a custom `__attribute__((section))` — pass the
-  linker script via `--aux` and CodeCarver roots `KEEP()`'d sections automatically; still eyeball the
-  `section:` count.
+- **Symbols referenced only from a linker `KEEP()`** or a custom `__attribute__((section))` — the linker
+  script is kept by default (keep-by-default passthrough) and CodeCarver roots `KEEP()`'d sections
+  automatically; still eyeball the `section:` count.
 
 > Rule of thumb: if dropping it would leave the chip unable to boot, respond to an interrupt, or answer
 > a command you poke over TRACE32 — it's a root.
@@ -96,8 +103,9 @@ drop the flag.
 ## 1. Smoke test (analysis only, no write)
 
 ```
-carve <REPO> --roots <ROOTS> --lang <LANG> --exclude <EXCLUDE> --aux <AUX>
+carve <REPO> --config carve.json
 ```
+(`roots`, `lang`, `exclude`, `aux` live in `carve.json` — step 0.)
 
 Read the summary hard:
 - `roots` / `implicit:` / `asm:` / `section:` — do the implicit counts match reality? (see Roots).
@@ -111,8 +119,9 @@ Read the summary hard:
 ## 2. Compiler-free soundness gate
 
 ```
-carve <REPO> --roots <ROOTS> --lang <LANG> --exclude <EXCLUDE> --prune --verify
+carve <REPO> --config carve.json --prune --verify
 ```
+(`--prune` and `--verify` stay CLI toggles; inputs come from the config.)
 
 `--verify` flags any **kept** function that calls an **in-scope dropped** function (that wouldn't link)
 and exits non-zero. Run with and without `--prune`. Every violation is a concrete bug — note the
@@ -125,41 +134,44 @@ image) is the authoritative test.**
 An `#ifdef`-heavy firmware tree carves *looser* than needed in open-world mode (unknown branches kept)
 and, more dangerously, can mismatch your build if it guesses. Pin the world to your actual build:
 
-- `--build-log <make -n output>` — the exact `-D`/`-I`/`-isystem` flags your build uses (best). **A raw
-  build stdout capture works too**: the scraper extracts the compile command lines and ignores the rest
-  (warnings, echoes), so `--build-log build-stdout.txt` is fine — no need to pre-filter it.
-  **`--build-log` is repeatable** — pass the written log AND the stdout capture (they often differ):
-  `--build-log make.log --build-log build-stdout.txt` (or comma-separated). CodeCarver unions the `-D`/`-I`
-  from all of them; a named-but-missing log warns rather than silently degrading the config.
-- or `--define CHIP=X,FEATURE_Y,...` — the defines for **this** image variant.
-- or `--probe <arm-none-eabi-gcc>` — let CodeCarver ask the compiler for its predefined macros.
+- `buildLogs: ["make-n.log"]` — the exact `-D`/`-I`/`-isystem` flags your build uses (best). **A raw build
+  stdout capture works too**: the scraper extracts the compile command lines and ignores the rest (warnings,
+  echoes), so a `build-stdout.txt` is fine — no need to pre-filter it. **`buildLogs` is an array** — list the
+  written log AND the stdout capture (they often differ): `"buildLogs": ["make.log", "build-stdout.txt"]`.
+  CodeCarver unions the `-D`/`-I` from all; a named-but-missing log fails fast (or warns with
+  `ignoreMissingInputs`) rather than silently degrading the config.
+- or `defines: ["CHIP=X","FEATURE_Y"]` — the defines for **this** image variant.
+- or `probe: "arm-none-eabi-gcc"` — let CodeCarver ask the compiler for its predefined macros.
 
 Match this to the variant you're carving (chip rev, app-vs-bootloader). Getting it right is both a
 tightness win (smaller image) and a soundness guard (no branch mismatch). See `docs/USAGE.md` §tightness.
 
-### 3b. Runtime trace (the tightest input) — `--trace`
+### 3b. Runtime trace (the tightest input) — `traces`
 
-If you have a **trace of the functions a real run executed** (name, and optionally `file:line`), it's the
-strongest input CodeCarver takes. Two roles at once:
+If you have a **trace of the functions a real run executed** (name, and optionally `file:line`), it's a
+strong input CodeCarver takes (config key `traces: ["run.trace"]`). Two roles at once:
 
-- **Roots** — `--trace run.trace` roots every traced function, so the carve is guaranteed to keep what
-  actually ran, *including the dynamic-dispatch / function-pointer edges static reachability can't see*.
+- **Roots** — every traced function is rooted, so the carve is guaranteed to keep what actually ran,
+  *including the dynamic-dispatch / function-pointer edges static reachability can't see*.
 - **Soundness oracle** — a traced function that a plain carve *dropped* means the static analysis missed a
   real edge. On the real tree that's the highest-signal check short of building: carve with your normal
   roots, then confirm every traced function is in the kept set (the manifest's `keptFiles` / `--dump-spans`).
 
-The trace format isn't fixed to your toolchain's yet, so extraction is a **configurable regex**:
-`--trace-format '<regex with a named (?<fn>...) group, optional (?<file>..)/(?<line>..)>'`. The default
-handles a bare `funcName` per line or `funcName file:line`. When your friend's format lands, it's a
-`--trace-format` change, not a code change. (The synthetic corpus already emits a `-trace.txt` and the
-oracle asserts traced ⊆ kept, so the whole path is exercised locally today.)
+The trace format isn't fixed to your toolchain's yet, so extraction is a **configurable regex** —
+`traceFormat` (a regex with a named `(?<fn>...)` group, optional `(?<file>..)/(?<line>..)`). The default
+handles a bare `funcName` per line or `funcName file:line`. When your format lands, it's a `traceFormat`
+change, not a code change.
+
+> **File-access traces** (`buildFileTraces` / `runFileTraces`) are the embedded companion to this: instead of
+> *which functions ran*, they capture *which files the OS opened* during a build / a flash-run. That's how you
+> pin the TRACE32 loader layer (`.cmm` scripts, loaded binaries, data) that no function trace can see. See
+> `docs/USAGE.md` → Traces.
 
 ## 4. The authoritative test — build the carved image and compare size
 
 ```
 # File-level FIRST (the safe floor — should build+boot). Add --prune only after this is green.
-carve <REPO> --roots <ROOTS> --lang <LANG> --exclude <EXCLUDE> \
-      --build-log build.log --out out/ --report r.txt --manifest m.json
+carve <REPO> --config carve.json --out out/ --report r.txt --manifest m.json
 # then build out/ with YOUR toolchain / TRACE32 flow:
 <BUILD>            # pointed at out/  (keep-by-default already copied all build scaffolding)
 <SIZE>             # image size of the carved build
@@ -199,8 +211,8 @@ See `docs/SHAKEDOWN.md` §5b for the caveats.
 | axis | values |
 |---|---|
 | roots | full entry set · ISR-only · one exported API · bootloader vs app |
-| prune | *(off — file level, the safe floor)* · `--prune` · `--prune --prune-headers` |
-| config | `--build-log` (best) · `--define <variant>` · `--probe <cc>` |
+| prune | *(off — file level, the safe floor)* · `--prune` · `--prune` + `pruneHeaders` (config) |
+| config | `buildLogs` (best) · `defines` for the variant · `probe` |
 | exclude | none · tests/tools · **other chip/board variant** (stops name-collision over-keep) |
 | variant | each of the 24 targets' build config, if they differ |
 

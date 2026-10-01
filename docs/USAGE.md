@@ -118,12 +118,12 @@ a file the tool didn't model is a file it can't prove you don't need to build.
 
 Garbage pruning is deliberately **conservative**: ambiguous binaries that *could* be vendored prebuilts the
 build links (`.o`, `.a`, `.so`, `.lib`, `bin/`, `build/`) are **not** auto-dropped — they're kept and
-flagged in the report's "look like build outputs" section so you can `--exclude` them if they're generated.
-Disable garbage pruning entirely with `--keep-garbage`, or restore one file with `--aux`.
+flagged in the report's "look like build outputs" section so you can `exclude` them if they're generated.
+Disable garbage pruning entirely with `keepGarbage: true`, or restore one file with `aux`.
 
-The knob for trimming the rest is `--exclude DIR` (drop board/arch variants you don't build, or large
-non-build trees like `docs`); `--aux GLOB` forces a specific file back in from an excluded folder or the
-garbage set.
+The knob for trimming the rest is `exclude` (drop board/arch variants you don't build, or large non-build
+trees like `docs`); `aux` forces a specific file back in from an excluded folder or the garbage set. (Both
+are config keys now.)
 
 Because passthrough files are copied byte-for-byte, the headline **size reduction reflects only the code
 carve** (dead code removed) — the untouched infrastructure is delta-neutral, and dropped garbage is reported
@@ -164,9 +164,9 @@ Key points:
 Two optional inputs let an observed run tighten and audit the carve. Both **add** to the sound static carve —
 they never silently drop what they didn't see (a trace only proves what *that* run touched).
 
-- **Function trace** (`--trace FILE`, repeatable; `--trace-format REGEX` with a named `fn` group): the functions
-  a run executed become roots, covering dynamic dispatch (function pointers, vtables) static analysis
-  over-approximates.
+- **Function trace** (config `traces: ["run.trace", ...]`, and `traceFormat` — a regex with a named `fn` group —
+  for a non-default format): the functions a run executed become roots, covering dynamic dispatch (function
+  pointers, vtables) static analysis over-approximates.
 - **File-access trace** (**config-only** — `buildFileTraces` / `runFileTraces`, and `fileTraceFormat` for an
   unusual format): the **files the OS actually opened** under the repo. These are a set-once-per-repo input, so
   they live in the `--config` file rather than adding command-line flags. Capture two ways and list both:
@@ -201,18 +201,19 @@ they never silently drop what they didn't see (a trace only proves what *that* r
 
 ### `#ifdef` resolution: open vs. closed world
 
-By default (`--define`/`--build-log` supplied), resolution is **open-world**: a macro that's neither a
+By default (with `defines`/`buildLogs` supplied), resolution is **open-world**: a macro that's neither a
 supplied define nor defined in the file is treated as *unknown*, so its branch is **kept** (a header
 might define it). This is sound — it only drops what it's certain about (`#if 0`, definite conditions,
 and branches after a definitely-taken one).
 
-Add `--assume-defines-complete` for **closed-world**: the supplied defines are trusted as the complete
-macro set, so absent macros are undefined and their branches are dropped. Powerful for dropping
+Set `assumeDefinesComplete: true` (config) for **closed-world**: the supplied defines are trusted as the
+complete macro set, so absent macros are undefined and their branches are dropped. Powerful for dropping
 other-platform code, but only correct when your define set really is complete (e.g. taken from a
-preprocessed build). Example — carve Lua for Linux, dropping Windows/dyld paths:
+preprocessed build). Example — carve Lua for Linux, dropping Windows/dyld paths (config has
+`buildLogs: ["lua.build.log"]`, `assumeDefinesComplete: true`):
 
 ```
-carve lua/ --roots luaopen_package --build-log lua.build.log --assume-defines-complete --prune --out out/
+carve lua/ --roots luaopen_package --config carve.json --prune --out out/
 ```
 
 ## Getting a build log
@@ -222,7 +223,8 @@ Most builds don't emit a `compile_commands.json`. Any verbose build log works �
 ```
 make -n > build.log            # prints the compiler command lines without building
 carve scan-log build.log       # shows the translation units, defines, includes it found
-carve src/ --roots main --build-log build.log --prune --out out/
+# put it in the config:  "buildLogs": ["build.log"]
+carve src/ --roots main --config carve.json --prune --out out/
 ```
 
 `scan-log` recognizes gcc/clang/cc/cl and cross drivers (arm-none-eabi-gcc, …), GNU `-D/-I` and MSVC
@@ -257,7 +259,7 @@ and emit are a short tail after parsing; emit scales with how much is *kept*.
 
 It's built to survive a messy real tree: a file it can't read or can't parse is **skipped with a
 `warn:` line and kept whole** (never crashes the whole run), multi-GB generated headers are parsed-
-skipped (`--max-parse-bytes`), and a file that blows the parse budget is kept whole (`--parse-timeout`).
+skipped (config `maxParseBytes`), and a file that blows the parse budget is kept whole (config `parseTimeout`).
 
 **Macro-dense register headers are handled automatically** — no flag, no magic number. A big chip/register
 map (a few MB of almost-nothing-but-`#define`s, transitively `#include`d) sits *under* the byte cap but
@@ -281,5 +283,5 @@ carve <dir> --roots foo --why sym        # why a symbol was kept (its chain to a
 - It doesn't *run* your program to carve it (no runtime, no hardware in the loop).
 - It errs toward keeping code when a reference is ambiguous (soundness over minimality), so pruned
   output can carry a little unused code — but it should always build.
-- Correctness is bounded by input fidelity: wrong `--define`s or a wrong `--build-log` give a wrong
-  carve. Feed it the real build's config.
+- Correctness is bounded by input fidelity: wrong `defines` or a wrong `buildLogs` give a wrong carve.
+  Feed it the real build's config.

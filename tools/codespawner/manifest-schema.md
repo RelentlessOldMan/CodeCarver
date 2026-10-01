@@ -114,7 +114,7 @@ is defined only by a vendor header that is **absent from the tree**. This has tw
   is preprocessed out. Resolving it is a false positive (failing honesty, not passing recall).
 - **Soundness-first carver (open-world):** MAY **keep** the `#ifdef VENDOR_OK` branch as a sound
   over-approximation (a macro it can't see might enable it). So for a carver this is a **closed-world
-  precision** case (`--assume-defines-complete`), not a soundness one.
+  precision** case (`assumeDefinesComplete`), not a soundness one.
 
 Schema note: `unreachableRefs` = "resolvable only if the missing macro is known."
 
