@@ -45,3 +45,6 @@ perf-baseline.json
 # Test coverage output (coverlet / VSTest)
 TestResults/
 **/TestResults/
+
+# Generated carve output for the worked example (regenerate with run.ps1/run.sh)
+examples/multistage-firmware/out/

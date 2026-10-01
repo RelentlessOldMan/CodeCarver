@@ -183,6 +183,30 @@ public sealed class InfrastructureEmitterTests
     }
 
     [Fact]
+    public void Copy_RespectsNestedExclude()
+    {
+        // A NESTED exclude ("boards/old") must trim the infra passthrough too, not just the code scan — the
+        // multistage-firmware example caught that per-segment matching missed two-segment excludes.
+        var root = Path.Combine(Path.GetTempPath(), "cc-infra-nest-" + Guid.NewGuid().ToString("N"));
+        var outDir = Path.Combine(Path.GetTempPath(), "cc-infra-nestout-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "boards", "old"));
+        Directory.CreateDirectory(Path.Combine(root, "boards", "new"));
+        File.WriteAllText(Path.Combine(root, "boards", "old", "variant.ld"), "OLD\n");
+        File.WriteAllText(Path.Combine(root, "boards", "new", "variant.ld"), "NEW\n");
+        File.WriteAllText(Path.Combine(root, "flash.ld"), "MAIN\n");
+        try
+        {
+            var res = InfrastructureEmitter.Copy(root, outDir,
+                Array.Empty<string>(), Array.Empty<string>(),
+                excludeDirs: new[] { "boards/old" }, auxGlobs: Array.Empty<string>());
+            Assert.False(File.Exists(Path.Combine(outDir, "boards", "old", "variant.ld")));  // nested dir excluded
+            Assert.True(File.Exists(Path.Combine(outDir, "boards", "new", "variant.ld")));    // sibling kept
+            Assert.True(File.Exists(Path.Combine(outDir, "flash.ld")));
+        }
+        finally { Cleanup(root); Cleanup(outDir); }
+    }
+
+    [Fact]
     public void Copy_OutEqualsSource_DoesNotCopyOntoItself()
     {
         // Belt-and-braces: if a caller points --out at the source tree, every dst resolves to its own src;

@@ -1,0 +1,39 @@
+# Worked example: a tiny Cortex-M-style firmware image carved at three aggressiveness stages,
+# with a real build log (pins the #ifdef world) and observed build/run traces.
+#   carve src --config carve.toml            # runs all stages into out/<stage>/
+#   carve src --config carve.toml --stage max
+
+outputDirectory = "out"
+
+[common]
+# Entry symbols the image truly needs. Timer_ISR is reached only via the vector table in startup.s.
+entryPoints = ["main", "Timer_ISR"]
+languages   = ["c"]
+# A different board variant that isn't part of this image.
+excludeDirectories = ["boards/old"]
+
+[builds.main]
+# The build log pins -DFEATURE_FAST per file, so the carve resolves #ifdefs the way the real build does
+# (closed-world) and drops the dead #else branch in sensor.c.
+buildLogs = ["inputs/compile_commands.json"]
+# A file-access trace captured while building would go here too (see tools/capture):
+# buildTraceFiles = ["inputs/build.procmon.csv"]
+
+[runs.smoke]
+# Observed during a real flash/run: the loader .cmm + the calib blob (file trace), and the functions
+# that executed (run log). These are kept + attributed; they catch the loader/data layer static analysis can't.
+runTraceFiles = ["inputs/run.procmon.csv"]
+runTraceLogs  = ["inputs/run.log"]
+
+# Three aggressiveness tiers — only the two carve toggles differ. Omit --stage to emit all three side by side.
+[stages.safe]
+carveSourceFileContents = false   # file-level only (the sound floor)
+carveHeaderFileContents = false
+
+[stages.aggressive]
+carveSourceFileContents = true    # also drop unused functions within kept .c files
+carveHeaderFileContents = false
+
+[stages.max]
+carveSourceFileContents = true    # also strip unused #defines from kept headers
+carveHeaderFileContents = true

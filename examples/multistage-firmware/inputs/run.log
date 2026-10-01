@@ -1,0 +1,8 @@
+# functions observed during a smoke run
+main
+init
+run_loop
+read_sensor
+send_status
+uart_write
+Timer_ISR

@@ -102,14 +102,19 @@ public static class InfrastructureEmitter
         // A file a real build/run was observed to OPEN is evidence it's used — never prune it as "garbage".
         var observedSet = new HashSet<string>(observed ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
 
-        // --exclude matches DIRECTORY segments (not the file's own name): a rel path a/b/c.mk is excluded
-        // when 'a' or 'b' is an excluded dir. Mirrors the source/asm/linker scans in the CLI.
+        // excludeDirectories matches a directory path ANYWHERE in the rel path — single-segment ("tests") OR
+        // nested ("boards/old"). Uses the same "/x/" substring test as the CLI's source/asm/linker scans, so a
+        // nested exclude trims the infra passthrough too (not just the code scan). A rel path a/b/c.mk is excluded
+        // when "a", "b", or "a/b" is an excluded dir.
         bool Included(string rel)
         {
             if (excludeDirs.Count == 0) return true;
-            var segs = rel.Split('/');
-            for (var i = 0; i < segs.Length - 1; i++)
-                if (excludeDirs.Contains(segs[i], StringComparer.OrdinalIgnoreCase)) return false;
+            var slashed = "/" + rel.Replace('\\', '/') + "/";
+            foreach (var x in excludeDirs)
+            {
+                var seg = "/" + x.Replace('\\', '/').Trim('/') + "/";
+                if (slashed.Contains(seg, StringComparison.OrdinalIgnoreCase)) return false;
+            }
             return true;
         }
 

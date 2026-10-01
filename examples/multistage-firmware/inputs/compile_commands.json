@@ -1,0 +1,7 @@
+[
+  { "directory": ".", "file": "main.c",   "arguments": ["gcc","-c","main.c"] },
+  { "directory": ".", "file": "app.c",    "arguments": ["gcc","-DFEATURE_FAST","-c","app.c"] },
+  { "directory": ".", "file": "sensor.c", "arguments": ["gcc","-DFEATURE_FAST","-c","sensor.c"] },
+  { "directory": ".", "file": "comms.c",  "arguments": ["gcc","-c","comms.c"] },
+  { "directory": ".", "file": "isr.c",    "arguments": ["gcc","-c","isr.c"] }
+]

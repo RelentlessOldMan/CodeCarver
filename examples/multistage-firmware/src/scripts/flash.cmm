@@ -1,0 +1,5 @@
+; TRACE32 PRACTICE loader (infrastructure; kept, observed in the run trace)
+SYStem.Up
+Data.LOAD.Elf image.elf
+Data.LOAD.Binary &calib_path /NoClear
+Go

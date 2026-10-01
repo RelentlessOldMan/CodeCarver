@@ -303,8 +303,9 @@ public static class CarveCommand
             }
         }
 
-        // outputDirectory must be OUTSIDE the source tree (we write a complete tree there, atomically). Also exclude
-        // any 'codecarver' dir from the source scan so a prior in-tree output never re-ingests.
+        // outputDirectory must be OUTSIDE the source tree (we write a complete tree there, atomically). Because
+        // it's disjoint from source, our own codecarver/ output is never under the scanned tree — no need to
+        // exclude it by name (and excluding a bare "codecarver" would wrongly match a repo/path segment of that name).
         string outputFull;
         try { outputFull = Path.GetFullPath(outputDirectory); }
         catch (Exception ex) { err.WriteLine($"outputDirectory '{outputDirectory}' is not a usable path ({ex.GetType().Name}: {ex.Message})"); return 2; }
@@ -312,7 +313,6 @@ public static class CarveCommand
         { err.WriteLine($"outputDirectory must be OUTSIDE the source tree (source '{Path.GetFullPath(dir)}' overlaps '{outputFull}')."); return 2; }
         if (File.Exists(outputFull))
         { err.WriteLine($"outputDirectory '{outputFull}' is a file, not a directory."); return 2; }
-        if (!excludeDirs.Contains("codecarver", StringComparer.OrdinalIgnoreCase)) excludeDirs.Add("codecarver");
 
         // Diagnostic collector for this run: a source-free snapshot (version/env/params/stats/warnings/timings)
         // written to ONE shareable .zip on request via --diag, or automatically on an unhandled failure (the
