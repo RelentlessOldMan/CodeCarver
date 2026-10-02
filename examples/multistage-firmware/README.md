@@ -31,6 +31,7 @@ Output lands in `out/<stage>/{carved,codecarver}` (git-ignored; regenerate with 
 | `src/boards/old/variant.c` | a board variant NOT in this image — dropped via `excludeDirectories` |
 | `src/.git/`, `src/notes.txt.bak` | **auto-excluded** (VCS/editor junk — never a build/run input) |
 | `inputs/compile_commands.json` | the **build log** (pins `-D`/`-I` → `#ifdef` world) |
+| `inputs/build.procmon.csv` | a **build file-trace** — files opened while *building*; catches inputs the compile log doesn't list: the assembled `startup.s`, the linker script `flash.ld`, the `config.h` the compiler pulled in (all flip to `[observed]`) |
 | `inputs/run.procmon.csv` | a **run file-trace** — the loader opened `scripts/flash.cmm` + `data/calib.bin` (kept + `[observed]`) |
 | `inputs/run.log` | a **run function-trace** — the functions that actually executed (become roots) |
 
@@ -42,7 +43,7 @@ The build/run traces here are tiny hand-written samples; on a real project you c
 ```
   roots   : main, Timer_ISR
   trace   : 7 function(s) from 1 trace(s) rooted; 7 resolved in-scope
-  files   : 2 observed in-tree from 0 build + 1 run file-trace(s)
+  files   : 11 observed in-tree from 1 build + 1 run file-trace(s) (6 code rooted)
   files   : 6/7 kept, 1 dropped
   dropped : debug.c
   verify  : OK — every in-scope callee of a kept function is kept
@@ -62,9 +63,11 @@ files as drop candidates:
 
 ```
 == KEPT - infrastructure / other, not code (5) ==
-  (file-trace: 2 of 5 observed being opened; 3 NOT observed - candidates to drop if the trace(s) covered a full build+run)
+  (file-trace: 5 of 5 observed being opened; 0 NOT observed - candidates to drop if the trace(s) covered a full build+run)
     ...
-      scripts/flash.cmm  [observed]
-      data/calib.bin     [observed]
+      flash.ld           [observed]   # from the BUILD trace (not in the compile log)
+      startup.s          [observed]   # from the BUILD trace
+      scripts/flash.cmm  [observed]   # from the RUN trace
+      data/calib.bin     [observed]   # from the RUN trace
 == REMOVED - garbage, not a build/run input (3) ==   (notes.txt.bak, build.log, __pycache__/codegen.pyc)
 ```

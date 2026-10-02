@@ -16,8 +16,9 @@ excludeDirectories = ["boards/old"]
 # The build log pins -DFEATURE_FAST per file, so the carve resolves #ifdefs the way the real build does
 # (closed-world) and drops the dead #else branch in sensor.c.
 buildLogs = ["inputs/compile_commands.json"]
-# A file-access trace captured while building would go here too (see tools/capture):
-# buildTraceFiles = ["inputs/build.procmon.csv"]
+# A file-access trace captured while BUILDING: catches inputs the compile log doesn't enumerate —
+# the assembled startup.s, the linker script flash.ld, and the config.h the compiler pulled in.
+buildTraceFiles = ["inputs/build.procmon.csv"]
 
 [runs.smoke]
 # Observed during a real flash/run: the loader .cmm + the calib blob (file trace), and the functions
