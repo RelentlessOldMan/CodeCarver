@@ -281,9 +281,9 @@ public static class CarveCommand
         var strictRoots = true;         // a missing NAMED entry point always fails (soundness check always runs below)
         string? traceFormat = null;     // standard trace-log format only (no regex knob)
         string? fileTraceFormat = null; // file-access traces auto-detect
-        long maxParseBytes = 20_000_000;
-        int? parseTimeoutMs = null;
-        int? maxSymbolsPerFile = null;
+        long maxParseBytes = cv.MaxParseBytes ?? 20_000_000;            // [advanced] escape hatches
+        int? parseTimeoutMs = cv.ParseTimeout is { } pt ? pt * 1000 : null;
+        int? maxSymbolsPerFile = cv.MaxSymbolsPerFile;
         var dumpSpans = false;
         string? diagPath = null;        // no --diag flag; crash auto-diag still works via DiagState
         // Per-stage; declared here for the diag snapshot, set inside the emit loop.
@@ -1081,6 +1081,40 @@ public static class CarveCommand
             try { File.WriteAllText(path, content); @out.WriteLine($"  {what,-8}: {path}"); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException or System.Security.SecurityException)
             { err.WriteLine($"  warn    : could not write {what} '{path}' ({ex.GetType().Name}: {ex.Message})"); }
+        }
+
+        // Analysis-only (no carved tree): compute the decision and write report + manifest, skipping the (possibly
+        // huge) emit. The WORKREPO "dry run" and the ground-truth oracle use this to inspect kept/dropped fast.
+        if (cv.AnalysisOnly)
+        {
+            var ccDir = Path.Combine(outputDirectory, "codecarver");
+            Directory.CreateDirectory(ccDir);
+            @out.WriteLine("  mode    : analysis only — plan + report + manifest, no carved tree emitted");
+            var carvedCode = plan.KeptFiles.Sum(f => sizeByRel.TryGetValue(f, out var b) ? b : 0);
+            @out.WriteLine($"  size    : {originalBytes:N0} B scanned, {carvedCode:N0} B in kept code files");
+            @out.WriteLine($"  buckets : {plan.KeptFiles.Count:N0} reachable-code + {plan.DroppedFiles.Count:N0} dead-code file(s) "
+                + "(infrastructure + include closure are enumerated only when emitting)");
+            var report = CarveReport.Render(new CarveReport.Inputs(
+                SourceRoot: dir, Roots: roots, BuildRequired: plan.KeptFiles, KeptCode: plan.KeptFiles,
+                RemovedDeadCode: plan.DroppedFiles, Infrastructure: Array.Empty<string>(), ExcludedDirs: excludeDirs,
+                CodeBytesBefore: originalBytes, CodeBytesAfter: carvedCode, InfraBytes: 0, InfraEnumerated: false,
+                RemovedGarbage: Array.Empty<string>(), GarbageBytes: 0, Observed: observedRel.ToList()));
+            WriteArtifact(Path.Combine(ccDir, "report.txt"), report, "report");
+            var m = new
+            {
+                codecarverVersion = Version(), root = dir, roots, lang, analysisOnly = true,
+                defines = defineSpecs.Distinct().ToArray(), closedWorld,
+                stats = new { s.TotalNodes, s.ReachedNodes, s.DroppedNodes, s.TotalFiles, s.KeptFiles, s.DroppedFiles },
+                keptFiles = plan.KeptFiles, droppedFiles = plan.DroppedFiles,
+                observedFiles = observedRel.OrderBy(f => f, StringComparer.Ordinal).ToArray(),
+            };
+            WriteArtifact(Path.Combine(ccDir, "manifest.json"),
+                System.Text.Json.JsonSerializer.Serialize(m, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), "manifest");
+            Mark("analyze");
+            diag.Set("analysisOnly", true);
+            diag.Set("totalNodes", s.TotalNodes); diag.Set("keptFiles", s.KeptFiles); diag.Set("droppedFiles", s.DroppedFiles);
+            diag.Set("verifyFailed", verifyFailed); diag.Event("run complete");
+            return verifyFailed ? 3 : 0;
         }
 
         // --- Emit each stage. The graph + reachability plan are SHARED across stages; only the emit granularity

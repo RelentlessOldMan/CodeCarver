@@ -44,17 +44,23 @@ foreach ($t in $cases) {
     if (-not (Test-Path $inPath)) { Write-Host ("SKIP {0} (not under .corpus)" -f $t.n) -ForegroundColor DarkGray; continue }
     $outPath = Join-Path $o $t.n
     Write-Host ("=== {0} ===" -f $t.n) -ForegroundColor Cyan
-    $carveArgs = @('carve', $inPath, '--lang', 'cpp', '--roots', $t.roots, '--prune', '--out', $outPath)
-    if ($t.cfg.Count -gt 0) {
-        $cfgPath = "$outPath.cfg.json"
-        $t.cfg | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $cfgPath
-        $carveArgs += @('--config', $cfgPath)
-    }
-    & dotnet $cli @carveArgs 2>&1 |
+    $tl = @()
+    $tl += 'outputDirectory = "' + ($outPath -replace '\\','/') + '"'
+    $tl += '[common]'
+    $tl += 'entryPoints = ["' + (($t.roots -split ',') -join '","') + '"]'
+    $tl += 'languages = ["cpp"]'
+    $tl += 'carveSourceFileContents = true'
+    if ($t.cfg.ContainsKey('exclude'))      { $tl += 'excludeDirectories = ["' + ($t.cfg.exclude -join '","') + '"]' }
+    if ($t.cfg.ContainsKey('pruneHeaders')) { $tl += 'carveHeaderFileContents = true' }
+    $cfgPath = "$outPath.toml"
+    ($tl -join "`n") | Set-Content -Encoding utf8 $cfgPath
+    & dotnet $cli carve $inPath --config $cfgPath 2>&1 |
         Select-String 'nodes|files|UNRESOLVED' | ForEach-Object { Write-Host "  $_" }
-    $env:INC = "-I$ow/$($t.n)$($t.inc)"
+    Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
+    # Carved tree is at <outPath>/carved now.
+    $env:INC = "-I$ow/$($t.n)/carved$($t.inc)"
     if ($t.excl) { $env:EXCLUDE = $t.excl } else { Remove-Item Env:\EXCLUDE -ErrorAction SilentlyContinue }
-    $res = wsl -d Ubuntu -- bash -c "INC='$env:INC' EXCLUDE='$($t.excl)' bash $sh $ow/$($t.n) $drv/$($t.drv)"
+    $res = wsl -d Ubuntu -- bash -c "INC='$env:INC' EXCLUDE='$($t.excl)' bash $sh $ow/$($t.n)/carved $drv/$($t.drv)"
     $line = ($res | Select-String 'SOUND|FAILED').Line
     if ($line -match 'SOUND') { Write-Host "  $line" -ForegroundColor Green }
     else { Write-Host "  $line" -ForegroundColor Red; $res | Select-Object -Last 12 | ForEach-Object { "    $_" }; $fail++ }

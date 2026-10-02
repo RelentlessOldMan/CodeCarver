@@ -9,8 +9,8 @@ $Roots   = 'main,Reset_Handler,SysTick_Handler,USART1_IRQHandler,app_entry'  # <
 $Lang    = 'c'                                   # 'c' or 'cpp'
 $Exclude = 'tests,tools,bootloader'              # <EXCLUDE> dirs NOT in this image (other variants!)
 $Aux     = '*.ld,*.lds,*.s,*.S,*.icf'            # <AUX> linker/startup files copied verbatim
-$BuildLog= ''                                    # optional: path to `make -n` output (--build-log). '' to skip
-$Defines = ''                                    # optional: 'CHIP=X,FEATURE_Y' (--define). '' to skip
+$BuildLog= ''                                    # optional: path to `make -n` output (-> buildLogs). '' to skip
+$Defines = ''                                    # optional: 'CHIP=X,FEATURE_Y' (-> defines). '' to skip
 
 # Your real build + size probe. {OUT} is replaced with the carved tree path.
 # Must produce the image from the carved sources and print/emit it so <SizeCmd> can measure it.
@@ -22,44 +22,47 @@ $RunBuild = $false                               # set $true once BuildCmd/SizeC
 $ErrorActionPreference = 'Stop'
 $cli = Join-Path $PSScriptRoot '..\src\CodeCarver.Cli\bin\Release\net8.0\CodeCarver.Cli.dll'
 if (-not (Test-Path $cli)) { throw "build the CLI first: dotnet build -c Release  (missing $cli)" }
-# Inputs (exclude / aux / build log / defines) are config-only now -> write a --config file. --strict-roots
-# stays a CLI toggle: a typo'd ISR/API name among a curated root list fails the run instead of silently carving
-# the real symbol away (see WORKREPO.md 0). Drop it only if you accept unresolved roots.
-$cfg = @{ exclude = @($Exclude -split ','); aux = @($Aux -split ',') }
-if ($BuildLog) { $cfg.buildLogs = @($BuildLog) }
-if ($Defines)  { $cfg.defines  = @($Defines -split ',') }
-$cfgPath = Join-Path $env:TEMP 'codecarver-embedded-arm.cfg.json'
-$cfg | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $cfgPath
-$common = @('--roots', $Roots, '--lang', $Lang, '--config', $cfgPath, '--strict-roots')
+# Everything is config now: build a carve.toml from the CONFIG block above, then `carve <repo> --config`.
+# (A missing named entry point fails the run; the compiler-free soundness check runs automatically — watch the
+# 'verify' line. See WORKREPO.md 0 for curating entryPoints.)
+$outDir = Join-Path $Repo '..\carved'
+$tl = @()
+$tl += 'outputDirectory = "' + ($outDir -replace '\\','/') + '"'
+$tl += '[common]'
+$tl += 'entryPoints = ["' + (($Roots -split ',') -join '","') + '"]'
+$tl += 'languages = ["' + $Lang + '"]'
+if ($Exclude) { $tl += 'excludeDirectories = ["' + (($Exclude -split ',') -join '","') + '"]' }
+if ($Aux)     { $tl += 'forceKeepFiles = ["' + (($Aux -split ',') -join '","') + '"]' }
+if ($BuildLog -or $Defines) {
+  $tl += '[builds.main]'
+  if ($BuildLog) { $tl += 'buildLogs = ["' + ($BuildLog -replace '\\','/') + '"]' }
+  if ($Defines)  { $tl += 'defines = ["' + (($Defines -split ',') -join '","') + '"]' }
+}
+# Two aggressiveness tiers: the safe file-level floor, then the intra-file carve.
+$tl += @('[stages.file-level]', 'carveSourceFileContents = false',
+         '[stages.prune]',      'carveSourceFileContents = true')
+$cfgPath = Join-Path $PSScriptRoot 'embedded-arm.toml'
+($tl -join "`n") | Set-Content -Encoding utf8 $cfgPath
+Write-Host "config -> $cfgPath" -ForegroundColor DarkGray
 
-function Carve([string[]]$extra) { & dotnet $cli carve $Repo @common @extra 2>&1 }
+Write-Host "== Carve (both stages) ==" -ForegroundColor Cyan
+& dotnet $cli carve $Repo --config $cfgPath 2>&1 |
+  Select-String 'roots|nodes|files|implicit|asm:|section:|verify|world|stage|emitted|size|warn|none of the requested'
 
-Write-Host "== 1. Smoke test (check implicit/asm/section counts match your ISRs/ctors) ==" -ForegroundColor Cyan
-Carve @() | Select-String 'roots|nodes|files|implicit|asm:|section:|warn|none of the requested'
-
-Write-Host "`n== 2. Compiler-free soundness gate (--prune --verify) ==" -ForegroundColor Cyan
-$v = Carve @('--prune','--verify')
-$v | Select-String 'verify|violation|->'
-if ($LASTEXITCODE -ne 0) { Write-Host "  VERIFY FAILED - fix before trusting a --prune image (run --why on the callee)." -ForegroundColor Red }
-
-Write-Host "`n== 3. Carve file-level (safe floor) and --prune (aggressive) ==" -ForegroundColor Cyan
-$outFile  = Join-Path $Repo '..\carved-file'
-$outPrune = Join-Path $Repo '..\carved-prune'
-Write-Host "  file-level -> $outFile";  Carve @('--out', $outFile,  '--manifest', "$outFile.json")  | Select-String 'files|size'
-Write-Host "  --prune    -> $outPrune"; Carve @('--prune','--out', $outPrune, '--manifest', "$outPrune.json") | Select-String 'files|size'
+$outFile  = Join-Path $outDir 'file-level\carved'
+$outPrune = Join-Path $outDir 'prune\carved'
 
 if (-not $RunBuild) {
-    Write-Host "`n== 4. Build+size skipped (set `$RunBuild=`$true and make BuildCmd/SizeCmd real). ==" -ForegroundColor Yellow
-    Write-Host "   Then this builds each carved tree with your toolchain and prints the image-size delta."
+    Write-Host "`n== Build+size skipped (set `$RunBuild=`$true and make BuildCmd/SizeCmd real). ==" -ForegroundColor Yellow
+    Write-Host "   carved trees:  $outFile   and   $outPrune"
     return
 }
 
-Write-Host "`n== 4. Build each carved tree and compare IMAGE SIZE ==" -ForegroundColor Cyan
-foreach ($t in @(@{n='file-level'; o=$outFile}, @{n='--prune'; o=$outPrune})) {
+Write-Host "`n== Build each carved tree and compare IMAGE SIZE ==" -ForegroundColor Cyan
+foreach ($t in @(@{n='file-level'; o=$outFile}, @{n='prune'; o=$outPrune})) {
     Write-Host "  --- building $($t.n): $($t.o) ---"
-    $b = $BuildCmd.Replace('{OUT}', $t.o)
-    Invoke-Expression $b
-    if ($LASTEXITCODE -ne 0) { Write-Host "  BUILD FAILED for $($t.n) - a dropped symbol/broken structure (see WORKREPO.md 7)." -ForegroundColor Red; continue }
+    Invoke-Expression ($BuildCmd.Replace('{OUT}', $t.o))
+    if ($LASTEXITCODE -ne 0) { Write-Host "  BUILD FAILED for $($t.n) - a dropped symbol/broken structure (see WORKREPO.md)." -ForegroundColor Red; continue }
     Write-Host "  size ($($t.n)):" -ForegroundColor Green
     Invoke-Expression ($SizeCmd.Replace('{OUT}', $t.o))
 }

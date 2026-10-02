@@ -130,20 +130,30 @@ $expectedFiles = @{}; foreach ($s in $reach.Keys) { $expectedFiles[$defBase[$s]]
 Write-Host ("roots {0} => {1} functions transitively reachable (direct+indirect); expect {2} def-files kept" -f ($rootList -join ','), $reach.Count, $expectedFiles.Count)
 
 # Run the carve (analysis + CodeCarver manifest listing kept files). No --out: correctness only, no copy.
-$ccManifest = Join-Path $env:TEMP ("cc-gt-" + [Guid]::NewGuid().ToString('N').Substring(0,8) + ".json")
+# analysisOnly => plan + manifest only (no multi-GB emit). Manifest lands under codecarver/.
+$ccOut = Join-Path $env:TEMP ("cc-gt-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
+$ccManifest = Join-Path $ccOut 'codecarver\manifest.json'
+$gtCfg = "$ccOut.toml"
+@"
+outputDirectory = "$($ccOut -replace '\\','/')"
+analysisOnly = true
+[common]
+entryPoints = ["$(($Root -split ',') -join '","')"]
+languages = ["c"]
+[advanced]
+maxParseBytes = $MaxParseBytes
+"@ | Set-Content -Encoding utf8 $gtCfg
 Write-Host "== carving (this may take minutes on a 100 GB tree) ==" -ForegroundColor Cyan
 # CodeCarver writes progress ('scanning:', 'warn:') to stderr; under -ErrorActionPreference Stop a native
 # exe's stderr is turned into a terminating NativeCommandError even on a clean exit. Switch to Continue for
 # the invocation and gate on the exit code instead (a known PS 5.1 hazard).
 $ErrorActionPreference = 'Continue'
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-# --max-parse-bytes is config-only now.
-$gtCfg = Join-Path (Split-Path $ccManifest) 'gt-oracle.cfg.json'
-@{ maxParseBytes = $MaxParseBytes } | ConvertTo-Json | Set-Content -Encoding utf8 $gtCfg
-& dotnet $CliDll carve $Corpus --roots $Root --lang c --config $gtCfg --manifest $ccManifest 2>&1 |
-  Select-String 'nodes|files|size|scanning|warn' | ForEach-Object { "  " + $_.Line }
+& dotnet $CliDll carve $Corpus --config $gtCfg 2>&1 |
+  Select-String 'nodes|files|size|scanning|warn|mode' | ForEach-Object { "  " + $_.Line }
 $carveExit = $LASTEXITCODE
 $sw.Stop()
+Remove-Item $gtCfg -Force -ErrorAction SilentlyContinue
 if ($carveExit -ne 0) { Write-Host "  (carve exit $carveExit)" -ForegroundColor Yellow }
 if (-not (Test-Path $ccManifest)) { throw "carve produced no manifest ($ccManifest)" }
 

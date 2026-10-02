@@ -240,6 +240,25 @@ public sealed class CarveTomlRunTests
     }
 
     [Fact]
+    public void Carve_AnalysisOnly_WritesReportManifest_NoCarvedTree()
+    {
+        var (work, src, outDir) = NewWork();
+        BasicTree(src);
+        try
+        {
+            var cfg = Config(work, outDir, "analysisOnly = true\n[common]\nentryPoints = [\"main\"]\n");
+            var (code, o, _) = Run("carve", src, "--config", cfg);
+            Assert.Equal(0, code);
+            Assert.Contains("analysis only", o);
+            Assert.False(Directory.Exists(Path.Combine(outDir, "carved")));          // no tree emitted
+            Assert.True(File.Exists(Path.Combine(outDir, "codecarver", "manifest.json")));
+            Assert.True(File.Exists(Path.Combine(outDir, "codecarver", "report.txt")));
+            Assert.Contains("\"droppedFiles\"", File.ReadAllText(Path.Combine(outDir, "codecarver", "manifest.json")));
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
     public void Carve_ExcludeDirectories_DropsThatTree()
     {
         var (work, src, outDir) = NewWork();

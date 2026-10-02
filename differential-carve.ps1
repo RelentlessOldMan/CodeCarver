@@ -35,29 +35,39 @@ if (-not $RepoB) { $RepoB = $RepoA; Write-Host "(determinism mode: carving $Repo
 $work = Join-Path $env:TEMP ("cc-diff-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
 $oA = Join-Path $work 'A'; $oB = Join-Path $work 'B'
 New-Item -ItemType Directory -Force $oA, $oB | Out-Null
-$mA = Join-Path $work 'a.json'; $mB = Join-Path $work 'b.json'
+# Manifests land under the fixed codecarver/ layout (no stages => directly under the output dir).
+$mA = Join-Path $oA 'codecarver\manifest.json'; $mB = Join-Path $oB 'codecarver\manifest.json'
 
-function CarveTo([string]$repo, [string]$out, [string]$man) {
-    # Inputs/tuning are config-only now; write a per-call --config and keep only the operational flags on the CLI.
-    $cfg = @{ parseTimeout = $ParseTimeout }       # 0 = disabled (see param note): isolate path from timing
-    if ($Exclude)      { $cfg.exclude = @($Exclude -split ',') }
-    if ($PruneHeaders) { $cfg.pruneHeaders = $true }
-    if ($BuildLog)     { $cfg.buildLogs = @($BuildLog) }
-    if ($Defines)      { $cfg.defines = @($Defines -split ',') }
-    $cfgPath = "$out.cfg.json"
-    $cfg | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 $cfgPath
-    $a = @('carve', $repo, '--roots', $Roots, '--lang', $Lang, '--out', $out, '--manifest', $man, '--config', $cfgPath)
-    if ($Prune)        { $a += '--prune' }
+function CarveTo([string]$repo, [string]$out) {
+    # Everything goes in a per-call TOML config. The carved tree lands at <out>/carved, the manifest at
+    # <out>/codecarver/manifest.json.
+    $lines = @()
+    $lines += 'outputDirectory = "' + ($out -replace '\\','/') + '"'
+    $lines += '[common]'
+    $lines += 'entryPoints = ["' + (($Roots -split ',') -join '","') + '"]'
+    $lines += 'languages = ["' + $Lang + '"]'
+    if ($Exclude)      { $lines += 'excludeDirectories = ["' + (($Exclude -split ',') -join '","') + '"]' }
+    if ($Prune)        { $lines += 'carveSourceFileContents = true' }
+    if ($PruneHeaders) { $lines += 'carveHeaderFileContents = true' }
+    if ($BuildLog -or $Defines) {
+        $lines += '[builds.main]'
+        if ($BuildLog) { $lines += 'buildLogs = ["' + ($BuildLog -replace '\\','/') + '"]' }
+        if ($Defines)  { $lines += 'defines = ["' + (($Defines -split ',') -join '","') + '"]' }
+    }
+    $lines += '[advanced]'; $lines += "parseTimeout = $ParseTimeout"   # 0 = disabled (isolate path from timing)
+    $cfgPath = "$out.toml"
+    ($lines -join "`n") | Set-Content -Encoding utf8 $cfgPath
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    & dotnet $cli @a 2>&1 | Select-String 'nodes|files|size|verify|warn' | ForEach-Object { Write-Host "    $_" }
+    & dotnet $cli carve $repo --config $cfgPath 2>&1 | Select-String 'nodes|files|size|verify|warn|world' | ForEach-Object { Write-Host "    $_" }
     $sw.Stop()
+    Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
     return $sw.Elapsed.TotalSeconds
 }
 
 Write-Host "== Carve A: $RepoA ==" -ForegroundColor Cyan
-$tA = CarveTo $RepoA $oA $mA
+$tA = CarveTo $RepoA $oA
 Write-Host "== Carve B: $RepoB ==" -ForegroundColor Cyan
-$tB = CarveTo $RepoB $oB $mB
+$tB = CarveTo $RepoB $oB
 Write-Host ("`nwall-clock:  A = {0:N1}s   B = {1:N1}s   (B/A = {2:N2}x)" -f $tA, $tB, ($tB / [Math]::Max($tA, 0.001)))
 
 # --- 1. manifest decisions (ignore the absolute `root` line) ---
@@ -76,13 +86,15 @@ if ($mdiff) {
 # --- 2. emitted trees byte-for-byte ---
 function TreeHashes([string]$root) {
     $h = @{}
-    Get-ChildItem -Recurse -File $root | ForEach-Object {
+    Get-ChildItem -Recurse -File $root | Where-Object { $_.Name -ne '.codecarver-output' } | ForEach-Object {
         $rel = $_.FullName.Substring($root.Length).TrimStart('\','/').Replace('\','/')
         $h[$rel] = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash
     }
     return $h
 }
-$hA = TreeHashes $oA; $hB = TreeHashes $oB
+# Compare the carved trees only (the codecarver/ metadata legitimately differs by path: manifest 'root',
+# resolved-config outputDirectory).
+$hA = TreeHashes (Join-Path $oA 'carved'); $hB = TreeHashes (Join-Path $oB 'carved')
 $onlyA = $hA.Keys | Where-Object { -not $hB.ContainsKey($_) }
 $onlyB = $hB.Keys | Where-Object { -not $hA.ContainsKey($_) }
 $diffContent = $hA.Keys | Where-Object { $hB.ContainsKey($_) -and $hA[$_] -ne $hB[$_] }

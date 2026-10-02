@@ -50,9 +50,19 @@ foreach ($t in $cases) {
     $baseOK = @($base | Where-Object { $_ -like 'OK *' } | ForEach-Object { $_.Substring(3) })
     if ($baseOK.Count -eq 0) { Write-Host "  (0 baseline compile standalone - needs build config; skipped)" -ForegroundColor DarkGray; continue }
 
-    $out = Join-Path $root ".oracle-cpp\sweep-$($t.n)"
-    & dotnet $cli carve $src --lang $t.lang --roots $t.roots --prune --out $out 2>&1 |
+    $outBase = Join-Path $root ".oracle-cpp\sweep-$($t.n)"
+    $cfg = "$outBase.toml"
+    @"
+outputDirectory = "$($outBase -replace '\\','/')"
+[common]
+entryPoints = ["$(($t.roots -split ',') -join '","')"]
+languages = ["$($t.lang)"]
+carveSourceFileContents = true
+"@ | Set-Content -Encoding utf8 $cfg
+    & dotnet $cli carve $src --config $cfg 2>&1 |
         Select-String 'nodes|UNRESOLVED' | ForEach-Object { Write-Host "  $_" }
+    Remove-Item $cfg -Force -ErrorAction SilentlyContinue
+    $out = Join-Path $outBase 'carved'   # carved tree under <outputDirectory>/carved
     $outW = ToWsl $out
     $carved = wsl -d Ubuntu -- bash $sh $outW $t.lang $t.inc
     $carvedOK = @{}; foreach ($l in ($carved | Where-Object { $_ -like 'OK *' })) { $carvedOK[$l.Substring(3)] = $true }

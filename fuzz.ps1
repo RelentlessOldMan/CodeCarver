@@ -61,12 +61,22 @@ if ($baseline.Count -eq 0) {
     exit 2
 }
 
-# 2. Carve + prune + emit. (--exclude is config-only now.)
+# 2. Carve + prune + emit. Everything goes in a TOML config; the carved tree lands at $out/carved.
 Write-Host "carving..."
-$fuzzCfg = Join-Path $env:TEMP 'codecarver-fuzz.cfg.json'
-@{ exclude = @($Exclude -split ',') } | ConvertTo-Json | Set-Content -Encoding utf8 $fuzzCfg
-dotnet run --project src/CodeCarver.Cli -c Release -- carve $Repo --lang $Lang --roots $Roots `
-    --prune --out $out --config $fuzzCfg 2>&1 | Select-String 'emitted|none of|support' | ForEach-Object { "  $_" }
+$fuzzCfg = Join-Path $env:TEMP 'codecarver-fuzz.toml'
+$eps = '["' + (($Roots -split ',') -join '","') + '"]'
+$exc = if ($Exclude) { '["' + (($Exclude -split ',') -join '","') + '"]' } else { '[]' }
+@"
+outputDirectory = "$($out -replace '\\','/')"
+[common]
+entryPoints = $eps
+languages = ["$Lang"]
+excludeDirectories = $exc
+carveSourceFileContents = true
+"@ | Set-Content -Encoding utf8 $fuzzCfg
+dotnet run --project src/CodeCarver.Cli -c Release -- carve $Repo --config $fuzzCfg `
+    2>&1 | Select-String 'emitted|none of|support' | ForEach-Object { "  $_" }
+$out = Join-Path $out 'carved'   # the carved tree is under <outputDirectory>/carved
 
 # 3. Re-compile the carved version of each baseline-passing file; a regression is a carve bug.
 $carvedIncs = @($Inc | ForEach-Object { Join-Path $out $_ }) + $out

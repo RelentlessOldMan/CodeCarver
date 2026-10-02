@@ -102,8 +102,17 @@ $psi.RedirectStandardError = $true
 $psi.UseShellExecute = $false
 $psi.EnvironmentVariables['CODECARVER_TIMING'] = '1'
 # Windows PowerShell 5.1 runs on .NET Framework, which has no ProcessStartInfo.ArgumentList — use the
-# single Arguments string with quoted paths.
-$psi.Arguments = '"{0}" carve "{1}" --roots main' -f $dll, $src
+# single Arguments string with quoted paths. Inputs go in a TOML config; analysisOnly => measure the carve
+# decision (parse/reachability) without the emit.
+$benchCfg = Join-Path $env:TEMP ("cc-perf-" + [Guid]::NewGuid().ToString('N').Substring(0,8) + ".toml")
+@"
+outputDirectory = "$(($benchCfg + '.out') -replace '\\','/')"
+analysisOnly = true
+[common]
+entryPoints = ["main"]
+languages = ["c"]
+"@ | Set-Content -Encoding utf8 $benchCfg
+$psi.Arguments = '"{0}" carve "{1}" --config "{2}"' -f $dll, $src, $benchCfg
 
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $proc = [Diagnostics.Process]::Start($psi)

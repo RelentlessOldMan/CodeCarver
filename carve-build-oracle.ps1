@@ -85,16 +85,26 @@ $externList = @($externs.Keys | Sort-Object)
 $dropList   = @($dropObjs.Keys | Sort-Object)
 Write-Host ("root {0}: {1} reachable; stub externs: [{2}]; neg-control drop: [{3}]" -f $Root, $reach.Count, ($externList -join ' '), ($dropList -join ' '))
 
-# Carve to --out (file-level; correctness of the build, not intra-file pruning, is what we're judging here).
+# Carve (file-level; correctness of the build, not intra-file pruning, is what we're judging here). Inputs go in
+# a TOML config; the carved tree lands at <OutDir>/carved (keep-by-default complete project).
 if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
-Write-Host "== carving --out ==" -ForegroundColor Cyan
+Write-Host "== carving ==" -ForegroundColor Cyan
+$cfg = Join-Path $env:TEMP ("cc-bo-" + [Guid]::NewGuid().ToString('N').Substring(0,8) + ".toml")
+@"
+outputDirectory = "$($OutDir -replace '\\','/')"
+[common]
+entryPoints = ["$Root"]
+languages = ["c"]
+"@ | Set-Content -Encoding utf8 $cfg
 $ErrorActionPreference = 'Continue'
-& dotnet $CliDll carve $Corpus --roots $Root --lang c --out $OutDir 2>&1 | Select-String 'emitted|files|error' | ForEach-Object { "  " + $_.Line }
+& dotnet $CliDll carve $Corpus --config $cfg 2>&1 | Select-String 'emitted|files|error' | ForEach-Object { "  " + $_.Line }
 if ($LASTEXITCODE -ne 0) { throw "carve failed (exit $LASTEXITCODE)" }
+Remove-Item $cfg -Force -ErrorAction SilentlyContinue
+$carvedDir = Join-Path $OutDir 'carved'
 
 # Windows path -> WSL /mnt path.
 function ConvertTo-WslPath([string]$p) { $f=(Resolve-Path $p).Path; '/mnt/' + $f.Substring(0,1).ToLower() + ($f.Substring(2) -replace '\\','/') }
-$srcForBash = if ($NativeBash) { (Resolve-Path $OutDir).Path -replace '\\','/' } else { ConvertTo-WslPath $OutDir }
+$srcForBash = if ($NativeBash) { (Resolve-Path $carvedDir).Path -replace '\\','/' } else { ConvertTo-WslPath $carvedDir }
 
 # Emit a build script (tagged output lines the PS side parses). Compiler + paths interpolated.
 $bash = @"

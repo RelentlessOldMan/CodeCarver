@@ -14,6 +14,7 @@ public sealed class ResolvedCarve
     public List<string> EntryPoints = new();
     public List<string> Languages = new();
     public string OutputDirectory = "";
+    public bool AnalysisOnly;
     public List<string> BuildLogs = new();
     public List<string> Compilers = new();        // from each selected build that named one
     public List<string> Defines = new();
@@ -25,6 +26,10 @@ public sealed class ResolvedCarve
     public bool ClosedWorld;                       // derived: a selected build has a build log or a compiler
     public string WorldReason = "";                // one-line explanation for the report
     public List<ResolvedStage> Stages = new();
+    // [advanced] escape hatches (null = engine default).
+    public long? MaxParseBytes;
+    public int? ParseTimeout;                      // seconds
+    public int? MaxSymbolsPerFile;
 }
 
 public static class CarveResolver
@@ -38,6 +43,7 @@ public static class CarveResolver
         var errors = new List<string>();
         var r = new ResolvedCarve();
 
+        r.AnalysisOnly = cfg.AnalysisOnly ?? false;
         if (string.IsNullOrWhiteSpace(cfg.OutputDirectory))
             errors.Add("outputDirectory is required (top of the config) — where the carved tree + reports go.");
         else
@@ -73,6 +79,9 @@ public static class CarveResolver
 
         r.ExcludeDirectories = cfg.Common.ExcludeDirectories.ToList();
         r.ForceKeepFiles = cfg.Common.ForceKeepFiles.ToList();
+        r.MaxParseBytes = cfg.MaxParseBytes;
+        r.ParseTimeout = cfg.ParseTimeout;
+        r.MaxSymbolsPerFile = cfg.MaxSymbolsPerFile;
 
         // Selected builds/runs (UNION). Null selection = all defined.
         var buildNames = cfg.UseBuilds ?? cfg.Builds.Keys.ToList();

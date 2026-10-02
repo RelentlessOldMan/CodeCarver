@@ -69,13 +69,19 @@ foreach ($r in $repos) {
   if (-not (Test-Path $dir)) { Write-Host ("skip {0,-14} (not in .corpus)" -f $r.name); continue }
   Write-Host ("carving {0} ..." -f $r.name) -NoNewline
   $out = Join-Path $env:TEMP ("ccbr-" + $r.name.Replace('\','_') + "-" + [guid]::NewGuid().ToString('N').Substring(0,8))
-  $ca = @('carve', $dir, '--roots', $r.roots, '--lang', 'c', '--prune', '--out', $out)
-  if ($r.exclude) {   # --exclude is config-only now
-    $cfgPath = "$out.cfg.json"
-    @{ exclude = @($r.exclude -split ',') } | ConvertTo-Json | Set-Content -Encoding utf8 $cfgPath
-    $ca += @('--config', $cfgPath)
-  }
-  $o = (& dotnet $dll @ca 2>&1 | Out-String)
+  $eps = '["' + (($r.roots -split ',') -join '","') + '"]'
+  $exc = if ($r.exclude) { '["' + (($r.exclude -split ',') -join '","') + '"]' } else { '[]' }
+  $cfg = "$out.toml"
+  @"
+outputDirectory = "$($out -replace '\\','/')"
+[common]
+entryPoints = $eps
+languages = ["c"]
+excludeDirectories = $exc
+carveSourceFileContents = true
+"@ | Set-Content -Encoding utf8 $cfg
+  $o = (& dotnet $dll carve $dir --config $cfg 2>&1 | Out-String)
+  Remove-Item $cfg -Force -ErrorAction SilentlyContinue
 
   $orig = 0; $carved = 0; $pct = 0; $files = 0
   foreach ($line in ($o -split "`n")) {
@@ -84,7 +90,7 @@ foreach ($r in $repos) {
     }
     if ($line -match 'emitted\s*:\s*(\d+)\s*files') { $files = [int]$matches[1] }
   }
-  $builds = if ($haveGcc) { if (Compile-Carved $out) { 'YES' } else { 'NO' } } else { 'no-gcc' }
+  $builds = if ($haveGcc) { if (Compile-Carved (Join-Path $out 'carved')) { 'YES' } else { 'NO' } } else { 'no-gcc' }
   Write-Host ("  {0}  ({1}% smaller, {2} files, builds={3})" -f $r.name, $pct, $files, $builds)
   $rows += [pscustomobject]@{ Repo=$r.name; Lang='c'; Orig=$orig; Carved=$carved; Pct=$pct; Files=$files; Builds=$builds }
   Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue
@@ -96,14 +102,24 @@ if (-not $NoArm -and $haveArm -and (-not $Only -or $Only -contains 'cortexm')) {
   if (Test-Path $fix) {
     Write-Host 'carving cortexm-firmware (ARM) ...' -NoNewline
     $out = Join-Path $env:TEMP ("ccbr-arm-" + [guid]::NewGuid().ToString('N').Substring(0,8))
-    $o = (& dotnet $dll carve $fix --roots Reset_Handler,main --lang c --prune --out $out --verify 2>&1 | Out-String)
+    $cfg = "$out.toml"
+    @"
+outputDirectory = "$($out -replace '\\','/')"
+[common]
+entryPoints = ["Reset_Handler","main"]
+languages = ["c"]
+carveSourceFileContents = true
+"@ | Set-Content -Encoding utf8 $cfg
+    $o = (& dotnet $dll carve $fix --config $cfg 2>&1 | Out-String)
+    Remove-Item $cfg -Force -ErrorAction SilentlyContinue
     $orig = 0; $carved = 0; $pct = 0; $files = 0
     foreach ($line in ($o -split "`n")) {
       if ($line -match '([\d,]+)\s*B\s*->\s*([\d,]+)\s*B\s*\(\s*([\-\d]+)%') { $orig=[int64]($matches[1] -replace ',',''); $carved=[int64]($matches[2] -replace ',',''); $pct=[int]$matches[3] }
       if ($line -match 'emitted\s*:\s*(\d+)\s*files') { $files = [int]$matches[1] }
     }
-    $cfiles = @(Get-ChildItem $out -Filter *.c | ForEach-Object { $_.FullName })
-    $ld = (Get-ChildItem $out -Filter *.ld | Select-Object -First 1).FullName
+    $carvedDir = Join-Path $out 'carved'
+    $cfiles = @(Get-ChildItem $carvedDir -Filter *.c | ForEach-Object { $_.FullName })
+    $ld = (Get-ChildItem $carvedDir -Filter *.ld | Select-Object -First 1).FullName
     $elf = Join-Path $out 'firmware.elf'
     $aa = @('-mcpu=cortex-m4','-mthumb','-nostartfiles','-ffunction-sections','-Wl,--gc-sections','-T',$ld,'-o',$elf) + $cfiles
     & $arm @aa *> $null

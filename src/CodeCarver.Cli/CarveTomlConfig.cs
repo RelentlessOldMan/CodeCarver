@@ -9,12 +9,17 @@ namespace CodeCarver.Cli;
 public sealed class CarveTomlConfig
 {
     public string? OutputDirectory;
+    public bool? AnalysisOnly;        // true = decide only (plan + report + manifest), don't emit a carved tree
     public CommonSection Common = new();
     public Dictionary<string, BuildSection> Builds = new(StringComparer.Ordinal);
     public Dictionary<string, RunSection> Runs = new(StringComparer.Ordinal);
     public Dictionary<string, StageSection> Stages = new(StringComparer.Ordinal);
     public List<string>? UseBuilds;   // null = use all defined builds
     public List<string>? UseRuns;     // null = use all defined runs
+    // [advanced] — rarely-needed tuning escape hatches (not in the init template). null = engine default.
+    public long? MaxParseBytes;
+    public int? ParseTimeout;         // seconds (0 disables)
+    public int? MaxSymbolsPerFile;
 }
 
 public sealed class CommonSection
@@ -55,7 +60,8 @@ public static class ConfigLoader
 {
     public sealed record Result(CarveTomlConfig? Config, IReadOnlyList<string> Errors, IReadOnlyList<string> Warnings);
 
-    private static readonly string[] TopKeys = { "outputDirectory", "common", "builds", "runs", "stages", "use" };
+    private static readonly string[] TopKeys = { "outputDirectory", "analysisOnly", "common", "builds", "runs", "stages", "use", "advanced" };
+    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "maxSymbolsPerFile" };
     private static readonly string[] CommonKeys =
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
@@ -97,6 +103,7 @@ public static class ConfigLoader
 
         RejectUnknownKeys(root, TopKeys, "(top level)", ctx);
         cfg.OutputDirectory = GetString(root, "outputDirectory", "(top level)", ctx);
+        cfg.AnalysisOnly = GetBool(root, "analysisOnly", "(top level)", ctx);
 
         if (GetTable(root, "common", ctx) is { } common)
         {
@@ -154,6 +161,14 @@ public static class ConfigLoader
             RejectUnknownKeys(use, UseKeys, "[use]", ctx);
             cfg.UseBuilds = use.ContainsKey("builds") ? GetStringList(use, "builds", "[use]", ctx) : null;
             cfg.UseRuns = use.ContainsKey("runs") ? GetStringList(use, "runs", "[use]", ctx) : null;
+        }
+
+        if (GetTable(root, "advanced", ctx) is { } adv)
+        {
+            RejectUnknownKeys(adv, AdvancedKeys, "[advanced]", ctx);
+            cfg.MaxParseBytes = GetLong(adv, "maxParseBytes", "[advanced]", ctx);
+            cfg.ParseTimeout = (int?)GetLong(adv, "parseTimeout", "[advanced]", ctx);
+            cfg.MaxSymbolsPerFile = (int?)GetLong(adv, "maxSymbolsPerFile", "[advanced]", ctx);
         }
 
         // Cross-checks: a [use] selection must name a defined section.
@@ -276,6 +291,19 @@ public static class ConfigLoader
             else ctx.Errors.Add($"{where}: '{key}' must contain only strings (got {item?.GetType().Name ?? "null"}).");
         }
         return result;
+    }
+
+    private static long? GetLong(TomlTable t, string key, string where, Ctx ctx)
+    {
+        if (!t.TryGetValue(key, out var v) || v is null) return null;
+        switch (v)
+        {
+            case long l: return l;
+            case int i: return i;
+            case string s when long.TryParse(s, out var p): return p;
+        }
+        ctx.Errors.Add($"{where}: '{key}' must be an integer.");
+        return null;
     }
 
     // Accepts a TOML bool (true/false) OR a string yes/no/true/false/on/off/1/0 (case-insensitive) — user request.
