@@ -957,6 +957,23 @@ public static class CarveCommand
             { err.WriteLine($"  warn    : could not write {what} '{path}' ({ex.GetType().Name}: {ex.Message})"); }
         }
 
+        // The anonymized repro graph ships by default alongside report/decisions — it's safe to share (opaque
+        // tokens, no names/paths/source), so there's no reason to gate it behind a flag. Guarded by a node cap
+        // because ReproBundle.Build still materializes the whole graph in memory (a streaming writer is the
+        // queued fix); above the cap we skip with a note rather than risk a memory/disk spike on a huge graph.
+        // Any build failure degrades to a warning — a diagnostic aid must never fail the carve.
+        const int reproNodeCap = 500_000;
+        void WriteRepro(string ccDir)
+        {
+            if (graph.NodeCount > reproNodeCap)
+            {
+                @out.WriteLine($"  repro   : skipped — graph too large ({graph.NodeCount:N0} nodes > {reproNodeCap:N0} cap); streaming writer pending");
+                return;
+            }
+            try { WriteArtifact(Path.Combine(ccDir, "repro.graph.json"), ReproBundle.Build(graph, plan), "repro"); }
+            catch (Exception ex) { err.WriteLine($"  warn    : could not build repro graph ({ex.GetType().Name}: {ex.Message})"); }
+        }
+
         // Analysis-only (no carved tree): compute the decision and write report + manifest, skipping the (possibly
         // huge) emit. The WORKREPO "dry run" and the ground-truth oracle use this to inspect kept/dropped fast.
         if (cv.AnalysisOnly)
@@ -985,6 +1002,7 @@ public static class CarveCommand
             WriteArtifact(Path.Combine(ccDir, "manifest.json"),
                 System.Text.Json.JsonSerializer.Serialize(m, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), "manifest");
             WriteArtifact(Path.Combine(ccDir, "decisions.txt"), DecisionsReport.Render(graph, plan, ""), "decisions");
+            WriteRepro(ccDir);
             Mark("analyze");
             diag.Set("analysisOnly", true);
             diag.Set("totalNodes", s.TotalNodes); diag.Set("keptFiles", s.KeptFiles); diag.Set("droppedFiles", s.DroppedFiles);
@@ -1088,6 +1106,7 @@ public static class CarveCommand
                 + $"# entryPoints={roots.Length}  languages={string.Join(",", cv.Languages)}  buildLogs={buildLogs.Count}  "
                 + $"runTraceFiles={runFileTraces.Count}  runTraceLogs={traceList.Count}\n\n{configText}", "config");
             WriteArtifact(Path.Combine(ccDir, "decisions.txt"), DecisionsReport.Render(graph, plan, stage.Name), "decisions");
+            WriteRepro(ccDir);
         }
         Mark("emit");
 

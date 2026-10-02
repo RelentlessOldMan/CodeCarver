@@ -28,6 +28,7 @@ Every carve writes a `codecarver/` folder next to the carved tree — no flags n
   report.txt           human-readable: roots, kept/dropped files, sizes, the verify result, the #ifdef world used
   manifest.json        the same decision, structured (kept/dropped files, stats, observed files)
   decisions.txt        per-SYMBOL keep/drop — every function/type/global/macro, KEPT or CARVED, and why
+  repro.graph.json     the dependency graph, fully ANONYMIZED — the safe-to-share artifact (see below)
   resolved-config.toml the exact config the run resolved to
 ```
 
@@ -36,9 +37,9 @@ disappear?" across the whole tree at once — one line per symbol, and for a kep
 chain back to the root that pulled it in. For a single symbol, `carve <dir> --config carve.toml
 --why <symbol>` prints just that chain.
 
-> **These artifacts include your file and symbol NAMES** (never file *contents*). That's fine for
-> your own debugging; **review `decisions.txt` / `manifest.txt` before sending them** if identifiers
-> are sensitive. A fully anonymized, name-free share path is tracked below.
+> `report.txt`, `manifest.json`, and `decisions.txt` include your file and symbol **NAMES** (never file
+> *contents*). That's fine for your own debugging; **review them before sending** if identifiers are
+> sensitive — or just send `repro.graph.json`, which is fully anonymized (see below).
 
 ## The `verify` check
 
@@ -47,17 +48,21 @@ the run output: it flags any kept function that calls an in-scope function that 
 wouldn't link). If a carved tree won't build, read the `verify` line first — a non-empty result points
 straight at the broken edge, and the run exits non-zero so it can gate CI.
 
+## `repro.graph.json` — the anonymized, safe-to-share bundle
+
+Written on every carve (no flag). It's the dependency graph the carve ran over, with **every symbol name
+and file path replaced by an opaque token** (`s0`, `f3.c`, …) that has no way back to the original — only
+the file *extension* is kept, because carve behavior depends on it. It carries no source, no real names,
+no paths: just the structure (nodes, edges, roots, and the set that was kept).
+
+This is the most useful artifact for "it kept/dropped the wrong thing" bugs **and the one you can send
+without any review** — a developer can replay reachability on the anonymized graph and reproduce your
+exact result on their machine, with none of your IP. (On a very large graph the bundle is skipped with a
+note in the output, to avoid a memory spike; a streaming writer that lifts that cap is queued.)
+
 ## Reporting a bug
 
 Include: what you ran (your `carve.toml` — it has no source in it), what you expected, what happened,
-and either the crash `.zip` or the relevant `codecarver/` artifacts. For a wrong keep/drop, the
-`decisions.txt` line for the symbol in question (plus its `--why` chain) is usually enough to reproduce.
-
-## Known gap — the anonymized share bundle
-
-An earlier build could emit `repro.graph.json`: the full dependency graph with **every symbol and path
-replaced by an opaque token** (no reverse mapping) — the ideal "safe to share, zero IP" artifact for
-reproducing a wrong keep/drop off-box. The engine that produces it still exists, but the lean CLI
-dropped the flag that requested it, so today the shareable artifacts are the name-bearing ones above.
-Re-exposing the anonymized bundle (as a `--diag` option or a config switch) is the open design item;
-until then, prefer the crash `.zip` (source-free) and redact names from `decisions.txt` before sharing.
+and `repro.graph.json` (anonymized) or, if you're fine sharing names, the relevant `codecarver/`
+artifacts. For a wrong keep/drop, the anonymized graph alone usually reproduces it; the `decisions.txt`
+line for the symbol in question (plus its `--why` chain) pins it down in your own names.

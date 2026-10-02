@@ -93,6 +93,15 @@ public sealed class CarveTomlRunTests
             Assert.Matches(@"CARVED\s+Function\s+never\b", text);
             // A kept non-root carries its provenance chain back toward the root.
             Assert.Contains("ROOT[", text);
+
+            // The anonymized repro graph ships by default too, and must leak no real names/paths.
+            var repro = Path.Combine(outDir, "codecarver", "repro.graph.json");
+            Assert.True(File.Exists(repro));
+            Assert.Contains("repro", o);                    // reported in the run output
+            var rtext = File.ReadAllText(repro);
+            Assert.DoesNotContain("main", rtext);           // real symbol names are tokenized away
+            Assert.DoesNotContain("helper", rtext);         // (file tokens keep only the extension, e.g. f0.c)
+            Assert.Contains("reproFormatVersion", rtext);   // it is the anonymized bundle
         }
         finally { Cleanup(work); }
     }
