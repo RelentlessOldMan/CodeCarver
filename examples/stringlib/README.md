@@ -24,8 +24,15 @@ chosen entry set reaches — dropping whole files, unused functions, *and* unuse
 
 A firmware that only ever encodes doesn't need the decoder or its 256-entry reverse table.
 
+```toml
+# carve.toml
+outputDirectory = "out/base64-encode"
+[common]
+entryPoints = ["sl_base64_encode"]
+carveSourceFileContents = true          # intra-file pruning (drop unused funcs + tables within kept files)
 ```
-carve src --roots sl_base64_encode --prune --out carved-base64-encode
+```
+carve src --config carve.toml           # -> out/base64-encode/carved/
 ```
 
 ```
@@ -45,8 +52,15 @@ What happened, visible in [`carved-base64-encode/`](carved-base64-encode):
 
 ## Scenario B — an input **sanitizer** (trim + upper-case)
 
+```toml
+# carve.toml  (same as above, different entryPoints + output)
+outputDirectory = "out/sanitize"
+[common]
+entryPoints = ["sl_trim", "sl_to_upper"]
+carveSourceFileContents = true
 ```
-carve src --roots sl_trim,sl_to_upper --prune --out carved-sanitize
+```
+carve src --config carve.toml           # -> out/sanitize/carved/
 ```
 
 ```
@@ -65,18 +79,19 @@ entirely; `case.c` is kept but **`sl_to_lower` is pruned** — you rooted `sl_to
 
 ```powershell
 # from the repo root, after `dotnet build CodeCarver.sln -c Release`
-dotnet run --project src/CodeCarver.Cli -- carve examples/stringlib/src --roots sl_base64_encode --prune --out /tmp/out
+dotnet run --project src/CodeCarver.Cli -- init carve.toml   # then set entryPoints + carveSourceFileContents as above
+dotnet run --project src/CodeCarver.Cli -- carve examples/stringlib/src --config carve.toml
 # then compile the result to prove it still builds:
-gcc -c /tmp/out/*.c -I/tmp/out
+gcc -c out/base64-encode/carved/*.c -Iout/base64-encode/carved
 ```
 
-Drop `--prune` for the sound file-level-only carve (keeps whole files, never rewrites them). Add
-`--why sl_base64_decode` to see why a symbol was kept or carved. Full options: [`../../docs/USAGE.md`](../../docs/USAGE.md).
+Set `carveSourceFileContents = false` for the sound file-level-only carve (keeps whole files, never rewrites
+them). Add `--why sl_base64_decode` to see why a symbol was kept or carved. Full options: [`../../docs/USAGE.md`](../../docs/USAGE.md).
 
 ## Notes
 
-- `--prune` (intra-file) is the aggressive tier — always build-verify the output, which is why the
-  checked-in trees here are compile-checked by the test suite.
+- Intra-file carving (`carveSourceFileContents = true`) is the aggressive tier — always build-verify the output,
+  which is why the checked-in trees here are compile-checked by the test suite.
 - A pruned definition's *own-line* trailing comment goes with it, but a comment on the line **above** a
   removed definition is left in place (CodeCarver never deletes standalone comment lines — they may be
   license headers or describe the next kept item).

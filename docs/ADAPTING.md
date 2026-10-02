@@ -74,24 +74,25 @@ permanent regression test.
 
 Given a profile, a session will typically:
 
-1. **Translate it to a `carve.toml`.** Inputs live in the config (`carve init carve.toml`); only
-   `roots`/`lang`/`out` have CLI twins. The profile maps directly:
+1. **Translate it to a `carve.toml`.** Everything lives in the config — the CLI is just
+   `carve <src> --config carve.toml [--stage <name>] [--why <sym>]` (`carve init carve.toml` writes an
+   annotated template). The profile maps directly:
 
    | Profile says | Becomes (config key) |
    |---|---|
-   | Entry points | `entryPoints = ["a","b","c"]` |
-   | Feature macros | `defines: ["X=1","Y"]` (or `buildLogs` / `probe`) |
-   | Language | `lang: "c"` \| `"cpp"` \| `"csharp"` \| `"cmm"` |
-   | Dirs to ignore | `exclude: ["tests","generated"]` |
-   | Complete macro set | `assumeDefinesComplete: true` |
-   | All of it | one `carve.json` (see `docs/USAGE.md`) |
+   | Entry points | `entryPoints = ["a","b","c"]` (in `[common]`) |
+   | Feature macros | prefer `[builds.main] buildLogs = ["build.log"]` or `compiler = "<cc>"`; manual override `defines = ["X=1","Y"]` |
+   | Language | `languages = ["c"]` \| `["cpp"]` \| `["c","cpp"]` (merged) \| `["csharp"]`. `.cmm` → `[runs.*] runTraceFiles`, not here |
+   | Dirs to ignore | `excludeDirectories = ["tests","generated"]` (in `[common]`) |
+   | Closed #ifdef world | auto-derived: any `buildLogs`/`compiler` ⇒ closed-world (dead branches dropped) |
+   | All of it | one `carve.toml` (see `docs/USAGE.md`) |
 
 2. **Find a public analogue** — an open-source repo with the same shapes — and add it to the corpus so
    the "compile everything" harness exercises it.
 3. **Add a regression** — turn each renamed snippet from #6 into a fixture the test suite keeps forever.
 4. **Harden** — run the carve + compile harness, fix anything the new shape exposes, lock it in.
 
-You get back: a `carve.json` for your codebase, plus a more robust tool — without any private code
+You get back: a `carve.toml` for your codebase, plus a more robust tool — without any private code
 leaving your side.
 
 ---

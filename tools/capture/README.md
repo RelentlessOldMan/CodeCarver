@@ -45,4 +45,5 @@ Needs `strace` (`apt-get install strace`). Run from the repo root so relative op
 ./capture-file-trace.sh run.trace --pid 1234
 ```
 
-Both formats (ProcMon CSV, strace) are auto-detected — no `fileTraceFormat` needed.
+Both formats (ProcMon CSV, strace) are auto-detected — no format configuration needed. Feed the output via
+`buildTraceFiles` / `runTraceFiles` in `carve.toml`.

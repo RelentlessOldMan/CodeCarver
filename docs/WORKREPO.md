@@ -128,7 +128,7 @@ carve <REPO> --config carve.toml      # with a [stages.prune] (carveSourceFileCo
 ```
 `verify` flags any **kept** function that calls an **in-scope dropped** function (that wouldn't link)
 and exits non-zero. Check it with file-level AND an intra-file stage. Every violation is a concrete bug — note the
-`caller -> callee` pair and run `--why <callee>`. Caveat learned the hard way: `--verify` only sees
+`caller -> callee` pair and run `--why <callee>`. Caveat learned the hard way: `verify` only sees
 call shapes the front-end recognizes, so it cannot catch a reference it never modeled — **§4 (build the
 image) is the authoritative test.**
 
@@ -137,40 +137,41 @@ image) is the authoritative test.**
 An `#ifdef`-heavy firmware tree carves *looser* than needed in open-world mode (unknown branches kept)
 and, more dangerously, can mismatch your build if it guesses. Pin the world to your actual build:
 
-- `buildLogs: ["make-n.log"]` — the exact `-D`/`-I`/`-isystem` flags your build uses (best). **A raw build
+All of these live under a `[builds.main]` section:
+- `buildLogs = ["make-n.log"]` — the exact `-D`/`-I`/`-isystem` flags your build uses (best). **A raw build
   stdout capture works too**: the scraper extracts the compile command lines and ignores the rest (warnings,
   echoes), so a `build-stdout.txt` is fine — no need to pre-filter it. **`buildLogs` is an array** — list the
-  written log AND the stdout capture (they often differ): `"buildLogs": ["make.log", "build-stdout.txt"]`.
-  CodeCarver unions the `-D`/`-I` from all; a named-but-missing log fails fast (or warns with
-  `ignoreMissingInputs`) rather than silently degrading the config.
-- or `defines: ["CHIP=X","FEATURE_Y"]` — the defines for **this** image variant.
-- or `probe: "arm-none-eabi-gcc"` — let CodeCarver ask the compiler for its predefined macros.
+  written log AND the stdout capture (they often differ): `buildLogs = ["make.log", "build-stdout.txt"]`.
+  CodeCarver unions the `-D`/`-I` from all; a named-but-missing log **fails fast** rather than silently
+  degrading the config.
+- or `defines = ["CHIP=X","FEATURE_Y"]` — the defines for **this** image variant (manual override).
+- or `compiler = "arm-none-eabi-gcc"` — let CodeCarver ask the compiler for its predefined macros.
 
-Match this to the variant you're carving (chip rev, app-vs-bootloader). Getting it right is both a
+Any of these ⇒ **closed-world** (dead `#ifdef` branches dropped); with none, the world is open (both branches
+kept). Match this to the variant you're carving (chip rev, app-vs-bootloader). Getting it right is both a
 tightness win (smaller image) and a soundness guard (no branch mismatch). See `docs/USAGE.md` §tightness.
 
-### 3b. Runtime trace (the tightest input) — `traces`
+### 3b. Runtime trace (the tightest input) — `runTraceLogs`
 
 If you have a **trace of the functions a real run executed** (name, and optionally `file:line`), it's a
-strong input CodeCarver takes (config key `traces: ["run.trace"]`). Two roles at once:
+strong input CodeCarver takes (config key `[runs.smoke] runTraceLogs = ["run.log"]`). Two roles at once:
 
 - **Roots** — every traced function is rooted, so the carve is guaranteed to keep what actually ran,
   *including the dynamic-dispatch / function-pointer edges static reachability can't see*.
 - **Soundness oracle** — a traced function that a plain carve *dropped* means the static analysis missed a
   real edge. On the real tree that's the highest-signal check short of building: carve with your normal
-  roots, then confirm every traced function is in the kept set (the manifest's `keptFiles` / `--dump-spans`).
+  roots, then confirm every traced function is in the kept set (the manifest's `keptFiles`).
 
-The trace format isn't fixed to your toolchain's yet, so extraction is a **configurable regex** —
-`traceFormat` (a regex with a named `(?<fn>...)` group, optional `(?<file>..)/(?<line>..)`). The default
-handles a bare `funcName` per line or `funcName file:line`. When your format lands, it's a `traceFormat`
-change, not a code change.
+The trace log uses **one standard format** — a function name per line, optionally `funcName file:line`.
+Write a small per-product converter from your tracer's output to that format (there's no regex knob).
 
-> **File-access traces** (`buildFileTraces` / `runFileTraces`) are the embedded companion to this: instead of
-> *which functions ran*, they capture *which files the OS opened* during a build / a flash-run. That's how you
-> pin the TRACE32 loader layer (`.cmm` scripts, loaded binaries, data) that no function trace can see. **Capture
-> the run trace with Process Monitor** while your TRACE32 flash/debug session runs (filter Path to the repo,
-> export CSV → `runFileTraces`), and the **build trace** with ProcMon (Windows) or `strace -f -e trace=openat`
-> (Linux) → `buildFileTraces`. Step-by-step recipes: `docs/USAGE.md` → *Capturing a file-access trace*.
+> **File-access traces** (`[builds.main] buildTraceFiles` / `[runs.smoke] runTraceFiles`) are the embedded
+> companion to this: instead of *which functions ran*, they capture *which files the OS opened* during a build /
+> a flash-run. That's how you pin the TRACE32 loader layer (`.cmm` scripts, loaded binaries, data) that no
+> function trace can see. **Capture the run trace with Process Monitor** while your TRACE32 flash/debug session
+> runs (filter Path to the repo, export CSV → `runTraceFiles`), and the **build trace** with ProcMon (Windows)
+> or `strace -f -e trace=openat` (Linux) → `buildTraceFiles`. Step-by-step recipes:
+> `docs/USAGE.md` → *Capturing a file-access trace*.
 
 ## 4. The authoritative test — build the carved image and compare size
 
@@ -189,10 +190,10 @@ Compare against the same `<BUILD>`/`<SIZE>` on the original tree:
   (vector entry, weak alias, `KEEP()` section, C++ constructor). Add it to `<ROOTS>` or file it.
 - **Boots but misbehaves** → an indirectly-referenced table/handler dropped. Rare (CodeCarver
   over-approximates function-pointer tables), but if it happens, capture the construct.
-- **Image size delta** → the payoff. Record before/after `<SIZE>`. Do a **file-level** run (omit
-  `--prune`) too: it should almost always build, and its size delta is your safe floor.
+- **Image size delta** → the payoff. Record before/after `<SIZE>`. Do a **file-level** run
+  (`carveSourceFileContents = false`) too: it should almost always build, and its size delta is your safe floor.
 
-Order of trust: **builds + boots + smaller** > builds > `--verify` clean. Only the first is the goal.
+Order of trust: **builds + boots + smaller** > builds > `verify` clean. Only the first is the goal.
 
 ## 5. If you have a Linux host (mini-PC / WSL) — the linker-map oracle
 
@@ -202,8 +203,8 @@ linker-kept function the carve dropped is a real soundness bug). This is how the
 template-call bugs were found. Tooling is committed and ready:
 
 - `wsl-map-oracle.sh` — linker-kept ⊆ carve-kept (C).
-- `wsl-cpp-oracle.sh` + `cpp-oracle-sweep.ps1` — link the carved C++ `--out` against a root-calling
-  driver (`oracle/*_driver.cpp`).
+- `wsl-cpp-oracle.sh` + `cpp-oracle-sweep.ps1` — link the carved C++ tree (`<outputDirectory>/carved`) against
+  a root-calling driver (`oracle/*_driver.cpp`).
 - `wsl-obj-oracle.sh` — single hot file, no full link: compile one source baseline-vs-carved and diff
   object symbols; flags any symbol defined in baseline but referenced-undefined in the carve (catches
   prototype-covered static drops). Ideal for a giant amalgamation-style `.c`.
@@ -231,11 +232,11 @@ class is worth a look on your own templates.
 ## 7. Triage (for anything that breaks)
 
 Capture: the **file** + first compiler-error lines; `--why <missing_symbol>` (was it CARVED, or kept
-with a chain to a root?); `--dump-spans | findstr <symbol>` (captured at all? right span?); the
+with a chain to a root?); check the manifest's kept/dropped lists (was it captured at all?); the
 **construct** that tripped it (macro/table/asm/`#if`/template); and a **minimal repro** if you can. A
-good report reads: *"carving `<REPO>` for roots `<X>` with `--prune`: `foo.c` fails — `get_bar`
-undeclared; `--why get_bar` says CARVED; it's called from a `FOO_TABLE(...)` macro at foo.c:120."*
-That's directly fixable as a front-end/emitter change with a regression test.
+good report reads: *"carving `<REPO>` for roots `<X>` with an intra-file stage (`carveSourceFileContents`):
+`foo.c` fails — `get_bar` undeclared; `--why get_bar` says CARVED; it's called from a `FOO_TABLE(...)` macro
+at foo.c:120."* That's directly fixable as a front-end/emitter change with a regression test.
 
 ## 8. Local vs network file-share differential (no toolchain needed)
 

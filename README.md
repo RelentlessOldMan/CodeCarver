@@ -17,14 +17,14 @@ minimal slice that still **builds, links, and runs**.
 
 > ⚠️ **WIP — not yet validated on a real-world production build.** The engine works and the carved
 > output compiles across 20+ open-source repos (below), but it hasn't been proven on a large
-> proprietary target yet. Treat `--prune` (intra-file) as experimental; file-level carving is the
-> sound default.
+> proprietary target yet. Treat intra-file carving (`carveSourceFileContents`) as experimental; file-level
+> carving is the sound default.
 >
 > Status: **working for C, C++, C#, and TRACE32 `.cmm`.** Tree-sitter front-end, deterministic reachability engine,
 > `#ifdef` resolution, build-log scraping, and an emitter that does both **file-level** and
 > **intra-file** carving (unused functions *and* data tables). Scales to **multi-GB auto-generated
 > headers** — files past `maxParseBytes` skip the parser and are kept whole via `#include`-closure,
-> so a 1.4 GB register header ingests in a second instead of exhausting memory; `pruneHeaders` then
+> so a 1.4 GB register header ingests in a second instead of exhausting memory; `carveHeaderFileContents` then
 > streams it down to just the `#define`s you transitively use (a 45 MB / 1M-define header → a few hundred
 > bytes, in one test). Carve → prune → **compile-clean** is
 > verified on 20+ real repos (cJSON, SQLite, Lua, zlib, mongoose, mimalloc, monocypher, tiny-regex-c,
@@ -84,8 +84,9 @@ metric and roots are ISRs/vector-table/exported API — use the tailored
 ## Carve something
 
 ```powershell
-dotnet run --project src/CodeCarver.Cli -- carve <dir> --roots foo,bar --prune --out out/
-dotnet run --project src/CodeCarver.Cli -- demo          # a narrated toy embedded carve
+dotnet run --project src/CodeCarver.Cli -- init carve.toml          # write an annotated config, then edit it
+dotnet run --project src/CodeCarver.Cli -- carve <dir> --config carve.toml
+dotnet run --project src/CodeCarver.Cli -- demo                     # a narrated toy embedded carve
 ```
 
 Full command/option reference — the tightness ladder, `#ifdef` resolution, build-log scraping, the
@@ -98,7 +99,7 @@ intra-file + table pruning on one small library).
 ```
 src/CodeCarver.Core       graph model · roots · reachability · #ifdef scanner · build-log scraper · emitter
 src/CodeCarver.Frontend   tree-sitter C/C++ extraction (calls, macros, globals, conservative edges)
-src/CodeCarver.Cli        the `carve` / `scan-log` / `demo` commands
+src/CodeCarver.Cli        the `carve` / `init` / `scan-log` / `demo` commands
 tests/CodeCarver.Tests    xUnit suite (fast) + build-verify (compiles carved output with gcc)
 docs/USAGE.md             how to use it        DESIGN.txt   architecture + rationale
 docs/TOOLING.md           toolchain adapters   docs/TESTING.md   test strategy
@@ -108,7 +109,7 @@ docs/WORKREPO.md          tailored runbook for a real firmware image (size metri
 presets/                  fill-in-the-blanks carve+build+size drivers (embedded-arm.example.ps1)
 differential-carve.ps1    carve same repo from two paths (local vs network share); assert identical
 release.ps1               package a versioned zip ONLY for a commit already pushed to origin
-wsl-*-oracle.sh           Linux soundness oracles: linker-map (C) · link carved --out (C++) · object-symbol
+wsl-*-oracle.sh           Linux soundness oracles: linker-map (C) · link carved tree (C++) · object-symbol
 tools/codespawner/        vendored CodeSpawner generator (exe + manifest-schema.md + GENERATOR_VERSION)
 carver-groundtruth-oracle.ps1  soundness+precision oracle: reads a CodeSpawner v1 manifest, carves, asserts kept ⊇ reachable + measures over-keep (scales to 100 GB)
 carve-build-report.ps1    carve every corpus repo, BUILD the carved output (host gcc + ARM ELF), size table

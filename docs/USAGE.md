@@ -170,12 +170,13 @@ path can't silently carve with less config than intended.
 Two optional inputs let an observed run tighten and audit the carve. Both **add** to the sound static carve —
 they never silently drop what they didn't see (a trace only proves what *that* run touched).
 
-- **Function trace** (config `traces: ["run.trace", ...]`, and `traceFormat` — a regex with a named `fn` group —
-  for a non-default format): the functions a run executed become roots, covering dynamic dispatch (function
-  pointers, vtables) static analysis over-approximates.
-- **File-access trace** (**config-only** — `buildFileTraces` / `runFileTraces`, and `fileTraceFormat` for an
-  unusual format): the **files the OS actually opened** under the repo. These are a set-once-per-repo input, so
-  they live in the `--config` file rather than adding command-line flags. Capture two ways and list both:
+- **Function trace** (config `[runs.smoke] runTraceLogs = ["run.log", ...]`): the functions a run executed become
+  roots, covering dynamic dispatch (function pointers, vtables) static analysis over-approximates. One standard
+  format — a function name per line, optionally `name file:line`; write a small per-product converter to it
+  (there's no regex knob).
+- **File-access trace** (config `[builds.main] buildTraceFiles` / `[runs.smoke] runTraceFiles`): the **files the OS
+  actually opened** under the repo. These are a set-once-per-repo input, so they live in the config. Capture two
+  ways and list both:
   - **build trace** — ProcMon/strace *while building* → the exact compile/link inputs.
   - **run trace** — ProcMon *while flashing/running* → the loader/orchestration layer (TRACE32 `.cmm` scripts,
     the binaries and data they load) that a function trace can't see and that static analysis can't resolve
@@ -183,8 +184,8 @@ they never silently drop what they didn't see (a trace only proves what *that* r
 
   Observed **code** files become roots (keep the file + its closure); every observed file is kept (never pruned as
   garbage), and the report tags observed infrastructure and flags the **kept-but-unobserved** files as drop
-  candidates. The reader is format-tolerant — ProcMon CSV, `strace -e trace=openat`, or a plain path-per-line list
-  all work; set `fileTraceFormat` only for an unusual format.
+  candidates. The reader **auto-detects** the format — ProcMon CSV, `strace -e trace=openat`, or a plain
+  path-per-line list all work; it extracts the path tokens and keeps only those under the carve root that exist.
 
   ```toml
   # in carve.toml
@@ -206,14 +207,14 @@ produce a clean list — a raw capture works. Any capture tool that records open
 1. Launch `Procmon.exe`. Press **Ctrl+E** to stop the initial capture, **Ctrl+X** to clear.
 2. **Ctrl+L** (Filter) → add `Path` **begins with** `C:\path\to\repo` → **Include** (optionally also `Operation` **is** `ReadFile` → Include, to shrink it). Apply.
 3. **Ctrl+E** to start capturing, then **run your TRACE32 flash/run session** end to end, then **Ctrl+E** to stop.
-4. **File → Save** → *Events displayed using current filter* → format **CSV** → `flash.csv`. Put it in `runFileTraces`.
+4. **File → Save** → *Events displayed using current filter* → format **CSV** → `flash.csv`. Put it in `runTraceFiles`.
 
 **Windows — the BUILD trace — ProcMon from the command line (scriptable):**
 ```
 Procmon.exe /AcceptEula /Quiet /Minimized /BackingFile C:\caps\build.pml
 <your build>                                   # e.g. make / cmake --build / the IDE build
 Procmon.exe /Terminate
-Procmon.exe /OpenLog C:\caps\build.pml /SaveAs C:\caps\build.csv   # -> buildFileTraces
+Procmon.exe /OpenLog C:\caps\build.pml /SaveAs C:\caps\build.csv   # -> buildTraceFiles
 ```
 (The same GUI steps as above also work for the build — just build instead of flashing between the Ctrl+E's.)
 
@@ -222,14 +223,14 @@ Procmon.exe /OpenLog C:\caps\build.pml /SaveAs C:\caps\build.csv   # -> buildFil
 strace -f -e trace=open,openat -o build.trace -- make <target>
 ```
 `-f` follows the compiler/sub-make forks; the reader parses strace's `openat(AT_FDCWD, "path", …)` lines directly,
-so `buildFileTraces: ["build.trace"]` just works. **Run it from the repo root** so relative opens resolve under the
+so `buildTraceFiles = ["build.trace"]` just works. **Run it from the repo root** so relative opens resolve under the
 carve root (absolute-path opens always resolve). `fatrace -c` or a `bpftrace` openat probe work too. A build on
 Linux targeting embedded is the usual case; a Windows build is the ProcMon recipe above.
 
 **Linux — the RUN trace — strace (if you launch the run) or fatrace (if you don't):**
 ```
 # a) you start the run/loader yourself:
-strace -f -e trace=open,openat -o run.trace -- ./run-or-flash-tool <args>     # -> runFileTraces
+strace -f -e trace=open,openat -o run.trace -- ./run-or-flash-tool <args>     # -> runTraceFiles
 
 # b) the run is launched by something you don't control (daemon/debugger) — attach by PID:
 strace -f -p <pid> -e trace=open,openat -o run.trace                          # Ctrl+C to stop
@@ -237,11 +238,14 @@ strace -f -p <pid> -e trace=open,openat -o run.trace                          # 
 # c) system-wide during the run window (no PID needed), with fatrace:
 fatrace > run.fatrace        # run the session, then Ctrl+C
 ```
-strace options (a)/(b) use quoted paths, so they feed `runFileTraces` as-is. `fatrace` lines look like
-`comm(pid): R /abs/path`, so set a format regex that grabs from the first slash to end of line:
-`"fileTraceFormat": "(?<path>/.*)$"`. (On a desktop/host
-build the "run" is just your program; for embedded-on-hardware the loader runs on the *host*, so trace the host
-loader process — same recipe.)
+strace options (a)/(b) use quoted paths, so they feed `runTraceFiles` as-is. `fatrace` lines look like
+`comm(pid): R /abs/path` (the path is **not** quoted), so reduce them to a plain path-per-line list first —
+the reader auto-detects that:
+```
+awk '{print $NF}' run.fatrace > run.trace     # -> runTraceFiles = ["run.trace"]
+```
+(On a desktop/host build the "run" is just your program; for embedded-on-hardware the loader runs on the *host*,
+so trace the host loader process — same recipe.)
 
 > Not a function trace — these record *files*, which is the whole point: they catch the orchestration + data layer
 > a function trace can't see. Over-capturing (writes, directory scans, un-exercised paths) is harmless: it only
