@@ -984,6 +984,7 @@ public static class CarveCommand
             };
             WriteArtifact(Path.Combine(ccDir, "manifest.json"),
                 System.Text.Json.JsonSerializer.Serialize(m, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), "manifest");
+            WriteArtifact(Path.Combine(ccDir, "decisions.txt"), DecisionsReport.Render(graph, plan, ""), "decisions");
             Mark("analyze");
             diag.Set("analysisOnly", true);
             diag.Set("totalNodes", s.TotalNodes); diag.Set("keptFiles", s.KeptFiles); diag.Set("droppedFiles", s.DroppedFiles);
@@ -1086,6 +1087,7 @@ public static class CarveCommand
                 $"# CodeCarver resolved config — stage '{stage.Name}'\n# {cv.WorldReason}\n"
                 + $"# entryPoints={roots.Length}  languages={string.Join(",", cv.Languages)}  buildLogs={buildLogs.Count}  "
                 + $"runTraceFiles={runFileTraces.Count}  runTraceLogs={traceList.Count}\n\n{configText}", "config");
+            WriteArtifact(Path.Combine(ccDir, "decisions.txt"), DecisionsReport.Render(graph, plan, stage.Name), "decisions");
         }
         Mark("emit");
 

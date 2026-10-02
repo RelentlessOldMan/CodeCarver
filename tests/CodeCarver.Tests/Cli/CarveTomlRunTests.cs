@@ -70,6 +70,34 @@ public sealed class CarveTomlRunTests
     }
 
     [Fact]
+    public void Carve_WritesDecisionsLedger_PerSymbolKeepDrop()
+    {
+        var (work, src, outDir) = NewWork();
+        BasicTree(src);
+        try
+        {
+            var cfg = Config(work, outDir, "[common]\nentryPoints = [\"main\"]\n");
+            var (code, o, _) = Run("carve", src, "--config", cfg);
+            Assert.Equal(0, code);
+
+            var decisions = Path.Combine(outDir, "codecarver", "decisions.txt");
+            Assert.True(File.Exists(decisions));                 // always written, no flag
+            Assert.Contains("decisions:", o.Replace(" ", ""));   // reported in the run output
+            var text = File.ReadAllText(decisions);
+
+            // main + helper are reachable; never() is not. Each symbol gets a verdict line.
+            Assert.Contains("KEPT", text);
+            Assert.Contains("CARVED", text);
+            Assert.Matches(@"KEPT\s+Function\s+main\b", text);
+            Assert.Matches(@"KEPT\s+Function\s+helper\b", text);
+            Assert.Matches(@"CARVED\s+Function\s+never\b", text);
+            // A kept non-root carries its provenance chain back toward the root.
+            Assert.Contains("ROOT[", text);
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
     public void Carve_AutoExcludesGit_ForceKeepUndrops()
     {
         var (work, src, outDir) = NewWork();
