@@ -70,21 +70,25 @@ public sealed class CmmFrontEnd : ICarveFrontEnd
         // DO resolution with diagnostics (Finding B): dynamic &var paths can't be resolved; a missing
         // basename resolves to nothing; a duplicate basename is ambiguous. All were previously silent —
         // the "100% smaller" trap. Warn, and bind ambiguous DOs deterministically to the first match.
+        // De-dup identical warnings: a real script DOs the same helper many times (observed on real TRACE32
+        // trees — one file `DO std_utils` ~13x), and N copies of the same line is noise, not signal.
+        var warned = new HashSet<string>(StringComparer.Ordinal);
+        void Warn(string m) { if (warned.Add(m)) _warnings.Add(m); }
         foreach (var (from, fromPath, rawArg) in pendingIncludes)
         {
             if (rawArg.Contains('&'))
             {
-                _warnings.Add($"{fromPath}: `DO {rawArg}` uses a variable path (dynamic dispatch) — unresolved; scripts reached only this way may be wrongly dropped (prefer file-level carve here)");
+                Warn($"{fromPath}: `DO {rawArg}` uses a variable path (dynamic dispatch) — unresolved; scripts reached only this way may be wrongly dropped (prefer file-level carve here)");
                 continue;
             }
             var stem = Stem(rawArg);
             if (!filesByStem.TryGetValue(stem, out var targets) || targets.Count == 0)
             {
-                _warnings.Add($"{fromPath}: `DO {rawArg}` — no '{stem}.cmm' among the carved inputs; target unresolved (outside the carve root?)");
+                Warn($"{fromPath}: `DO {rawArg}` — no '{stem}.cmm' among the carved inputs; target unresolved (outside the carve root?)");
                 continue;
             }
             if (targets.Count > 1)
-                _warnings.Add($"{fromPath}: `DO {rawArg}` — ambiguous basename '{stem}' matches {targets.Count} files; bound to the first");
+                Warn($"{fromPath}: `DO {rawArg}` — ambiguous basename '{stem}' matches {targets.Count} files; bound to the first");
             if (!targets[0].Equals(from)) graph.AddEdge(from, targets[0], EdgeKind.Includes);
         }
 

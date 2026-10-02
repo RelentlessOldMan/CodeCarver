@@ -107,6 +107,16 @@ public class CmmFrontEndTests
         Assert.DoesNotContain(fe.Warnings, w => w.Contains("worker")); // the one clean DO is silent
     }
 
+    [Fact]
+    public void RepeatedDoOfSameMissingTarget_WarnsOnce()
+    {
+        // Real TRACE32 scripts DO the same helper many times (observed on the real .cmm corpus: one file
+        // `DO std_utils` ~13x). Identical warnings must be de-duplicated — N copies buries the real signal.
+        using var fe = new CmmFrontEnd();
+        fe.BuildGraph(new[] { ("main.cmm", "Main:\n  DO std_utils\n  DO std_utils\n  DO std_utils\n  RETURN\n") });
+        Assert.Equal(1, fe.Warnings.Count(w => w.Contains("std_utils")));
+    }
+
     private static NodeId Find(CodeGraph graph, string name) =>
         graph.Nodes.First(n => n.Kind == NodeKind.Function && n.Name == name).Id;
 }
