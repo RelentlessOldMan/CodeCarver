@@ -5,67 +5,70 @@ flashed to many identical chips over a TRACE32 flow, where **image size is the h
 is the "point a local session at it" doc — narrower and more opinionated than `docs/SHAKEDOWN.md`
 (which is the general bug-hunting runbook). Fill in the blanks, work top-to-bottom.
 
-The one invariant: **a carve must still build and still boot.** File-level carving (no `--prune`) is
-the sound default; `--prune` (intra-file) is the aggressive tier where the size win — and the bugs —
+The one invariant: **a carve must still build and still boot.** File-level carving is the sound default;
+intra-file carving (`carveSourceFileContents`) is the aggressive tier where the size win — and the bugs —
 live. Never trade soundness for size: when unsure, CodeCarver keeps more, and so should you.
 
 ---
 
 ## Quick start — the first buildable carve (do this first)
 
-**Inputs live in a config file.** Generate the annotated template once, fill in what you have, and the
-command line stays short (`--config` + a couple of operational flags). `--out` is a **complete buildable
-project** (keep-by-default: reachable code + its include closure + *every* non-code file — Makefiles, linker
-scripts, startup asm, data, configs — passed through verbatim; the only omissions are code the carve proved
-dead, and garbage like `.git`). So there's no scaffolding to hand-copy — carve, then build the `--out` dir.
+**Everything lives in one TOML config; the command line is just `carve <dir> --config carve.toml`.** The output
+is a **complete buildable project** (keep-by-default: reachable code + its include closure + *every* non-code
+file — Makefiles, linker scripts, startup asm, data, configs — passed through verbatim; the only omissions are
+code the carve proved dead and auto-excluded junk like `.git`). No scaffolding to hand-copy — carve, then build
+`<outputDirectory>/carved`.
 
 **Step 0 — make the config (once):**
 ```
-carve emit-config carve.json
+carve init carve.toml
 ```
-Then edit `carve.json` — at minimum `roots`, `lang`, `exclude`, and `buildLogs`:
-- `buildLogs` — a real `make -n` of THIS image (and the build's console capture). Pins the exact `-D`/`-I`
-  so the carve's `#ifdef` view matches the compiler's. **The single most important input**; without it the
-  config is guessing. List both the written log and the stdout capture — they often differ.
-- `exclude` — dirs NOT in this image (tests, host tools, **other board/chip variants**, bootloader-vs-app).
-- `roots`/`lang` can go in the config too, or stay on the CLI (below). CLI overrides the config.
+Then edit `carve.toml` — at minimum `outputDirectory`, `[common].entryPoints`, and (best) `[builds.main].buildLogs`:
+```toml
+outputDirectory = "D:/carved/myimage"     # OUTSIDE the source tree
+[common]
+entryPoints = ["main","Reset_Handler"]    # ISRs, main, exported API — see Roots below (this is the whole game)
+languages   = ["c"]                        # or ["c","cpp"]
+excludeDirectories = ["tests","boards/other"]   # dirs NOT in this image (variants, host tools)
+[builds.main]
+buildLogs = ["make-n.log","build.console.txt"]  # a real `make -n` of THIS image. Pins -D/-I so #ifdefs match.
+```
+`buildLogs` is **the single most important input** — without it the `#ifdef` world is open (keeps both branches).
 
-**Pass 1 — dry run (analysis only, seconds, zero risk):**
+**Pass 1 — dry run (analysis only, seconds, zero risk):** add `analysisOnly = true` to the top of the config, then:
 ```
-carve <REPO>\<image-subtree> --config carve.json --strict-roots --report r.txt
+carve <REPO>\<image-subtree> --config carve.toml
 ```
-- `--strict-roots` — a typo'd/renamed root fails the run loudly instead of silently carving it away.
-- Read `r.txt` (the report): confirm **nothing load-bearing is under "REMOVED — dead code"**, eyeball the
-  role-grouped "KEPT — infrastructure" bucket, and check "REMOVED — garbage". This is size-by-category
-  (code vs dead vs infra vs garbage), per file.
+- A missing named entry point **fails the run**; the compiler-free soundness check runs automatically (`verify` line).
+- Read `<outputDirectory>/codecarver/report.txt`: confirm **nothing load-bearing is under "REMOVED — dead code"**,
+  eyeball the role-grouped "KEPT — infrastructure" bucket, and "REMOVED — auto-excluded". Size-by-category, per file.
 
-**Pass 2 — real carve + build:**
+**Pass 2 — real carve + build:** remove `analysisOnly` (and add `[stages]` if you want tiers), then:
 ```
-carve <REPO>\<image-subtree> --config carve.json --strict-roots --out out\ --report r.txt --manifest m.json
-<BUILD>   pointed at out\      # your real toolchain / TRACE32 flow
-<SIZE>    on out\ vs the original
+carve <REPO>\<image-subtree> --config carve.toml
+<BUILD>   pointed at  <outputDirectory>\carved      # (or \<stage>\carved) — your toolchain / TRACE32 flow
+<SIZE>    on the carved tree vs the original
 ```
-- **File-level (NO `--prune`)** — the safe floor. Prove it *builds+boots* first; tighten with `prune` in the
-  config only once file-level is green. Start with **one image/subtree**, not the whole repo.
-- `--out` must be a fresh dir OUTSIDE the tree.
+- **File-level (`carveSourceFileContents = false`)** is the safe floor. Prove it *builds+boots* first; tighten
+  with a `[stages.prune]` (`carveSourceFileContents = true`) only once file-level is green. Start with **one
+  image/subtree**, not the whole repo.
 
-**Bring back (source stays on the box — all of this is source-free):** the counts + before/after `<SIZE>`
-from `r.txt`; on any failure, `--diag <zip>` (or `--diag-repro` for a replayable anonymized graph). The
-likely first hiccup is a **linker `undefined reference`** — that's the valuable signal (an edge static
-analysis missed: a symbol reached only via a macro, inline asm, or an unresolved table). Send the symbol
-name (or the repro) and it's directly diagnosable.
+**Bring back (source stays on the box — all source-free):** the counts + before/after `<SIZE>` from `report.txt`;
+on any failure a source-free diagnostic `.zip` is **auto-written** (path printed). The likely first hiccup is a
+**linker `undefined reference`** — the valuable signal (an edge static analysis missed: a symbol reached only via
+a macro, inline asm, or an unresolved table). Send the symbol name and it's directly diagnosable.
 
 The rest of this doc is the deeper runbook (roots enumeration, soundness gates, hammering matrix, oracles).
 
-Fill these in once (CLI blanks + `carve.json` keys):
+Fill these in once (`carve.toml` keys):
 
-| blank / key | what it is | how to find it |
+| key | what it is | how to find it |
 |---|---|---|
-| `<REPO>` (CLI) | firmware source root | — |
-| `roots` (config) | entry symbols the image truly needs | see **Roots** below — this is the whole game |
-| `lang` (config) | `c` or `cpp` | `cpp` if any `.cpp/.cc/.hpp` in the build |
-| `exclude` (config) | dirs NOT in this image | tests, host tools, **other board/chip variants**, bootloader-vs-app |
-| `aux` (config) | *(usually unneeded)* force-copy a file from an `exclude`'d dir or the garbage set | keep-by-default already passes through ALL non-code files |
+| `outputDirectory` | where output goes (OUTSIDE the source tree) | — |
+| `entryPoints` | entry symbols the image truly needs | see **Roots** below — this is the whole game |
+| `languages` | `["c"]` or `["c","cpp"]` | `cpp` if any `.cpp/.cc/.hpp` in the build |
+| `excludeDirectories` | dirs NOT in this image | tests, host tools, **other board/chip variants**, bootloader-vs-app |
+| `forceKeepFiles` | *(usually unneeded)* globs to keep from an excluded dir or the auto-excluded set | keep-by-default already passes through ALL non-code files |
 | `<BUILD>` | your real build command | the make/cmake/TRACE32 invocation that produces the image |
 | `<SIZE>` | image-size probe | `arm-none-eabi-size`, or `.bin` byte count |
 
@@ -92,39 +95,39 @@ wrong. Enumerate:
 > Rule of thumb: if dropping it would leave the chip unable to boot, respond to an interrupt, or answer
 > a command you poke over TRACE32 — it's a root.
 
-**Guard the list with `--strict-roots`.** Because the root set is long and hand-maintained, a single
-typo'd ISR/API name would otherwise carve that symbol away silently and look like a *cleaner* result
-(bigger size win). CodeCarver warns per unresolved root and flags them on the `roots` summary line;
-`--strict-roots` turns any unresolved root into a non-zero exit. Use it in CI / the preset so a typo
-fails loudly instead of shipping a broken image. If a name is legitimately absent for this variant
-(defined only under a different `#ifdef`, or in an excluded board dir), fix the name/exclude — don't
-drop the flag.
+> Rule of thumb: if dropping it would leave the chip unable to boot, respond to an interrupt, or answer
+> a command you poke over TRACE32 — it's a root.
+
+**A missing entry point always fails the run.** Because the root set is long and hand-maintained, a single
+typo'd ISR/API name would otherwise carve that symbol away silently and look like a *cleaner* result (bigger
+size win). So a named `entryPoints` that resolves to nothing is a **hard failure** (non-zero exit) — no flag
+needed. If a name is legitimately absent for this variant (defined only under a different `#ifdef`, or in an
+excluded board dir), fix the name / `excludeDirectories`.
 
 ## 1. Smoke test (analysis only, no write)
 
+Set `analysisOnly = true` at the top of `carve.toml`, then:
 ```
-carve <REPO> --config carve.json
+carve <REPO> --config carve.toml
 ```
-(`roots`, `lang`, `exclude`, `aux` live in `carve.json` — step 0.)
 
 Read the summary hard:
 - `roots` / `implicit:` / `asm:` / `section:` — do the implicit counts match reality? (see Roots).
 - `none of the requested roots were found` → a macro-defined signature or namespace-macro file the
-  front-end didn't capture. `--dump-spans | findstr <sym>` to confirm; if truly missing it's a bug —
-  capture the definition's exact text and file it (see `docs/SHAKEDOWN.md` §6).
+  front-end didn't capture. `--why <sym>` to confirm; if truly missing it's a bug — capture the
+  definition's exact text and file it (see `docs/SHAKEDOWN.md` §6).
 - `0 files kept` / `100% smaller` with lots of `warn:` → the "silently resolved nothing" trap; your
   roots didn't anchor anything. Fix roots before going further.
 - A crash/stack trace → always a bug (the tool warns-and-skips, never throws). Capture it.
 
 ## 2. Compiler-free soundness gate
 
+The soundness check runs on **every** carve (no flag) — just look at the `verify` line:
 ```
-carve <REPO> --config carve.json --prune --verify
+carve <REPO> --config carve.toml      # with a [stages.prune] (carveSourceFileContents = true) to stress intra-file
 ```
-(`--prune` and `--verify` stay CLI toggles; inputs come from the config.)
-
-`--verify` flags any **kept** function that calls an **in-scope dropped** function (that wouldn't link)
-and exits non-zero. Run with and without `--prune`. Every violation is a concrete bug — note the
+`verify` flags any **kept** function that calls an **in-scope dropped** function (that wouldn't link)
+and exits non-zero. Check it with file-level AND an intra-file stage. Every violation is a concrete bug — note the
 `caller -> callee` pair and run `--why <callee>`. Caveat learned the hard way: `--verify` only sees
 call shapes the front-end recognizes, so it cannot catch a reference it never modeled — **§4 (build the
 image) is the authoritative test.**
@@ -172,10 +175,10 @@ change, not a code change.
 ## 4. The authoritative test — build the carved image and compare size
 
 ```
-# File-level FIRST (the safe floor — should build+boot). Add --prune only after this is green.
-carve <REPO> --config carve.json --out out/ --report r.txt --manifest m.json
-# then build out/ with YOUR toolchain / TRACE32 flow:
-<BUILD>            # pointed at out/  (keep-by-default already copied all build scaffolding)
+# File-level FIRST (the safe floor — should build+boot). Add a [stages.prune] only after this is green.
+carve <REPO> --config carve.toml
+# then build the carved tree with YOUR toolchain / TRACE32 flow:
+<BUILD>            # pointed at <outputDirectory>\carved  (keep-by-default already copied all build scaffolding)
 <SIZE>             # image size of the carved build
 ```
 
@@ -210,11 +213,11 @@ See `docs/SHAKEDOWN.md` §5b for the caveats.
 
 ## 6. Systematic hammering (vary one axis, re-run §2 + §4)
 
-| axis | values |
+| axis | values (all config keys) |
 |---|---|
-| roots | full entry set · ISR-only · one exported API · bootloader vs app |
-| prune | *(off — file level, the safe floor)* · `--prune` · `--prune` + `pruneHeaders` (config) |
-| config | `buildLogs` (best) · `defines` for the variant · `probe` |
+| entryPoints | full entry set · ISR-only · one exported API · bootloader vs app |
+| granularity | file-level (floor) · `carveSourceFileContents` · + `carveHeaderFileContents` (use `[stages]`) |
+| config | `buildLogs` (best) · `defines` for the variant · `compiler` (probe) |
 | exclude | none · tests/tools · **other chip/board variant** (stops name-collision over-keep) |
 | variant | each of the 24 targets' build config, if they differ |
 
