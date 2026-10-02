@@ -199,8 +199,9 @@ public static class ConfigLoader
         entryPoints = ["main", "Reset_Handler"]
         # entryPointsFile = "roots.txt"   # alternative: one symbol per line (for long curated lists)
 
-        # The linked code to carve: "c", "cpp", "csharp" (mixing allowed). asm (.s) is auto-scanned for roots;
-        # .cmm is handled via run traces, not here.
+        # The linked code to carve: "c", "cpp", "csharp". A mixed C+C++ tree -> ["c","cpp"] carves both into ONE
+        # graph (reachability crosses the C/C++ boundary). "csharp" is its own graph — run it as a separate carve.
+        # asm (.s) is auto-scanned for roots; .cmm is handled via run traces, not here.
         languages = ["c"]
 
         excludeDirectories = ["tests", "other_board"]   # dirs NOT in this image (variants, host tools, tests)

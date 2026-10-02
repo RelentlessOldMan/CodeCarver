@@ -125,10 +125,15 @@ public static class CarveCommand
 
         // Resolved config -> engine inputs.
         var roots = cv.EntryPoints.ToArray();
-        var lang = cv.Languages[0];
+        // Effective carve grammar. A mixed C+C++ tree is carved as ONE graph using the C++ grammar: it is a
+        // superset of C, so plain-C files parse under it (any C-not-C++ region degrades to keep-whole — sound),
+        // and both languages' symbols/calls land in a single graph so reachability crosses the C/C++ boundary
+        // (a C root reaching a C++ `extern "C"` callee, and vice versa). The resolver already guarantees a
+        // multi-language set is the C family only.
+        var lang = cv.Languages.Contains("cpp") ? "cpp" : cv.Languages[0];
         if (cv.Languages.Count > 1)
-            err.WriteLine($"  note    : languages [{string.Join(", ", cv.Languages)}] given; carving '{lang}' this build "
-                + "(C+C++ single-graph merge is a later phase).");
+            err.WriteLine($"  note    : languages [{string.Join(", ", cv.Languages)}] -> one graph via the C++ grammar "
+                + "(superset of C); reachability crosses the C/C++ boundary.");
         var defineSpecs = cv.Defines.ToList();
         var buildLogs = cv.BuildLogs.ToList();
         var closedWorld = cv.ClosedWorld;
@@ -352,13 +357,18 @@ public static class CarveCommand
             defines = haveDefines ? BuildTable(new List<string>(), new List<string>()) : null; // probe/manual only, or none
         }
 
-        var exts = lang switch
+        static string[] ExtsFor(string l) => l switch
         {
             "cpp" => new[] { ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h" },
             "csharp" or "cs" => new[] { ".cs" },
             "cmm" => new[] { ".cmm" },
             _ => new[] { ".c", ".h" },
         };
+        // A mixed C+C++ carve scans the UNION of both families' extensions (so the C++-grammar front-end sees the
+        // .c files too); a single-language carve just uses that language's extensions.
+        var exts = cv.Languages.Count > 1
+            ? cv.Languages.SelectMany(ExtsFor).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+            : ExtsFor(lang);
 
         // Intra-file pruning is only compile-verifiable for C/C++; other languages carve file-level.
         if (prune && lang is not ("c" or "cpp"))

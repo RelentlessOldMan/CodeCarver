@@ -76,6 +76,16 @@ public static class CarveResolver
         foreach (var l in r.Languages)
             if (!knownLangs.Contains(l))
                 errors.Add($"languages: '{l}' is not supported (use c, cpp, csharp). .cmm is handled via run traces, not here.");
+        // Multi-language carves merge into ONE graph, which only works for the C family (the C++ grammar is a
+        // superset of C, so both parse together). C# has its own graph shape and can't be merged — run it separately.
+        if (r.Languages.Count > 1)
+        {
+            var family = new[] { "c", "cpp" };
+            var outside = r.Languages.Where(l => !family.Contains(l)).ToList();
+            if (outside.Count > 0)
+                errors.Add($"languages: multiple languages can only be merged for the C family (c + cpp). "
+                    + $"Cannot merge {string.Join(", ", outside)} into the same graph — run a separate carve for those.");
+        }
 
         r.ExcludeDirectories = cfg.Common.ExcludeDirectories.ToList();
         r.ForceKeepFiles = cfg.Common.ForceKeepFiles.ToList();

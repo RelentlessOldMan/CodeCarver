@@ -90,7 +90,7 @@ The command line is tiny — everything else lives in the config:
 | Key | Effect |
 |---|---|
 | `entryPoints = ["main","Reset_Handler"]` | the symbols to keep — a missing named one **fails** the run. Or `entryPointsFile = "roots.txt"` (one per line) for a long list. |
-| `languages = ["c","cpp"]` | source languages (`c`/`cpp`/`csharp`). asm is auto-scanned for roots; `.cmm` is handled via run traces. |
+| `languages = ["c","cpp"]` | source languages (`c`/`cpp`/`csharp`). A mixed `["c","cpp"]` tree is carved as **one graph** (reachability crosses the C/C++ boundary — a C root reaching an `extern "C"` C++ callee is kept). `csharp` is a separate graph — carve it on its own. asm is auto-scanned for roots; `.cmm` is handled via run traces. |
 | `excludeDirectories = ["tests","boards/old"]` | directories to drop (tests, other board/arch variants). Nested paths OK. |
 | `forceKeepFiles = ["prebuilt/*.a"]` | globs to **always** keep (even under an excluded dir or auto-excluded as a non-input) |
 | `carveSourceFileContents`, `carveHeaderFileContents` | the two aggressiveness toggles (above) |

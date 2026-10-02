@@ -259,6 +259,49 @@ public sealed class CarveTomlRunTests
     }
 
     [Fact]
+    public void Carve_MixedCAndCpp_OneGraph_CrossesLanguageBoundary()
+    {
+        // Phase 4: languages = ["c","cpp"] carves both families into ONE graph via the C++ grammar. A C root
+        // (main, in a .c) reaches a C++ `extern "C"` function (in a .cpp), which reaches a C++-only helper —
+        // all kept. A dead C++ class is dropped. This proves reachability crosses the C/C++ boundary.
+        var (work, src, outDir) = NewWork();
+        File.WriteAllText(Path.Combine(src, "main.c"),
+            "int cpp_api(int);\nint main(void){return cpp_api(3);}\n");
+        File.WriteAllText(Path.Combine(src, "engine.cpp"), """
+            static int cpp_helper(int x){ return x * 2; }
+            extern "C" int cpp_api(int x){ return cpp_helper(x); }
+            struct Unused { int dead() const { return 9; } };
+            """);
+        try
+        {
+            var cfg = Config(work, outDir, "[common]\nentryPoints = [\"main\"]\nlanguages = [\"c\",\"cpp\"]\n");
+            var (code, o, err) = Run("carve", src, "--config", cfg);
+            Assert.Equal(0, code);
+            Assert.Contains("one graph via the C++ grammar", err);                  // the merge note (stderr)
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", "main.c")));     // C root
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", "engine.cpp"))); // reached across the boundary
+            Assert.Contains("verify  : OK", o);
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Carve_MixedCFamily_WithCSharp_Rejected()
+    {
+        // C# has its own graph shape and can't be merged into the C-family graph — the resolver must reject it.
+        var (work, src, outDir) = NewWork();
+        BasicTree(src);
+        try
+        {
+            var cfg = Config(work, outDir, "[common]\nentryPoints = [\"main\"]\nlanguages = [\"c\",\"csharp\"]\n");
+            var (code, _, err) = Run("carve", src, "--config", cfg);
+            Assert.Equal(2, code);
+            Assert.Contains("C family", err);
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
     public void Carve_ExcludeDirectories_DropsThatTree()
     {
         var (work, src, outDir) = NewWork();
