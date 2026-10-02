@@ -34,7 +34,7 @@ These are the regressions behind every fix — e.g. `Cpp_ControlFlowMacro_TryCat
 ## 3. Hunt (the bug-finding loop)
 
 `fuzz.ps1` is the exact loop that found the fmt / simdjson / pugixml / wren / janet / capstone bugs:
-baseline-compile every source **uncarved**, carve `--prune --out`, recompile the carved output. A file
+baseline-compile every source **uncarved**, carve (intra-file) to the output tree, recompile it. A file
 that compiled before but fails after is a carve bug (dropped symbol, shattered class, orphaned brace).
 
 ```powershell

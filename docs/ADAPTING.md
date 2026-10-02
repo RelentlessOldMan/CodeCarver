@@ -74,12 +74,12 @@ permanent regression test.
 
 Given a profile, a session will typically:
 
-1. **Translate it to a `carve.json`.** Inputs live in the config (`carve emit-config carve.json`); only
+1. **Translate it to a `carve.toml`.** Inputs live in the config (`carve init carve.toml`); only
    `roots`/`lang`/`out` have CLI twins. The profile maps directly:
 
    | Profile says | Becomes (config key) |
    |---|---|
-   | Entry points | `roots: ["a","b","c"]` (or `--roots a,b,c`) |
+   | Entry points | `entryPoints = ["a","b","c"]` |
    | Feature macros | `defines: ["X=1","Y"]` (or `buildLogs` / `probe`) |
    | Language | `lang: "c"` \| `"cpp"` \| `"csharp"` \| `"cmm"` |
    | Dirs to ignore | `exclude: ["tests","generated"]` |

@@ -25,11 +25,10 @@ commit is stamped into the build, so cite this exact string in any report (it al
 summary and is written to each `--manifest` as `codecarverVersion`). `-dirty` means the built tree had
 uncommitted changes; a clean pulled build won't show it. Rebuild after a `git pull` so the stamp updates.
 
-Inputs live in a `--config` file (`carve emit-config carve.json` writes an annotated template); the CLI
-carries only operational flags. Pick your inputs:
-- **roots** — the entry symbols a build actually needs (ISRs, `main`, exported API, task entry points).
-- **lang** — `c` or `cpp` (default `c`). (CLI `--roots`/`--lang` also work and override the config.)
-- **exclude** (config) — test/vendor/third-party dirs, and any *other* build variant (e.g. a second board's
+Inputs live in a TOML `--config` file (`carve init carve.toml` writes an annotated template). Pick your inputs:
+- **entryPoints** — the entry symbols a build actually needs (ISRs, `main`, exported API, task entry points).
+- **languages** — `["c"]` or `["c","cpp"]`.
+- **excludeDirectories** — test/vendor/third-party dirs, and any *other* build variant (e.g. a second board's
   startup) so name collisions don't over-keep.
 
 ---
@@ -37,14 +36,14 @@ carries only operational flags. Pick your inputs:
 ## 1. Smoke test
 
 ```
-carve emit-config carve.json   # then fill in roots, lang, exclude: ["tests","vendor"], ...
-carve <repo> --config carve.json
+carve init carve.toml          # then fill in entryPoints, languages, excludeDirectories, analysisOnly=true
+carve <repo> --config carve.toml
 ```
 
-Expect a summary: `roots`, `nodes`, `files`, `size`, and `implicit:`/`asm:`/`section:` lines for
-auto-kept embedded roots. **Red flags right here:**
+Expect a summary: `roots`, `nodes`, `files`, `size`, `verify`, `world`, and `implicit:`/`asm:`/`section:`
+lines for auto-kept embedded roots. **Red flags right here:**
 - `none of the requested roots were found` → the front-end didn't capture your entry symbols. Try
-  `--dump-spans | grep <sym>`. If it's a macro-defined signature or a namespace-macro file, that's a
+  `--why <sym>`. If it's a macro-defined signature or a namespace-macro file, that's a
   real bug — capture the definition's exact text.
 - `0 files kept` / `100% smaller` with lots of `warn:` lines → the "silently resolved nothing" trap.
 - A crash / stack trace → always a bug (the tool is supposed to warn-and-skip, never throw). Capture it.
@@ -52,20 +51,21 @@ auto-kept embedded roots. **Red flags right here:**
 ## 2. The soundness loop (no compiler needed)
 
 ```
-carve <repo> --config carve.json --prune --verify
+carve <repo> --config carve.toml      # with a [stages.prune] (carveSourceFileContents = true)
 ```
 
-`--verify` is a compiler-free gate: it flags any **kept** function that calls an **in-scope** function
-the carve dropped (that wouldn't link) and exits non-zero. Run it with and without `--prune`. Any
-violation it prints is a concrete bug — note the `caller -> callee` pair and run `--why <callee>`.
+The **soundness check runs on every carve** (the `verify` line): it flags any **kept** function that calls
+an **in-scope** function the carve dropped (that wouldn't link) and exits non-zero. Check it with file-level
+AND an intra-file stage. Any violation is a concrete bug — note the `caller -> callee` pair and run
+`carve <repo> --config carve.toml --why <callee>`.
 
 ## 3. The real test — build the carved output
 
 The ultimate check is your own build pointed at the carved tree:
 
 ```
-carve <repo> --config carve.json --prune --out out/ --manifest m.json
-# then build `out/` with YOUR toolchain/build system (make, cmake, TRACE32 flow, arm-none-eabi-gcc, …)
+carve <repo> --config carve.toml   # outputDirectory + a [stages.prune] in the config
+# then build `<outputDirectory>/[<stage>/]carved` with YOUR toolchain (make, cmake, TRACE32, arm-none-eabi-gcc, …)
 ```
 
 - **Compile errors** (`undeclared`, `implicit declaration`, `has no member`, `expected '}'`) → a dropped
@@ -81,13 +81,13 @@ than an intra-file one (file-level should almost always build).
 
 Vary one axis at a time and re-run steps 2–3. Each cell is a chance to break it:
 
-| Axis | Values to try |
+| Axis | Values to try (config keys) |
 |---|---|
-| roots | one symbol · your full entry set · an obscure/rarely-used API · an ISR-only set |
-| prune | *(off — file level)* · `--prune` · `--prune` + `pruneHeaders` (config) |
-| config | none · `defines: ["X=1","Y"]` · `buildLogs: ["build.log"]` (from `make -n`) · `probe: "<cc>"` |
-| exclude | none · `exclude: ["tests","vendor"]` · exclude other board/arch variants |
-| limits | default · `maxParseBytes: 5000000` · `parseTimeout: 5` |
+| entryPoints | one symbol · your full entry set · an obscure/rarely-used API · an ISR-only set |
+| granularity | file-level · `carveSourceFileContents` · + `carveHeaderFileContents` (via `[stages]`) |
+| config | none · `defines: ["X=1","Y"]` · `buildLogs: ["build.log"]` (from `make -n`) · `compiler: "<cc>"` |
+| exclude | none · `excludeDirectories: ["tests","vendor"]` · exclude other board/arch variants |
+| limits (`[advanced]`) | default · `maxParseBytes: 5000000` · `parseTimeout: 5` |
 
 High-yield shapes to aim at (these are where past bugs came from): heavy macros, macro-opened namespaces
 (`FMT_BEGIN_NAMESPACE`-style), computed-goto interpreters, `try`/`catch` wrapped in macros, generated
