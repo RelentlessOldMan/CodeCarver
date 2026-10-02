@@ -27,14 +27,17 @@ public sealed class StagedOutput : IDisposable
     private bool _promoted;
     private bool _disposed;
 
-    /// <summary>Marker file dropped at the root of every carve output. Its PRESENCE is how a later run
-    /// recognizes a directory as a prior CodeCarver output that is safe to atomically replace — as opposed
-    /// to a checkout, a home directory, or arbitrary user files, which must NEVER be silently destroyed.</summary>
+    /// <summary>Marker file dropped in the output AREA (the parent that holds the carved tree beside the
+    /// <c>codecarver/</c> metadata), NOT inside the carved tree itself — so the carved tree stays a clean,
+    /// buildable project with no stray dotfile. Its PRESENCE is how a later run recognizes a directory as a
+    /// prior CodeCarver output that is safe to atomically replace — as opposed to a checkout, a home
+    /// directory, or arbitrary user files, which must NEVER be silently destroyed.</summary>
     public const string MarkerName = ".codecarver-output";
 
-    /// <summary>True if <paramref name="dir"/> looks like a directory CodeCarver produced (carries the
-    /// marker), and is therefore safe to replace. A non-existent or empty directory is also safe (nothing
-    /// to lose) but that is the caller's check; this only asserts "this is one of ours".</summary>
+    /// <summary>True if <paramref name="dir"/> is a CodeCarver output AREA (carries the marker), and is
+    /// therefore safe to replace. Pass the directory that HOLDS the carved tree (the parent), not the carved
+    /// tree itself. A non-existent or empty directory is also safe (nothing to lose) but that is the caller's
+    /// check; this only asserts "this is one of ours".</summary>
     public static bool IsCodeCarverOutput(string dir)
     {
         try { return File.Exists(Path.Combine(dir, MarkerName)); }
@@ -70,11 +73,17 @@ public sealed class StagedOutput : IDisposable
         // Extremely unlikely, but never emit onto a pre-existing dir we didn't just make.
         if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true);
         Directory.CreateDirectory(staging);
-        // Drop the marker so the promoted --out is recognizable as a CodeCarver output next time (which is
-        // what makes a re-carve into the same dir safe to auto-replace without wiping non-carve data).
-        File.WriteAllText(Path.Combine(staging, MarkerName),
-            $"CodeCarver output tree — created (UTC) {DateTimeOffset.UtcNow:o}.\n"
-            + "This directory is an atomically-replaceable carve output; CodeCarver may overwrite it.\n");
+        // Drop the marker in the output AREA (the parent), NOT inside the staged tree — so the promoted carved
+        // tree stays clean while the area is still recognizable as a CodeCarver output next time (what makes a
+        // re-carve into the same place safe to auto-replace without wiping non-carve data). Best-effort: a
+        // failure to write it must never sink the carve.
+        try
+        {
+            File.WriteAllText(Path.Combine(parent, MarkerName),
+                $"CodeCarver output area — created (UTC) {DateTimeOffset.UtcNow:o}.\n"
+                + "The carved tree beside this marker is an atomically-replaceable carve output; CodeCarver may overwrite it.\n");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* marker is advisory */ }
         return new StagedOutput(staging, finalOut, token);
     }
 

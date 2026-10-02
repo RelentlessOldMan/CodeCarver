@@ -27,9 +27,10 @@ public sealed class StagedOutputTests
             using var staged = StagedOutput.Begin(outDir);
 
             Assert.True(Directory.Exists(staged.Dir));
-            // Staging starts with only the marker file (dropped so the promoted --out is recognizable).
-            Assert.Equal(new[] { StagedOutput.MarkerName },
-                Directory.EnumerateFileSystemEntries(staged.Dir).Select(Path.GetFileName).ToArray());
+            // Staging starts EMPTY — the carved tree carries no marker, so it promotes to a clean project. The
+            // marker lives in the output AREA (the parent) instead.
+            Assert.Empty(Directory.EnumerateFileSystemEntries(staged.Dir));
+            Assert.True(File.Exists(Path.Combine(work, StagedOutput.MarkerName)));
             Assert.NotEqual(Path.GetFullPath(outDir), Path.GetFullPath(staged.Dir));
             Assert.Equal(Path.GetDirectoryName(Path.GetFullPath(outDir)),
                          Path.GetDirectoryName(Path.GetFullPath(staged.Dir))); // same parent -> same volume
@@ -132,7 +133,7 @@ public sealed class StagedOutputTests
     }
 
     [Fact]
-    public void PromotedOutput_CarriesMarker_AndIsRecognized()
+    public void OutputArea_CarriesMarker_AndIsRecognized_WhileCarvedTreeStaysClean()
     {
         var work = NewWork();
         try
@@ -143,8 +144,13 @@ public sealed class StagedOutputTests
                 File.WriteAllText(Path.Combine(staged.Dir, "a.c"), "1");
                 staged.Promote();
             }
-            Assert.True(File.Exists(Path.Combine(outDir, StagedOutput.MarkerName)));
-            Assert.True(StagedOutput.IsCodeCarverOutput(outDir));  // a re-carve can safely replace it
+            // The marker marks the AREA (the parent), so a re-carve recognizes it as safe to replace…
+            Assert.True(File.Exists(Path.Combine(work, StagedOutput.MarkerName)));
+            Assert.True(StagedOutput.IsCodeCarverOutput(work));
+            // …but the carved tree itself stays clean — no stray dotfile in the buildable output.
+            Assert.False(File.Exists(Path.Combine(outDir, StagedOutput.MarkerName)));
+            Assert.Equal(new[] { "a.c" },
+                Directory.EnumerateFiles(outDir).Select(Path.GetFileName).ToArray());
         }
         finally { Cleanup(work); }
     }
