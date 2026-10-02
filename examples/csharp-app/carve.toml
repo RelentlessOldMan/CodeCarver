@@ -1,0 +1,14 @@
+# Worked example: a tiny C# console app, carved file-level.
+#
+# C# is its OWN graph (it can't merge with C/C++) and carving is FILE-LEVEL: a .cs file is kept if any
+# reached method lives in it, dropped otherwise. There are no [stages] — intra-file method pruning needs
+# a real semantic compiler (Roslyn), so C# answers "which files does the build need?" and stops there.
+# C# also ignores #ifdef defines, so no [builds] are needed here.
+#
+#   carve src --config carve.toml
+
+outputDirectory = "out"
+
+[common]
+entryPoints = ["Main"]
+languages   = ["csharp"]

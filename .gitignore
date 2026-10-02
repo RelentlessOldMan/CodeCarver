@@ -49,3 +49,4 @@ TestResults/
 # Generated carve output for the worked examples (regenerate with run.ps1/run.sh)
 examples/multistage-firmware/out/
 examples/mixed-cpp-firmware/out/
+examples/csharp-app/out/

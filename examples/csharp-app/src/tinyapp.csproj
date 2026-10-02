@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- SDK-style project: *.cs is globbed, so dropping LegacyReport.cs just removes it from the build.
+       Infrastructure — the carve copies it verbatim so out/carved is a buildable project. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>tinyapp</AssemblyName>
+  </PropertyGroup>
+
+</Project>
