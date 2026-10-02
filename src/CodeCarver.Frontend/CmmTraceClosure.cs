@@ -86,13 +86,18 @@ public static class CmmTraceClosure
         var keptList = allCmm.Where(c => kept.Contains(c.Rel)).Select(c => c.Rel).OrderBy(x => x, StringComparer.Ordinal).ToList();
         var dropped = allCmm.Where(c => !kept.Contains(c.Rel)).Select(c => c.Rel).OrderBy(x => x, StringComparer.Ordinal).ToList();
 
-        // Surface unresolved-dispatch warnings ONLY for scripts we actually kept (a dynamic DO in a dropped
-        // script is moot), plus oversized kept-whole scripts whose closure we couldn't compute.
+        // Surface unresolved-dispatch warnings, but drop the ones about scripts we didn't keep (a dynamic DO in
+        // a DROPPED script is moot). Fail OPEN: only suppress a warning we can POSITIVELY attribute to a dropped
+        // script (its `{path}:` prefix is a known .cmm that isn't kept). A warning whose shape we don't recognise
+        // is surfaced, not silently swallowed — better a stray warning than a hidden one.
+        var allRel = new HashSet<string>(allCmm.Select(c => c.Rel), StringComparer.OrdinalIgnoreCase);
         var warnings = new List<string>();
         foreach (var w in fe.Warnings)
         {
             var colon = w.IndexOf(':');
-            if (colon > 0 && kept.Contains(w[..colon])) warnings.Add(w);
+            var prefix = colon > 0 ? w[..colon] : "";
+            if (prefix.Length > 0 && allRel.Contains(prefix) && !kept.Contains(prefix)) continue; // attributed to a dropped script
+            warnings.Add(w);
         }
         var oversizedKept = keptList.Where(oversized.Contains).ToList();
         foreach (var o in oversizedKept)

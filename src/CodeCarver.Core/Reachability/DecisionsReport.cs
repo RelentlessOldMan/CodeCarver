@@ -52,8 +52,9 @@ public static class DecisionsReport
         var sb = new StringBuilder();
         var cur = id;
         var guard = 0;
-        while (guard++ < 1024)
+        while (true)
         {
+            if (guard++ >= 1024) { sb.Append("<= …(chain truncated)"); break; } // cycle/pathological depth — don't read as "no root"
             if (!plan.Why.TryGetValue(cur, out var r)) break;
             if (r.IsRoot) { sb.Append($"<= ROOT[{r.AsRoot}]"); break; }
             if (!r.Via.IsValid) break;

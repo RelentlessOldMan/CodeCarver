@@ -1014,6 +1014,24 @@ public static class CarveCommand
             catch (Exception ex) { err.WriteLine($"  warn    : could not build repro graph ({ex.GetType().Name}: {ex.Message})"); }
         }
 
+        // decisions.txt is the per-symbol ledger. One line per symbol is tiny for a normal tree but would be a
+        // multi-MB file on a pathological graph (and it's written on EVERY run, incl. the oracle's analysis-only
+        // passes) — so cap it the same way as the repro bundle: above the cap, write a short note and defer to the
+        // file-level keep/drop in manifest.json instead of the full dump.
+        void WriteDecisions(string ccDir, string stageName)
+        {
+            if (graph.NodeCount > reproNodeCap)
+            {
+                WriteArtifact(Path.Combine(ccDir, "decisions.txt"),
+                    $"# CodeCarver decisions — per-symbol ledger omitted: graph too large "
+                    + $"({graph.NodeCount:N0} nodes > {reproNodeCap:N0} cap).\n"
+                    + $"# {s.ReachedNodes}/{s.TotalNodes} nodes kept. See manifest.json for file-level keep/drop, "
+                    + "or use `--why <symbol>` for a single symbol.\n", "decisions");
+                return;
+            }
+            WriteArtifact(Path.Combine(ccDir, "decisions.txt"), DecisionsReport.Render(graph, plan, stageName), "decisions");
+        }
+
         // Analysis-only (no carved tree): compute the decision and write report + manifest, skipping the (possibly
         // huge) emit. The WORKREPO "dry run" and the ground-truth oracle use this to inspect kept/dropped fast.
         if (cv.AnalysisOnly)
@@ -1041,7 +1059,7 @@ public static class CarveCommand
             };
             WriteArtifact(Path.Combine(ccDir, "manifest.json"),
                 System.Text.Json.JsonSerializer.Serialize(m, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), "manifest");
-            WriteArtifact(Path.Combine(ccDir, "decisions.txt"), DecisionsReport.Render(graph, plan, ""), "decisions");
+            WriteDecisions(ccDir, "");
             WriteRepro(ccDir);
             Mark("analyze");
             diag.Set("analysisOnly", true);
@@ -1145,7 +1163,7 @@ public static class CarveCommand
                 $"# CodeCarver resolved config — stage '{stage.Name}'\n# {cv.WorldReason}\n"
                 + $"# entryPoints={roots.Length}  languages={string.Join(",", cv.Languages)}  buildLogs={buildLogs.Count}  "
                 + $"runTraceFiles={runFileTraces.Count}  runTraceLogs={traceList.Count}\n\n{configText}", "config");
-            WriteArtifact(Path.Combine(ccDir, "decisions.txt"), DecisionsReport.Render(graph, plan, stage.Name), "decisions");
+            WriteDecisions(ccDir, stage.Name);
             WriteRepro(ccDir);
         }
         Mark("emit");
