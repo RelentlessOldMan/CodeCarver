@@ -336,6 +336,63 @@ public sealed class CarveTomlRunTests
         finally { Cleanup(work); }
     }
 
+    // Walk up from the test binary to the repo and return <repo>/examples/<name>, or null if not found.
+    private static string? FindExample(string name)
+    {
+        var dir = AppContext.BaseDirectory;
+        for (var i = 0; i < 8 && dir is not null; i++)
+        {
+            var cand = Path.Combine(dir, "examples", name);
+            if (Directory.Exists(cand)) return cand;
+            dir = Path.GetDirectoryName(dir.TrimEnd(Path.DirectorySeparatorChar));
+        }
+        return null;
+    }
+
+    [Fact]
+    public void Example_CmmTrace_CheckedInCarveIsUpToDate()
+    {
+        // The examples/cmm-trace carved tree is checked in as documentation of the trace-seeded .cmm closure.
+        // Regenerate it through the real CLI and assert it matches byte-for-byte, so it can't drift from the tool.
+        var ex = FindExample("cmm-trace");
+        if (ex is null) return;                       // example not present (packaged build) — skip
+        var golden = Path.Combine(ex, "carved");
+        if (!Directory.Exists(golden)) return;
+
+        var work = Path.Combine(Path.GetTempPath(), "cc-cmmex-" + Guid.NewGuid().ToString("N"));
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(work);
+        try
+        {
+            var trace = Fwd(Path.Combine(ex, "inputs", "run.trace"));
+            var cfg = Config(work, outDir,
+                $"[common]\nentryPoints = [\"main\"]\nlanguages = [\"c\"]\n[runs.smoke]\nrunTraceFiles = [\"{trace}\"]\n");
+            var (code, o, _) = Run("carve", Path.Combine(ex, "src"), "--config", cfg);
+            Assert.Equal(0, code);
+            Assert.Contains("cmm     : 4/6 script(s) kept (1 observed + 3 via DO/GOSUB closure), 2 dropped", o);
+
+            var carved = Path.Combine(outDir, "carved");
+            static string Norm(string s) => s.Replace("\r\n", "\n");
+            // The .codecarver-output marker carries a per-run UTC timestamp — it's an internal marker, not part
+            // of the buildable tree, so it isn't checked in and is excluded from the diff.
+            static bool IsTree(string f) => Path.GetFileName(f) != ".codecarver-output";
+            var checkedIn = Directory.EnumerateFiles(golden, "*.*", SearchOption.AllDirectories).Where(IsTree).ToList();
+            foreach (var f in checkedIn)
+            {
+                var rel = Path.GetRelativePath(golden, f);
+                var regen = Path.Combine(carved, rel);
+                Assert.True(File.Exists(regen), $"carved/{rel} is checked in but the carve no longer emits it — regenerate the example");
+                Assert.True(Norm(File.ReadAllText(f)) == Norm(File.ReadAllText(regen)), $"carved/{rel} is stale — re-run the carve and commit the example");
+            }
+            Assert.Equal(checkedIn.Count, Directory.EnumerateFiles(carved, "*.*", SearchOption.AllDirectories).Where(IsTree).Count());
+
+            // The two scripts the trace can't justify are gone; the dynamic-DO one is warned, not silent.
+            Assert.False(File.Exists(Path.Combine(carved, "scripts", "debug_dump.cmm")));
+            Assert.False(File.Exists(Path.Combine(carved, "scripts", "board_rev_a.cmm")));
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
     [Fact]
     public void Carve_AnalysisOnly_WritesReportManifest_NoCarvedTree()
     {

@@ -1,0 +1,8 @@
+; flash.cmm — the TRACE32 PRACTICE sequence the run executes (the observed entry).
+  DO init                 ; bring the board up
+  GOSUB Program           ; then program the image
+  ENDDO
+
+Program:
+  DO write_image          ; a DO inside a subroutine still counts at file level
+  RETURN

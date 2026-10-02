@@ -1,0 +1,3 @@
+; write_image.cmm — reached by flash.cmm's Program subroutine via `DO write_image`.
+  DO common
+  ENDDO

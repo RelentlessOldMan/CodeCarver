@@ -7,6 +7,7 @@ tool does before running anything.
 |---|---|
 | [`multistage-firmware/`](multistage-firmware) | **The full redesign, end to end.** A Cortex-M-style image carved at three stages (safe / aggressive / max) driven entirely by a `carve.toml` — build log (pins `#ifdef` world), observed build/run traces, a `.cmm` loader, dead-code drop, an excluded board variant, auto-excluded junk, implicit ISR root, and the per-stage report/manifest layout. |
 | [`stringlib/`](stringlib) | A small multi-feature C library carved two ways (encode-only; input-sanitizer). Demonstrates file-level dropping, intra-file function pruning, data-table pruning, and the size report — with the carved output checked in for each scenario. |
+| [`cmm-trace/`](cmm-trace) | **Trace-seeded TRACE32 `.cmm` tightening.** A run trace that opened one flash script seeds a `DO`/`GOSUB` closure; scripts it reaches are kept, an orphan script is dropped, and a script reachable only via a dynamic `DO &var` is dropped **with a warning** (widen the trace or `forceKeepFiles`). Shows C dead-code drop and `.cmm` tightening in one carve. |
 | [`cortexm-firmware/`](cortexm-firmware) | A bare-metal Cortex-M image (vector table, weak-alias handlers, a `KEEP()`'d registration section, a linker script). Shows the embedded story: implicit roots, and emitting the `.ld` so the carved tree links with `arm-none-eabi-gcc`. Exercised by the build-verify tests. |
 | [`tiny-firmware/`](tiny-firmware) | The minimal three-file demo (`main`/`sensor`/`debug`) — the smallest "drop an unused module" carve. |
 

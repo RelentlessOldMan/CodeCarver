@@ -1,0 +1,4 @@
+; init.cmm — board bring-up. Reached by flash.cmm via `DO init`.
+  DO common               ; static DO -> common.cmm is kept
+  DO &board               ; DYNAMIC: the board script is chosen at runtime; can't resolve statically
+  ENDDO

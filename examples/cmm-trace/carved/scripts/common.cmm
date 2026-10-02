@@ -1,0 +1,3 @@
+; common.cmm — shared helpers, reached transitively from init.cmm and write_image.cmm (a leaf).
+Common:
+  RETURN

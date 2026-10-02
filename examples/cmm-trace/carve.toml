@@ -1,0 +1,15 @@
+# Worked example: a C firmware whose TRACE32 .cmm scripts are tightened by a RUN trace.
+#   carve src --config carve.toml
+# The run trace (inputs/run.trace) records that the flash sequence opened scripts/flash.cmm. CodeCarver
+# seeds the DO/GOSUB closure from that script and keeps only what it (transitively) reaches — dropping the
+# scripts no run needs. See README.md for the before/after.
+
+outputDirectory = "out"
+
+[common]
+entryPoints = ["main"]
+languages   = ["c"]           # .cmm is NOT a language here — it's infrastructure, tightened by the run trace
+
+[runs.smoke]
+# Paths in a trace resolve against the carve root (src/), so this is "src/scripts/flash.cmm was opened".
+runTraceFiles = ["inputs/run.trace"]

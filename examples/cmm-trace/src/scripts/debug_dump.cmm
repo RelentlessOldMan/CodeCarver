@@ -1,0 +1,3 @@
+; debug_dump.cmm — a maintenance script no run executes and nothing DOs. Dropped: reached by nobody.
+Dump:
+  RETURN
