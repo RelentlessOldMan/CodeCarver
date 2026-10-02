@@ -277,6 +277,66 @@ public sealed class CarveTomlRunTests
     }
 
     [Fact]
+    public void Carve_RunTrace_TightensCmm_ViaDoClosure()
+    {
+        // The real headline for the work repo: a C/C++ carve whose .cmm are infrastructure. A RUN trace that
+        // opened one script must keep that script + its static DO closure, and DROP .cmm reachable by nobody.
+        var (work, src, outDir) = NewWork();
+        BasicTree(src);                                           // main.c -> helper.c ; dead.c
+        var scripts = Path.Combine(src, "scripts");
+        Directory.CreateDirectory(scripts);
+        File.WriteAllText(Path.Combine(scripts, "main.cmm"),   "DO flash\n");          // the observed seed
+        File.WriteAllText(Path.Combine(scripts, "flash.cmm"),  "Flash:\n  DO common\n  RETURN\n");
+        File.WriteAllText(Path.Combine(scripts, "common.cmm"), "Common:\n  RETURN\n");
+        File.WriteAllText(Path.Combine(scripts, "orphan.cmm"), "Orphan:\n  RETURN\n"); // reached by nobody
+        var trace = Path.Combine(work, "run.trace");
+        File.WriteAllText(trace, Fwd(Path.Combine(scripts, "main.cmm")) + "\n");       // run opened main.cmm
+        try
+        {
+            var cfg = Config(work, outDir,
+                $"[common]\nentryPoints = [\"main\"]\n[runs.smoke]\nrunTraceFiles = [\"{Fwd(trace)}\"]\n");
+            var (code, o, _) = Run("carve", src, "--config", cfg);
+            Assert.Equal(0, code);
+
+            Assert.Contains("cmm     :", o);                                           // the tightening ran
+            // Seed + its DO closure are kept; the orphan is dropped.
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", "scripts", "main.cmm")));
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", "scripts", "flash.cmm")));
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", "scripts", "common.cmm")));
+            Assert.False(File.Exists(Path.Combine(outDir, "carved", "scripts", "orphan.cmm")));
+            // And the C carve is unaffected.
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", "main.c")));
+            Assert.False(File.Exists(Path.Combine(outDir, "carved", "dead.c")));
+
+            var manifest = File.ReadAllText(Path.Combine(outDir, "codecarver", "manifest.json"));
+            Assert.Contains("scripts/orphan.cmm", manifest.Replace("\\/", "/"));       // recorded as droppedCmm
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Carve_NoRunTrace_KeepsAllCmm()
+    {
+        // Without a run trace we can't prove which scripts run — keep every .cmm (sound default, no tightening).
+        var (work, src, outDir) = NewWork();
+        BasicTree(src);
+        var scripts = Path.Combine(src, "scripts");
+        Directory.CreateDirectory(scripts);
+        File.WriteAllText(Path.Combine(scripts, "a.cmm"), "A:\n  RETURN\n");
+        File.WriteAllText(Path.Combine(scripts, "b.cmm"), "B:\n  RETURN\n");
+        try
+        {
+            var cfg = Config(work, outDir, "[common]\nentryPoints = [\"main\"]\n");
+            var (code, o, _) = Run("carve", src, "--config", cfg);
+            Assert.Equal(0, code);
+            Assert.DoesNotContain("cmm     :", o);                                     // no trace => no tightening
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", "scripts", "a.cmm")));
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", "scripts", "b.cmm")));
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
     public void Carve_AnalysisOnly_WritesReportManifest_NoCarvedTree()
     {
         var (work, src, outDir) = NewWork();

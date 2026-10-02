@@ -257,8 +257,13 @@ so trace the host loader process — same recipe.)
   resolution, file-level **and** `carveSourceFileContents` intra-file carving, all compile-verified.
 - **C#** (`languages = ["csharp"]`): **file-level** carving (drop unused `.cs` files). Sound intra-file method
   pruning needs semantic analysis (Roslyn), so `carveSourceFileContents` falls back to file-level for C#.
-- **TRACE32 `.cmm`**: file-level, trace-driven (keep the `.cmm` a run trace shows were used); handled via
-  `runTraceFiles`, not `languages`. Never carved internally.
+- **TRACE32 `.cmm`**: file-level, trace-driven, handled via `runTraceFiles` (not `languages`); never carved
+  internally. A run trace that opened some scripts **seeds a `DO`/`GOSUB` closure**: those scripts plus every
+  script they can `DO` (transitively) are kept, and `.cmm` reachable by nobody are dropped — so a run that
+  touches a handful of scripts no longer drags the whole script library into the image. A dynamic `DO &var`
+  (runtime-chosen path) can't be resolved statically, so scripts reachable *only* that way are flagged in the
+  output (`warn: cmm …`) — widen the trace or `forceKeepFiles` them — rather than silently dropped. With **no**
+  run trace, every `.cmm` is kept (can't prove which run). The `cmm:` report line shows kept/closure/dropped.
 
 ### `#ifdef` resolution: open vs. closed world
 

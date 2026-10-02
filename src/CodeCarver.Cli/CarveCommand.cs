@@ -930,6 +930,46 @@ public static class CarveCommand
         if (plan.DroppedFiles.Count > 0)
             @out.WriteLine("  dropped : " + Summarize(plan.DroppedFiles));
 
+        // --- Secondary .cmm trace-seeded closure (infrastructure tightening) --------------------------------
+        // TRACE32 .cmm scripts are orchestration, not linked code — kept as infrastructure. A RUN trace lets us
+        // tighten: the observed scripts seed the static DO/GOSUB closure CmmFrontEnd builds, and any .cmm neither
+        // observed nor reachable from one is dropped. No run trace (or no observed .cmm) => keep them all (sound;
+        // we can't prove which ran). Dynamic `DO &var` and oversized kept-whole scripts are surfaced, never
+        // silently dropped. Skipped when the PRIMARY carve already IS cmm (then the main plan handles .cmm).
+        var cmmDropped = new List<string>();
+        if (lang != "cmm" && runFileTraces.Count > 0)
+        {
+            var rootFullC = Path.GetFullPath(dir);
+            var relToFull = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var allCmm = new List<(string Rel, long Bytes)>();
+            foreach (var p in CodeCarver.Core.Util.SourceWalk.Files(dir))
+            {
+                if (!p.EndsWith(".cmm", StringComparison.OrdinalIgnoreCase)) continue;
+                var rel = Path.GetRelativePath(rootFullC, p).Replace('\\', '/');
+                long len; try { len = new FileInfo(p).Length; } catch { len = 0; }
+                allCmm.Add((rel, len));
+                relToFull[rel] = p;
+            }
+            if (allCmm.Count > 0)
+            {
+                var observedCmm = observedRel.Where(r => r.EndsWith(".cmm", StringComparison.OrdinalIgnoreCase)).ToList();
+                var cc = CmmTraceClosure.Compute(allCmm, observedCmm, rel => File.ReadAllText(relToFull[rel]), maxParseBytes);
+                cmmDropped = cc.Dropped.ToList();
+                if (cc.ObservedSeeds == 0)
+                    @out.WriteLine($"  cmm     : {allCmm.Count} .cmm kept whole — run trace opened none, can't tighten without an observed seed");
+                else
+                    @out.WriteLine($"  cmm     : {cc.Kept.Count}/{cc.Total} script(s) kept ({cc.ObservedSeeds} observed + {cc.ClosureAdded} via DO/GOSUB closure), {cc.Dropped.Count} dropped"
+                        + (cc.OversizedKeptWhole > 0 ? $"; {cc.OversizedKeptWhole} oversized kept-whole" : ""));
+                foreach (var w in cc.Warnings) { err.WriteLine($"  warn    : cmm {w}"); diag.Warn("cmm " + w); }
+                diag.Set("cmmTotal", cc.Total); diag.Set("cmmKept", cc.Kept.Count); diag.Set("cmmDropped", cc.Dropped.Count);
+            }
+        }
+        // Dropped .cmm are infrastructure, not modelled code — fold them into the emitter's drop set so they
+        // aren't copied, but keep plan.DroppedFiles (dead CODE) distinct for the report's accounting.
+        IReadOnlyCollection<string> infraDropped = cmmDropped.Count == 0
+            ? plan.DroppedFiles
+            : plan.DroppedFiles.Concat(cmmDropped).ToList();
+
         // --- Soundness check (plan-based; identical for every stage): a KEPT fn must not call an in-scope DROPPED
         // fn (it wouldn't link). Always on now; folded into the normal output + each stage's report. ---
         var verifyFailed = false;
@@ -996,7 +1036,7 @@ public static class CarveCommand
                 codecarverVersion = Version(), root = dir, roots, lang, analysisOnly = true,
                 defines = defineSpecs.Distinct().ToArray(), closedWorld,
                 stats = new { s.TotalNodes, s.ReachedNodes, s.DroppedNodes, s.TotalFiles, s.KeptFiles, s.DroppedFiles },
-                keptFiles = plan.KeptFiles, droppedFiles = plan.DroppedFiles,
+                keptFiles = plan.KeptFiles, droppedFiles = plan.DroppedFiles, droppedCmm = cmmDropped,
                 observedFiles = observedRel.OrderBy(f => f, StringComparer.Ordinal).ToArray(),
             };
             WriteArtifact(Path.Combine(ccDir, "manifest.json"),
@@ -1052,7 +1092,7 @@ public static class CarveCommand
 
             // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
             // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
-            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, plan.DroppedFiles, excludeDirs, auxGlobs, pruneGarbage, observedRel);
+            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, infraDropped, excludeDirs, auxGlobs, pruneGarbage, observedRel);
             carvedBytes += infra.Bytes;
             var origTotal = originalCodeBytes + infra.Bytes;   // delta-neutral passthrough (both sides)
             if (infra.Count > 0)
@@ -1095,7 +1135,7 @@ public static class CarveCommand
                 stage = stage.Name, carveSourceFileContents = prune, carveHeaderFileContents = pruneHeaders,
                 stats = new { s.TotalNodes, s.ReachedNodes, s.DroppedNodes, s.TotalFiles, s.KeptFiles, s.DroppedFiles,
                     originalBytes = origTotal, carvedBytes, savedBytes = saved },
-                keptFiles = plan.KeptFiles, droppedFiles = plan.DroppedFiles,
+                keptFiles = plan.KeptFiles, droppedFiles = plan.DroppedFiles, droppedCmm = cmmDropped,
                 infrastructureFiles = infra.Files, removedGarbageFiles = infra.Garbage,
                 observedFiles = observedRel.OrderBy(f => f, StringComparer.Ordinal).ToArray(),
             };
