@@ -1,0 +1,55 @@
+# Worked example: a mixed C / C++ / TRACE32 firmware image.
+#
+# The C entry (main.c) reaches the C++ application (hub.cpp) through a C-linkage bridge, and the
+# C++ sensors call back DOWN into the C HAL (hal.c) — one carve graph whose reachability crosses the
+# C <-> C++ boundary in both directions. A .cmm loader is kept/tightened via the run trace.
+#
+# It also shows the UNION of multiple builds and runs:
+#   - two builds: the C HAL (gcc) + the C++ app (g++)      -> unioned into one #ifdef world
+#   - two runs:   a flash/loader session (FILE trace) + a smoke run (FUNCTION trace) -> unioned
+#
+#   carve src --config carve.toml            # all stages into out/<stage>/
+#   carve src --config carve.toml --stage max
+
+outputDirectory = "out"
+
+[common]
+entryPoints = ["main"]
+# Merged into ONE graph via the C++ grammar (a superset of C), so reachability crosses C <-> C++.
+languages = ["c", "cpp"]
+
+# ===== builds — UNIONED: both compilers' views combine into one image =====
+[builds.hal]
+# The C hardware layer, built with gcc.
+buildLogs = ["inputs/hal.compile_commands.json"]
+
+[builds.app]
+# The C++ application, built with g++. Pins -DSENSOR_PRESSURE so the pressure path is in the image.
+buildLogs = ["inputs/app.compile_commands.json"]
+
+# ===== runs — UNIONED: different evidence from two captured sessions =====
+[runs.flash]
+# The flash/loader session — a file-access trace. Catches the .cmm loader + the calib blob.
+runTraceFiles = ["inputs/flash.procmon.csv"]
+
+[runs.smoke]
+# A functional smoke run — the functions that actually executed.
+runTraceLogs = ["inputs/run.log"]
+
+# ===== stages — three aggressiveness tiers =====
+[stages.safe]
+carveSourceFileContents = false   # file-level only (the sound floor)
+carveHeaderFileContents = false
+
+[stages.aggressive]
+carveSourceFileContents = true    # also drop unused members/functions in kept files (TempSensor::selftest, hal_unused_calibration)
+carveHeaderFileContents = false
+
+[stages.max]
+carveSourceFileContents = true
+carveHeaderFileContents = true    # also strip unused #defines from kept headers
+
+# ===== use (optional) — default is ALL defined builds+runs; uncomment to carve a subset =====
+# [use]
+# builds = ["hal", "app"]
+# runs   = ["flash", "smoke"]

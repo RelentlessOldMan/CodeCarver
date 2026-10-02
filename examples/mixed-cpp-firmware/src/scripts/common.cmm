@@ -1,0 +1,4 @@
+; Shared register setup, pulled in by flash.cmm via `DO common` -> kept by the .cmm closure
+; even though the run trace only observed flash.cmm directly.
+PER.Set.simple C15:0x1 %Long 0x00C5187D
+ENDDO

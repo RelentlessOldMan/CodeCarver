@@ -46,5 +46,6 @@ perf-baseline.json
 TestResults/
 **/TestResults/
 
-# Generated carve output for the worked example (regenerate with run.ps1/run.sh)
+# Generated carve output for the worked examples (regenerate with run.ps1/run.sh)
 examples/multistage-firmware/out/
+examples/mixed-cpp-firmware/out/

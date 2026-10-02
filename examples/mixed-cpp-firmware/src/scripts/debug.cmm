@@ -1,0 +1,5 @@
+; Offline register dump — never run during flashing and not reachable from flash.cmm via DO,
+; so the .cmm closure drops it.
+PRINT "registers:"
+Register.view
+ENDDO

@@ -1,0 +1,6 @@
+; TRACE32 PRACTICE loader (infrastructure; kept, observed in the flash run trace).
+SYStem.Up
+DO common                               ; shared setup -> kept via the DO closure
+Data.LOAD.Elf image.elf
+Data.LOAD.Binary data/calib.bin /NoClear
+Go

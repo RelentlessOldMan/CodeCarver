@@ -1,0 +1,4 @@
+[
+  { "directory": ".", "file": "main.c", "arguments": ["gcc","-ffreestanding","-Os","-c","main.c"] },
+  { "directory": ".", "file": "hal.c",  "arguments": ["gcc","-ffreestanding","-Os","-c","hal.c"] }
+]

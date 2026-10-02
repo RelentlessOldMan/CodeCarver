@@ -1,0 +1,4 @@
+[
+  { "directory": ".", "file": "hub.cpp",     "arguments": ["g++","-std=c++11","-DSENSOR_PRESSURE=1","-ffreestanding","-fno-exceptions","-fno-rtti","-c","hub.cpp"] },
+  { "directory": ".", "file": "sensors.cpp", "arguments": ["g++","-std=c++11","-ffreestanding","-fno-exceptions","-fno-rtti","-c","sensors.cpp"] }
+]

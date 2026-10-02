@@ -1,0 +1,3 @@
+"09:00:00.1","trace32.exe","1234","ReadFile","C:\windows\system32\ntdll.dll","SUCCESS","noise"
+"09:00:00.2","trace32.exe","1234","CreateFile","scripts/flash.cmm","SUCCESS",""
+"09:00:00.3","trace32.exe","1234","ReadFile","data/calib.bin","SUCCESS","Offset: 0"
