@@ -17,13 +17,26 @@ namespace CodeCarver.Core.Diagnostics;
 /// the algorithm consumes: node kinds, flags, spans, the edge set, the root set, and the reached set the
 /// run produced (so a replay can diff its result against what actually happened). No home paths, no source,
 /// no real names.
+///
+/// <see cref="Write"/> STREAMS straight to the output via <see cref="Utf8JsonWriter"/> — nodes and edges are
+/// emitted incrementally, never materialized into an in-memory object list or string, so it scales to
+/// multi-million-node graphs (e.g. a 13M-node synthetic corpus) without exhausting memory. The only thing
+/// retained is the name/file token maps, bounded by the count of distinct identifiers.
 /// </summary>
 public static class ReproBundle
 {
     /// <summary>Bump when the snapshot shape changes so a replayer can tell versions apart.</summary>
     public const int FormatVersion = 1;
 
-    public static string Build(CodeGraph graph, CarvePlan plan)
+    private const string Note =
+        "Anonymized CodeCarver repro graph. Names/paths are replaced by stable tokens with no reverse "
+        + "mapping; contains NO source text, NO real identifiers, NO home paths. Replay reachability over "
+        + "(nodes, edges, roots) and diff against 'reached' to reproduce a carve.";
+
+    /// <summary>Stream the anonymized snapshot to <paramref name="output"/>. Memory stays bounded (only the
+    /// token maps are held), so this works at any graph size. Counts are emitted LAST — they depend on the
+    /// token maps that fill as nodes stream — but JSON field order is immaterial to a replayer.</summary>
+    public static void Write(Stream output, CodeGraph graph, CarvePlan plan, bool indented = true)
     {
         var names = new Dictionary<string, string>(StringComparer.Ordinal);
         var files = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -46,54 +59,80 @@ public static class ReproBundle
             return t;
         }
 
+        using var w = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = indented });
+        w.WriteStartObject();
+        w.WriteNumber("reproFormatVersion", FormatVersion);
+        w.WriteString("note", Note);
+
         // A File node IS its path (Name holds the path); every other kind's path is in File. Route each
         // through the file-token map so the same path is one token wherever it appears.
-        var nodes = new List<object>(graph.NodeCount);
+        w.WriteStartArray("nodes");
         foreach (var n in graph.Nodes)
-            nodes.Add(new
-            {
-                id = n.Id.Value,
-                kind = n.Kind.ToString(),
-                name = n.Kind == NodeKind.File ? FileTok(n.Name) : NameTok(n.Name),
-                file = FileTok(n.File),
-                line = n.Span.StartLine,
-                endLine = n.Span.EndLine,
-                flags = (int)n.Flags,
-            });
+        {
+            w.WriteStartObject();
+            w.WriteNumber("id", n.Id.Value);
+            w.WriteString("kind", n.Kind.ToString());
+            w.WriteString("name", n.Kind == NodeKind.File ? FileTok(n.Name) : NameTok(n.Name));
+            w.WriteString("file", FileTok(n.File));
+            w.WriteNumber("line", n.Span.StartLine);
+            w.WriteNumber("endLine", n.Span.EndLine);
+            w.WriteNumber("flags", (int)n.Flags);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
 
-        var edges = new List<object>();
+        long edgeCount = 0;
+        w.WriteStartArray("edges");
         foreach (var n in graph.Nodes)
             foreach (var e in graph.OutEdges(n.Id))
-                edges.Add(new { from = e.From.Value, to = e.To.Value, kind = e.Kind.ToString() });
+            {
+                w.WriteStartObject();
+                w.WriteNumber("from", e.From.Value);
+                w.WriteNumber("to", e.To.Value);
+                w.WriteString("kind", e.Kind.ToString());
+                w.WriteEndObject();
+                edgeCount++;
+            }
+        w.WriteEndArray();
 
         // Roots are recovered from the plan (nodes whose keep-reason is "is a root"), so the bundle is
         // self-contained: graph + roots + the reached set the run produced.
-        var roots = new List<object>();
+        long rootCount = 0;
+        w.WriteStartArray("roots");
         foreach (var kv in plan.Why)
             if (kv.Value.IsRoot)
-                roots.Add(new { node = kv.Key.Value, kind = kv.Value.AsRoot!.Value.ToString() });
-        var reached = plan.ReachedNodes.Select(r => r.Value).ToList();
-
-        var doc = new
-        {
-            reproFormatVersion = FormatVersion,
-            note = "Anonymized CodeCarver repro graph. Names/paths are replaced by stable tokens with no "
-                 + "reverse mapping; contains NO source text, NO real identifiers, NO home paths. Replay "
-                 + "reachability over (nodes, edges, roots) and diff against 'reached' to reproduce a carve.",
-            counts = new
             {
-                nodes = graph.NodeCount,
-                edges = edges.Count,
-                roots = roots.Count,
-                reached = reached.Count,
-                distinctNames = names.Count,
-                distinctFiles = files.Count,
-            },
-            nodes,
-            edges,
-            roots,
-            reached,
-        };
-        return JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true });
+                w.WriteStartObject();
+                w.WriteNumber("node", kv.Key.Value);
+                w.WriteString("kind", kv.Value.AsRoot!.Value.ToString());
+                w.WriteEndObject();
+                rootCount++;
+            }
+        w.WriteEndArray();
+
+        w.WriteStartArray("reached");
+        foreach (var r in plan.ReachedNodes) w.WriteNumberValue(r.Value);
+        w.WriteEndArray();
+
+        w.WriteStartObject("counts");
+        w.WriteNumber("nodes", graph.NodeCount);
+        w.WriteNumber("edges", edgeCount);
+        w.WriteNumber("roots", rootCount);
+        w.WriteNumber("reached", plan.ReachedNodes.Count);
+        w.WriteNumber("distinctNames", names.Count);
+        w.WriteNumber("distinctFiles", files.Count);
+        w.WriteEndObject();
+
+        w.WriteEndObject();
+        w.Flush();
+    }
+
+    /// <summary>Convenience for tests and small graphs: the snapshot as an (indented) string. Prefer
+    /// <see cref="Write"/> straight to a file for large graphs — this buffers the whole document in memory.</summary>
+    public static string Build(CodeGraph graph, CarvePlan plan)
+    {
+        using var ms = new MemoryStream();
+        Write(ms, graph, plan, indented: true);
+        return System.Text.Encoding.UTF8.GetString(ms.ToArray());
     }
 }

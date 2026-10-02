@@ -57,8 +57,8 @@ no paths: just the structure (nodes, edges, roots, and the set that was kept).
 
 This is the most useful artifact for "it kept/dropped the wrong thing" bugs **and the one you can send
 without any review** — a developer can replay reachability on the anonymized graph and reproduce your
-exact result on their machine, with none of your IP. (On a very large graph the bundle is skipped with a
-note in the output, to avoid a memory spike; a streaming writer that lifts that cap is queued.)
+exact result on their machine, with none of your IP. It's streamed straight to disk, so it's produced at
+any graph size (the run output reports its byte size).
 
 ## Reporting a bug
 

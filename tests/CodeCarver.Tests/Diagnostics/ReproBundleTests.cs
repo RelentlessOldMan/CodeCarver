@@ -79,4 +79,42 @@ public sealed class ReproBundleTests
         // the graph's actual node count (the snapshot is complete, not a sample).
         Assert.Contains($"\"nodes\": {graph.NodeCount}", json);
     }
+
+    [Fact]
+    public void Write_StreamsToOutput_EquivalentToBuild()
+    {
+        // The streaming writer (used by the CLI straight-to-file) must produce the same snapshot as Build,
+        // so lifting the old node cap doesn't change the artifact — just how it's written.
+        var (graph, plan) = SampleCarve();
+        using var ms = new MemoryStream();
+        ReproBundle.Write(ms, graph, plan, indented: true);
+        var streamed = System.Text.Encoding.UTF8.GetString(ms.ToArray());
+        Assert.Equal(ReproBundle.Build(graph, plan), streamed);
+    }
+
+    [Fact]
+    public void Write_ScalesToLargeGraph_WithoutMaterializing()
+    {
+        // A chain of many nodes — exercises the streaming path on a graph far past the old 500k-node cap would
+        // have been meaningful, bounded only by the token maps. We assert it completes and the counts are right.
+        var b = new GraphBuilder();
+        const int n = 60_000;
+        var prev = b.Func("f0", "f0.c", line: 1);
+        for (var i = 1; i < n; i++)
+        {
+            var cur = b.Func($"f{i}", $"f{i}.c", line: 1);
+            b.Calls(prev, cur);
+            prev = cur;
+        }
+        var plan = ReachabilityEngine.Compute(b.Graph,
+            new List<Root> { new(b.Graph.Nodes.First().Id, RootKind.EntryPoint) }, ReachabilityOptions.Safe);
+
+        using var ms = new MemoryStream();
+        ReproBundle.Write(ms, b.Graph, plan, indented: false);  // compact: this is a machine artifact
+        ms.Position = 0;
+        using var doc = System.Text.Json.JsonDocument.Parse(ms);
+        var counts = doc.RootElement.GetProperty("counts");
+        Assert.Equal(b.Graph.NodeCount, counts.GetProperty("nodes").GetInt32());
+        Assert.Equal(n - 1, counts.GetProperty("edges").GetInt32());        // a chain of n nodes has n-1 edges
+    }
 }

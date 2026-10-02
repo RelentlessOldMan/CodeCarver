@@ -998,33 +998,39 @@ public static class CarveCommand
         }
 
         // The anonymized repro graph ships by default alongside report/decisions — it's safe to share (opaque
-        // tokens, no names/paths/source), so there's no reason to gate it behind a flag. Guarded by a node cap
-        // because ReproBundle.Build still materializes the whole graph in memory (a streaming writer is the
-        // queued fix); above the cap we skip with a note rather than risk a memory/disk spike on a huge graph.
-        // Any build failure degrades to a warning — a diagnostic aid must never fail the carve.
-        const int reproNodeCap = 500_000;
+        // tokens, no names/paths/source), so there's no reason to gate it behind a flag. ReproBundle.Write STREAMS
+        // straight to the file (no in-memory graph/string), so it scales to any size — we report the bytes so a
+        // large one is visible. Any write failure degrades to a warning (and removes the partial file) — a
+        // diagnostic aid must never fail the carve.
         void WriteRepro(string ccDir)
         {
-            if (graph.NodeCount > reproNodeCap)
+            var path = Path.Combine(ccDir, "repro.graph.json");
+            try
             {
-                @out.WriteLine($"  repro   : skipped — graph too large ({graph.NodeCount:N0} nodes > {reproNodeCap:N0} cap); streaming writer pending");
-                return;
+                using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+                    ReproBundle.Write(fs, graph, plan);
+                @out.WriteLine($"  repro   : {path}  ({new FileInfo(path).Length:N0} B, anonymized — safe to share)");
             }
-            try { WriteArtifact(Path.Combine(ccDir, "repro.graph.json"), ReproBundle.Build(graph, plan), "repro"); }
-            catch (Exception ex) { err.WriteLine($"  warn    : could not build repro graph ({ex.GetType().Name}: {ex.Message})"); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+            {
+                err.WriteLine($"  warn    : could not write repro graph ({ex.GetType().Name}: {ex.Message})");
+                try { if (File.Exists(path)) File.Delete(path); } catch { /* best effort */ }
+            }
         }
 
-        // decisions.txt is the per-symbol ledger. One line per symbol is tiny for a normal tree but would be a
-        // multi-MB file on a pathological graph (and it's written on EVERY run, incl. the oracle's analysis-only
-        // passes) — so cap it the same way as the repro bundle: above the cap, write a short note and defer to the
-        // file-level keep/drop in manifest.json instead of the full dump.
+        // decisions.txt is the per-symbol ledger: one line per symbol. Tiny for a normal tree, but a 13M-symbol
+        // graph would be a multi-GB text dump no one reads — and it's written on EVERY run, incl. the oracle's
+        // analysis-only passes. Unlike the repro bundle (machine-replayable, so worth streaming at any size), a
+        // giant human ledger has no value, so above this cap we write a short note and defer to manifest.json /
+        // `--why`. (The cap is only about the ledger now; the repro bundle streams uncapped.)
+        const int decisionsNodeCap = 500_000;
         void WriteDecisions(string ccDir, string stageName)
         {
-            if (graph.NodeCount > reproNodeCap)
+            if (graph.NodeCount > decisionsNodeCap)
             {
                 WriteArtifact(Path.Combine(ccDir, "decisions.txt"),
                     $"# CodeCarver decisions — per-symbol ledger omitted: graph too large "
-                    + $"({graph.NodeCount:N0} nodes > {reproNodeCap:N0} cap).\n"
+                    + $"({graph.NodeCount:N0} nodes > {decisionsNodeCap:N0} cap).\n"
                     + $"# {s.ReachedNodes}/{s.TotalNodes} nodes kept. See manifest.json for file-level keep/drop, "
                     + "or use `--why <symbol>` for a single symbol.\n", "decisions");
                 return;
