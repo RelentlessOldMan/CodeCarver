@@ -71,3 +71,30 @@ files as drop candidates:
       data/calib.bin     [observed]   # from the RUN trace
 == REMOVED - garbage, not a build/run input (3) ==   (notes.txt.bak, build.log, __pycache__/codegen.pyc)
 ```
+
+## Other input options (not needed here, but you may want them)
+
+This example resolves its `#ifdef` world from a build log and lists its roots inline. Three config options
+cover the cases where that isn't enough — add them to `carve.toml` as needed:
+
+- **No build log?** Give the compiler instead — it's probed for its built-in macros — and/or list defines by
+  hand. CodeCarver still resolves `#ifdef`s closed-world:
+  ```toml
+  [builds.main]
+  compiler = "arm-none-eabi-gcc"       # probed for built-in macros (__ARM_ARCH, etc.)
+  defines  = ["FEATURE_FAST=1", "CHIP=F4"]   # manual -D, when you have neither a log nor the compiler
+  ```
+- **Something the carve can't see it needs** (a prebuilt `.a`, a generated file, a resource) — pin it so it's
+  always kept, even if it sits under an excluded dir or looks unreferenced:
+  ```toml
+  [common]
+  forceKeepFiles = ["prebuilt/*.a", "gen/version.h"]
+  ```
+- **A long, curated root list** — keep it in a file (one symbol per line, `#` comments allowed) instead of
+  inline:
+  ```toml
+  [common]
+  entryPointsFile = "roots.txt"        # unioned with any inline entryPoints
+  ```
+
+Run `codecarver init` for the fully annotated config template documenting every key.
