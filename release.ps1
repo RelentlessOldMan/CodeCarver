@@ -128,14 +128,22 @@ Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 # Not ZipFile.CreateFromDirectory either: under Windows PowerShell 5.1 it still writes '\' entry names. Add each
 # file with an explicit '/'-separated name instead.
-$pubRoot = (Resolve-Path $pub).ProviderPath.TrimEnd('\') + '\'
+# EnumerateFiles returns paths that start with exactly the string passed in. Get-ChildItem's FullName does not:
+# on a CI runner %TEMP% is an 8.3 short path (RUNNER~1) and FullName the long one, so a Substring by the root's
+# length put every entry under a stray folder.
+$pubRoot = $pub.TrimEnd('\')
 $zw = [System.IO.Compression.ZipFile]::Open($zip, [System.IO.Compression.ZipArchiveMode]::Create)
 try {
-    foreach ($f in Get-ChildItem $pub -Recurse -File) {
-        $entry = $f.FullName.Substring($pubRoot.Length).Replace('\', '/')
-        [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zw, $f.FullName, $entry, [System.IO.Compression.CompressionLevel]::Optimal)
+    foreach ($f in [System.IO.Directory]::EnumerateFiles($pubRoot, '*', [System.IO.SearchOption]::AllDirectories)) {
+        $entry = $f.Substring($pubRoot.Length + 1).Replace('\', '/')
+        [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zw, $f, $entry, [System.IO.Compression.CompressionLevel]::Optimal)
     }
 } finally { $zw.Dispose() }
+$za = [System.IO.Compression.ZipFile]::OpenRead($zip)
+try { $names = @($za.Entries | ForEach-Object { $_.FullName }) } finally { $za.Dispose() }
+foreach ($must in @('codecarver.dll', 'RELEASE.txt', 'THIRD-PARTY-NOTICES.txt', 'runtimes/linux-x64/native/libtree-sitter-c.so')) {
+    if ($names -notcontains $must) { Remove-Item -Force $zip; throw "zip is missing '$must' at its root (first entry: $($names[0])) - not packaging" }
+}
 # Verify, never assume: no entry may carry a '\'.
 $za = [System.IO.Compression.ZipFile]::OpenRead($zip)
 try { $bad = @($za.Entries | Where-Object { $_.FullName.Contains('\') } | Select-Object -First 3 | ForEach-Object { $_.FullName }) }
