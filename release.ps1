@@ -86,13 +86,25 @@ if (Test-Path $docsSrc) {
 } else {
     Write-Host "  WARN: no docs/ folder found to bundle" -ForegroundColor Yellow
 }
+# The repo README lives at the root (not under docs/), and USAGE.md tells users to run the capture scripts.
+$readme = Join-Path $root 'README.md'
+if (Test-Path $readme) { Copy-Item -Force $readme (Join-Path $pub 'README.md') }
+$capture = Join-Path $root 'tools\capture'
+if (Test-Path $capture) {
+    New-Item -ItemType Directory -Force (Join-Path $pub 'tools') | Out-Null
+    Copy-Item -Recurse -Force $capture (Join-Path $pub 'tools\capture')
+    Write-Host "  bundled tools/capture/ into the release" -ForegroundColor DarkGray
+}
 
 # --- 5. zip (only reached AFTER push is confirmed) ---
 if (-not $Output) { $Output = Join-Path $root 'dist' }
 New-Item -ItemType Directory -Force $Output | Out-Null
 $zip = Join-Path $Output "codecarver-$Version.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
-Compress-Archive -Path (Join-Path $pub '*') -DestinationPath $zip
+# Not Compress-Archive: on Windows PowerShell 5.1 it writes backslash entry names, which several Linux
+# extractors turn into flat files (the native tree-sitter libraries are then not found).
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory($pub, $zip)
 Remove-Item -Recurse -Force $pub -ErrorAction SilentlyContinue
 
 Write-Host "`nPACKAGED: $zip" -ForegroundColor Green
