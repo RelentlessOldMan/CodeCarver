@@ -23,14 +23,20 @@ namespace CodeCarver.Core.Frontend;
 /// </summary>
 public static class FileAccessTrace
 {
-    private static readonly Regex Quoted = new("\"([^\"]*)\"", RegexOptions.Compiled);
+    private static readonly Regex Quoted = new("\"((?:\\\\.|[^\"\\\\])*)\"", RegexOptions.Compiled);
+    // strace -y: the path behind the returned descriptor, absolute — "= 3</abs/path>".
+    private static readonly Regex StraceFdPath = new(@"\) = \d+<(.+)>$", RegexOptions.Compiled);
+    private static readonly Regex StraceLine = new(@"^\s*(?:\[pid\s+\d+\]\s*|\d+\s+)?(?:\d[\d:.]*\s+)?\w+\(|resumed>", RegexOptions.Compiled);
 
-    public static IReadOnlyCollection<string> Paths(string text, Regex? pattern = null)
+    public static IReadOnlyCollection<string> Paths(string text, Regex? pattern = null) =>
+        string.IsNullOrEmpty(text) ? new HashSet<string>() : Paths(text.Split('\n'), pattern);
+
+    /// <summary>Streaming form: the caller passes <c>File.ReadLines</c>, so a multi-GB raw capture is never one
+    /// string (review T2).</summary>
+    public static IReadOnlyCollection<string> Paths(IEnumerable<string> lines, Regex? pattern = null)
     {
         var paths = new HashSet<string>(StringComparer.Ordinal);
-        if (string.IsNullOrEmpty(text)) return paths;
-
-        foreach (var raw in text.Split('\n'))
+        foreach (var raw in lines)
         {
             var line = raw.TrimEnd('\r');
             if (line.Length == 0) continue;
@@ -48,16 +54,54 @@ public static class FileAccessTrace
                 continue;
             }
 
+            // A raw strace line: prefer the absolute path strace -y reports for the returned fd; otherwise its
+            // quoted argument. strace escapes non-ASCII bytes and quotes (caf\303\251.c, \") — decode them, or a
+            // real file never matches (review SC-A6). Only strace lines are decoded: a Windows path has backslashes.
+            var strace = StraceLine.IsMatch(line);
+            if (strace)
+            {
+                var fd = StraceFdPath.Match(line);
+                if (fd.Success) { paths.Add(DecodeStrace(fd.Groups[1].Value).Replace(" (deleted)", "")); continue; }
+                if (line.Contains("= -1", StringComparison.Ordinal)) continue;   // a failed open is not a dependency
+            }
+
             // No pattern: pull every quoted token (ProcMon CSV fields, strace's quoted path); if a line has no
             // quotes, treat the whole trimmed line as a path (the plain-list case).
             var any = false;
             foreach (Match q in Quoted.Matches(line))
             {
-                var v = q.Groups[1].Value;
+                var v = strace ? DecodeStrace(q.Groups[1].Value) : q.Groups[1].Value;
                 if (!string.IsNullOrWhiteSpace(v)) { paths.Add(v.Trim()); any = true; }
             }
             if (!any) paths.Add(line.Trim());
         }
         return paths;
+    }
+
+    /// <summary>Undo strace's string escaping: \NNN octal bytes (UTF-8 sequences), \" and \\.</summary>
+    public static string DecodeStrace(string s)
+    {
+        if (!s.Contains('\\')) return s;
+        var bytes = new List<byte>(s.Length);
+        for (var i = 0; i < s.Length; i++)
+        {
+            if (s[i] == '\\' && OctalAt(s, i + 1) is { } b) { bytes.Add(b); i += 3; continue; }
+            if (s[i] == '\\' && i + 1 < s.Length && s[i + 1] is '"' or '\\') { bytes.Add((byte)s[i + 1]); i++; continue; }
+            bytes.AddRange(System.Text.Encoding.UTF8.GetBytes(s[i].ToString()));
+        }
+        return System.Text.Encoding.UTF8.GetString(bytes.ToArray());
+    }
+
+    private static byte? OctalAt(string s, int i)
+    {
+        if (i + 2 >= s.Length) return null;
+        var v = 0;
+        for (var k = 0; k < 3; k++)
+        {
+            var c = s[i + k];
+            if (c < '0' || c > '7') return null;
+            v = v * 8 + (c - '0');
+        }
+        return v <= 255 ? (byte)v : null;
     }
 }

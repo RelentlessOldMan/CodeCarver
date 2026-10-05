@@ -30,6 +30,8 @@ public sealed class ResolvedCarve
     public List<ResolvedStage> Stages = new();
     // [advanced] escape hatches (null = engine default).
     public long? MaxParseBytes;
+    public List<(string From, string To)> PathMap = new();
+    public bool AllowUnmatchedTraces;
     public int? ParseTimeout;                      // seconds
     public int? MaxSymbolsPerFile;
 }
@@ -92,6 +94,8 @@ public static class CarveResolver
         r.ExcludeDirectories = cfg.Common.ExcludeDirectories.ToList();
         r.ForceKeepFiles = cfg.Common.ForceKeepFiles.ToList();
         r.MaxParseBytes = cfg.MaxParseBytes;
+        r.PathMap = cfg.PathMap;
+        r.AllowUnmatchedTraces = cfg.AllowUnmatchedTraces;
         r.ParseTimeout = cfg.ParseTimeout;
         r.MaxSymbolsPerFile = cfg.MaxSymbolsPerFile;
 

@@ -20,6 +20,8 @@ public sealed class CarveTomlConfig
     public long? MaxParseBytes;
     public int? ParseTimeout;         // seconds (0 disables)
     public int? MaxSymbolsPerFile;
+    public List<(string From, string To)> PathMap = new();   // trace / compile-command path prefixes -> carve root
+    public bool AllowUnmatchedTraces;                         // a trace with no in-tree path is a warning, not an error
 }
 
 public sealed class CommonSection
@@ -63,7 +65,7 @@ public static class ConfigLoader
     public sealed record Result(CarveTomlConfig? Config, IReadOnlyList<string> Errors, IReadOnlyList<string> Warnings);
 
     private static readonly string[] TopKeys = { "outputDirectory", "analysisOnly", "common", "builds", "runs", "stages", "use", "advanced" };
-    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "maxSymbolsPerFile" };
+    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "maxSymbolsPerFile", "pathMap", "allowUnmatchedTraces" };
     private static readonly string[] CommonKeys =
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
@@ -171,6 +173,20 @@ public static class ConfigLoader
         {
             RejectUnknownKeys(adv, AdvancedKeys, "[advanced]", ctx);
             cfg.MaxParseBytes = GetLong(adv, "maxParseBytes", "[advanced]", ctx);
+            cfg.AllowUnmatchedTraces = GetBool(adv, "allowUnmatchedTraces", "[advanced]", ctx) ?? false;
+            if (adv.TryGetValue("pathMap", out var pm))
+            {
+                // pathMap = [{ from = "/build/agent/repo", to = "." }, ...]   ("to" is relative to the carve root)
+                IEnumerable<object> items = pm is TomlTableArray ta ? ta.Cast<object>() : pm is TomlArray arr ? arr.Cast<object>() : Array.Empty<object>();
+                if (pm is not (TomlTableArray or TomlArray)) ctx.Errors.Add("[advanced]: 'pathMap' must be an array of { from = \"...\", to = \"...\" }.");
+                foreach (var it in items)
+                {
+                    if (it is TomlTable t && t.TryGetValue("from", out var f) && f is string fs && fs.Length > 0
+                        && t.TryGetValue("to", out var to) && to is string ts)
+                        cfg.PathMap.Add((fs, ts));
+                    else ctx.Errors.Add("[advanced]: each 'pathMap' entry needs string 'from' and 'to'.");
+                }
+            }
             cfg.ParseTimeout = (int?)GetLong(adv, "parseTimeout", "[advanced]", ctx);
             cfg.MaxSymbolsPerFile = (int?)GetLong(adv, "maxSymbolsPerFile", "[advanced]", ctx);
         }

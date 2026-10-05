@@ -144,6 +144,20 @@ public static class CarveCommand
         var buildFileTraces = cv.BuildTraceFiles.ToList();
         var runFileTraces = cv.RunTraceFiles.ToList();
         var outputDirectory = cv.OutputDirectory;
+        // [advanced] pathMap: rewrite a path captured elsewhere (CI agent, other drive) onto the carve root.
+        // "to" is relative to the carve root (review T3).
+        string MapPath(string p)
+        {
+            foreach (var (from, to) in cv.PathMap)
+            {
+                var pf = p.Replace('\\', '/');
+                var ff = from.Replace('\\', '/').TrimEnd('/');
+                if (!pf.StartsWith(ff, StringComparison.OrdinalIgnoreCase) || (pf.Length > ff.Length && pf[ff.Length] != '/')) continue;
+                var target = Path.IsPathFullyQualified(to) ? to : Path.Combine(Path.GetFullPath(args[1]), to);
+                return Path.GetFullPath(Path.Combine(target, pf[ff.Length..].TrimStart('/')));
+            }
+            return p;
+        }
 
         // Fixed, auto-handled settings (no longer user-facing flags).
         var pruneGarbage = true;        // auto-exclude provable non-inputs; forceKeepFiles un-drops
@@ -261,8 +275,9 @@ public static class CarveCommand
             {
                 try
                 {
+                    cmdDir = MapPath(cmdDir);
                     var bd = Path.IsPathFullyQualified(cmdDir) ? cmdDir : Path.Combine(dir, cmdDir);
-                    var full = Path.IsPathFullyQualified(path) ? path : Path.Combine(bd, path);
+                    var full = MapPath(Path.IsPathFullyQualified(path) ? path : Path.Combine(bd, path));
                     return File.Exists(full) ? File.ReadAllText(full) : null;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return null; }
@@ -279,7 +294,13 @@ public static class CarveCommand
                     + "JSON array of {directory, file, command|arguments}.");
                 return 2;
             }
-            buildCmds.AddRange(cmds);
+            buildCmds.AddRange(cv.PathMap.Count == 0 ? cmds : cmds.Select(c => c with
+            {
+                Directory = MapPath(c.Directory),
+                File = MapPath(c.File),
+                Includes = c.Includes.Select(MapPath).ToList(),
+                ForcedIncludes = c.ForcedIncludes.Select(MapPath).ToList(),
+            }));
         }
         // Per-TU preprocessor config from the build log. A build can compile the SAME file in multiple configs;
         // unioning all TUs' -D and applying it globally would mark a macro "defined" for a file that was compiled
@@ -939,7 +960,12 @@ public static class CarveCommand
             foreach (var tp in traceList)
             {
                 if (!File.Exists(tp)) continue; // defensive; missing ones were already handled
-                try { foreach (var n in TraceFile.FunctionNames(TraceFile.Parse(File.ReadAllText(tp), pat))) traceNames.Add(n); }
+                try
+                {
+                    var recs = TraceFile.Parse(File.ReadAllText(tp), pat, out var bad);
+                    foreach (var n in TraceFile.FunctionNames(recs)) traceNames.Add(n);
+                    if (bad > 0) err.WriteLine($"  warn    : {bad} line(s) of function trace '{Path.GetFileName(tp)}' had no readable function name");
+                }
                 catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
                 { err.WriteLine("--trace-format took too long to match a trace line (catastrophic backtracking?) — simplify the pattern"); return 2; }
             }
@@ -960,48 +986,96 @@ public static class CarveCommand
         // (attribution + flag the kept-but-unobserved infra as drop-candidates).
         var observedRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var fileTraceRoots = new List<Root>();
-        var observedExternalSrc = 0;   // source-like files read OUTSIDE the carve root (a real missing dependency)
+        int externalTu = 0, externalHeaders = 0;   // source files that EXIST outside the carve root (missing dependency?)
         if (buildFileTraces.Count + runFileTraces.Count > 0)
         {
-            System.Text.RegularExpressions.Regex? fpat = null;
-            if (fileTraceFormat is not null)
-                try { fpat = new System.Text.RegularExpressions.Regex(fileTraceFormat, System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(2)); }
-                catch (Exception ex) { err.WriteLine($"--file-trace-format is not a valid regex: {ex.Message}"); return 2; }
-
             var rootFull = Path.GetFullPath(dir);
-            void Ingest(List<string> traces)
+            var rootPrefix = Path.TrimEndingDirectorySeparator(rootFull) + Path.DirectorySeparatorChar;
+            // Compiler/system include trees are never "missing dependencies" (review T4).
+            var systemDirs = new List<string> { "/usr/", "/opt/", "/lib/", "/etc/", "/proc/", "/sys/", "/dev/", "/tmp/" };
+            foreach (var sf in new[] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86,
+                                       Environment.SpecialFolder.Windows, Environment.SpecialFolder.CommonApplicationData })
+                try { var f = Environment.GetFolderPath(sf); if (f.Length > 0) systemDirs.Add(Path.TrimEndingDirectorySeparator(f) + Path.DirectorySeparatorChar); } catch { }
+            if (probeCompiler is not null)
+                try
+                {
+                    var exe = File.Exists(probeCompiler) ? Path.GetFullPath(probeCompiler)
+                        : (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator)
+                            .Select(d => { try { return Path.Combine(d, probeCompiler); } catch { return ""; } })
+                            .FirstOrDefault(c => File.Exists(c) || File.Exists(c + ".exe"));
+                    // <toolchain>/bin/gcc -> <toolchain>/
+                    if (!string.IsNullOrEmpty(exe) && Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(exe))) is { } tc)
+                        systemDirs.Add(Path.TrimEndingDirectorySeparator(tc) + Path.DirectorySeparatorChar);
+                }
+                catch { /* best effort */ }
+            var tuExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".s", ".asm" };
+
+            // Returns false (after printing why) when a trace can't be used: unreadable, or nothing in it maps here.
+            bool Ingest(List<string> traces, string kind)
             {
                 foreach (var tp in traces)
                 {
-                    if (!File.Exists(tp)) continue; // defensive; missing ones were already handled up front
-                    string content;
-                    try { content = File.ReadAllText(tp); }
-                    catch (Exception ex) { err.WriteLine($"  warn    : could not read file-trace {Path.GetFileName(tp)} ({ex.GetType().Name}) — skipped"); continue; }
                     IReadOnlyCollection<string> cands;
-                    try { cands = FileAccessTrace.Paths(content, fpat); }
-                    catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
-                    { err.WriteLine("--file-trace-format took too long to match a line (catastrophic backtracking?) — simplify the pattern"); cands = Array.Empty<string>(); }
-                    foreach (var cand in cands)
+                    // Streamed (File.ReadLines): a multi-GB raw capture is never one string. A trace that can't be
+                    // read is an error like a missing one — carving on with fewer roots would be silent (review T2).
+                    try { cands = FileAccessTrace.Paths(File.ReadLines(tp)); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OutOfMemoryException)
+                    { err.WriteLine($"{kind} file-trace '{tp}' could not be read ({ex.GetType().Name}: {ex.Message})."); return false; }
+                    var inTree = 0;
+                    var absoluteMisses = new List<string>();
+                    foreach (var cand0 in cands)
                     {
+                        var cand = MapPath(cand0);
                         string full;
                         try { full = Path.IsPathFullyQualified(cand) ? Path.GetFullPath(cand) : Path.GetFullPath(Path.Combine(rootFull, cand)); }
                         catch { continue; } // not a usable path token (noise)
-                        if (full.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase) && File.Exists(full))
+                        if (full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) && File.Exists(full))
+                        {
                             observedRel.Add(Path.GetRelativePath(rootFull, full).Replace('\\', '/'));
-                        else if (exts.Any(e => cand.EndsWith(e, StringComparison.OrdinalIgnoreCase)))
-                            observedExternalSrc++; // a real source file, but outside the carve root — slice is missing it
+                            inTree++;
+                            continue;
+                        }
+                        if (Path.IsPathRooted(cand) && absoluteMisses.Count < 400) absoluteMisses.Add(cand);
+                        if (!exts.Concat(tuExts).Any(e => cand.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue;
+                        if (full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) || !File.Exists(full)) continue;
+                        var fwd = full.Replace('\\', '/');
+                        if (systemDirs.Any(sd => fwd.StartsWith(sd.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))) continue;
+                        if (tuExts.Any(e => full.EndsWith(e, StringComparison.OrdinalIgnoreCase))) externalTu++; else externalHeaders++;
+                    }
+                    if (cands.Count > 0 && inTree == 0)
+                    {
+                        // T3: a capture from another checkout (CI agent path, other drive, WSL vs Windows) matches
+                        // nothing. Say so, and suggest the prefix to map.
+                        var hint = SuggestPathMap(absoluteMisses, rootFull);
+                        var msg = $"{kind} file-trace '{tp}': none of its {cands.Count} path(s) is a file under '{rootFull}'"
+                            + (hint is null ? " — was it captured in a different checkout location?"
+                                            : $" — it looks captured under '{hint}'. Add [advanced] pathMap = [{{ from = \"{hint.Replace('\\', '/')}\", to = \".\" }}]");
+                        if (!cv.AllowUnmatchedTraces)
+                        { err.WriteLine(msg + " (or set [advanced] allowUnmatchedTraces = true)."); return false; }
+                        err.WriteLine("  warn    : " + msg);
                     }
                 }
+                return true;
             }
-            Ingest(buildFileTraces);
-            Ingest(runFileTraces);
+            if (!Ingest(buildFileTraces, "build") || !Ingest(runFileTraces, "run")) return 2;
 
-            var observedCode = observedRel.Where(r => exts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase))).ToList();
-            if (observedCode.Count > 0)
-                fileTraceRoots = new ExplicitRootProvider(files: observedCode).Discover(graph).ToList();
+            // T5: match observed files to the walk's own spelling (case-insensitive file systems report whatever
+            // case the opener used), so rooting — which compares exactly — finds them.
+            var walkByLower = fullByRel.Keys.GroupBy(k => k, StringComparer.OrdinalIgnoreCase)
+                                       .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+            var observedCode = observedRel.Select(r => walkByLower.TryGetValue(r, out var w) ? w : null)
+                                          .Where(r => r is not null).Select(r => r!).Distinct(StringComparer.Ordinal).ToList();
+            // D-D: an observed code file roots its FILE node only. The file is kept (and, file-level, closed over
+            // whole by EmitClosure); the pruned stage can still remove functions no entry point reaches.
+            var wantFiles = new HashSet<string>(observedCode, StringComparer.Ordinal);
+            foreach (var n in graph.Nodes)
+                if (n.Kind == NodeKind.File && wantFiles.Contains(n.Name))
+                    fileTraceRoots.Add(new Root(n.Id, RootKind.ExplicitFile, "observed"));
             err.WriteLine($"  files   : {observedRel.Count} observed in-tree from {buildFileTraces.Count} build + {runFileTraces.Count} run file-trace(s)"
-                + $" ({observedCode.Count} code rooted)"
-                + (observedExternalSrc > 0 ? $"; {observedExternalSrc} source file(s) read OUTSIDE the carve root (missing dependency?)" : ""));
+                + $" ({fileTraceRoots.Count} code file(s) rooted)"
+                + (externalTu + externalHeaders > 0
+                    ? $"; {externalTu} translation unit(s) + {externalHeaders} header(s) read OUTSIDE the carve root (missing dependency?)" : ""));
+            diag.Set("observedOutsideTu", externalTu); diag.Set("observedOutsideHeaders", externalHeaders);
         }
 
         // forceKeepFiles (review K1): resolve each glob once. A forced code file is an ExplicitFile root, so its
@@ -1450,6 +1524,29 @@ public static class CarveCommand
         diag.Event("run complete");
 
         return verifyFailed ? 3 : 0; // non-zero so the soundness check is usable as a CI gate
+    }
+
+    /// <summary>For absolute trace paths that miss the carve root, find the prefix most of them share once their
+    /// tail is found under the root: "/build/agent/repo/src/a.c" with root/src/a.c present -> "/build/agent/repo".</summary>
+    static string? SuggestPathMap(IReadOnlyList<string> misses, string rootFull)
+    {
+        var votes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var m in misses.Take(200))
+        {
+            var segs = m.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+            for (var i = 1; i < segs.Length; i++)
+            {
+                string cand;
+                try { cand = Path.Combine(rootFull, string.Join(Path.DirectorySeparatorChar, segs[i..])); } catch { continue; }
+                if (!File.Exists(cand)) continue;
+                var norm = m.Replace('\\', '/');
+                var tail = "/" + string.Join('/', segs[i..]);
+                var prefix = norm.EndsWith(tail, StringComparison.OrdinalIgnoreCase) ? norm[..^tail.Length] : null;
+                if (!string.IsNullOrEmpty(prefix)) votes[prefix] = votes.GetValueOrDefault(prefix) + 1;
+                break;
+            }
+        }
+        return votes.Count == 0 ? null : votes.OrderByDescending(v => v.Value).First().Key;
     }
 
     // Human ETA from a seconds estimate. "?" when not yet computable (no throughput sample yet).

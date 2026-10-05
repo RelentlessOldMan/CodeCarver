@@ -22,12 +22,19 @@ public readonly record struct TraceRecord(string Function, string? File, int? Li
 public static class TraceFile
 {
     /// <summary>Default: a leading identifier (the function), optionally followed by <c>file:line</c>.</summary>
+    /// An optional leading hex address (<c>0x0800a1c4</c>) or timestamp (<c>12.345</c>) is skipped, and a C++
+    /// qualified name (<c>ns::Class::method</c>) yields its last component (review T6).
     public static readonly Regex DefaultPattern = new(
-        @"^\s*(?<fn>[A-Za-z_]\w*)\b(?:.*?\s(?<file>[^\s:]+):(?<line>\d+))?", RegexOptions.Compiled);
+        @"^\s*(?:(?:0x)?[0-9A-Fa-f]{6,}:?\s+|\[?\d+(?:[.:]\d+)*\]?\s+)?(?<fn>[A-Za-z_~][\w~]*(?:::[A-Za-z_~][\w~]*)*)\b(?:.*?\s(?<file>[^\s:]+):(?<line>\d+))?",
+        RegexOptions.Compiled);
 
-    public static IReadOnlyList<TraceRecord> Parse(string text, Regex? pattern = null)
+    public static IReadOnlyList<TraceRecord> Parse(string text, Regex? pattern = null) => Parse(text, pattern, out _);
+
+    /// <param name="unmatched">Non-blank, non-comment lines no function name could be read from.</param>
+    public static IReadOnlyList<TraceRecord> Parse(string text, Regex? pattern, out int unmatched)
     {
         pattern ??= DefaultPattern;
+        unmatched = 0;
         var recs = new List<TraceRecord>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var raw in (text ?? "").Split('\n'))
@@ -35,8 +42,10 @@ public static class TraceFile
             var line = raw.Trim();
             if (line.Length == 0 || line[0] == '#') continue;
             var m = pattern.Match(line);
-            if (!m.Success || !m.Groups["fn"].Success || m.Groups["fn"].Value.Length == 0) continue;
+            if (!m.Success || !m.Groups["fn"].Success || m.Groups["fn"].Value.Length == 0) { unmatched++; continue; }
             var fn = m.Groups["fn"].Value;
+            var colons = fn.LastIndexOf("::", StringComparison.Ordinal);
+            if (colons >= 0) fn = fn[(colons + 2)..];
             var file = m.Groups["file"].Success && m.Groups["file"].Value.Length > 0 ? m.Groups["file"].Value : null;
             int? ln = m.Groups["line"].Success && int.TryParse(m.Groups["line"].Value, out var l) ? l : null;
             var key = fn + "\0" + (file ?? "") + "\0" + (ln?.ToString() ?? "");

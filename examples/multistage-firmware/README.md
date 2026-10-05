@@ -25,13 +25,13 @@ Output lands in `out/<stage>/{carved,codecarver}` (git-ignored; regenerate with 
 | `src/isr.c` (`Timer_ISR`) | an **implicit root** — reached only via the vector table in `startup.s` (`.word Timer_ISR`) |
 | `src/debug.c` | **dead code** — no entry point reaches it, so the carve drops the whole file |
 | `src/app.c` `diagnostic_selftest()` | an **unused function in a KEPT file** — kept whole at `safe`, stripped at `aggressive`/`max` |
-| `src/sensor.c` `#ifdef FEATURE_FAST` | **#ifdef resolution** — the build log pins `-DFEATURE_FAST`, so the dead `#else` is dropped (closed-world) |
+| `src/sensor.c` `#ifdef FEATURE_FAST` | **#ifdef resolution** — the build log pins `-DFEATURE_FAST`, so what only the dead `#else` calls is not kept (closed-world). The emitted text still contains both branches: resolution decides reachability, it never edits the `#if` |
 | `src/config.h` | a register header (its unused `#define`s would be stripped by header-carving on a *big* header) |
 | `src/startup.s`, `flash.ld`, `Makefile`, `scripts/flash.cmm`, `data/calib.bin` | **infrastructure** — copied verbatim so `out/.../carved` is a complete buildable project |
 | `src/boards/old/variant.c` | a board variant NOT in this image — dropped via `excludeDirectories` |
-| `src/.git/`, `src/notes.txt.bak` | **auto-excluded** (VCS/editor junk — never a build/run input) |
+| `src/notes.txt.bak`, `src/build.log`, `src/__pycache__/` | **auto-excluded** (editor/scratch junk — never a build/run input) |
 | `inputs/compile_commands.json` | the **build log** (pins `-D`/`-I` → `#ifdef` world) |
-| `inputs/build.procmon.csv` | a **build file-trace** — files opened while *building*; catches inputs the compile log doesn't list: the assembled `startup.s`, the linker script `flash.ld`, the `config.h` the compiler pulled in (all flip to `[observed]`) |
+| `inputs/build.procmon.csv` | a **build file-trace** — files opened while *building*; catches inputs the compile log doesn't list: the assembled `startup.s`, the linker script `flash.ld`, the `config.h` the compiler pulled in (all flip to `[observed]`). An observed code file is **kept**, but only its file is rooted — functions in it that no entry point reaches are still removed at `aggressive` |
 | `inputs/run.procmon.csv` | a **run file-trace** — the loader opened `scripts/flash.cmm` + `data/calib.bin` (kept + `[observed]`) |
 | `inputs/run.log` | a **run function-trace** — the functions that actually executed (become roots) |
 
@@ -41,19 +41,23 @@ The build/run traces here are tiny hand-written samples; on a real project you c
 ## What a run prints (abridged)
 
 ```
+  files   : 11 observed in-tree from 1 build + 1 run file-trace(s) (6 code file(s) rooted)
   roots   : main, Timer_ISR
   trace   : 7 function(s) from 1 trace(s) rooted; 7 resolved in-scope
-  files   : 11 observed in-tree from 1 build + 1 run file-trace(s) (6 code rooted)
   files   : 6/7 kept, 1 dropped
   dropped : debug.c
-  verify  : OK — every in-scope callee of a kept function is kept
-  world   : closed-world (dead #ifdef branches dropped) — have 1 build log(s)
-  stage   : safe        [source-contents=whole,  header-contents=whole]   size 2,761 B -> 2,567 B (7% smaller)
-  stage   : aggressive  [source-contents=carved, header-contents=whole]   size 2,761 B -> 2,300 B (17% smaller)
-  stage   : max         [source-contents=carved, header-contents=carved]  size 2,761 B -> 2,300 B (17% smaller)
+  world   : closed-world (dead #ifdef branches dropped) - have 5 compile command(s); ...
+  stage   : safe  [source-contents=whole, header-contents=whole]
+  verify  : OK - emitted code uses no function defined only in a dropped file (7 file(s) checked)
+  size    : 2,761 B -> 2,567 B  (7% smaller, saved 194 B)
+  stage   : aggressive  [source-contents=carved, header-contents=whole]
+  size    : 2,761 B -> 2,300 B  (17% smaller, saved 461 B)
+  stage   : max  [source-contents=carved, header-contents=carved]
+  size    : 2,761 B -> 2,300 B  (17% smaller, saved 461 B)
 ```
 
-`aggressive` beats `safe` because `diagnostic_selftest()` is stripped from the kept `app.c`. `max` matches
+`aggressive` beats `safe` because `diagnostic_selftest()` is stripped from the kept `app.c`. (The build trace
+observed `app.c` being compiled; that keeps the file, it does not root every function in it.) `max` matches
 `aggressive` here only because `config.h` is too small to trigger header-carving — on a real multi-MB register
 header, `max` strips the unused `#define`s too.
 
