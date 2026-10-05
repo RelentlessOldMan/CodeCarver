@@ -13,8 +13,15 @@ namespace CodeCarver.Frontend;
 ///
 /// Deliberately file-level: sound intra-file method pruning in C# needs semantic analysis (overload
 /// resolution, interfaces, reflection) that only a real compiler front-end (Roslyn) provides. So
-/// `--prune` is not applied to C#; this answers "which files does the build need for these entry
-/// points" — already a big win on a large solution.
+/// carveSourceFileContents is not applied to C#; this answers "which files does the build need for these
+/// entry points" — already a big win on a large solution.
+///
+/// File-level closure (review CS2): a kept file compiles WHOLE, so everything it names must be kept too —
+/// not just what reached methods call. Every file gets a File node; every definition points to its file;
+/// every identifier anywhere in a file (base types, field initialisers, property bodies, attributes,
+/// `new T()`, method groups) references every type and method of that name. A file with top-level
+/// statements is a program entry and is rooted. Still name-based: reflection and string-keyed DI are
+/// invisible — keep such files with forceKeepFiles.
 /// </summary>
 public sealed class CSharpFrontEnd : ICarveFrontEnd
 {
@@ -35,15 +42,19 @@ public sealed class CSharpFrontEnd : ICarveFrontEnd
         (object_creation_expression type: (identifier) @callee)
         """;
 
+    private const string IdentQuery = "(identifier) @id";
+
     private readonly Language _lang;
     private readonly Query _defs;
     private readonly Query _calls;
+    private readonly Query _idents;
 
     public CSharpFrontEnd()
     {
         _lang = new Language("tree-sitter-c-sharp.dll", "tree_sitter_c_sharp");
         _defs = new Query(_lang, DefsQuery);
         _calls = new Query(_lang, CallsQuery);
+        _idents = new Query(_lang, IdentQuery);
     }
 
     /// <inheritdoc/>
@@ -59,23 +70,36 @@ public sealed class CSharpFrontEnd : ICarveFrontEnd
     {
         var graph = new CodeGraph();
         var functionsByName = new Dictionary<string, List<NodeId>>(StringComparer.Ordinal);
+        var typesByName = new Dictionary<string, List<NodeId>>(StringComparer.Ordinal);
         var pending = new List<(NodeId From, string Name)>();
+        var fileRefs = new List<(NodeId File, string Name)>();
 
         foreach (var (path, text) in files)
+        {
+            var fileNode = graph.GetOrAddNode(NodeKind.File, path);
             if (text.Length > 0) // oversized/empty-file guard (C# has no include-closure so the CLI never skips .cs)
-                ProcessFile(graph, path, text, functionsByName, pending);
+                ProcessFile(graph, path, text, fileNode, functionsByName, typesByName, pending, fileRefs);
+        }
 
         foreach (var (from, name) in pending)
             if (functionsByName.TryGetValue(name, out var targets))
                 foreach (var t in targets)
                     graph.AddEdge(from, t, EdgeKind.Calls);
+        foreach (var (file, name) in fileRefs)
+        {
+            if (functionsByName.TryGetValue(name, out var fns))
+                foreach (var t in fns) graph.AddEdge(file, t, EdgeKind.References);
+            if (typesByName.TryGetValue(name, out var tys))
+                foreach (var t in tys) graph.AddEdge(file, t, EdgeKind.References);
+        }
 
         return graph;
     }
 
-    private void ProcessFile(CodeGraph graph, string path, string text,
+    private void ProcessFile(CodeGraph graph, string path, string text, NodeId fileNode,
                              Dictionary<string, List<NodeId>> functionsByName,
-                             List<(NodeId, string)> pending)
+                             Dictionary<string, List<NodeId>> typesByName,
+                             List<(NodeId, string)> pending, List<(NodeId, string)> fileRefs)
     {
         using var parser = new Parser(_lang);
         using var tree = parser.Parse(text);
@@ -96,12 +120,26 @@ public sealed class CSharpFrontEnd : ICarveFrontEnd
                     functionsByName[node.Text] = list = new List<NodeId>();
                 list.Add(id);
                 methodSpans.Add((span.Item1, span.Item2, id));
+                graph.AddEdge(id, fileNode, EdgeKind.DefinedIn);   // a reached method keeps its whole file
             }
             else
             {
-                graph.GetOrAddNode(NodeKind.Type, node.Text, path, new SourceSpan(row, row));
+                var id = graph.GetOrAddNode(NodeKind.Type, node.Text, path, new SourceSpan(row, row));
+                if (!typesByName.TryGetValue(node.Text, out var list))
+                    typesByName[node.Text] = list = new List<NodeId>();
+                list.Add(id);
+                graph.AddEdge(id, fileNode, EdgeKind.DefinedIn);   // partial types: every declaring file
             }
         }
+
+        // Everything this file names, wherever it appears — the file compiles whole.
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var cap in _idents.Execute(root).Captures)
+            if (seen.Add(cap.Node.Text)) fileRefs.Add((fileNode, cap.Node.Text));
+
+        // Top-level statements (C# 9 program without Main): the file is the entry point.
+        foreach (var child in root.NamedChildren)
+            if (child.Type == "global_statement") { graph.AddFlag(fileNode, NodeFlags.Keep); break; }
 
         foreach (var cap in _calls.Execute(root).Captures)
         {
@@ -136,6 +174,7 @@ public sealed class CSharpFrontEnd : ICarveFrontEnd
 
     public void Dispose()
     {
+        _idents.Dispose();
         _calls.Dispose();
         _defs.Dispose();
         _lang.Dispose();

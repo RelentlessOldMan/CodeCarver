@@ -139,8 +139,10 @@ public static class InfrastructureEmitter
         {
             var rel = Path.GetRelativePath(sourceRoot, p).Replace('\\', '/');
             if (skip.Contains(rel)) continue;      // already emitted (kept code + include closure)
-            if (dropped.Contains(rel)) continue;   // modelled dead code — removed on carve evidence
             var isForced = forced.Contains(rel);
+            // Modelled dead code is removed on carve evidence — unless forceKeepFiles names it (review K1: the
+            // dropped check used to win, so forceKeepFiles could not restore a dropped file).
+            if (dropped.Contains(rel) && !isForced) continue;
             if (!isForced && !Included(rel)) continue; // --exclude prunes (unless --aux forces it back)
             // Garbage is dropped only on CONVENTION (never a build/run input), only when enabled, never when --aux
             // forced the file back in, and never when a trace OBSERVED the file being opened (hard evidence it's used).

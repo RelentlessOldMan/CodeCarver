@@ -97,8 +97,12 @@ public static class FileTreeEmitter
             // multi-GB headers kept whole — is stream-copied, so a big kept file never becomes a
             // >2GB string in memory (it would throw) and is emitted in bounded memory.
             var ranges = !IsHeader(rel) && defsByFile.TryGetValue(rel, out var defs) ? DropRangesFor(defs, plan.IsKept) : null;
-            if (ranges is { Count: > 0 })
-                File.WriteAllText(dst, RemoveLineRanges(File.ReadAllText(src), ranges));
+            // Rewritten byte-transparently (Latin-1): a Latin-1/Shift-JIS/UTF-8 string literal must come out with
+            // exactly its original bytes (review E1). UTF-16 text can't be edited line-wise this way: copy it whole
+            // (CarvePlan already closed over the whole file being written; see EmitClosure).
+            if (ranges is { Count: > 0 } && !IsUtf16(src))
+                // Bytes in, bytes out: ReadAllText would honour (and strip) a UTF-8 BOM even when told Latin-1.
+                File.WriteAllBytes(dst, Encoding.Latin1.GetBytes(RemoveLineRanges(Encoding.Latin1.GetString(File.ReadAllBytes(src)), ranges)));
             else
                 File.Copy(src, dst, overwrite: true);
             bytes += new FileInfo(dst).Length;
@@ -162,10 +166,24 @@ public static class FileTreeEmitter
 
         var ranges = DropRangesFor(defs, isKept);
         var text = ranges is { Count: > 0 } ? readText(rel) : null;
+        if (text is not null && text.Length > 1 && (text[0] == '\u00FF' && text[1] == '\u00FE' || text[0] == '\u00FE' && text[1] == '\u00FF'))
+            text = null;   // UTF-16 (read as Latin-1): EmitPruned copies it whole
         if (text is null) return unreached.Select(n => n.Id).ToList();        // written whole
         var applied = AppliedRanges(text.Split('\n'), ranges!);
         return unreached.Where(n => !(n.Span.IsKnown && applied.Contains((n.Span.StartLine, n.Span.EndLine))))
                         .Select(n => n.Id).ToList();
+    }
+
+    /// <summary>UTF-16 by byte-order mark.</summary>
+    public static bool IsUtf16(string path)
+    {
+        try
+        {
+            using var fs = File.OpenRead(path);
+            int a = fs.ReadByte(), b = fs.ReadByte();
+            return (a == 0xFF && b == 0xFE) || (a == 0xFE && b == 0xFF);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
     }
 
     /// <summary>Do these two paths resolve to the same file on disk? Used to refuse writing a carved file

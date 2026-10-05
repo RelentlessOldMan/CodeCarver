@@ -40,14 +40,17 @@ public static class HeaderCarver
         //    ALSO collect token-paste fragments: if code builds a name with `##` (`REG_##n##_BASE`), the
         //    concrete define (`REG_0_BASE`) never appears literally, so we'd wrongly drop it. Any define
         //    whose name a fragment could form is kept (sound over-approximation — the paste blind spot).
+        //    Every TEXT file in the output counts — assembly, linker scripts, .inc tables, scripts — not only C:
+        //    a define used only by startup.S or a linker script is still needed (review H1). The caller runs this
+        //    after the infrastructure copy so those files are present. Binary files are skipped.
         var needed = new HashSet<string>(StringComparer.Ordinal);
         var fragments = new HashSet<string>(StringComparer.Ordinal);
         var walk = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
         foreach (var f in Directory.EnumerateFiles(outDir, "*", walk))
         {
             var rel = Path.GetRelativePath(outDir, f).Replace('\\', '/');
-            if (bigSet.Contains(rel)) continue;
-            foreach (var line in File.ReadLines(f))
+            if (bigSet.Contains(rel) || LooksBinary(f)) continue;
+            foreach (var line in File.ReadLines(f, Encoding.Latin1))
             {
                 AddIdentifiers(needed, line);
                 if (line.Contains("##", StringComparison.Ordinal)) AddPasteFragments(fragments, line);
@@ -63,16 +66,26 @@ public static class HeaderCarver
         // 2. Fixpoint: grow `needed` with the bodies of wanted defines and all #if-condition identifiers,
         //    streaming each header per pass. Terminates because `needed` only grows and is finite. Passes
         //    ≈ the deepest define-dependency chain (small for register maps).
+        //    The header's own non-#define lines (typedefs, enums, inline functions) are kept verbatim, so the
+        //    names they use are needed too; and a kept define that pastes (##) can form further names.
         bool grew = true;
         while (grew)
         {
             grew = false;
             foreach (var path in bigFull)
-                foreach (var (name, text, isConditional) in EnumerateLogicalDirectives(path))
+                foreach (var (name, text, kind) in EnumerateLogicalLines(path))
                 {
-                    if (isConditional) { grew |= AddIdentifiers(needed, text); continue; }
+                    if (kind != LineKind.Define) { grew |= AddIdentifiers(needed, text); continue; }
                     if (name is not null && Wanted(name))
+                    {
                         grew |= AddIdentifiers(needed, text); // keep it -> its body's names are needed too
+                        if (text.Contains("##", StringComparison.Ordinal))
+                        {
+                            var n = fragments.Count;
+                            AddPasteFragments(fragments, text);
+                            grew |= fragments.Count != n;
+                        }
+                    }
                 }
         }
 
@@ -85,6 +98,9 @@ public static class HeaderCarver
             before += new FileInfo(path).Length;
             var tmp = path + ".carve.tmp";
             RewriteDroppingUnneeded(path, tmp, Wanted, ref kept, ref dropped);
+            // A read-only source copy (Perforce) must not make the replace throw.
+            var attrs = File.GetAttributes(path);
+            if ((attrs & FileAttributes.ReadOnly) != 0) File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
             File.Delete(path);
             File.Move(tmp, path);
             after += new FileInfo(path).Length;
@@ -92,37 +108,42 @@ public static class HeaderCarver
         return new HeaderCarveResult(before, after, kept, dropped);
     }
 
+    private enum LineKind { Define, Conditional, Other }
+
     /// <summary>
-    /// Stream a header yielding one entry per logical directive: for a <c>#define</c>, its
-    /// (name, full-text-including-continuations, isConditional=false); for <c>#if/#ifdef/#ifndef/#elif</c>,
-    /// (null, the-condition-text, true). Continuation (<c>\</c>) lines are joined. Bounded memory.
+    /// Stream a header yielding one entry per logical line (continuations joined): a <c>#define</c> with its
+    /// name and full text, a conditional (<c>#if/#ifdef/#ifndef/#elif</c>) with its whole condition, or any
+    /// other line. Bounded memory; Latin-1 so no byte can fail to decode.
     /// </summary>
-    private static IEnumerable<(string? Name, string Text, bool IsConditional)> EnumerateLogicalDirectives(string path)
+    private static IEnumerable<(string? Name, string Text, LineKind Kind)> EnumerateLogicalLines(string path)
     {
-        using var r = new StreamReader(path);
+        using var r = new StreamReader(path, Encoding.Latin1);
         string? line;
         while ((line = r.ReadLine()) is not null)
         {
             var t = line.TrimStart();
-            if (IsConditionalDirective(t)) { yield return (null, line, true); continue; }
-            if (!IsDefineDirective(t)) continue;
-
+            var isDefine = IsDefineDirective(t);
+            var isCond = !isDefine && IsConditionalDirective(t);
             var sb = new StringBuilder(line);
-            while (EndsWithContinuation(line) && (line = r.ReadLine()) is not null)
-                sb.Append('\n').Append(line);
+            if (isDefine || isCond)
+                while (EndsWithContinuation(line) && (line = r.ReadLine()) is not null)
+                    sb.Append('\n').Append(line);
             var full = sb.ToString();
-            yield return (DefineName(full), full, false);
+            yield return isDefine ? (DefineName(full), full, LineKind.Define)
+                 : isCond ? (null, full, LineKind.Conditional)
+                 : (null, full, LineKind.Other);
         }
     }
 
-    /// <summary>Copy <paramref name="src"/> to <paramref name="dst"/>, omitting #defines the predicate rejects.</summary>
+    /// <summary>Copy <paramref name="src"/> to <paramref name="dst"/>, omitting #defines the predicate rejects.
+    /// Byte-transparent (Latin-1) and every kept line keeps its own line ending (review E1).</summary>
     private static void RewriteDroppingUnneeded(string src, string dst, Func<string, bool> wanted, ref int kept, ref int dropped)
     {
-        using var r = new StreamReader(src);
-        using var w = new StreamWriter(dst);
-        string? line;
-        while ((line = r.ReadLine()) is not null)
+        using var w = new StreamWriter(dst, false, Encoding.Latin1);
+        using var e = ReadLinesWithEol(src).GetEnumerator();
+        while (e.MoveNext())
         {
+            var (line, eol) = e.Current;
             if (IsDefineDirective(line.TrimStart()))
             {
                 var name = DefineName(line);
@@ -130,16 +151,52 @@ public static class HeaderCarver
                 if (drop) dropped++; else kept++;
 
                 // Consume the whole (possibly multi-line) define; write it only if kept.
-                if (!drop) w.Write(line);
+                if (!drop) { w.Write(line); w.Write(eol); }
                 var cont = line;
-                while (EndsWithContinuation(cont) && (cont = r.ReadLine()) is not null)
-                    if (!drop) { w.Write('\n'); w.Write(cont); }
-                if (!drop) w.Write('\n');
+                while (EndsWithContinuation(cont) && e.MoveNext())
+                {
+                    (cont, eol) = e.Current;
+                    if (!drop) { w.Write(cont); w.Write(eol); }
+                }
                 continue;
             }
             w.Write(line);
-            w.Write('\n');
+            w.Write(eol);
         }
+    }
+
+    /// <summary>Lines with their exact terminators ("\r\n", "\n", "\r" or "" at EOF), Latin-1, streaming.</summary>
+    private static IEnumerable<(string Line, string Eol)> ReadLinesWithEol(string path)
+    {
+        using var r = new StreamReader(path, Encoding.Latin1, detectEncodingFromByteOrderMarks: false);
+        var sb = new StringBuilder();
+        int c;
+        while ((c = r.Read()) >= 0)
+        {
+            if (c == '\n') { yield return (sb.ToString(), "\n"); sb.Clear(); continue; }
+            if (c == '\r')
+            {
+                if (r.Peek() == '\n') { r.Read(); yield return (sb.ToString(), "\r\n"); }
+                else yield return (sb.ToString(), "\r");
+                sb.Clear();
+                continue;
+            }
+            sb.Append((char)c);
+        }
+        if (sb.Length > 0) yield return (sb.ToString(), "");
+    }
+
+    /// <summary>A NUL byte in the first 8 KB: treat as binary (no identifiers to seed from).</summary>
+    private static bool LooksBinary(string path)
+    {
+        try
+        {
+            using var fs = File.OpenRead(path);
+            var buf = new byte[8192];
+            var n = fs.Read(buf, 0, buf.Length);
+            return Array.IndexOf(buf, (byte)0, 0, n) >= 0;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return true; }
     }
 
     private static bool IsDefineDirective(string trimmed) => StartsWithHash(trimmed, "define");

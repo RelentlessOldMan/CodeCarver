@@ -483,13 +483,6 @@ public static class CarveCommand
             ? cv.Languages.SelectMany(ExtsFor).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
             : ExtsFor(lang);
 
-        // Intra-file pruning is only compile-verifiable for C/C++; other languages carve file-level.
-        if (prune && lang is not ("c" or "cpp"))
-        {
-            @out.WriteLine($"  note    : --prune is C/C++ only (needs compile verification); using file-level carve for '{lang}'.");
-            prune = false;
-        }
-
         if (roots.Length == 0)
         {
             err.WriteLine("carve needs --roots sym1,sym2 (the entry symbols to keep)");
@@ -1011,8 +1004,25 @@ public static class CarveCommand
                 + (observedExternalSrc > 0 ? $"; {observedExternalSrc} source file(s) read OUTSIDE the carve root (missing dependency?)" : ""));
         }
 
+        // forceKeepFiles (review K1): resolve each glob once. A forced code file is an ExplicitFile root, so its
+        // callees and includes come with it; a forced .cmm seeds the .cmm closure; everything forced is copied
+        // even when the carve dropped it.
+        var forcedRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var glob in auxGlobs)
+        {
+            if (BuildSupportEmitter.GlobEscapesRoot(glob))
+            { err.WriteLine($"forceKeepFiles '{glob}' refused: contains '..' or an absolute path"); return 2; }
+            var n = 0;
+            foreach (var p in BuildSupportEmitter.MatchGlob(dir, glob)) { forcedRel.Add(Path.GetRelativePath(dir, p).Replace('\\', '/')); n++; }
+            err.WriteLine(n == 0 ? $"  warn    : forceKeepFiles '{glob}' matched no file (a bare pattern like '*.inc' searches all subdirectories)"
+                                 : $"  force   : forceKeepFiles '{glob}' -> {n} file(s) kept");
+        }
+        var forcedGraphFiles = forcedRel.Where(r => fullByRel.ContainsKey(r)).ToList();
+        var forcedRoots = forcedGraphFiles.Count > 0
+            ? new ExplicitRootProvider(files: forcedGraphFiles).Discover(graph).ToList() : new List<Root>();
+
         var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots)
-                                   .Concat(ctorRoots).Concat(forceKeepRoots).Concat(traceRoots).Concat(fileTraceRoots).ToList();
+                                   .Concat(ctorRoots).Concat(forceKeepRoots).Concat(forcedRoots).Concat(traceRoots).Concat(fileTraceRoots).ToList();
         if (rootSet.Count == 0)
         {
             err.WriteLine("no roots to carve from: name entry symbols with --roots");
@@ -1140,7 +1150,9 @@ public static class CarveCommand
             }
             if (allCmm.Count > 0)
             {
-                var observedCmm = observedRel.Where(r => r.EndsWith(".cmm", StringComparison.OrdinalIgnoreCase)).ToList();
+                var observedCmm = observedRel.Where(r => r.EndsWith(".cmm", StringComparison.OrdinalIgnoreCase))
+                    .Concat(forcedRel.Where(r => r.EndsWith(".cmm", StringComparison.OrdinalIgnoreCase)))
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
                 var cc = CmmTraceClosure.Compute(allCmm, observedCmm, rel => File.ReadAllText(relToFull[rel]), maxParseBytes);
                 cmmDropped = cc.Dropped.ToList();
                 if (cc.ObservedSeeds == 0)
@@ -1312,6 +1324,13 @@ public static class CarveCommand
         {
             prune = stage.CarveSourceFileContents;
             pruneHeaders = stage.CarveHeaderFileContents;
+            // Intra-file pruning is C/C++ only: C# method pruning is unsound without semantic analysis, and .cmm
+            // is not pruned (review CS1). Applied per stage — before, the guard ran before `prune` was ever set.
+            if (prune && lang is not ("c" or "cpp"))
+            {
+                @out.WriteLine($"  note    : carveSourceFileContents applies to C/C++ only; stage '{stage.Name}' carves '{lang}' file-level.");
+                prune = false;
+            }
             var splan = PlanFor(prune);
             var baseDir = stage.Name.Length == 0 ? outputDirectory : Path.Combine(outputDirectory, stage.Name);
             var outDir = Path.Combine(baseDir, "carved");
@@ -1332,19 +1351,6 @@ public static class CarveCommand
             @out.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{(prune ? "intra-file (unused functions removed)" : "file-level (whole kept files)")}]");
             if (prune) @out.WriteLine("  note    : carveSourceFileContents is EXPERIMENTAL — always build-verify.");
 
-            if (pruneHeaders && lang is "c" or "cpp")
-            {
-                var keptBig = bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)).Where(splan.KeptFiles.Contains).ToList();
-                if (keptBig.Count > 0)
-                {
-                    var hc = HeaderCarver.Carve(stageDir, keptBig);
-                    carvedBytes -= hc.BytesBefore - hc.BytesAfter;
-                    var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
-                    @out.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} kept, {hc.DefinesDropped:N0} dropped; "
-                        + $"{hc.BytesBefore:N0} B -> {hc.BytesAfter:N0} B ({hpct:P0} smaller)");
-                }
-            }
-
             if (VerifyEmitted(splan, res.Written.Select(r => (r, Path.Combine(stageDir, r))).ToList(), ccDir)) verifyFailed = true;
 
             // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
@@ -1357,6 +1363,21 @@ public static class CarveCommand
             if (infra.Garbage.Count > 0)
                 @out.WriteLine($"  excluded: {infra.Garbage.Count:N0} non-input file(s) NOT copied ({infra.GarbageBytes:N0} B) — VCS/scratch/editor (forceKeepFiles to keep)");
             foreach (var w in infra.Warnings) err.WriteLine($"  warn    : {w}");
+
+            // After the infrastructure copy: assembly, linker scripts and other text files seed what the header
+            // carve must keep (review H1).
+            if (pruneHeaders && lang is "c" or "cpp")
+            {
+                var keptBig = bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)).Where(splan.KeptFiles.Contains).ToList();
+                if (keptBig.Count > 0)
+                {
+                    var hc = HeaderCarver.Carve(stageDir, keptBig);
+                    carvedBytes -= hc.BytesBefore - hc.BytesAfter;
+                    var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
+                    @out.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} kept, {hc.DefinesDropped:N0} dropped; "
+                        + $"{hc.BytesBefore:N0} B -> {hc.BytesAfter:N0} B ({hpct:P0} smaller)");
+                }
+            }
 
             try { staged.Promote(); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
