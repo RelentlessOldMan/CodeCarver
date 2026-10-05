@@ -155,10 +155,14 @@ use only letters, digits, `_` and `-`.
 | `maxSymbolsPerFile` | `50000` | a file with more symbols than this is kept whole instead of exploding the graph |
 | `pathMap = [{ from = "/build/agent/repo", to = "." }]` | none | rewrites a path prefix captured elsewhere (CI agent, other drive, WSL vs Windows) onto the carve root. `to` is relative to the carve root. Applies to trace paths and to compile commands (directory, file, `-I`, response files) |
 | `allowUnmatchedTraces = true` | `false` | a file trace with no path under the carve root becomes a warning instead of exit 2 |
+| `pruneGarbage = false` | `true` | keep every non-input too (VCS metadata, IDE scratch, logs, editor backups, make `.d` dependency files) |
+
+Integer keys are range-checked: a negative or oversized value is a config error (exit 2).
 
 Three things are **automatic**: the open/closed `#ifdef` world is derived (below); the emitted-tree `verify`
-check runs on every carve; and non-inputs (VCS/scratch/editor junk) are **auto-excluded** (`forceKeepFiles`
-un-drops one).
+check runs on every carve; and non-inputs (VCS/scratch/editor junk, logs, make `.d` dependency files — a `.d`
+is judged by its content, so D source and DTrace scripts are kept) are **auto-excluded** (`forceKeepFiles`
+un-drops one, `pruneGarbage = false` all).
 
 ### A minimal config
 
@@ -191,6 +195,7 @@ typo'd path can't silently carve with less config than intended.
     decisions.txt          per-symbol KEPT/CARVED ledger with the chain back to a root
     repro.graph.json       the dependency graph, anonymized (opaque tokens) — safe to share
     verify.txt             the emitted-tree link check (see Verify)
+    warnings.txt           every repeated warning in full (the console shows the first 20 per category); names paths
     summary.txt / .json    numbers only — no path, file name or symbol
   .codecarver-output       marker: this directory was written by CodeCarver
 ```
@@ -200,7 +205,8 @@ under `<outputDirectory>/codecarver/`, and `verify` checks the kept files as the
 
 `summary.txt` / `summary.json` hold only counts, booleans and fixed category names (world, graph, roots by
 kind, traces, `.cmm`, per-stage sizes and verify counts, warnings by category, exit code). They are what you
-send back when the source must not leave the machine. `decisions.txt` is replaced by a short note above
+send back when the source must not leave the machine. Repeated warnings (unresolved `#include`s, front-end notes) are capped at 20 per category on the console;
+the full list is in `warnings.txt` and the count per category in the summary. `decisions.txt` is replaced by a short note above
 500,000 graph nodes (use `--why` or `manifest.json` then).
 
 **Output safety.** An existing, non-empty `carved/` or `codecarver/` is replaced only if its parent carries the

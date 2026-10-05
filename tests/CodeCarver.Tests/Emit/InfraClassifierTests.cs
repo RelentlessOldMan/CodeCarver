@@ -22,8 +22,7 @@ public sealed class InfraClassifierTests
     [InlineData("build/CMakeFiles/foo.dir/x.c.o")]
     [InlineData("tools/__pycache__/gen.cpython-311.pyc")]
     [InlineData(".vs/CodeCarver/v17/Browse.VC.db")]
-    // Dependency / coverage artifacts.
-    [InlineData("obj/main.d")]
+    // Coverage artifacts (a .d is judged by content - see below).
     [InlineData("cov/main.gcda")]
     [InlineData("cov/main.gcno")]
     [InlineData("cov/main.c.gcov")]
@@ -40,6 +39,23 @@ public sealed class InfraClassifierTests
     [InlineData("scratch.tmp")]
     public void IsGarbage_True_ForProvablyNonInputs(string rel)
         => Assert.True(InfraClassifier.IsGarbage(rel), rel);
+
+    [Theory]
+    [InlineData("main.o: main.c main.h \\\n  config.h\n", true)]          // gcc -MD
+    [InlineData("\nobj/x.obj : x.c\n", true)]
+    [InlineData("module app.main;\nimport std.stdio;\n", false)]        // D source
+    [InlineData("syscall::open:entry\n{\n  printf(\"%s\", copyinstr(arg0));\n}\n", false)] // DTrace
+    public void DotD_IsGarbageOnlyWhenItIsAMakeDependencyFile_RB15(string content, bool garbage)
+    {
+        var p = Path.Combine(Path.GetTempPath(), "cc-dfile-" + Guid.NewGuid().ToString("N") + ".d");
+        File.WriteAllText(p, content);
+        try
+        {
+            Assert.Equal(garbage, InfraClassifier.IsGarbage("obj/x.d", p));
+            Assert.False(InfraClassifier.IsGarbage("obj/x.d"));   // never by name alone
+        }
+        finally { File.Delete(p); }
+    }
 
     [Theory]
     // Real source / headers / build files — obviously not garbage.

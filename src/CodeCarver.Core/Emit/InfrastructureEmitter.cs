@@ -146,7 +146,7 @@ public static class InfrastructureEmitter
             if (!isForced && !Included(rel)) continue; // --exclude prunes (unless --aux forces it back)
             // Garbage is dropped only on CONVENTION (never a build/run input), only when enabled, never when --aux
             // forced the file back in, and never when a trace OBSERVED the file being opened (hard evidence it's used).
-            var garbage = pruneGarbage && !isForced && !observedSet.Contains(rel) && InfraClassifier.IsGarbage(rel);
+            var garbage = pruneGarbage && !isForced && !observedSet.Contains(rel) && InfraClassifier.IsGarbage(rel, p);
             yield return (rel, Path.GetFullPath(p), garbage);
         }
     }

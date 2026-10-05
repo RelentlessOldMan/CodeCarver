@@ -32,6 +32,7 @@ public sealed class ResolvedCarve
     public long? MaxParseBytes;
     public List<(string From, string To)> PathMap = new();
     public bool AllowUnmatchedTraces;
+    public bool PruneGarbage = true;
     public int? ParseTimeout;                      // seconds
     public int? MaxSymbolsPerFile;
 }
@@ -97,6 +98,7 @@ public static class CarveResolver
         r.MaxParseBytes = cfg.MaxParseBytes;
         r.PathMap = cfg.PathMap;
         r.AllowUnmatchedTraces = cfg.AllowUnmatchedTraces;
+        r.PruneGarbage = cfg.PruneGarbage;
         r.ParseTimeout = cfg.ParseTimeout;
         r.MaxSymbolsPerFile = cfg.MaxSymbolsPerFile;
 

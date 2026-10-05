@@ -165,7 +165,7 @@ public static class CarveCommand
         }
 
         // Fixed, auto-handled settings (no longer user-facing flags).
-        var pruneGarbage = true;        // auto-exclude provable non-inputs; forceKeepFiles un-drops
+        var pruneGarbage = cv.PruneGarbage; // auto-exclude provable non-inputs; forceKeepFiles un-drops one, [advanced] pruneGarbage = false all (RB15)
         long maxParseBytes = cv.MaxParseBytes ?? 20_000_000;            // [advanced] escape hatches
         int? parseTimeoutMs = cv.ParseTimeout is { } pt ? pt * 1000 : null;
         int? maxSymbolsPerFile = cv.MaxSymbolsPerFile;
@@ -596,6 +596,23 @@ public static class CarveCommand
         // — the sounder choice; the emitter's copy is best-effort so an unreadable kept file can't crash the emit.
         // ReadRel may be called more than once per file (a scope-macro pre-pass, the parse pass, include scans);
         // the OS file cache serves the re-reads, so peak memory — not I/O — is what this trades for.
+        // Repetitive per-file warnings (one per unresolved include, one per front-end note) are capped on the
+        // console and written in full to codecarver/warnings.txt in every stage (review RB10).
+        const int WarnConsoleCap = 20;
+        var warnLog = new List<string>();
+        var warnShown = new Dictionary<string, int>(StringComparer.Ordinal);
+        void CappedWarn(string category, string msg)
+        {
+            warnLog.Add(msg);
+            var n = warnShown.GetValueOrDefault(category);
+            warnShown[category] = n + 1;
+            if (n < WarnConsoleCap) err.WriteLine("  warn    : " + msg);
+        }
+        void FlushCappedWarn(string category)
+        {
+            var n = warnShown.GetValueOrDefault(category);
+            if (n > WarnConsoleCap) err.WriteLine($"  warn    : (+{n - WarnConsoleCap} more {category} warnings — all in codecarver/warnings.txt)");
+        }
         var readErrors = 0;
         var readWarned = new HashSet<string>(StringComparer.Ordinal);
         string ReadRel(string rel)
@@ -622,6 +639,7 @@ public static class CarveCommand
         if (closureLang && lang is "c" or "cpp")
         {
             var rootFull = Path.GetFullPath(dir);
+            var rootUnder = Path.TrimEndingDirectorySeparator(rootFull) + Path.DirectorySeparatorChar;   // "/repo2" is not under "/repo" (RB9)
             var have = paths.Select(Path.GetFullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var gathered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var incRe = new System.Text.RegularExpressions.Regex("^\\s*#\\s*include\\s+\"([^\"]+)\"",
@@ -690,7 +708,7 @@ public static class CarveCommand
                     var cands = new List<string>();
                     void TryCand(string cand)
                     {
-                        try { var f = Path.GetFullPath(cand); if (f.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase) && File.Exists(f)) cands.Add(f); } catch { }
+                        try { var f = Path.GetFullPath(cand); if (f.StartsWith(rootUnder, StringComparison.OrdinalIgnoreCase) && File.Exists(f)) cands.Add(f); } catch { }
                     }
                     TryCand(Path.Combine(fromDir, inc));
                     foreach (var sd in searchDirs) TryCand(Path.Combine(sd, inc));
@@ -701,7 +719,7 @@ public static class CarveCommand
                         // ALL of them (sound for building, but a source of bloat). Note it so an over-keep is
                         // attributable -- supply -I via --build-log to resolve it exactly.
                         if (hits.Count > 1 && unresolved.Add(("ambig:" + Path.GetFileName(inc), inc)))
-                            err.WriteLine($"  warn    : #include \"{inc}\" matched {hits.Count} files by basename "
+                            CappedWarn("include", $"#include \"{inc}\" matched {hits.Count} files by basename "
                                                     + "(kept all — sound but may over-keep; a build log with -I flags (buildLogs) disambiguates)");
                     }
 
@@ -709,21 +727,29 @@ public static class CarveCommand
                     {
                         var fromRel = Path.GetRelativePath(dir, fromFull).Replace('\\', '/');
                         if (unresolved.Add((fromRel, inc)))
-                            err.WriteLine($"  warn    : {fromRel}: #include \"{inc}\" resolved to no file in the tree — "
+                            CappedWarn("include", $"{fromRel}: #include \"{inc}\" resolved to no file in the tree — "
                                                     + "the carved tree may not compile (a build log with -I flags (buildLogs) resolves it)");
                         continue;
                     }
                     foreach (var target in cands)
                     {
                         if (have.Contains(target) || !gathered.Add(target) || !File.Exists(target)) continue;
-                        if (new FileInfo(target).Length > maxParseBytes) continue;
-                        var itext = File.ReadAllText(target);
+                        if (SafeLength(target) > maxParseBytes) continue;   // vanished/locked: long.MaxValue, skipped (RB4)
+                        string itext;
+                        try { itext = File.ReadAllText(target); }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        {
+                            err.WriteLine($"  warn    : could not read included {Path.GetFileName(target)} ({ex.GetType().Name}) — not scanned; check it is in the carved tree");
+                            continue;
+                        }
                         refIncludes.Add((Path.GetRelativePath(dir, target).Replace('\\', '/'), itext));
                         queue.Enqueue(target); // an .inc may include another — re-read on dequeue (cache-hot)
                     }
                 }
             }
         }
+
+        FlushCappedWarn("include");
 
         using ICarveFrontEnd fe = lang switch
         {
@@ -892,9 +918,8 @@ public static class CarveCommand
         // the "silent 100% smaller" trap. Capped so a tree with hundreds of dynamic DOs doesn't flood output.
         if (fe.Warnings.Count > 0)
         {
-            const int cap = 12;
-            foreach (var w in fe.Warnings.Take(cap)) err.WriteLine("  warn    : " + w);
-            if (fe.Warnings.Count > cap) err.WriteLine($"  warn    : (+{fe.Warnings.Count - cap} more warnings)");
+            foreach (var w in fe.Warnings) CappedWarn("front-end", w);
+            FlushCappedWarn("front-end");
         }
         foreach (var w in fe.Warnings) diag.Warn(w); // full set (uncapped) into the diagnostic package
 
@@ -1397,6 +1422,11 @@ public static class CarveCommand
         void WriteSummary(string ccDir)
         {
             foreach (var (cat, n) in diag.WarningCounts) summary[$"warnings.{cat}"] = n;
+            foreach (var (cat, n) in warnShown) summary[$"warnings.{cat}"] = n;
+            if (warnLog.Count > 0)
+                WriteArtifact(Path.Combine(ccDir, "warnings.txt"),
+                    "# Every capped warning of this run, in full. Names paths and symbols — keep it local.\n"
+                    + string.Concat(warnLog.Select(w => w + "\n")), "warnings");
             summary["exitCode"] = verifyFailed ? 3 : 0;
             WriteArtifact(Path.Combine(ccDir, "summary.txt"),
                 "# CodeCarver summary — numbers only: no path, file name or symbol. Safe to send back.\n"
@@ -1537,6 +1567,7 @@ public static class CarveCommand
             if (cv.ParseTimeout is { } ptv) sb.AppendLine($"parseTimeout = {ptv}");
             if (maxSymbolsPerFile is { } msf) sb.AppendLine($"maxSymbolsPerFile = {msf}");
             sb.AppendLine($"allowUnmatchedTraces = {(cv.AllowUnmatchedTraces ? "true" : "false")}");
+            sb.AppendLine($"pruneGarbage = {(pruneGarbage ? "true" : "false")}");
             if (cv.PathMap.Count > 0)
                 sb.AppendLine("pathMap = [" + string.Join(", ", cv.PathMap.Select(m => $"{{ from = {Q(m.From)}, to = {Q(m.To)} }}")) + "]");
             return sb.ToString();
@@ -1569,7 +1600,7 @@ public static class CarveCommand
             // Crash-safe: stage into a private dir, promote atomically only after every step succeeds.
             using var staged = StagedOutput.Begin(outDir);
             var stageDir = staged.Dir;
-            Console.CancelKeyPress += (_, _) => { try { staged.Dispose(); } catch { } };
+            CancelHook.Track(staged);
 
             if (splan.KeptFiles.Count > plan.KeptFiles.Count)
                 @out.WriteLine($"  closure : +{splan.KeptFiles.Count - plan.KeptFiles.Count} file(s) kept because code this stage writes uses them (the output must link)");
@@ -1607,7 +1638,7 @@ public static class CarveCommand
                 }
             }
 
-            try { staged.Promote(); }
+            try { CancelHook.Promote(staged); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 var torn = ex is PromoteFailedException { Torn: true };
@@ -1808,9 +1839,13 @@ public static class CarveCommand
             psi.ArgumentList.Add("--version");
             using var p = System.Diagnostics.Process.Start(psi);
             if (p is null) return null;
-            var outp = p.StandardOutput.ReadToEnd();
-            var errp = p.StandardError.ReadToEnd();
+            // Both pipes read concurrently, so the timeout applies and a full stderr can't deadlock (review RB3).
+            var outTask = p.StandardOutput.ReadToEndAsync();
+            var errTask = p.StandardError.ReadToEndAsync();
             if (!p.WaitForExit(5000)) { try { p.Kill(entireProcessTree: true); } catch { /* ignore */ } return null; }
+            p.WaitForExit();
+            var outp = outTask.Result;
+            var errp = errTask.Result;
             var text = string.IsNullOrWhiteSpace(outp) ? errp : outp; // some toolchains print --version to stderr
             return text.Split('\n').FirstOrDefault(l => !string.IsNullOrWhiteSpace(l))?.Trim();
         }

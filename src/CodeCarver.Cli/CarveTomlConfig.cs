@@ -21,7 +21,8 @@ public sealed class CarveTomlConfig
     public int? ParseTimeout;         // seconds (0 disables)
     public int? MaxSymbolsPerFile;
     public List<(string From, string To)> PathMap = new();   // trace / compile-command path prefixes -> carve root
-    public bool AllowUnmatchedTraces;                         // a trace with no in-tree path is a warning, not an error
+    public bool AllowUnmatchedTraces;
+    public bool PruneGarbage = true;                          // drop VCS/IDE scratch, logs, dep files (false = keep everything)                         // a trace with no in-tree path is a warning, not an error
 }
 
 public sealed class CommonSection
@@ -65,7 +66,7 @@ public static class ConfigLoader
     public sealed record Result(CarveTomlConfig? Config, IReadOnlyList<string> Errors, IReadOnlyList<string> Warnings);
 
     private static readonly string[] TopKeys = { "outputDirectory", "analysisOnly", "common", "builds", "runs", "stages", "use", "advanced" };
-    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "maxSymbolsPerFile", "pathMap", "allowUnmatchedTraces" };
+    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "maxSymbolsPerFile", "pathMap", "allowUnmatchedTraces", "pruneGarbage" };
     private static readonly string[] CommonKeys =
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
@@ -195,8 +196,9 @@ public static class ConfigLoader
         if (GetTable(root, "advanced", ctx) is { } adv)
         {
             RejectUnknownKeys(adv, AdvancedKeys, "[advanced]", ctx);
-            cfg.MaxParseBytes = GetLong(adv, "maxParseBytes", "[advanced]", ctx);
+            cfg.MaxParseBytes = GetLong(adv, "maxParseBytes", "[advanced]", ctx, min: 1);
             cfg.AllowUnmatchedTraces = GetBool(adv, "allowUnmatchedTraces", "[advanced]", ctx) ?? false;
+            cfg.PruneGarbage = GetBool(adv, "pruneGarbage", "[advanced]", ctx) ?? true;
             if (adv.TryGetValue("pathMap", out var pm))
             {
                 // pathMap = [{ from = "/build/agent/repo", to = "." }, ...]   ("to" is relative to the carve root)
@@ -210,8 +212,8 @@ public static class ConfigLoader
                     else ctx.Errors.Add("[advanced]: each 'pathMap' entry needs string 'from' and 'to'.");
                 }
             }
-            cfg.ParseTimeout = (int?)GetLong(adv, "parseTimeout", "[advanced]", ctx);
-            cfg.MaxSymbolsPerFile = (int?)GetLong(adv, "maxSymbolsPerFile", "[advanced]", ctx);
+            cfg.ParseTimeout = (int?)GetLong(adv, "parseTimeout", "[advanced]", ctx, min: 0, max: int.MaxValue / 1000);
+            cfg.MaxSymbolsPerFile = (int?)GetLong(adv, "maxSymbolsPerFile", "[advanced]", ctx, min: 1, max: int.MaxValue);
         }
 
         // Cross-checks: a [use] selection must name a defined section.
@@ -233,7 +235,7 @@ public static class ConfigLoader
         # Inputs and options live here, so the command line stays short. Relative paths are relative to THIS
         # file's directory; globs (excludeDirectories, forceKeepFiles) are relative to the source dir.
         # Rarely needed: analysisOnly = true (top level: plan + reports, no carved tree) and an [advanced]
-        # section (maxParseBytes, parseTimeout, maxSymbolsPerFile, pathMap, allowUnmatchedTraces) — see USAGE.md.
+        # section (maxParseBytes, parseTimeout, maxSymbolsPerFile, pathMap, allowUnmatchedTraces, pruneGarbage) — see USAGE.md.
 
         # Where the carved project + reports go — must be OUTSIDE the source tree. CodeCarver manages a
         # carved/ + codecarver/ layout under it, and never replaces an existing directory it did not create.
@@ -347,17 +349,24 @@ public static class ConfigLoader
         return result;
     }
 
-    private static long? GetLong(TomlTable t, string key, string where, Ctx ctx)
+    // Range-checked so a negative or oversized value is a config error, not a silent wrap in an (int) cast (RB13).
+    private static long? GetLong(TomlTable t, string key, string where, Ctx ctx, long min = long.MinValue, long max = long.MaxValue)
     {
         if (!t.TryGetValue(key, out var v) || v is null) return null;
-        switch (v)
+        long? n = v switch
         {
-            case long l: return l;
-            case int i: return i;
-            case string s when long.TryParse(s, out var p): return p;
+            long l => l,
+            int i => i,
+            string s when long.TryParse(s, out var p) => p,
+            _ => null,
+        };
+        if (n is null) { ctx.Errors.Add($"{where}: '{key}' must be an integer."); return null; }
+        if (n < min || n > max)
+        {
+            ctx.Errors.Add($"{where}: '{key}' = {n} is out of range ({min}..{max}).");
+            return null;
         }
-        ctx.Errors.Add($"{where}: '{key}' must be an integer.");
-        return null;
+        return n;
     }
 
     // Accepts a TOML bool (true/false) OR a string yes/no/true/false/on/off/1/0 (case-insensitive) — user request.

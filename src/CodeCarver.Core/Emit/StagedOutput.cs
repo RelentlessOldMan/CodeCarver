@@ -24,6 +24,7 @@ public sealed class StagedOutput : IDisposable
 
     private readonly string _finalOut;   // resolved full path of the user's --out
     private readonly string _token;
+    private FileStream? _lock;           // held while this stage is live; tells a concurrent run not to reap it
     private bool _promoted;
     private bool _disposed;
 
@@ -60,11 +61,33 @@ public sealed class StagedOutput : IDisposable
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return false; }
     }
 
-    private StagedOutput(string dir, string finalOut, string token)
+    private StagedOutput(string dir, string finalOut, string token, FileStream? lockFile)
     {
         Dir = dir;
         _finalOut = finalOut;
         _token = token;
+        _lock = lockFile;
+    }
+
+    // A live stage holds `<staging>.lock` open exclusively (an flock on Linux/macOS). Reaping skips any staging
+    // or backup directory whose lock is still held, so two runs into the same output never delete each other's
+    // work in progress (review RB14); a hard-killed run's lock is released by the OS and its leftovers reaped.
+    private static string LockPath(string parent, string finalName, string token) =>
+        Path.Combine(parent, $".ccstaging-{finalName}-{token}.lock");
+
+    private static FileStream? TryTakeLock(string path)
+    {
+        try { return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
+    }
+
+    private void ReleaseLock()
+    {
+        if (_lock is null) return;
+        var path = _lock.Name;
+        try { _lock.Dispose(); } catch { /* best effort */ }
+        _lock = null;
+        try { File.Delete(path); } catch { /* best effort */ }
     }
 
     /// <summary>
@@ -92,6 +115,7 @@ public sealed class StagedOutput : IDisposable
 
         var token = Guid.NewGuid().ToString("N")[..8];
         var staging = Path.Combine(parent, $".ccstaging-{Path.GetFileName(finalOut)}-{token}");
+        var lockFile = TryTakeLock(LockPath(parent, Path.GetFileName(finalOut), token));   // before the dir exists
         // Extremely unlikely, but never emit onto a pre-existing dir we didn't just make.
         if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true);
         Directory.CreateDirectory(staging);
@@ -106,7 +130,7 @@ public sealed class StagedOutput : IDisposable
                 + "The carved tree beside this marker is an atomically-replaceable carve output; CodeCarver may overwrite it.\n");
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* marker is advisory */ }
-        return new StagedOutput(staging, finalOut, token);
+        return new StagedOutput(staging, finalOut, token, lockFile);
     }
 
     /// <summary>
@@ -123,6 +147,7 @@ public sealed class StagedOutput : IDisposable
         {
             PromoteStaging(Dir, _finalOut); // fresh out: move staging into place
             _promoted = true;
+            ReleaseLock();
             return;
         }
 
@@ -145,6 +170,7 @@ public sealed class StagedOutput : IDisposable
             ReplaceInPlace(Dir, _finalOut);
             TryDelete(Dir);
             _promoted = true;
+            ReleaseLock();
             return;
         }
         try
@@ -160,6 +186,7 @@ public sealed class StagedOutput : IDisposable
         }
         _promoted = true;
         TryDelete(backup); // prior output no longer needed
+        ReleaseLock();
     }
 
     /// <summary>
@@ -275,6 +302,7 @@ public sealed class StagedOutput : IDisposable
         if (_disposed) return;
         _disposed = true;
         if (!_promoted) TryDelete(Dir);
+        ReleaseLock();
     }
 
     /// <summary>Delete any <c>.ccstaging-&lt;name&gt;-*</c> / <c>&lt;name&gt;.ccold-*</c> siblings in
@@ -292,9 +320,18 @@ public sealed class StagedOutput : IDisposable
             foreach (var d in Directory.EnumerateDirectories(parent))
             {
                 var name = Path.GetFileName(d);
-                if ((name.StartsWith(stagingPrefix, StringComparison.Ordinal) && Token(name[stagingPrefix.Length..])) ||
-                    (name.StartsWith(backupPrefix, StringComparison.Ordinal) && Token(name[backupPrefix.Length..])))
-                    TryDelete(d);
+                string? token = null;
+                if (name.StartsWith(stagingPrefix, StringComparison.Ordinal) && Token(name[stagingPrefix.Length..])) token = name[stagingPrefix.Length..];
+                else if (name.StartsWith(backupPrefix, StringComparison.Ordinal) && Token(name[backupPrefix.Length..])) token = name[backupPrefix.Length..];
+                if (token is null) continue;
+                // Still owned by a live run (its lock is held): leave it alone.
+                var lockPath = LockPath(parent, finalName, token);
+                using (var held = TryTakeLock(lockPath))
+                {
+                    if (held is null) continue;
+                }
+                TryDelete(d);
+                try { File.Delete(lockPath); } catch { /* best effort */ }
             }
         }
         catch { /* best effort */ }

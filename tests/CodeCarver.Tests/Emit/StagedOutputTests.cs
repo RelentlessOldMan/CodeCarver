@@ -433,6 +433,43 @@ public sealed class StagedOutputTests
         Assert.Null(ex);
     }
 
+    [Fact]
+    public void Begin_DoesNotReapTheLiveStagingOfAConcurrentRun_RB14()
+    {
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            using var first = StagedOutput.Begin(outDir);
+            File.WriteAllText(Path.Combine(first.Dir, "a.c"), "int a;");
+            var second = StagedOutput.Begin(outDir);   // a second run into the same output
+            Assert.True(File.Exists(Path.Combine(first.Dir, "a.c")));
+            first.Promote();
+            Assert.True(File.Exists(Path.Combine(outDir, "a.c")));
+            Assert.Single(Directory.GetFiles(work, "*.lock"));   // only the still-live second stage's
+            second.Dispose();
+            Assert.Empty(Directory.GetFiles(work, "*.lock"));
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Begin_ReapsAnOrphanWhoseOwnerIsGone_RB14()
+    {
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            var orphan = Path.Combine(work, ".ccstaging-out-0123abcd");
+            Directory.CreateDirectory(orphan);
+            File.WriteAllText(Path.Combine(work, ".ccstaging-out-0123abcd.lock"), "");   // released lock left by a killed run
+            using var s = StagedOutput.Begin(outDir);
+            Assert.False(Directory.Exists(orphan));
+            Assert.False(File.Exists(Path.Combine(work, ".ccstaging-out-0123abcd.lock")));
+        }
+        finally { Cleanup(work); }
+    }
+
     private static void Cleanup(string work)
     {
         try { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); } catch { }

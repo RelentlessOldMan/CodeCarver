@@ -24,7 +24,7 @@ public enum InfraRole
 /// artifacts, editor/OS junk, and logs/temp. Ambiguous binaries (<c>.o/.a/.so/.lib/.dll/.exe</c>, <c>bin/</c>,
 /// <c>build/</c>) are expressly NOT garbage: they may be vendored prebuilts the build links, so dropping them
 /// would break the "keep-by-default, evidence-based removal only" guarantee. The user restores anything with
-/// <c>--keep-garbage</c> (all of it) or <c>--aux GLOB</c> (one file).</para>
+/// <c>[advanced] pruneGarbage = false</c> (all of it) or <c>forceKeepFiles</c> (a glob).</para>
 ///
 /// <para><b>Role</b> (<see cref="RoleOf"/>, <see cref="LooksLikeBuildOutput"/>) — purely informational grouping
 /// for the report; never drives keep/drop.</para>
@@ -39,12 +39,13 @@ public static class InfraClassifier
         "CMakeFiles", "__pycache__", ".pytest_cache", ".mypy_cache", ".vs", // compiler / IDE scratch
     };
 
-    // Extensions produced BY a build or an editor — never consumed by one. (.d dep-files, coverage, compiled
-    // Python, editor backups, logs/temp.) Deliberately excludes .o/.a/.so/.lib/.obj/.dll/.exe: those may be
-    // vendored prebuilts, so they are kept and only flagged for review (LooksLikeBuildOutput).
+    // Extensions produced BY a build or an editor — never consumed by one. (Coverage, compiled Python, editor
+    // backups, logs/temp.) Deliberately excludes .o/.a/.so/.lib/.obj/.dll/.exe: those may be vendored prebuilts,
+    // so they are kept and only flagged for review (LooksLikeBuildOutput). `.d` is NOT here: it is also D source
+    // and DTrace — a `.d` is garbage only when its content is a make dependency rule (IsMakeDepFile, review RB15).
     private static readonly HashSet<string> GarbageExts = new(StringComparer.OrdinalIgnoreCase)
     {
-        ".d", ".gcda", ".gcno", ".gcov", ".pyc", ".pyo",    // dep / coverage / compiled-python
+        ".gcda", ".gcno", ".gcov", ".pyc", ".pyo",          // coverage / compiled-python
         ".bak", ".orig", ".swp", ".tmp", ".log",            // editor / build junk
     };
 
@@ -55,7 +56,38 @@ public static class InfraClassifier
 
     /// <summary>True iff <paramref name="rel"/> is provably not a build/run input (safe to drop by default).
     /// <paramref name="rel"/> is a '/'-separated relative path.</summary>
-    public static bool IsGarbage(string rel)
+    public static bool IsGarbage(string rel) => IsGarbage(rel, null);
+
+    /// <summary>As <see cref="IsGarbage(string)"/>, and a <c>.d</c> at <paramref name="fullPath"/> is garbage when
+    /// it is a compiler-generated make dependency file.</summary>
+    public static bool IsGarbage(string rel, string? fullPath)
+    {
+        if (fullPath is not null && rel.EndsWith(".d", StringComparison.OrdinalIgnoreCase) && IsMakeDepFile(fullPath)) return true;
+        return IsGarbageByName(rel);
+    }
+
+    /// <summary>A gcc/clang <c>-MD</c> dependency file: its first rule's target is an object file
+    /// (<c>foo.o: foo.c foo.h \</c>). D source and DTrace scripts never start that way.</summary>
+    public static bool IsMakeDepFile(string fullPath)
+    {
+        try
+        {
+            using var r = new StreamReader(fullPath);
+            for (var i = 0; i < 5 && r.ReadLine() is { } line; i++)
+            {
+                var t = line.Trim();
+                if (t.Length == 0) continue;
+                return MakeDepHead.IsMatch(t);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        return false;
+    }
+
+    static readonly System.Text.RegularExpressions.Regex MakeDepHead =
+        new(@"^\S+\.(o|obj|lo|d)\s*:(\s|$)", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    private static bool IsGarbageByName(string rel)
     {
         var segs = rel.Split('/', '\\');
         for (var i = 0; i < segs.Length - 1; i++)       // directory segments only (not the filename)
