@@ -7,6 +7,11 @@ using CodeCarver.Core.Roots;
 // CodeCarver CLI dispatcher. The real work of `carve` lives in CarveCommand.Run (extracted so it can be
 // driven — and coverage-measured — in-process); `demo` and `scan-log` are small enough to stay here.
 
+// Output (summary.txt, the console report) must read the same on every machine: CI runners and a German
+// workstation format numbers differently from en-US, so pin the culture before anything is printed.
+System.Globalization.CultureInfo.DefaultThreadCurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
+
 var cmd = args.Length > 0 ? args[0] : "help";
 switch (cmd)
 {
@@ -118,7 +123,7 @@ static void RunDemo()
 
     Console.WriteLine("CodeCarver demo — carve of a toy embedded image\n");
     Console.WriteLine($"  nodes total   : {safe.Stats.TotalNodes}");
-    Console.WriteLine($"  nodes kept    : {safe.Stats.ReachedNodes}  ({safe.Stats.NodeKeepRatio:P0})");
+    Console.WriteLine($"  nodes kept    : {safe.Stats.ReachedNodes}  ({safe.Stats.NodeKeepRatio:0%})");
     Console.WriteLine($"  nodes carved  : {safe.Stats.DroppedNodes}");
     Console.WriteLine($"  files kept    : {string.Join(", ", safe.KeptFiles)}");
     Console.WriteLine($"  files dropped : {string.Join(", ", safe.DroppedFiles)}");

@@ -87,7 +87,7 @@ public static class CarveReport
         if (keptAbsent.Count > 0)
             sb.AppendLine($"  NOTE                     : {keptAbsent.Count,7} kept file(s) were NOT written (absent/locked on disk) - listed below");
         sb.AppendLine($"  code size                : {x.CodeBytesBefore:N0} B -> {x.CodeBytesAfter:N0} B "
-                      + $"({pct:P0} smaller, saved {codeSaved:N0} B by dropping dead code)");
+                      + $"({pct:0%} smaller, saved {codeSaved:N0} B by dropping dead code)");
         if (x.InfraEnumerated)
             sb.AppendLine($"  infrastructure size      : {x.InfraBytes:N0} B (unchanged - copied verbatim)");
         if (x.InfraEnumerated && x.RemovedGarbage.Count > 0)

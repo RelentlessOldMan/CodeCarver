@@ -1320,7 +1320,7 @@ public static class CarveCommand
         if (defines is not null)
             @out.WriteLine($"  config  : {defineSpecs.Distinct().Count()} define(s), #ifdef resolution ON" +
                               (closedWorld ? " (closed-world: absent macros treated as undefined)" : " (open-world: unknown branches kept)"));
-        @out.WriteLine($"  nodes   : {s.ReachedNodes}/{s.TotalNodes} kept ({s.NodeKeepRatio:P0}), {s.DroppedNodes} carved");
+        @out.WriteLine($"  nodes   : {s.ReachedNodes}/{s.TotalNodes} kept ({s.NodeKeepRatio:0%}), {s.DroppedNodes} carved");
         @out.WriteLine($"  files   : {s.KeptFiles}/{s.TotalFiles} kept, {s.DroppedFiles} dropped");
         if (bigFiles.Count > 0)
             @out.WriteLine($"  big     : {bigFiles.Count} file(s) > {maxParseBytes:N0} B not parsed (kept whole via #include-closure): "
@@ -1647,7 +1647,7 @@ public static class CarveCommand
                     carvedBytes -= hc.BytesBefore - hc.BytesAfter;
                     var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
                     @out.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} kept, {hc.DefinesDropped:N0} dropped; "
-                        + $"{hc.BytesBefore:N0} B -> {hc.BytesAfter:N0} B ({hpct:P0} smaller)");
+                        + $"{hc.BytesBefore:N0} B -> {hc.BytesAfter:N0} B ({hpct:0%} smaller)");
                 }
             }
 
@@ -1664,7 +1664,7 @@ public static class CarveCommand
 
             var saved = origTotal - carvedBytes;
             var pct = origTotal > 0 ? (double)saved / origTotal : 0;
-            @out.WriteLine($"  size    : {origTotal:N0} B -> {carvedBytes:N0} B  ({pct:P0} smaller, saved {saved:N0} B)");
+            @out.WriteLine($"  size    : {origTotal:N0} B -> {carvedBytes:N0} B  ({pct:0%} smaller, saved {saved:N0} B)");
             summary[$"{summaryStage}.bytesBefore"] = origTotal;
             summary[$"{summaryStage}.bytesAfter"] = carvedBytes;
             summary[$"{summaryStage}.emittedCodeFiles"] = res.FilesWritten;
