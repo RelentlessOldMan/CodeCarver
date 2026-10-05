@@ -222,9 +222,9 @@ public static class FileTreeEmitter
     {
         var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourceRoot)) + Path.DirectorySeparatorChar;
         var outRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outDir)) + Path.DirectorySeparatorChar;
-        var known = new HashSet<string>(plan.KeptFiles, StringComparer.OrdinalIgnoreCase);
+        var known = new HashSet<string>(plan.KeptFiles, CodeCarver.Core.Util.PathComparer.Default);
         foreach (var f in plan.DroppedFiles) known.Add(f);          // graph-known drops: leave dropped
-        var copied = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var copied = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
         var queue = new Queue<string>(written);                      // scan every emitted file for includes
 
         while (queue.Count > 0)

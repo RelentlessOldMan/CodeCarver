@@ -48,6 +48,25 @@ public sealed class RobustnessTests
     }
 
     [Fact]
+    public void CaseTwins_OnACaseSensitiveFileSystem_AreBothEmitted_RB8()
+    {
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+        {
+            // One file there: the comparer must fold case.
+            Assert.Equal(StringComparer.OrdinalIgnoreCase, CodeCarver.Core.Util.PathComparer.Default);
+            return;
+        }
+        using var w = new Work();
+        w.W("main.c", "#include \"Cfg.h\"\n#include \"cfg.h\"\nint main(void){ return CFG + OTHER; }\n");
+        w.W("Cfg.h", "#define CFG 1\n");
+        w.W("cfg.h", "#define OTHER 2\n");   // a different file that differs only by case
+        var (code, o, e) = w.Carve();
+        Assert.Equal(0, code);
+        Assert.True(File.Exists(w.Out("carved/Cfg.h")), o + e);
+        Assert.True(File.Exists(w.Out("carved/cfg.h")), o + e);
+    }
+
+    [Fact]
     public void PruneGarbageFalse_KeepsLogsAndScratch_RB15()
     {
         using var w = new Work();

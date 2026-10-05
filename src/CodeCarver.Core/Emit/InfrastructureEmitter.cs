@@ -97,8 +97,8 @@ public static class InfrastructureEmitter
         IReadOnlyCollection<string>? observed,
         List<string> warnings)
     {
-        var skip = new HashSet<string>(alreadyEmittedRel, StringComparer.OrdinalIgnoreCase);
-        var dropped = new HashSet<string>(droppedCodeFilesRel, StringComparer.OrdinalIgnoreCase);
+        var skip = new HashSet<string>(alreadyEmittedRel, CodeCarver.Core.Util.PathComparer.Default);
+        var dropped = new HashSet<string>(droppedCodeFilesRel, CodeCarver.Core.Util.PathComparer.Default);
         // A file a real build/run was observed to OPEN is evidence it's used — never prune it as "garbage".
         var observedSet = new HashSet<string>(observed ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
 

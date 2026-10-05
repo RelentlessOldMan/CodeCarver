@@ -650,8 +650,8 @@ public static class CarveCommand
         {
             var rootFull = Path.GetFullPath(dir);
             var rootUnder = Path.TrimEndingDirectorySeparator(rootFull) + Path.DirectorySeparatorChar;   // "/repo2" is not under "/repo" (RB9)
-            var have = paths.Select(Path.GetFullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var gathered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var have = paths.Select(Path.GetFullPath).ToHashSet(CodeCarver.Core.Util.PathComparer.Default);
+            var gathered = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
             var incRe = new System.Text.RegularExpressions.Regex("^\\s*#\\s*include\\s+\"([^\"]+)\"",
                 System.Text.RegularExpressions.RegexOptions.Multiline);
 
@@ -1342,7 +1342,7 @@ public static class CarveCommand
         if (runFileTraces.Count > 0)
         {
             var rootFullC = Path.GetFullPath(dir);
-            var relToFull = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var relToFull = new Dictionary<string, string>(CodeCarver.Core.Util.PathComparer.Default);
             var allCmm = new List<(string Rel, long Bytes)>();
             foreach (var p in CodeCarver.Core.Util.SourceWalk.Files(dir))
             {

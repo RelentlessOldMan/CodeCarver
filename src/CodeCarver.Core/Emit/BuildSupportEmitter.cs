@@ -30,7 +30,7 @@ public static class BuildSupportEmitter
             !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase));
 
         var warnings = new List<string>();
-        var picked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var picked = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
         // SourceWalk: skip unreadable dirs (network shares) and don't recurse into directory junctions/
         // symlinks (loop / double-copy), while still returning symlinked files.
         foreach (var p in CodeCarver.Core.Util.SourceWalk.Files(sourceRoot))
@@ -55,7 +55,7 @@ public static class BuildSupportEmitter
         }
 
         var outFull = Path.GetFullPath(outDir);
-        var already = new HashSet<string>(alreadyEmittedRel, StringComparer.OrdinalIgnoreCase);
+        var already = new HashSet<string>(alreadyEmittedRel, CodeCarver.Core.Util.PathComparer.Default);
         var count = 0;
         long bytes = 0;
         foreach (var p in picked)
