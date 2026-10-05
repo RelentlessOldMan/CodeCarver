@@ -190,7 +190,9 @@ typo'd path can't silently carve with less config than intended.
   carved/                  the complete buildable project
   codecarver/
     report.txt             human-readable: roots, kept/dropped files by bucket, sizes, observed-file tags
-    manifest.json          the same decision, structured (kept/dropped files, droppedCmm, stats, observed files)
+    manifest.json          the same decision, structured: keptFiles, includeClosureFiles (written only because kept
+                           code #includes them), infrastructureFiles, droppedFiles, droppedCmm, removedGarbageFiles,
+                           stats, observed files — every emitted file is in exactly one kept list
     resolved-config.toml   the configuration actually used: selected builds/runs merged, paths resolved
     decisions.txt          per-symbol KEPT/CARVED ledger with the chain back to a root
     repro.graph.json       the dependency graph, anonymized (opaque tokens) — safe to share

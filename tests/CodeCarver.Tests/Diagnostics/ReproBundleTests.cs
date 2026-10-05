@@ -134,9 +134,7 @@ public sealed class ReproBundleTests
         Assert.Equal(n - 1, counts.GetProperty("edges").GetInt32());        // a chain of n nodes has n-1 edges
     }
 
-    [Fact(Skip = "PRODUCT BUG: ReproBundle.Write wraps the stream in a Utf8JsonWriter and flushes only at the end, so the "
-               + "whole document is buffered in memory and reaches the stream in ONE write (2.7 MB for 20k nodes). "
-               + "Fix: w.Flush() periodically (e.g. when w.BytesPending > 64 KB). Un-skip when fixed.")]
+    [Fact]
     public void Write_StreamsIncrementally_DoesNotBufferWholeDocument()
     {
         // What "without materializing" means observably: the bytes reach the output stream in many bounded

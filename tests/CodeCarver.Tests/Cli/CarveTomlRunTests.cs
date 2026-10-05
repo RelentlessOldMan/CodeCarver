@@ -332,8 +332,7 @@ public sealed class CarveTomlRunTests
         File.WriteAllText(Path.Combine(src, "fallback.c"), "int fallback_impl(void){return 2;}\n");
         var db = Path.Combine(work, "cc.json");
         var d = Fwd(src);
-        // The absent case still passes one unrelated -D: with ZERO -D in the whole log the product currently skips
-        // #ifdef resolution entirely (see Carve_BuildLog_NoDefinesAtAll_StillResolvesIfdefs below).
+        // The absent case passes one unrelated -D; the zero -D case is Carve_BuildLog_NoDefinesAtAll_StillResolvesIfdefs.
         var flag = defined ? "\"-DFEATURE\"," : "\"-DUNRELATED=1\",";
         File.WriteAllText(db, "[" + string.Join(",", new[] { "main.c", "feature.c", "fallback.c" }.Select(f =>
             "{\"directory\":\"" + d + "\",\"file\":\"" + f + "\",\"arguments\":[\"gcc\"," + flag + "\"-c\",\"" + f + "\"]}")) + "]");
@@ -353,9 +352,7 @@ public sealed class CarveTomlRunTests
         finally { Cleanup(work); }
     }
 
-    [Fact(Skip = "PRODUCT BUG: a build log whose commands carry no -D at all leaves haveDefines false "
-               + "(CarveCommand.cs ~473-502), so no #ifdef resolution runs, yet the run reports 'closed-world (dead #ifdef "
-               + "branches dropped)'. Sound but imprecise and the world line is wrong. Un-skip when fixed.")]
+    [Fact]
     public void Carve_BuildLog_NoDefinesAtAll_StillResolvesIfdefs()
     {
         var (work, src, outDir) = NewWork();
@@ -623,13 +620,11 @@ public sealed class CarveTomlRunTests
         finally { Cleanup(work); }
     }
 
-    [Fact(Skip = "PRODUCT GAP (review 8c 'Examples'): a file copied by FileTreeEmitter.CopyUnscannedIncludes is emitted "
-               + "but recorded in no manifest list (the manifest records plan.KeptFiles, not what was written). "
-               + "Un-skip when the manifest lists it.")]
+    [Fact]
     public void Carve_UnscannedIncludeInExcludedDir_IsListedInManifest()
     {
         // main.c includes a header that lives in an excluded directory. The emitter rightly copies it (the tree would
-        // not compile without it), but manifest.json lists it nowhere: not keptFiles, not infrastructureFiles.
+        // not compile without it), and manifest.json must list it (includeClosureFiles).
         var (work, src, outDir) = NewWork();
         Directory.CreateDirectory(Path.Combine(src, "vendor"));
         File.WriteAllText(Path.Combine(src, "main.c"), "#include \"vendor/cfg.h\"\nint main(void){return CFG;}\n");
@@ -641,10 +636,10 @@ public sealed class CarveTomlRunTests
             Assert.Equal(0, code);
             Assert.True(File.Exists(Path.Combine(outDir, "carved", "vendor", "cfg.h")));   // emitted (correct)
             using var m = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(outDir, "codecarver", "manifest.json")));
-            var listed = new[] { "keptFiles", "infrastructureFiles" }
+            var listed = new[] { "keptFiles", "includeClosureFiles", "infrastructureFiles" }
                 .SelectMany(p => m.RootElement.GetProperty(p).EnumerateArray().Select(e => e.GetString()))
                 .ToList();
-            Assert.Contains("vendor/cfg.h", listed);                                         // fails today
+            Assert.Contains("vendor/cfg.h", listed);
         }
         finally { Cleanup(work); }
     }

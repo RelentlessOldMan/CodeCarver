@@ -473,7 +473,10 @@ public static class CarveCommand
         var haveDefines = manualDefines.Count > 0 || probeBase is not null
                           || universalConsistent.Count > 0 || universalVarying.Count > 0
                           || perFileSpecs.Values.Any(v => v.Consistent.Count > 0 || v.Varying.Count > 0);
-        if (buildCmds.Count > 0 && haveDefines)
+        // A compile command with no -D at all still pins its file's define set (FEATURE is undefined for it), so
+        // compile commands alone are enough to resolve per file — requiring a define here turned resolution off
+        // while the run still reported closed-world.
+        if (buildCmds.Count > 0)
         {
             var universalTable = BuildTable(universalConsistent, universalVarying);
             var perFile = perFileSpecs.ToDictionary(kv => kv.Key, kv => BuildTable(kv.Value.Consistent, kv.Value.Varying),
@@ -1688,6 +1691,10 @@ public static class CarveCommand
                 stats = new { splan.Stats.TotalNodes, splan.Stats.ReachedNodes, splan.Stats.DroppedNodes, splan.Stats.TotalFiles,
                     splan.Stats.KeptFiles, splan.Stats.DroppedFiles, originalBytes = origTotal, carvedBytes, savedBytes = saved },
                 keptFiles = splan.KeptFiles, droppedFiles = splan.DroppedFiles, droppedCmm = cmmDropped,
+                // Written because kept code #includes them, though they hold no reached node (an .inc table, a
+                // header in an excluded directory) — so every emitted file is in exactly one list.
+                includeClosureFiles = buildRequiredFiles.Except(splan.KeptFiles, CodeCarver.Core.Util.PathComparer.Default)
+                                                        .OrderBy(f => f, StringComparer.Ordinal).ToArray(),
                 infrastructureFiles = infra.Files, removedGarbageFiles = infra.Garbage,
                 observedFiles = observedRel.OrderBy(f => f, StringComparer.Ordinal).ToArray(),
             };

@@ -60,6 +60,9 @@ public static class ReproBundle
         }
 
         using var w = new Utf8JsonWriter(output, new JsonWriterOptions { Indented = indented });
+        // Utf8JsonWriter buffers until Flush: without these periodic flushes the whole document sat in memory and
+        // reached the stream in one write, which is not streaming at all.
+        void Drain() { if (w.BytesPending > 64 * 1024) w.Flush(); }
         w.WriteStartObject();
         w.WriteNumber("reproFormatVersion", FormatVersion);
         w.WriteString("note", Note);
@@ -78,6 +81,7 @@ public static class ReproBundle
             w.WriteNumber("endLine", n.Span.EndLine);
             w.WriteNumber("flags", (int)n.Flags);
             w.WriteEndObject();
+            Drain();
         }
         w.WriteEndArray();
 
@@ -92,6 +96,7 @@ public static class ReproBundle
                 w.WriteString("kind", e.Kind.ToString());
                 w.WriteEndObject();
                 edgeCount++;
+                Drain();
             }
         w.WriteEndArray();
 
@@ -107,11 +112,12 @@ public static class ReproBundle
                 w.WriteString("kind", kv.Value.AsRoot!.Value.ToString());
                 w.WriteEndObject();
                 rootCount++;
+                Drain();
             }
         w.WriteEndArray();
 
         w.WriteStartArray("reached");
-        foreach (var r in plan.ReachedNodes) w.WriteNumberValue(r.Value);
+        foreach (var r in plan.ReachedNodes) { w.WriteNumberValue(r.Value); Drain(); }
         w.WriteEndArray();
 
         w.WriteStartObject("counts");

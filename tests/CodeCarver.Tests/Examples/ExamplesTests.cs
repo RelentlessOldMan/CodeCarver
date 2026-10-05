@@ -119,14 +119,13 @@ public sealed class ExamplesTests
             foreach (var e in emitted)
                 Assert.True(sources.Contains(e), $"{example}/{stage}: carved/{e} is not a file of src/");
 
-            // The manifest's kept lists account for the whole emitted tree. Review 8c ("Examples") predicts a gap
-            // here: files copied by CopyUnscannedIncludes are emitted but recorded in no manifest list (the manifest
-            // records plan.KeptFiles, not what was written). If this assertion fails, that is the product gap, not
-            // a test bug — report it; do not weaken this check.
-            var keptLists = List(manifest, "keptFiles").Concat(List(manifest, "infrastructureFiles")).ToHashSet(StringComparer.Ordinal);
+            // The manifest's kept lists account for the whole emitted tree (review 8c "Examples": files written by
+            // the include closure are in includeClosureFiles). Do not weaken this check.
+            var keptLists = List(manifest, "keptFiles").Concat(List(manifest, "includeClosureFiles"))
+                .Concat(List(manifest, "infrastructureFiles")).ToHashSet(StringComparer.Ordinal);
             var unlisted = emitted.Where(e => !keptLists.Contains(e)).OrderBy(e => e, StringComparer.Ordinal).ToList();
             Assert.True(unlisted.Count == 0,
-                $"{example}/{stage}: emitted but in neither keptFiles nor infrastructureFiles: {string.Join(", ", unlisted)}");
+                $"{example}/{stage}: emitted but in no kept list of the manifest: {string.Join(", ", unlisted)}");
         }
     }
 
