@@ -12,6 +12,12 @@
 *.psm1 text eol=crlf
 *.psd1 text eol=crlf
 
+# Example inputs and their checked-in carved outputs are quoted byte-for-byte (README size lines, the
+# ExamplesTests drift checks), so they must check out identically everywhere: a CRLF checkout on a Windows
+# runner grew every count. The example scripts keep their own rules above (*.ps1 CRLF, *.sh LF).
+examples/** text eol=lf
+examples/**/*.ps1 text eol=crlf
+
 # Visual Studio solution files are CRLF by convention.
 *.sln text eol=crlf
 
