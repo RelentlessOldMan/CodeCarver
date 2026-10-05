@@ -6,10 +6,19 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    # Windows: the tree-sitter front-end loads the grammar as a native .dll (tree-sitter-c.dll, …).
-    runs-on: windows-latest
+    # Both platforms: the tree-sitter grammars are native libraries (tree-sitter-c.dll / libtree-sitter-c.so) and
+    # path handling differs (dot-files are Hidden on Linux, case sensitivity) — a Windows-only CI missed both.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,7 +31,29 @@ jobs:
       - name: Build
         run: dotnet build CodeCarver.sln -c Release
 
-      # Fast suite only. The build-verify tests self-skip when the pinned gcc + corpus are absent
-      # (neither is committed), so they'd pass trivially here — excluding them keeps CI quick and honest.
+      # Fast suite. The BuildVerify namespace compiles carved output with pinned toolchains that are not
+      # committed, so it runs locally (and under ComputeWarden), not here; its compiler-free halves live in
+      # the fast suite.
       - name: Test (fast)
-        run: dotnet test CodeCarver.sln -c Release --no-build --filter "FullyQualifiedName!~BuildVerify"
+        run: dotnet test CodeCarver.sln -c Release --no-build --filter "FullyQualifiedName!~BuildVerify" --blame-hang-timeout 5m
+
+      # Every example must carve cleanly with the CLI as shipped (exit 0: verify passed).
+      - name: Examples
+        shell: bash
+        run: |
+          set -e
+          for ex in examples/*/; do
+            [ -f "$ex/carve.toml" ] || continue
+            echo "== $ex"
+            (cd "$ex" && rm -rf out && dotnet ../../src/CodeCarver.Cli/bin/Release/net8.0/codecarver.dll carve src --config carve.toml)
+          done
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get install -y shellcheck >/dev/null
+          git ls-files '*.sh' | xargs shellcheck --severity=error

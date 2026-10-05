@@ -130,7 +130,7 @@ public sealed class InfrastructureEmitterTests
             // Real infra still written:
             Assert.True(File.Exists(Path.Combine(outDir, "Makefile")));
             // Reported in the garbage bucket (not the kept Files bucket), with bytes:
-            Assert.Contains(".git/config", res.Garbage);
+            Assert.DoesNotContain(".git/config", res.Garbage);   // VCS metadata dirs are never walked at all (RB6)
             Assert.Contains("keep.c.bak", res.Garbage);
             Assert.Contains("build.log", res.Garbage);
             Assert.Contains("obj/keep.d", res.Garbage);
@@ -153,7 +153,7 @@ public sealed class InfrastructureEmitterTests
                 excludeDirs: Array.Empty<string>(), auxGlobs: Array.Empty<string>(),
                 pruneGarbage: false);
 
-            Assert.True(File.Exists(Path.Combine(outDir, ".git", "config")));
+            Assert.False(File.Exists(Path.Combine(outDir, ".git", "config")));   // VCS metadata: never walked
             Assert.True(File.Exists(Path.Combine(outDir, "build.log")));
             Assert.Empty(res.Garbage);
             Assert.Equal(0, res.GarbageBytes);

@@ -70,4 +70,29 @@ public sealed class SourceWalkTests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+
+    [Fact]
+    public void DotFilesAndHiddenEntries_AreWalked_VcsMetadataIsNot()
+    {
+        // Review RB6: Linux reports every dot-file as Hidden; skipping Hidden lost .config (Kconfig) etc.
+        var root = Path.Combine(Path.GetTempPath(), "cc-walk-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, ".settings"));
+            Directory.CreateDirectory(Path.Combine(root, ".git", "objects"));
+            File.WriteAllText(Path.Combine(root, ".config"), "CONFIG_X=y");
+            File.WriteAllText(Path.Combine(root, ".settings", "board.mk"), "X=1");
+            File.WriteAllText(Path.Combine(root, ".git", "objects", "ab"), "blob");
+            if (OperatingSystem.IsWindows())
+            {
+                File.SetAttributes(Path.Combine(root, ".config"), FileAttributes.Hidden);
+                new DirectoryInfo(Path.Combine(root, ".settings")).Attributes |= FileAttributes.Hidden;
+            }
+            var found = SourceWalk.Files(root).Select(f => Rel(root, f)).ToList();
+            Assert.Contains(".config", found);
+            Assert.Contains(".settings/board.mk", found);
+            Assert.DoesNotContain(found, f => f.StartsWith(".git/", StringComparison.Ordinal));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
 }

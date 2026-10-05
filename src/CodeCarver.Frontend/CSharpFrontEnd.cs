@@ -51,7 +51,7 @@ public sealed class CSharpFrontEnd : ICarveFrontEnd
 
     public CSharpFrontEnd()
     {
-        _lang = new Language("tree-sitter-c-sharp.dll", "tree_sitter_c_sharp");
+        _lang = new Language("tree-sitter-c-sharp", "tree_sitter_c_sharp");
         _defs = new Query(_lang, DefsQuery);
         _calls = new Query(_lang, CallsQuery);
         _idents = new Query(_lang, IdentQuery);

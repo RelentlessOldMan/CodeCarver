@@ -9,7 +9,7 @@ namespace CodeCarver.Frontend;
 /// #include resolution by basename. File-scope address-taken (vector/dispatch tables) IS handled —
 /// attributed to the file node (see <see cref="TreeSitterFrontEnd"/>).
 /// </summary>
-public sealed class CFrontEnd() : TreeSitterFrontEnd("tree-sitter-c.dll", "tree_sitter_c", DefsQuery, CallsQuery)
+public sealed class CFrontEnd() : TreeSitterFrontEnd("tree-sitter-c", "tree_sitter_c", DefsQuery, CallsQuery)
 {
     private const string DefsQuery = """
         (function_declarator declarator: (identifier) @function)

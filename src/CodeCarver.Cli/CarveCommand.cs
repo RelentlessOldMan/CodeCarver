@@ -1011,7 +1011,7 @@ public static class CarveCommand
             var rootFull = Path.GetFullPath(dir);
             var rootPrefix = Path.TrimEndingDirectorySeparator(rootFull) + Path.DirectorySeparatorChar;
             // Compiler/system include trees are never "missing dependencies" (review T4).
-            var systemDirs = new List<string> { "/usr/", "/opt/", "/lib/", "/etc/", "/proc/", "/sys/", "/dev/", "/tmp/" };
+            var systemDirs = new List<string> { "/usr/", "/opt/", "/lib/", "/etc/", "/proc/", "/sys/", "/dev/" };
             foreach (var sf in new[] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86,
                                        Environment.SpecialFolder.Windows, Environment.SpecialFolder.CommonApplicationData })
                 try { var f = Environment.GetFolderPath(sf); if (f.Length > 0) systemDirs.Add(Path.TrimEndingDirectorySeparator(f) + Path.DirectorySeparatorChar); } catch { }
@@ -1338,7 +1338,7 @@ public static class CarveCommand
             foreach (var v in hard) sb.AppendLine($"FAIL {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined only in dropped {v.DefinedIn}");
             foreach (var v in soft) sb.AppendLine($"DEAD {v.Name}\tused {v.ReferencedIn}:{v.Line} (#ifdef-dead line)\tdefined only in dropped {v.DefinedIn}");
             Directory.CreateDirectory(ccDir);
-            WriteArtifact(Path.Combine(ccDir, "verify.txt"), sb.ToString(), "verify");
+            WriteArtifact(Path.Combine(ccDir, "verify.txt"), sb.ToString(), "verifylog");
             if (hard.Count == 0)
                 @out.WriteLine($"  verify  : OK — emitted code uses no function defined only in a dropped file ({r.FilesChecked} file(s) checked)");
             else

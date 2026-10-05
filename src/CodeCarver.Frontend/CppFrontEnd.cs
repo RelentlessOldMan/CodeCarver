@@ -11,7 +11,7 @@ namespace CodeCarver.Frontend;
 /// Limits today: templates/lambdas/operators are parsed loosely (calls inside a lambda attribute to
 /// the enclosing method); no overload resolution (names are enough for a sound file/function carve).
 /// </summary>
-public sealed class CppFrontEnd() : TreeSitterFrontEnd("tree-sitter-cpp.dll", "tree_sitter_cpp", DefsQuery, CallsQuery)
+public sealed class CppFrontEnd() : TreeSitterFrontEnd("tree-sitter-cpp", "tree_sitter_cpp", DefsQuery, CallsQuery)
 {
     private const string DefsQuery = """
         (function_declarator declarator: (identifier) @function)
