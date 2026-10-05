@@ -48,6 +48,42 @@ jobs:
             (cd "$ex" && rm -rf out && dotnet ../../src/CodeCarver.Cli/bin/Release/net8.0/codecarver.dll carve src --config carve.toml)
           done
 
+  # Every green push to main publishes its zip as GitHub Release v1.0.<commit-count>, the same number the
+  # build stamps into `codecarver version`. Packaging is release.ps1, exactly as run locally; the tests already
+  # passed in the jobs above, so it skips its own test gate.
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, lint]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0   # the version is the commit count
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Package and publish
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = "1.0.$(git rev-list --count HEAD)"
+          # A re-run of an already released commit is a no-op, not a failure.
+          # (Not `gh release view`: its not-found message on stderr is a terminating error under PowerShell 5.1.)
+          $tags = gh release list --limit 1000 --json tagName -q '.[].tagName'
+          if ($tags -contains "v$version") { Write-Host "v$version already released"; exit 0 }
+          ./release.ps1 -Version $version -SkipTests
+          if (-not $?) { throw "release.ps1 failed" }
+          $short = (git rev-parse --short=7 HEAD).Trim()
+          gh release create "v$version" "dist/codecarver-$version.zip" --target $env:GITHUB_SHA --title "CodeCarver $version" --notes "Build $version+$short. Windows and Linux (x64), needs the .NET 8 runtime. Run ``dotnet codecarver.dll version`` to check. Docs are in the zip (USAGE.md, SUPPORT.md); trace-capture scripts are in tools/capture."
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
