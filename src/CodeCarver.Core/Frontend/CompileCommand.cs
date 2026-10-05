@@ -1,0 +1,25 @@
+namespace CodeCarver.Core.Frontend;
+
+/// <summary>One entry of a compile database: a file plus the exact command/flags it compiled with.
+/// <see cref="Defines"/> and <see cref="Includes"/> are the extracted essentials — the exact macros
+/// and include paths that resolve the preprocessor for this translation unit.</summary>
+public sealed record CompileCommand
+{
+    public required string File { get; init; }
+    public string Directory { get; init; } = ".";
+    public IReadOnlyList<string> Arguments { get; init; } = Array.Empty<string>();
+
+    /// <summary>Macro definitions, without the <c>-D</c> (e.g. "LUA_USE_LINUX", "FOO=1").</summary>
+    public IReadOnlyList<string> Defines { get; init; } = Array.Empty<string>();
+
+    /// <summary>Include search paths, without the <c>-I</c>.</summary>
+    public IReadOnlyList<string> Includes { get; init; } = Array.Empty<string>();
+
+    /// <summary>Files force-included before the source (<c>-include</c>, <c>-imacros</c>, <c>/FI</c>); the
+    /// macros they define are part of this TU's configuration.</summary>
+    public IReadOnlyList<string> ForcedIncludes { get; init; } = Array.Empty<string>();
+
+    /// <summary>True when the define set may be incomplete (an unreadable <c>@response</c> file): the file must
+    /// not be resolved closed-world from this command.</summary>
+    public bool Incomplete { get; init; }
+}

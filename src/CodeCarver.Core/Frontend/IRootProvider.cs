@@ -224,6 +224,8 @@ public sealed class LinkerSectionRootProvider : IRootProvider
 /// be kept too. Rooting constructors makes the closure sound: the constructor and its callees survive.
 /// Over-approximates (keeps every class's constructor + its init dependencies) — the sound price of not
 /// modelling instantiation. In C this only fires on the rare function-named-like-a-struct (harmless).
+/// The CLI uses the tighter <see cref="CodeCarver.Core.Reachability.ConstructorGate"/> (review P5), which roots
+/// a constructor only once its class is named in emitted text; this provider is the simple everything-rooted form.
 /// </summary>
 public sealed class ConstructorRootProvider : IRootProvider
 {

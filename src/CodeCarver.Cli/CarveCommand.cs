@@ -505,7 +505,6 @@ public static class CarveCommand
         {
             "cpp" => new[] { ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".h" },
             "csharp" or "cs" => new[] { ".cs" },
-            "cmm" => new[] { ".cmm" },
             _ => new[] { ".c", ".h" },
         };
         // A mixed C+C++ carve scans the UNION of both families' extensions (so the C++-grammar front-end sees the
@@ -550,9 +549,9 @@ public static class CarveCommand
 
         // Oversized files (multi-GB auto-generated register headers) are never read into a string or parsed:
         // they'd blow past .NET's ~2GB string limit and explode tree-sitter memory. For languages with
-        // include/DO-closure (C/C++/.cmm) we register them as File nodes with null text — kept whole when a
+        // include-closure (C/C++) we register them as File nodes with null text — kept whole when a
         // kept unit includes them, copied verbatim by the emitter. C# has no such closure, so it's exempt.
-        var closureLang = lang is "c" or "cpp" or "cmm";
+        var closureLang = lang is "c" or "cpp";
         // One stat per file: capture every source file's size ONCE here (rel path -> bytes) and reuse the map
         // for big-file detection now and the final size accounting later, instead of stat'ing every file twice
         // (a full extra pass of syscalls over the whole tree — noticeable on a large/network source root).
@@ -766,7 +765,6 @@ public static class CarveCommand
         {
             "cpp" => new CppFrontEnd(),
             "csharp" or "cs" => new CSharpFrontEnd(),
-            "cmm" => new CmmFrontEnd(),
             _ => new CFrontEnd(),
         };
 
@@ -1339,9 +1337,9 @@ public static class CarveCommand
         // tighten: the observed scripts seed the static DO/GOSUB closure CmmFrontEnd builds, and any .cmm neither
         // observed nor reachable from one is dropped. No run trace (or no observed .cmm) => keep them all (sound;
         // we can't prove which ran). Dynamic `DO &var` and oversized kept-whole scripts are surfaced, never
-        // silently dropped. Skipped when the PRIMARY carve already IS cmm (then the main plan handles .cmm).
+        // silently dropped.
         var cmmDropped = new List<string>();
-        if (lang != "cmm" && runFileTraces.Count > 0)
+        if (runFileTraces.Count > 0)
         {
             var rootFullC = Path.GetFullPath(dir);
             var relToFull = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);

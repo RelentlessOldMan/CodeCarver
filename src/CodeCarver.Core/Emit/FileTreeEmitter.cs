@@ -72,9 +72,9 @@ public static class FileTreeEmitter
         // carved library). Removing an unreached inline method from a header (C++ especially) silently
         // breaks such a caller. Headers are kept whole; only implementation units are pruned. This also
         // sidesteps a class of C++ mis-parses where a giant function's span swallows a nested class.
-        // Constructors are never pruned — but that's handled soundly upstream by ConstructorRootProvider,
-        // which ROOTS them so reachability keeps the constructor AND everything it calls (its
-        // member-initializer list / body). Here they simply appear as reached nodes.
+        // A needed constructor is handled upstream: the CLI's ConstructorGate ROOTS every constructor whose
+        // class is named in emitted text, so reachability keeps it AND everything it calls (its
+        // member-initializer list / body). Here it simply appears as a reached node.
         var defsByFile = EmitClosure.DefinitionsByFile(graph);
 
         var written = new List<string>();
