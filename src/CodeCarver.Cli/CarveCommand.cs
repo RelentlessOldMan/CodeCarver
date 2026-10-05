@@ -962,9 +962,31 @@ public static class CarveCommand
             }
         }
 
-        // C++ constructors run on every instantiation (untraceable) and can't be pruned, so root them: the
+        // C++ constructors run on every instantiation (untraceable), so a needed one must be rooted: the
         // constructor AND whatever it calls in its init-list/body must survive (a real pugixml dangling bug).
-        var ctorRoots = lang is "cpp" ? new ConstructorRootProvider().Discover(graph).ToList() : new List<Root>();
+        // Review P5: root a class's constructors only once its name appears in text that will be emitted — every
+        // header (kept whole when included) up front, then each file the carve keeps, to a fixpoint inside the
+        // plan's closure. A fresh gate per plan: what a stage emits decides what it roots.
+        var ctorHeaders = new List<string>();
+        var ctorGoverned = 0;
+        if (lang is "cpp")
+        {
+            ctorGoverned = new ConstructorGate(graph).ConstructorCount;
+            if (ctorGoverned > 0)
+                ctorHeaders = CodeCarver.Core.Util.SourceWalk.Files(dir).Where(p => !Excluded(p))
+                    .Select(p => Path.GetRelativePath(dir, p).Replace('\\', '/'))
+                    .Where(EmittedLinkCheck.IsHeader).OrderBy(r => r, StringComparer.Ordinal).ToList();
+        }
+        (ConstructorGate? Gate, List<Root> Initial) NewCtorGate()
+        {
+            if (ctorGoverned == 0) return (null, new List<Root>());
+            var gate = new ConstructorGate(graph);
+            var initial = ctorHeaders.SelectMany(r => gate.ReleasedByFile(r, Path.Combine(dir, r), maxParseBytes))
+                                     .Select(id => new Root(id, RootKind.Constructor, $"constructor {graph.GetNode(id).Name}")).ToList();
+            return (gate, initial);
+        }
+        Func<string, IEnumerable<NodeId>>? CtorsIn(ConstructorGate? gate) =>
+            gate is null ? null : f => gate.ReleasedByFile(f, Path.Combine(dir, f), maxParseBytes);
 
         // A file whose extraction threw was kept whole (not analysed) — root it so its code is emitted intact
         // rather than silently dropped. Sound over-approximation for the "couldn't parse it" case.
@@ -1147,7 +1169,7 @@ public static class CarveCommand
             ? new ExplicitRootProvider(files: forcedGraphFiles).Discover(graph).ToList() : new List<Root>();
 
         var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots)
-                                   .Concat(ctorRoots).Concat(forceKeepRoots).Concat(forcedRoots).Concat(traceRoots).Concat(fileTraceRoots).ToList();
+                                   .Concat(forceKeepRoots).Concat(forcedRoots).Concat(traceRoots).Concat(fileTraceRoots).ToList();
         if (rootSet.Count == 0)
         {
             err.WriteLine("no roots to carve from: list the entry symbols in [common] entryPoints");
@@ -1155,7 +1177,15 @@ public static class CarveCommand
         }
 
         Mark("roots");
-        var plan = ReachabilityEngine.Compute(graph, rootSet);
+        // The reachability plan (before closing over emitted text). For C++ it includes the constructor gate over
+        // the files reachability keeps, so it already roots every constructor the kept code instantiates.
+        var baseGate = NewCtorGate();
+        var plan = baseGate.Gate is null
+            ? ReachabilityEngine.Compute(graph, rootSet)
+            : EmitClosure.Close(graph, rootSet.Concat(baseGate.Initial), (_, _) => Array.Empty<NodeId>(),
+                                constructorsIn: CtorsIn(baseGate.Gate));
+        var ctorRootCount = baseGate.Gate is null ? 0
+            : graph.Nodes.Count(n => n.Kind == NodeKind.Function && baseGate.Gate.ReleasedTypes.Contains(n.Name) && plan.IsKept(n.Id));
         Mark("reachability");
         var s = plan.Stats;
         summary["world.closed"] = closedWorld;
@@ -1171,7 +1201,8 @@ public static class CarveCommand
         summary["roots.implicit"] = implicitRoots.Count;
         summary["roots.assembly"] = asmRoots.Count;
         summary["roots.linkerSection"] = sectionRoots.Count;
-        summary["roots.constructor"] = ctorRoots.Count;
+        summary["roots.constructor"] = ctorRootCount;
+        summary["roots.constructorNotRooted"] = ctorGoverned - ctorRootCount;
         summary["roots.parseFailedKeptWhole"] = forceKeepRoots.Count;
         summary["roots.forceKeepFiles"] = forcedRoots.Count;
         summary["roots.functionTrace"] = traceRoots.Count;
@@ -1201,8 +1232,10 @@ public static class CarveCommand
         {
             if (!closeOverEmit) return plan;
             if (stagePlans.TryGetValue(pruned, out var sp)) return sp;
-            sp = EmitClosure.Close(graph, rootSet,
-                (f, kept) => FileTreeEmitter.RetainedWhenEmitted(f, defsByFile!.GetValueOrDefault(f), kept, SourceText, pruned));
+            var (gate, initial) = NewCtorGate();
+            sp = EmitClosure.Close(graph, rootSet.Concat(initial),
+                (f, kept) => FileTreeEmitter.RetainedWhenEmitted(f, defsByFile!.GetValueOrDefault(f), kept, SourceText, pruned),
+                constructorsIn: CtorsIn(gate));
             return stagePlans[pruned] = sp;
         }
         var whyPlan = PlanFor(!cv.AnalysisOnly && cv.Stages.Count > 0 && cv.Stages[0].CarveSourceFileContents);

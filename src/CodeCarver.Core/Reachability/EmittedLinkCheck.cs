@@ -127,7 +127,7 @@ public static class EmittedLinkCheck
         public List<(string Name, int Line)> Uses { get; } = new();
     }
 
-    readonly record struct Tok(string Text, int Line, bool Ident, bool InDefine);
+    internal readonly record struct Tok(string Text, int Line, bool Ident, bool InDefine);
 
     // Words that can precede a USE of a name (so "keyword name" is not a declaration of name).
     static readonly HashSet<string> ExprKeywords = new(StringComparer.Ordinal)
@@ -309,7 +309,7 @@ public static class EmittedLinkCheck
     /// <summary>C/C++ tokens with comments, string/char literals (as <c>""</c>) and preprocessor lines handled.
     /// #define bodies are kept (as InDefine tokens, parameters and ## / # operands removed); every other
     /// directive line is skipped entirely.</summary>
-    static List<Tok> Tokenize(string s, bool directives = true)
+    internal static List<Tok> Tokenize(string s, bool directives = true)
     {
         var toks = new List<Tok>();
         var line = 1;

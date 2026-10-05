@@ -405,8 +405,9 @@ diagnostic `.zip` and prints its path — see [`SUPPORT.md`](SUPPORT.md).
 
 - It doesn't *run* your program to carve it (no runtime, no hardware in the loop).
 - It errs toward keeping code when a reference is ambiguous (soundness over minimality), so output can carry
-  some unused code — but it should always build. Known looser spots: C++ constructors are rooted for every
-  class, used or not; a virtual call keeps every override of that name.
+  some unused code — but it should always build. Known looser spots: a C++ constructor is kept whenever its
+  class name appears in any header or kept file (outside the class's own body), even if no object is ever
+  built; a virtual call keeps every override of that name.
 - Linker scripts are read for `KEEP()` only in GNU ld form (`.ld`, `.lds`, `.ldscript`). IAR `.icf`, ARM
   `.sct`, TI `.cmd` and preprocessed `.ld.S` scripts are copied but not read — name such sections' symbols in
   `entryPoints`.

@@ -20,9 +20,12 @@ public static class EmitClosure
 {
     /// <param name="retainedIn">For a kept file and the current keep-test, the definitions the emitter will
     /// write although they are unreached. Called again whenever the file gains a reached node.</param>
+    /// <param name="constructorsIn">Optional: the C++ constructors a kept file's text releases
+    /// (<see cref="ConstructorGate"/>); rooted as <see cref="RootKind.Constructor"/>. Called once per kept file.</param>
     public static CarvePlan Close(CodeGraph graph, IEnumerable<Root> roots,
                                   Func<string, Func<NodeId, bool>, IEnumerable<NodeId>> retainedIn,
-                                  ReachabilityOptions? options = null)
+                                  ReachabilityOptions? options = null,
+                                  Func<string, IEnumerable<NodeId>>? constructorsIn = null)
     {
         ArgumentNullException.ThrowIfNull(graph);
         options ??= ReachabilityOptions.Safe;
@@ -57,8 +60,13 @@ public static class EmitClosure
             var files = dirty.ToList();
             dirty.Clear();
             foreach (var f in files)
+            {
                 foreach (var id in retainedIn(f, reached.Contains))
                     Seed(id, RootKind.EmittedWhole);
+                if (constructorsIn is not null)
+                    foreach (var id in constructorsIn(f))
+                        Seed(id, RootKind.Constructor);
+            }
             if (work.Count == 0) break;
         }
         return new CarvePlan(graph, reached, why);
