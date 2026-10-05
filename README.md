@@ -133,3 +133,7 @@ This is a personal tool, published as-is — **issues and pull requests aren't a
 ## License
 
 MIT — see [LICENSE](LICENSE). © 2026 RelentlessOldMan.
+
+Bundled third-party components (Tomlyn, the tree-sitter .NET bindings, the tree-sitter library and its C, C++
+and C# grammars) keep their own licences — MIT, BSD-2-Clause and the Unicode/ICU licence — reproduced in full
+in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), which ships in every release.

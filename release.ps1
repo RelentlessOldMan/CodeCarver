@@ -72,6 +72,19 @@ if (Test-Path $pub) { Remove-Item -Recurse -Force $pub }
 Write-Host "== Publishing CLI (Release) ==" -ForegroundColor Cyan
 & dotnet publish (Join-Path $root 'src\CodeCarver.Cli\CodeCarver.Cli.csproj') -c Release -o $pub --nologo -p:ContinuousIntegrationBuild=true
 if ($LASTEXITCODE -ne 0) { throw "publish failed" }
+# TreeSitter.DotNet ships ~30 grammars per platform; CodeCarver loads only the core library and the C, C++
+# and C# grammars. Ship exactly those, so the release carries no unused native code and THIRD-PARTY-NOTICES.txt
+# covers everything in it.
+$keepNative = '^(lib)?tree-sitter(-c|-cpp|-c-sharp)?\.(dll|so|dylib)$'
+$pruned = 0
+Get-ChildItem (Join-Path $pub 'runtimes') -Recurse -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Directory.Name -eq 'native' -and $_.Name -notmatch $keepNative } |
+    ForEach-Object { Remove-Item -Force $_.FullName; $pruned++ }
+foreach ($rid in @('win-x64', 'linux-x64')) {
+    $n = @(Get-ChildItem (Join-Path $pub "runtimes\$rid\native") -File -ErrorAction SilentlyContinue).Count
+    if ($n -ne 4) { throw "expected 4 tree-sitter libraries for $rid after pruning, found $n" }
+}
+Write-Host "  pruned $pruned unused tree-sitter grammar libraries (kept core + c, cpp, c-sharp)" -ForegroundColor DarkGray
 # Stamp the exact commit into the artifact so a loose zip is always traceable to a pushed commit.
 "CodeCarver $Version`ncommit $sha`nbranch $branch`nbuilt  $(Get-Date -Format o)" |
     Set-Content -Encoding UTF8 (Join-Path $pub 'RELEASE.txt')
@@ -92,7 +105,7 @@ foreach ($d in $shipDocs) {
 foreach ($top in @('SUPPORT.md', 'USAGE.md')) { Copy-Item -Force (Join-Path $docsSrc $top) (Join-Path $pub $top) }
 Write-Host "  bundled docs/ ($($shipDocs -join ', ')) + SUPPORT.md/USAGE.md at the root" -ForegroundColor DarkGray
 # The repo README and LICENSE live at the root. A release without its licence is not redistributable.
-foreach ($top in @('README.md', 'LICENSE')) {
+foreach ($top in @('README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.txt')) {
     $p = Join-Path $root $top
     if (-not (Test-Path $p)) { throw "release file missing: $top" }
     Copy-Item -Force $p (Join-Path $pub $top)
@@ -102,7 +115,7 @@ $capture = Join-Path $root 'tools\capture'
 if (-not (Test-Path $capture)) { throw "tools\capture missing - USAGE.md tells users to run it" }
 New-Item -ItemType Directory -Force (Join-Path $pub 'tools') | Out-Null
 Copy-Item -Recurse -Force $capture (Join-Path $pub 'tools\capture')
-Write-Host "  bundled README.md, LICENSE, tools/capture/ into the release" -ForegroundColor DarkGray
+Write-Host "  bundled README.md, LICENSE, THIRD-PARTY-NOTICES.txt, tools/capture/ into the release" -ForegroundColor DarkGray
 
 # --- 5. zip (only reached AFTER push is confirmed) ---
 if (-not $Output) { $Output = Join-Path $root 'dist' }
