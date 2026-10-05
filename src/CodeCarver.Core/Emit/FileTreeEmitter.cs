@@ -100,11 +100,16 @@ public static class FileTreeEmitter
             // Rewritten byte-transparently (Latin-1): a Latin-1/Shift-JIS/UTF-8 string literal must come out with
             // exactly its original bytes (review E1). UTF-16 text can't be edited line-wise this way: copy it whole
             // (CarvePlan already closed over the whole file being written; see EmitClosure).
-            if (ranges is { Count: > 0 } && !IsUtf16(src))
-                // Bytes in, bytes out: ReadAllText would honour (and strip) a UTF-8 BOM even when told Latin-1.
-                File.WriteAllBytes(dst, Encoding.Latin1.GetBytes(RemoveLineRanges(Encoding.Latin1.GetString(File.ReadAllBytes(src)), ranges)));
-            else
-                File.Copy(src, dst, overwrite: true);
+            try
+            {
+                if (ranges is { Count: > 0 } && !IsUtf16(src))
+                    // Bytes in, bytes out: ReadAllText would honour (and strip) a UTF-8 BOM even when told Latin-1.
+                    File.WriteAllBytes(dst, Encoding.Latin1.GetBytes(RemoveLineRanges(Encoding.Latin1.GetString(File.ReadAllBytes(src)), ranges)));
+                else
+                    File.Copy(src, dst, overwrite: true);
+            }
+            // A locked/vanished file must not sink the whole emit (review RB5) — same tolerance as Emit.
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
             bytes += new FileInfo(dst).Length;
             written.Add(rel);
         }
@@ -215,7 +220,8 @@ public static class FileTreeEmitter
     private static void CopyUnscannedIncludes(CarvePlan plan, string sourceRoot, string outDir,
                                               List<string> written, ref long bytes)
     {
-        var root = Path.GetFullPath(sourceRoot);
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourceRoot)) + Path.DirectorySeparatorChar;
+        var outRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outDir)) + Path.DirectorySeparatorChar;
         var known = new HashSet<string>(plan.KeptFiles, StringComparer.OrdinalIgnoreCase);
         foreach (var f in plan.DroppedFiles) known.Add(f);          // graph-known drops: leave dropped
         var copied = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -239,17 +245,21 @@ public static class FileTreeEmitter
             var fromDir = Path.GetDirectoryName(full) ?? sourceRoot;
             foreach (Match m in LocalInclude.Matches(text))
             {
-                var target = Path.GetFullPath(Path.Combine(fromDir, m.Groups[1].Value));
+                string target;
+                try { target = Path.GetFullPath(Path.Combine(fromDir, m.Groups[1].Value)); } catch { continue; }
+                // Under the root WITH a separator: "/repo2" must not pass for root "/repo" (review RB9).
                 if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue; // outside the tree
                 if (!File.Exists(target)) continue;                  // unresolved here (system/other -I dir)
                 var trel = Path.GetRelativePath(sourceRoot, target).Replace('\\', '/');
                 if (known.Contains(trel) || !copied.Add(trel)) continue; // graph-known or already copied
 
-                var dst = Path.Combine(outDir, trel);
+                var dst = Path.GetFullPath(Path.Combine(outDir, trel));
+                if (!dst.StartsWith(outRoot, StringComparison.OrdinalIgnoreCase)) continue; // never write outside the output
                 if (SameFile(target, dst)) continue; // out overlaps source — don't copy onto the original
                 var dstDir = Path.GetDirectoryName(dst);
                 if (!string.IsNullOrEmpty(dstDir)) Directory.CreateDirectory(dstDir);
-                File.Copy(target, dst, overwrite: true);
+                try { File.Copy(target, dst, overwrite: true); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
                 bytes += new FileInfo(dst).Length;
                 written.Add(trel);
                 queue.Enqueue(trel);                                 // its own includes may need copying too

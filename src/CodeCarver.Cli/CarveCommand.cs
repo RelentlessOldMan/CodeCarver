@@ -354,7 +354,8 @@ public static class CarveCommand
                 var bd = Path.IsPathFullyQualified(cc.Directory) ? cc.Directory : Path.GetFullPath(Path.Combine(dir, cc.Directory));
                 var abs = Path.IsPathFullyQualified(cc.File) ? cc.File : Path.GetFullPath(Path.Combine(bd, cc.File));
                 var rel = Path.GetRelativePath(dir, abs).Replace('\\', '/');
-                return rel.StartsWith("..", StringComparison.Ordinal) ? null : rel; // outside the carve tree
+                // Outside the carve tree: above it (".."), or on another drive (GetRelativePath then returns the absolute path).
+                return rel.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(rel) ? null : rel;
             }
             catch { return null; }
         }
