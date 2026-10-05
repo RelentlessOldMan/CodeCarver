@@ -114,7 +114,8 @@ is defined only by a vendor header that is **absent from the tree**. This has tw
   is preprocessed out. Resolving it is a false positive (failing honesty, not passing recall).
 - **Soundness-first carver (open-world):** MAY **keep** the `#ifdef VENDOR_OK` branch as a sound
   over-approximation (a macro it can't see might enable it). So for a carver this is a **closed-world
-  precision** case (`assumeDefinesComplete`), not a soundness one.
+  precision** case, not a soundness one. (CodeCarver is closed-world only when given a build log with parsed
+  compile commands or a probed compiler; without either it keeps the branch.)
 
 Schema note: `unreachableRefs` = "resolvable only if the missing macro is known."
 

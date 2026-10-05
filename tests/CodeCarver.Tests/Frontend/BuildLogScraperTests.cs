@@ -148,7 +148,7 @@ public class BuildLogScraperTests
     [Fact]
     public void CompileCommandsJson_GeneratorCommandForm_ExtractsIncludesAndFile()
     {
-        // Mirrors make-firmware-corpus.ps1's emitted entry: clang -I"<dir>" -I"<out>" -c "<file>", with the
+        // Mirrors the (since-removed) make-firmware-corpus.ps1's emitted entry: clang -I"<dir>" -I"<out>" -c "<file>", with the
         // escaped inner quotes a real compile_commands.json carries. (Raw string => the \" are literal.)
         const string json = """
             [

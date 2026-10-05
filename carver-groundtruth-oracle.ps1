@@ -37,7 +37,7 @@ if (-not (Test-Path $Corpus)) { throw "corpus not found: $Corpus" }
 if (-not $Manifest) {
   $Manifest = Join-Path (Split-Path (Resolve-Path $Corpus)) ((Split-Path (Resolve-Path $Corpus) -Leaf) + '-manifest.json')
 }
-if (-not (Test-Path $Manifest)) { throw "manifest not found: $Manifest (generate with make-firmware-corpus.ps1 -Manifest)" }
+if (-not (Test-Path $Manifest)) { throw "manifest not found: $Manifest (CodeSpawner writes <corpus>-manifest.json beside the corpus: tools\codespawner\codespawner.exe gen)" }
 
 Write-Host "== parsing ground-truth manifest ==" -ForegroundColor Cyan
 $m = Get-Content $Manifest -Raw | ConvertFrom-Json

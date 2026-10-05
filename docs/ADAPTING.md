@@ -75,16 +75,18 @@ permanent regression test.
 Given a profile, a session will typically:
 
 1. **Translate it to a `carve.toml`.** Everything lives in the config — the CLI is just
-   `carve <src> --config carve.toml [--stage <name>] [--why <sym>]` (`carve init carve.toml` writes an
+   `codecarver carve <src> --config carve.toml [--stage <name>] [--why <sym>]` (`codecarver init` writes an
    annotated template). The profile maps directly:
 
    | Profile says | Becomes (config key) |
    |---|---|
    | Entry points | `entryPoints = ["a","b","c"]` (in `[common]`) |
-   | Feature macros | prefer `[builds.main] buildLogs = ["build.log"]` or `compiler = "<cc>"`; manual override `defines = ["X=1","Y"]` |
+   | Feature macros | prefer `[builds.main] buildLogs = ["build.log"]` or `compiler = "<cc>"`; manual `defines = ["X=1","Y"]` |
+   | Compiler family | a vendor driver in a text log → `compilerNames = ["armcc"]`; `compiler` must answer `-dM -E` (gcc/clang-like) |
    | Language | `languages = ["c"]` \| `["cpp"]` \| `["c","cpp"]` (merged) \| `["csharp"]`. `.cmm` → `[runs.*] runTraceFiles`, not here |
    | Dirs to ignore | `excludeDirectories = ["tests","generated"]` (in `[common]`) |
-   | Closed #ifdef world | auto-derived: any `buildLogs`/`compiler` ⇒ closed-world (dead branches dropped) |
+   | Closed #ifdef world | auto-derived: a `buildLogs` with parsed commands or a probed `compiler` ⇒ closed-world (dead branches leave reachability). `defines` alone stays open-world |
+   | Non-GNU linker files (IAR `.icf`, ARM `.sct`, TI `.cmd`) | not read for `KEEP()`: list those symbols in `entryPoints` |
    | All of it | one `carve.toml` (see `docs/USAGE.md`) |
 
 2. **Find a public analogue** — an open-source repo with the same shapes — and add it to the corpus so
@@ -103,4 +105,4 @@ leaving your side.
 - Anything that identifies the project.
 
 Patterns and shapes, anonymized, are enough. See [`USAGE.md`](USAGE.md) for the command reference and
-[`DESIGN.txt`](../DESIGN.txt) for how the carving actually works.
+[`DESIGN.txt`](../DESIGN.txt) for the original design rationale.

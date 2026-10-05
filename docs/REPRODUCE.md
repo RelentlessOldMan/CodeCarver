@@ -7,14 +7,14 @@ replicate both halves of what we do:
 1. **Validate** — the committed build-verify tests carve real repos and compile the output.
 2. **Hunt** — `fuzz.ps1` carves any repo and recompiles it to find *new* pruning bugs.
 
-The scripts are PowerShell (the dev + CI OS is Windows; the tree-sitter grammars load as native
-Windows DLLs). You need: `git`, the .NET 8 SDK, and 7-Zip (for the w64devkit archive).
+The scripts are PowerShell and fetch Windows toolchains (CodeCarver itself also runs on Linux, and CI tests
+both). You need: `git`, the .NET 8 SDK, and 7-Zip (for the w64devkit archive).
 
 ## 1. One-time setup
 
 ```powershell
 ./fetch-toolchains.ps1   # pinned w64devkit gcc/g++ (host) + arm-none-eabi-gcc (embedded) -> .toolchains/
-./fetch-corpus.ps1       # ~30 varied public repos -> .corpus/   (both dirs are .gitignored)
+./fetch-corpus.ps1       # ~35 varied public repos -> .corpus/   (both dirs are .gitignored)
 ```
 
 Both are idempotent (re-running skips what's present). `./check.ps1 -Big -Fetch` does both, builds, and
@@ -70,8 +70,8 @@ with `./check.ps1 -Big` once the ARM toolchain + corpus are fetched.
 - **Test harnesses over-keep.** Carving a repo *including* its own test driver (e.g. tinyxml2's
   `xmltest.cpp`) can surface a dropped symbol: the driver is pulled in by a virtual-dispatch name
   collision, then references API it doesn't reach. This is the sound over-approximation biting a file
-  you'd normally `exclude` (config); the *library* files carve clean. Real carves name real entry points
-  and exclude tests.
+  you'd normally leave out with `excludeDirectories`; the *library* files carve clean. Real carves name real
+  entry points and exclude tests.
 - **`0 baseline`** means the repo doesn't compile standalone here (needs its own generated headers or a
   config, e.g. mbedtls/PSA). Not a carve bug — just not fuzzable without its build system.
 - Every corpus repo is **pinned to a commit SHA** in `fetch-corpus.ps1` (a commit is immutable, so a

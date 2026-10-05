@@ -4,34 +4,46 @@ CodeCarver carves a repo down to only the code needed for a chosen entry set, an
 minimal tree that still **builds**. This is the practical guide: the commands, the inputs, and how to
 dial in how aggressively it carves.
 
-> Build the CLI: `dotnet build CodeCarver.sln -c Release`. The tool is invoked as `codecarver <command>`
-> (`carve`, `init`, `scan-log`, `version`); examples below write `carve`/`init` for brevity.
+> Build the CLI: `dotnet build CodeCarver.sln -c Release` (output: `src/CodeCarver.Cli/bin/Release/net8.0/`).
+> The tool is `codecarver` — `codecarver.exe` on Windows, or `dotnet codecarver.dll` anywhere. It runs on
+> Windows and Linux. The command examples below use `codecarver <command>`.
 
 ## Quick start
 
 CodeCarver is driven by **one TOML config file**, so the command line stays tiny:
 
 ```
-codecarver init carve.toml                              # write an annotated config template
+codecarver init                                          # write an annotated carve.toml template
 #   edit carve.toml: set entryPoints + outputDirectory (and a buildLog if you have one)
-codecarver carve <source-dir> --config carve.toml      # carve
+codecarver carve <source-dir> --config carve.toml                  # carve
 codecarver carve <source-dir> --config carve.toml --stage max      # run one named stage
 codecarver carve <source-dir> --config carve.toml --why <symbol>   # explain why a symbol is kept/dropped
 ```
 
 The config names the entry symbols to keep and where output goes; CodeCarver traces every dependency and
-writes a **complete buildable project** plus a `report.txt` + `manifest.json`. A missing named entry point
-fails the run, and the compiler-free soundness check runs automatically (the `verify` line). For a full
-config that exercises every feature, see the worked **`examples/multistage-firmware/`**.
+writes a **complete buildable project** plus a `codecarver/` folder of reports (see [Output](#output)). A
+named entry point that resolves to nothing fails the run, and an independent check of the emitted tree runs
+automatically (the `verify` line). For a full config that exercises every feature, see the worked
+**`examples/multistage-firmware/`**. One stage of its output:
 
 ```
-  roots   : cJSON_Parse, cJSON_Delete
-  nodes   : 76/1943 kept (4%), 1867 carved
-  files   : 2/5 kept, 3 dropped
-  verify  : OK — every in-scope callee of a kept function is kept
-  world   : open-world (both #ifdef branches kept) — no build log or compiler given
-  emitted : 2 files -> out/carved  [file-level (whole kept files)]
-  size    : 155,085 B -> 100,598 B  (35% smaller, saved 54,487 B)
+CodeCarver 1.0.142+3065c25b8 — carve of src
+  roots   : main, Timer_ISR
+  asm     : 1 symbol(s) referenced from .s startup auto-kept: Timer_ISR
+  trace   : 7 function(s) from 1 trace(s) rooted; 7 resolved in-scope
+  nodes   : 15/40 kept (38%), 25 carved
+  files   : 6/7 kept, 1 dropped
+  dropped : debug.c
+  world   : closed-world (dead #ifdef branches dropped) — have 5 compile command(s); macros #defined in the tree and compiler built-ins not probed for the TU stay unknown
+  stage   : safe  [source-contents=whole, header-contents=whole]
+  emitted : 6 files -> out/safe/carved  [file-level (whole kept files)]
+  verify  : OK — emitted code uses no function defined only in a dropped file (7 file(s) checked)
+  passthru: 5 non-code file(s) copied verbatim (541 B) — complete buildable project
+  excluded: 3 non-input file(s) NOT copied (53 B) — VCS/scratch/editor (forceKeepFiles to keep)
+  size    : 2,761 B -> 2,567 B  (7% smaller, saved 194 B)
+  buckets : 6 required-to-build + 5 infrastructure kept, 1 dead-code + 3 auto-excluded file(s) removed
+  report  : out/safe/codecarver/report.txt
+  ...
 ```
 
 ## How aggressively it carves (per stage)
@@ -40,13 +52,19 @@ File-level (drop whole unneeded files) is always the sound floor. Two independen
 
 | Config key | What it does | Soundness |
 |---|---|---|
-| `carveSourceFileContents` | also remove unreached **functions and data tables** within kept `.c` files | aggressive — **always build-verify** |
-| `carveHeaderFileContents` | also strip unused `#define`s from kept headers | aggressive — **always build-verify** |
+| `carveSourceFileContents` | also remove unreached **functions and data tables** within kept C/C++ files | aggressive — **always build-verify** |
+| `carveHeaderFileContents` | also strip unused `#define`s from **big** kept headers: those over `maxParseBytes`, or macro-dense headers of 1 MB or more. Ordinary headers are never rewritten. It runs after the infrastructure copy, and keeps every `#define` that assembly, linker scripts or other text files in the output use | aggressive — **always build-verify** |
 
 Intra-file carving is where the big wins are (e.g. carving AES to encrypt-only drops the inverse S-box
 table) — validated to compile on cJSON, zlib, Lua, SQLite, printf and tiny-AES-c, but treat it as "verify
 by building it." Define named **`[stages.NAME]`** blocks to emit several aggressiveness tiers in one run
 (`--stage` picks one; omit it to run them all, each into `outputDirectory/<stage>/`).
+
+**File-level output is closed over what it emits.** A kept file is written whole, so functions in it that no
+root reaches are still in the output, and whatever *they* call must be there too or the tree won't link.
+CodeCarver roots that unreached code before emitting (per stage, to a fixpoint), so the carved tree links
+without `--gc-sections`. When that adds files you see a line like
+`closure : +2 file(s) kept because code this stage writes uses them (the output must link)`.
 
 ## The tightness ladder (optional inputs)
 
@@ -55,15 +73,17 @@ Every carve is sound with just `entryPoints`. Each extra input lets it carve **t
 > **Implicit roots are always added.** Symbols the runtime/linker keep regardless of any call —
 > `__attribute__((constructor))`/`((destructor))`/`((used))`/`((retain))` and `.init_array`-family
 > section placement — are auto-discovered and kept (reported on an `implicit:` line), so a self-registering
-> driver or an initcall table isn't silently dropped. Vector-table ISRs are kept the same way (via the
-> file-scope address-taken edge). Symbols referenced only from a standalone `.s`/`.S` startup file are
-> rooted too (reported on an `asm:` line). And a symbol placed in a **custom section your linker script
-> keeps** — `__attribute__((section(".init_calls")))` where the `.ld` has `KEEP(*(.init_calls*))` — is
-> rooted from the tree's own linker script (reported on a `section:` line), generalising the hardcoded
-> `.init_array` handling to any KEEP'd registration/initcall table. Finally, a symbol called only from a
-> generated table `#include`d with a **non-source extension** (`#include "GenTables.inc"`, `.def`, X-macro
-> files) is kept too: those includes aren't parsed as C, but every symbol they name is retained and the
-> file is copied into the output. This is the sound over-approximation; it never drops these.
+> driver or an initcall table isn't silently dropped. The same holds when those attributes are hidden in a
+> macro (`#define INITCALL(f) ... __attribute__((section(".initcall"))) ...`): a use of the macro roots what it
+> decorates. Vector-table ISRs are kept the same way (via the file-scope address-taken edge). Symbols
+> referenced from a standalone `.s`/`.S` startup file are rooted too (reported on an `asm:` line); when the
+> build log or a build trace names assembly files, only those files count, so another target's startup file
+> can't root its handlers. A symbol placed in a **custom section your linker script keeps** —
+> `__attribute__((section(".init_calls")))` where the `.ld` has `KEEP(*(.init_calls*))` — is rooted from the
+> tree's own linker script (reported on a `section:` line). Finally, a symbol called only from a generated
+> table `#include`d with a **non-source extension** (`#include "GenTables.inc"`, `.def`, X-macro files) is kept
+> too: those includes aren't parsed as C, but every symbol they name is retained and the file is copied into
+> the output. This is the sound over-approximation; it never drops these.
 
 ## The CLI
 
@@ -71,84 +91,78 @@ The command line is tiny — everything else lives in the config:
 
 | Command | What it does |
 |---|---|
-| `carve <source-dir> --config carve.toml` | carve (all stages). `--stage <name>` runs one; `--why <symbol>` explains one symbol |
-| `init [carve.toml]` | write the annotated config template (won't overwrite an existing file) |
-| `scan-log <build-log>` | preview what a build log scrapes (TUs, defines, includes) |
-| `version` | the build's git-stamped version |
+| `codecarver carve <source-dir> --config carve.toml` | carve (all stages). `--stage <name>` runs one; `--why <symbol>` explains one symbol |
+| `codecarver init [path]` | write the annotated config template (default `carve.toml`; won't overwrite an existing file) |
+| `codecarver scan-log <build-log>` | preview what a build log scrapes (compile commands, TUs, defines, includes) |
+| `codecarver version` | the build's git-stamped version |
+| `codecarver demo` | a narrated toy carve of an in-memory graph |
+| `codecarver help` | usage and exit codes (also what you get with no arguments) |
+
+**Exit codes:** `0` ok · `1` runtime failure (including unresolved entry points) · `2` usage or configuration
+error (bad config, missing input file, unusable build log or trace, unprobeable compiler, unsafe output
+directory) · `3` the emitted tree failed `verify` (it would not link).
+
+`--stage` with a config that has no `[stages]`, or with `analysisOnly = true`, is an error.
 
 ## The config file (`carve.toml`)
 
-`init` writes this annotated; every option is a TOML key. (Booleans accept `true`/`false` or `yes`/`no`.)
+`init` writes this annotated; every option is a TOML key, and an unknown key is an error. Booleans accept
+`true`/`false` (or `yes`/`no`). **Relative paths** (`outputDirectory`, `entryPointsFile`, build logs, traces, a
+path-like `compiler`) resolve against the **config file's directory**, not the shell's; the globs
+(`excludeDirectories`, `forceKeepFiles`) are relative to the source directory. Build, run and stage names may
+use only letters, digits, `_` and `-`.
 
 **Top level**
-- `outputDirectory` — where output goes: `<dir>/[<stage>/]carved` (a complete buildable project) + a sibling
-  `codecarver/{report.txt, manifest.json, resolved-config.toml}`, always written. Must be **outside** the source.
-- `analysisOnly = true` — decide only (plan + report + manifest), don't emit a tree. A fast dry run.
+- `outputDirectory` — where output goes (see [Output](#output)). Must be **outside** the source tree.
+- `analysisOnly = true` — decide only (plan + reports), don't emit a tree. A fast dry run.
 
 **`[common]`** — the whole carve:
 
 | Key | Effect |
 |---|---|
-| `entryPoints = ["main","Reset_Handler"]` | the symbols to keep — a missing named one **fails** the run. Or `entryPointsFile = "roots.txt"` (one per line) for a long list. |
-| `languages = ["c","cpp"]` | source languages (`c`/`cpp`/`csharp`). A mixed `["c","cpp"]` tree is carved as **one graph** (reachability crosses the C/C++ boundary — a C root reaching an `extern "C"` C++ callee is kept). `csharp` is a separate graph — carve it on its own. asm is auto-scanned for roots; `.cmm` is handled via run traces. |
-| `excludeDirectories = ["tests","boards/old"]` | directories to drop (tests, other board/arch variants). Nested paths OK. |
-| `forceKeepFiles = ["prebuilt/*.a"]` | globs to **always** keep (even under an excluded dir or auto-excluded as a non-input) |
-| `carveSourceFileContents`, `carveHeaderFileContents` | the two aggressiveness toggles (above) |
+| `entryPoints = ["main","Reset_Handler"]` | the symbols to keep. A name that resolves to nothing **fails** the run (exit 1), with "did you mean" suggestions; `--why` still works so you can investigate. Qualify a name by file to pick one of several: `"app/a/main.c:main"` (the path matches the end of the file's path). Or `entryPointsFile = "roots.txt"` (one per line, `#` comments) for a long list. |
+| `languages = ["c","cpp"]` | source languages: `c`, `cpp` (also `c++`, `cxx`), `csharp` (also `cs`, `c#`). A mixed `["c","cpp"]` tree is carved as **one graph** (reachability crosses the C/C++ boundary — a C root reaching an `extern "C"` C++ callee is kept). `csharp` is a separate graph — carve it on its own. Assembly is auto-scanned for roots; `.cmm` is handled via run traces. |
+| `excludeDirectories = ["tests","boards/old"]` | directories to drop (tests, other board/arch variants). Each entry matches whole path segments of the path **relative to the carve root**, so `tests` does not match `mytests/`, and a carve root that itself sits under a `tests/` directory is unaffected. |
+| `forceKeepFiles = ["prebuilt/*.a"]` | globs to **always** keep, even under an excluded directory, auto-excluded, or dropped by the carve. A forced code file is a root, so its callees and includes come with it; a forced `.cmm` seeds the `.cmm` closure. Each glob prints how many files it matched (`force   : forceKeepFiles '...' -> N file(s) kept`), and a glob that matches nothing is a warning. A bare pattern like `*.inc` searches all subdirectories; a glob with `..` or an absolute path is refused (exit 2). |
+| `carveSourceFileContents`, `carveHeaderFileContents` | the two aggressiveness toggles (above), used when there are no `[stages]` |
 
 **`[builds.NAME]`** — how the real compiler sees the code (define several build *steps*; selected builds **union**):
 
 | Key | Effect |
 |---|---|
-| `buildLogs = ["make-n.log","build.console.txt"]` | scrape real per-file `-D`/`-I` from a `make -n` log, console capture, or `compile_commands.json`. **The** way to pin `#ifdef`s. |
-| `compiler = "arm-none-eabi-gcc"` | probe the compiler for its built-in macros |
-| `defines = ["CHIP=F4"]` | rare manual override when you have no build log |
-| `buildTraceFiles = ["build.csv"]` | files opened while **building** (capture with `tools/capture`) |
+| `buildLogs = ["make-n.log","build.console.txt"]` | scrape real per-file `-D`/`-I` from a `make -n` log, console capture, or `compile_commands.json`. **The** way to pin `#ifdef`s. A log with no recognised compile command, or none naming a file under the carve root, is exit 2. |
+| `compiler = "arm-none-eabi-gcc"` | probe the compiler (`-dM -E`) for its built-in macros. A compiler that can't be probed is exit 2. |
+| `compilerNames = ["armcc","iccarm"]` | extra compiler driver names to recognise in a **text** build log (gcc/clang/cl and cross drivers are known) |
+| `defines = ["CHIP=F4"]` | manual defines, applied to every file. They do **not** by themselves make the world closed (see below). |
+| `buildTraceFiles = ["build.trace"]` | files opened while **building** (capture with [`tools/capture`](../tools/capture/README.md)) |
 
-**`[runs.NAME]`** — what a real execution touched (optional; tightens + audits, never drops the unobserved):
+**`[runs.NAME]`** — what a real execution touched (optional; tightens + audits):
 
 | Key | Effect |
 |---|---|
-| `runTraceFiles = ["flash.csv"]` | files opened while **running/flashing** — catches the loader/`.cmm`/data layer |
-| `runTraceLogs = ["run.log"]` | functions that actually ran (one name per line, or `name file:line`) → roots |
+| `runTraceFiles = ["run.trace"]` | files opened while **running/flashing** — catches the loader/`.cmm`/data layer |
+| `runTraceLogs = ["run.log"]` | functions that actually ran → roots (format below) |
+| `dropUnobservedCmm = true` | opt in to dropping `.cmm` scripts the run neither opened nor reaches by `DO`/`GOSUB` (see Languages). Needed on **every** selected run that has a file trace. |
 
 **`[stages.NAME]`** — aggressiveness tiers; each sets the two carve toggles. `--stage` picks one; omit to run all.
 **`[use]`** — `builds = [...]` / `runs = [...]` to select a subset (default: all defined).
-**`[advanced]`** — rarely needed escape hatches: `maxParseBytes`, `parseTimeout`, `maxSymbolsPerFile`.
+**`[advanced]`** — rarely needed:
 
-Three things are **automatic**: the open/closed `#ifdef` world is derived (a build log or compiler ⇒ closed-world,
-dead branches dropped; otherwise open-world, both kept); the compiler-free **soundness check** runs every carve
-(the `verify` line); and non-inputs (VCS/scratch/editor junk) are **auto-excluded** (`forceKeepFiles` un-drops one).
+| Key | Default | Effect |
+|---|---|---|
+| `maxParseBytes` | `20000000` (bytes) | files larger than this are not parsed; they are kept whole via `#include` closure |
+| `parseTimeout` | `20` (seconds) | per-file parse budget; a file that exceeds it is kept whole. `0` disables the budget |
+| `maxSymbolsPerFile` | `50000` | a file with more symbols than this is kept whole instead of exploding the graph |
+| `pathMap = [{ from = "/build/agent/repo", to = "." }]` | none | rewrites a path prefix captured elsewhere (CI agent, other drive, WSL vs Windows) onto the carve root. `to` is relative to the carve root. Applies to trace paths and to compile commands (directory, file, `-I`, response files) |
+| `allowUnmatchedTraces = true` | `false` | a file trace with no path under the carve root becomes a warning instead of exit 2 |
 
-### Output is a complete, buildable project (keep-by-default)
-
-The carved output (`outputDirectory/[<stage>/]carved`) is not just the carved C — it's a **whole project you
-can build**. After emitting the reachable code and its `#include` closure, CodeCarver copies **every other
-file in the tree verbatim**: Makefiles / CMake, linker scripts and scatter/`.cmd` files, startup assembly,
-device trees, register and data tables, TRACE32 `.cmm`, prebuilt `.a`/`.o`, board configs — anything that
-isn't a translation unit the carve modelled. The rule is **evidence-based removal only**: the files left out
-are (1) the code already emitted, (2) code files the carve **proved unreachable** (dead translation units /
-unreferenced headers), and (3) **auto-excluded non-inputs** — files that cannot be a build/run input *by
-universal convention* (VCS metadata, compiler/IDE scratch, dep/coverage artifacts, editor/OS junk,
-logs/temp). Everything else is kept, because a file the tool didn't model is a file it can't prove you don't
-need to build.
-
-Auto-exclusion is deliberately **conservative**: ambiguous binaries that *could* be vendored prebuilts the
-build links (`.o`, `.a`, `.so`, `.lib`, `bin/`, `build/`) are **not** auto-dropped — they're kept and flagged
-in the report's "look like build outputs" section so you can `excludeDirectories` them if they're generated.
-Restore any wrongly-excluded file with `forceKeepFiles`.
-
-The knob for trimming the rest is `excludeDirectories` (drop board/arch variants you don't build, or large
-non-build trees like `docs`); `forceKeepFiles` forces a specific file back in from an excluded folder or the
-auto-excluded set.
-
-Because passthrough files are copied byte-for-byte, the headline **size reduction reflects only the code
-carve** (dead code removed) — the untouched infrastructure is delta-neutral, and auto-excluded files are
-reported separately (not folded into the headline %). The `report.txt` shows what landed in each bucket.
+Three things are **automatic**: the open/closed `#ifdef` world is derived (below); the emitted-tree `verify`
+check runs on every carve; and non-inputs (VCS/scratch/editor junk) are **auto-excluded** (`forceKeepFiles`
+un-drops one).
 
 ### A minimal config
 
-See "The config file" above for the full key reference; `init` writes an annotated template. A minimal
-single-stage carve with a build log:
+A single-stage carve with a build log:
 
 ```toml
 outputDirectory = "D:/carved/myimage"
@@ -162,147 +176,185 @@ excludeDirectories = ["tests"]
 buildLogs = ["build.log", "build.console.txt"]   # comments and arrays are fine; list several logs
 ```
 
-A referenced **input** file that's missing (a build log/trace) **fails fast** with the full list, so a typo'd
-path can't silently carve with less config than intended.
+A referenced **input** file that's missing (a build log/trace) **fails fast** (exit 2) with the full list, so a
+typo'd path can't silently carve with less config than intended.
 
-### Traces: keep what a real run actually touched
+## Output
 
-Two optional inputs let an observed run tighten and audit the carve. Both **add** to the sound static carve —
-they never silently drop what they didn't see (a trace only proves what *that* run touched).
+```
+<outputDirectory>/[<stage>/]
+  carved/                  the complete buildable project
+  codecarver/
+    report.txt             human-readable: roots, kept/dropped files by bucket, sizes, observed-file tags
+    manifest.json          the same decision, structured (kept/dropped files, droppedCmm, stats, observed files)
+    resolved-config.toml   the configuration actually used: selected builds/runs merged, paths resolved
+    decisions.txt          per-symbol KEPT/CARVED ledger with the chain back to a root
+    repro.graph.json       the dependency graph, anonymized (opaque tokens) — safe to share
+    verify.txt             the emitted-tree link check (see Verify)
+    summary.txt / .json    numbers only — no path, file name or symbol
+  .codecarver-output       marker: this directory was written by CodeCarver
+```
 
-- **Function trace** (config `[runs.smoke] runTraceLogs = ["run.log", ...]`): the functions a run executed become
-  roots, covering dynamic dispatch (function pointers, vtables) static analysis over-approximates. One standard
-  format — a function name per line, optionally `name file:line`; write a small per-product converter to it
-  (there's no regex knob).
-- **File-access trace** (config `[builds.main] buildTraceFiles` / `[runs.smoke] runTraceFiles`): the **files the OS
-  actually opened** under the repo. These are a set-once-per-repo input, so they live in the config. Capture two
-  ways and list both:
-  - **build trace** — ProcMon/strace *while building* → the exact compile/link inputs.
-  - **run trace** — ProcMon *while flashing/running* → the loader/orchestration layer (TRACE32 `.cmm` scripts,
-    the binaries and data they load) that a function trace can't see and that static analysis can't resolve
-    (its `DO`/`Data.LOAD` targets are computed `&var` paths). The OS reports the *concrete* path regardless.
+With `analysisOnly = true` there is no `carved/` and no `resolved-config.toml`; the other reports are written
+under `<outputDirectory>/codecarver/`, and `verify` checks the kept files as they would be emitted.
 
-  Observed **code** files become roots (keep the file + its closure); every observed file is kept (never pruned as
-  garbage), and the report tags observed infrastructure and flags the **kept-but-unobserved** files as drop
-  candidates. The reader **auto-detects** the format — ProcMon CSV, `strace -e trace=openat`, or a plain
-  path-per-line list all work; it extracts the path tokens and keeps only those under the carve root that exist.
+`summary.txt` / `summary.json` hold only counts, booleans and fixed category names (world, graph, roots by
+kind, traces, `.cmm`, per-stage sizes and verify counts, warnings by category, exit code). They are what you
+send back when the source must not leave the machine. `decisions.txt` is replaced by a short note above
+500,000 graph nodes (use `--why` or `manifest.json` then).
+
+**Output safety.** An existing, non-empty `carved/` or `codecarver/` is replaced only if its parent carries the
+`.codecarver-output` marker. Otherwise the run stops before doing any work (exit 2) rather than delete a
+directory CodeCarver didn't create. Each stage's `carved/` tree is built in a private staging directory and
+moved into place only when the stage completes.
+
+### Output is a complete, buildable project (keep-by-default)
+
+The carved output (`outputDirectory/[<stage>/]carved`) is not just the carved C — it's a **whole project you
+can build**. After emitting the reachable code and its `#include` closure, CodeCarver copies **every other
+file in the tree verbatim**: Makefiles / CMake, linker scripts and scatter/`.cmd` files, startup assembly,
+device trees, register and data tables, TRACE32 `.cmm`, prebuilt `.a`/`.o`, board configs, dot-files such as
+`.config` — anything that isn't a translation unit the carve modelled. The rule is **evidence-based removal
+only**: the files left out are (1) the code already emitted, (2) code files the carve **proved unreachable**
+(dead translation units / unreferenced headers), (3) `.cmm` scripts dropped under `dropUnobservedCmm`, and
+(4) **auto-excluded non-inputs** — files that cannot be a build/run input *by universal convention* (VCS
+metadata, compiler/IDE scratch, dep/coverage artifacts, editor/OS junk, logs/temp). `.git`, `.svn`, `.hg` and
+`.bzr` directories are never walked. Everything else is kept, because a file the tool didn't model is a file
+it can't prove you don't need to build.
+
+Auto-exclusion is deliberately **conservative**: ambiguous binaries that *could* be vendored prebuilts the
+build links (`.o`, `.a`, `.so`, `.lib`, `bin/`, `build/`) are **not** auto-dropped — they're kept and flagged
+in the report's "look like build outputs" section so you can `excludeDirectories` them if they're generated.
+Restore any wrongly-excluded file with `forceKeepFiles`.
+
+Because passthrough files are copied byte-for-byte, the headline **size reduction reflects only the code
+carve** (dead code removed) — the untouched infrastructure is delta-neutral, and auto-excluded files are
+reported separately (not folded into the headline %). The `report.txt` shows what landed in each bucket.
+
+## Traces: keep what a real run actually touched
+
+Two optional inputs let an observed build or run tighten and audit the carve. Both **add** to the static carve.
+
+- **Function trace** (`[runs.smoke] runTraceLogs = ["run.log", ...]`): the functions a run executed become
+  roots, covering dynamic dispatch (function pointers, vtables) static analysis can't resolve. One format — a
+  function name per line, optionally followed by `file:line`. A leading hex address (`0x0800a1c4`), timestamp
+  (`12.345`) or `[tag]` is skipped, and a C++ qualified name (`ns::Class::method`) uses its last component.
+  Lines with no readable name are counted in a warning. Write a small converter from your tracer's output if
+  it differs.
+- **File-access trace** (`[builds.main] buildTraceFiles` / `[runs.smoke] runTraceFiles`): the **files the OS
+  actually opened**. Capture them with the scripts in [`tools/capture`](../tools/capture/README.md) (ProcMon on
+  Windows, strace on Linux); they keep only the build's own processes, make Linux paths absolute, and reduce
+  the capture to one path per line. A raw ProcMon CSV or strace log is also accepted, but consolidating first
+  is strongly recommended.
+  - **build trace** — captured *while building* → the exact compile/link inputs.
+  - **run trace** — captured *while flashing/running* → the loader/orchestration layer (TRACE32 `.cmm`
+    scripts, the binaries and data they load) that a function trace can't see and that static analysis can't
+    resolve (computed `&var` paths).
+
+  An observed **code** file roots its **file** only: the file is kept (and, file-level, emitted whole with its
+  closure), but at a `carveSourceFileContents` stage its functions that no root reaches are still removed.
+  Every observed file is kept (never auto-excluded); the report tags observed infrastructure `[observed]` and
+  flags **kept-but-unobserved** files as drop candidates. Only paths under the carve root that exist count;
+  source files read *outside* the root are reported as a possible missing dependency.
+
+  A trace that can't be read is exit 2. A trace whose paths include **none** under the carve root (captured in
+  another checkout location) is exit 2, with the prefix it appears to use and the line to add:
+  `[advanced] pathMap = [{ from = "/build/agent/repo", to = "." }]`. Set `allowUnmatchedTraces = true` to make
+  that a warning.
 
   ```toml
   # in carve.toml
   [builds.main]
-  buildTraceFiles = ["build.csv"]
+  buildTraceFiles = ["build.trace"]
   [runs.smoke]
-  runTraceFiles   = ["flash.csv"]
-  ```
-  ```
-  carve repo/ --config carve.toml
+  runTraceFiles   = ["run.trace"]
   ```
 
-#### Capturing a file-access trace
+> Over-capturing (un-exercised paths, extra tools) only ever keeps more, and the report shows you exactly what
+> each trace touched. A clean, full build is required for a build trace: an incremental build opens almost
+> nothing.
 
-The extractor is tolerant and the "under the carve root + file exists" filter drops noise, so you don't have to
-produce a clean list — a raw capture works. Any capture tool that records opened paths is fine; the common ones:
+## Languages
 
-**Windows — the RUN trace (TRACE32 flash/debug session) — Process Monitor (Sysinternals ProcMon), GUI:**
-1. Launch `Procmon.exe`. Press **Ctrl+E** to stop the initial capture, **Ctrl+X** to clear.
-2. **Ctrl+L** (Filter) → add `Path` **begins with** `C:\path\to\repo` → **Include** (optionally also `Operation` **is** `ReadFile` → Include, to shrink it). Apply.
-3. **Ctrl+E** to start capturing, then **run your TRACE32 flash/run session** end to end, then **Ctrl+E** to stop.
-4. **File → Save** → *Events displayed using current filter* → format **CSV** → `flash.csv`. Put it in `runTraceFiles`.
+- **C / C++** (`languages = ["c","cpp"]`): calls, macros, globals, `#include` closure, `#ifdef` resolution,
+  file-level **and** `carveSourceFileContents` intra-file carving. `#include "x.h"` resolves beside the
+  including file first, then through the translation unit's own `-I` order (a basename match is only a
+  fallback). A file-scope `static` function is not reached from other translation units. A parameter or local
+  variable named like a function does not keep that function.
+- **C#** (`languages = ["csharp"]`): always **file-level** — a `.cs` file is kept or dropped whole;
+  `carveSourceFileContents` is ignored with a note. The file set is closed over identifier and type
+  references: a kept file that mentions a name keeps every type and method of that name. Files with top-level
+  statements are entry points. Reflection and string-based dependency injection are invisible to it — list
+  such files in `forceKeepFiles`. `verify` does not run for C#.
+- **TRACE32 `.cmm`**: file-level, handled via run traces (not `languages`); never carved internally. With
+  **no** run trace, or a trace that opened no `.cmm`, every script is kept. With a run trace, the observed
+  scripts **seed a `DO`/`GOSUB` closure** (those scripts plus every script they `DO`, transitively). A `DO`
+  target resolves as a path first (beside the calling script, then from the carve root, including `../` and
+  quoted paths); otherwise it binds to **every** script with that basename. By default the scripts outside the
+  closure are still **kept** — one run is one scenario — and the `cmm:` line reports how many the trace
+  accounts for. Set `[runs.X] dropUnobservedCmm = true` to drop them. Even then, nothing is dropped while a
+  kept script has a dynamic `DO &var` (it could run anything) or could not be read; the run says why. Dropped
+  scripts are listed in `manifest.json` under `droppedCmm`.
 
-**Windows — the BUILD trace — ProcMon from the command line (scriptable):**
-```
-Procmon.exe /AcceptEula /Quiet /Minimized /BackingFile C:\caps\build.pml
-<your build>                                   # e.g. make / cmake --build / the IDE build
-Procmon.exe /Terminate
-Procmon.exe /OpenLog C:\caps\build.pml /SaveAs C:\caps\build.csv   # -> buildTraceFiles
-```
-(The same GUI steps as above also work for the build — just build instead of flashing between the Ctrl+E's.)
+## `#ifdef` resolution: open vs. closed world
 
-**Linux — the BUILD trace — strace:**
-```
-strace -f -e trace=open,openat -o build.trace -- make <target>
-```
-`-f` follows the compiler/sub-make forks; the reader parses strace's `openat(AT_FDCWD, "path", …)` lines directly,
-so `buildTraceFiles = ["build.trace"]` just works. **Run it from the repo root** so relative opens resolve under the
-carve root (absolute-path opens always resolve). `fatrace -c` or a `bpftrace` openat probe work too. A build on
-Linux targeting embedded is the usual case; a Windows build is the ProcMon recipe above.
+CodeCarver **derives this automatically**; the `world:` line says which and why.
 
-**Linux — the RUN trace — strace (if you launch the run) or fatrace (if you don't):**
-```
-# a) you start the run/loader yourself:
-strace -f -e trace=open,openat -o run.trace -- ./run-or-flash-tool <args>     # -> runTraceFiles
+- **Open-world** (no build log and no compiler): a macro that's neither supplied nor defined in the file is
+  *unknown*, so both branches of its `#ifdef` are kept. Sound — it only drops what it's certain about
+  (`#if 0`, definite conditions, branches after a definitely-taken one). Manual `defines` are applied as
+  known-defined, but an absent macro stays unknown.
+- **Closed-world** (a `buildLogs` with at least one parsed compile command, or a probed `compiler`): an absent
+  macro is treated as undefined and its branch is **dropped**. Exactly what counts as known:
+  - the `-D`/`-U` flags of each translation unit's own compile command (including response files and
+    `-Wp,-D`). A macro defined in some of a file's commands but not others is unknown, and so is a name that
+    a forced include (`-include`/`-imacros`) `#define`s;
+  - the probed compiler's built-in macros. They are probed with the build's target flags only when every
+    compile command shares them; otherwise flag-dependent built-ins (`__ARM_*`, `__OPTIMIZE__`,
+    `__STDC_VERSION__`, …) are unknown, and they are always unknown in a C++ carve;
+  - **nothing else.** A macro `#define`d or `#undef`d anywhere in the tree is unknown unless the build defines it
+    (include guards excepted); a reserved name (`__x`, `_X`) the probe didn't report is unknown; a `#define`
+    under an uncertain condition makes the name unknown.
 
-# b) the run is launched by something you don't control (daemon/debugger) — attach by PID:
-strace -f -p <pid> -e trace=open,openat -o run.trace                          # Ctrl+C to stop
+  A translation unit that no compile command covers, or whose command was incomplete (unreadable response
+  file or forced include), is resolved open-world; the `build:` lines report how many.
 
-# c) system-wide during the run window (no PID needed), with fatrace:
-fatrace > run.fatrace        # run the session, then Ctrl+C
-```
-strace options (a)/(b) use quoted paths, so they feed `runTraceFiles` as-is. `fatrace` lines look like
-`comm(pid): R /abs/path` (the path is **not** quoted), so reduce them to a plain path-per-line list first —
-the reader auto-detects that:
-```
-awk '{print $NF}' run.fatrace > run.trace     # -> runTraceFiles = ["run.trace"]
-```
-(On a desktop/host build the "run" is just your program; for embedded-on-hardware the loader runs on the *host*,
-so trace the host loader process — same recipe.)
-
-> Not a function trace — these record *files*, which is the whole point: they catch the orchestration + data layer
-> a function trace can't see. Over-capturing (writes, directory scans, un-exercised paths) is harmless: it only
-> ever keeps more, and the report shows you exactly what each trace touched.
-
-### Languages
-
-- **C / C++** (`languages = ["c","cpp"]`): full support — calls, macros, globals, `#include` closure, `#ifdef`
-  resolution, file-level **and** `carveSourceFileContents` intra-file carving, all compile-verified.
-- **C#** (`languages = ["csharp"]`): **file-level** carving (drop unused `.cs` files). Sound intra-file method
-  pruning needs semantic analysis (Roslyn), so `carveSourceFileContents` falls back to file-level for C#.
-- **TRACE32 `.cmm`**: file-level, trace-driven, handled via `runTraceFiles` (not `languages`); never carved
-  internally. A run trace that opened some scripts **seeds a `DO`/`GOSUB` closure**: those scripts plus every
-  script they can `DO` (transitively) are kept, and `.cmm` reachable by nobody are dropped — so a run that
-  touches a handful of scripts no longer drags the whole script library into the image. A dynamic `DO &var`
-  (runtime-chosen path) can't be resolved statically, so scripts reachable *only* that way are flagged in the
-  output (`warn: cmm …`) — widen the trace or `forceKeepFiles` them — rather than silently dropped. With **no**
-  run trace, every `.cmm` is kept (can't prove which run). The `cmm:` report line shows kept/closure/dropped.
-
-### `#ifdef` resolution: open vs. closed world
-
-CodeCarver **derives this automatically** (the report's `world:` line says which and why):
-- **Open-world** (neither a build log nor a compiler given): a macro that's neither supplied nor defined in
-  the file is *unknown*, so its `#ifdef` branch is **kept** (a header might define it). Sound — it only drops
-  what it's certain about (`#if 0`, definite conditions, branches after a definitely-taken one).
-- **Closed-world** (a `buildLogs` or a `compiler` is given, so the define set is known): an absent macro is
-  undefined and its branch is **dropped** — tighter, and correct because the build told us the real set.
-
-So: feed a build log (or set a build's `compiler`) to carve tighter; give neither to stay safe. Example —
-carve Lua for Linux, dropping Windows/dyld paths (config pins the build via `buildLogs`):
-
-```
-carve lua/ --config carve.toml --stage prune
-```
+**Resolution affects reachability only.** It decides which calls count; the emitted text still contains both
+branches of every `#if`. So feed a build log (or set a build's `compiler`) to carve tighter; give neither to
+stay safe.
 
 ## Getting a build log
 
 Most builds don't emit a `compile_commands.json`. Any verbose build log works — even a dry run:
 
 ```
-make -n > build.log            # prints the compiler command lines without building
-carve scan-log build.log       # shows the translation units, defines, includes it found
+make -n > build.log                  # prints the compiler command lines without building
+codecarver scan-log build.log        # shows the compile commands, units, defines, includes it found
 # then in carve.toml:  [builds.main] buildLogs = ["build.log"]
-carve src/ --config carve.toml
+codecarver carve src/ --config carve.toml
 ```
 
-`scan-log` recognizes gcc/clang/cc/cl and cross drivers (arm-none-eabi-gcc, …), GNU `-D/-I` and MSVC
-`/D //I`, multi-source lines, `cd dir &&` prefixes, and quoted paths.
+The scraper recognises gcc/clang/cc/cl and cross drivers (`arm-none-eabi-gcc`, …), behind `VAR=x`
+assignments, a ninja `[n/m]` prefix or wrappers such as `ccache`/`distcc`. A line with several commands
+joined by `&&`, `||`, `;` or `|` is split so each compile gets only its own flags, and a leading `cd dir`
+carries forward. `@response` files are read (relative to the command's directory). GNU `-D/-U/-I` are parsed,
+and MSVC `/D /U /I` for `cl`-like drivers. For a vendor compiler in a text log, name it in
+`[builds.X] compilerNames`; a `compile_commands.json` must be a JSON array of
+`{directory, file, command|arguments}`. (`scan-log` previews with the built-in driver list only.)
 
-## Verify the output builds
+## Verify
 
-Intra-file pruning is aggressive, so build what you carved. CodeCarver never *runs* anything; the
-guarantee is only ever "it compiles/links":
+Every C/C++ carve runs `verify` on the **emitted** tree. It is an independent, tokenizer-only check that does
+not use the carve's graph: it fails the run (**exit 3**) when emitted code uses a function that only a
+**dropped** file defines — the carved tree would not link. Such a use on a line that is dead under the
+`#ifdef` world is reported as a note, not a failure (it is correct if the world is). Files over
+`maxParseBytes` are not checked and are counted. Details go to `codecarver/verify.txt`.
+
+`verify` is a link check, not a build: it cannot see a missing type, macro or header. Build what you carved:
 
 ```
-carve src/ --config carve.toml   # with carveSourceFileContents=true (e.g. a [stages.prune])
-cc -c out/carved/*.c -Iout/carved/   # or your real build, pointed at the carved tree
+codecarver carve src/ --config carve.toml   # e.g. with a [stages.prune] carveSourceFileContents = true
+cc -c out/prune/carved/*.c -Iout/prune/carved/   # or your real build, pointed at the carved tree
 ```
 
 ## First run on a large repo
@@ -310,22 +362,24 @@ cc -c out/carved/*.c -Iout/carved/   # or your real build, pointed at the carved
 Recommended workflow the first time you point it at a big, unfamiliar tree:
 
 ```
-# in carve.toml: analysisOnly=true for the dry run; drop it (and add [stages]) for the real emit.
-carve <dir> --config carve.toml           # 1. with analysisOnly=true: stats, dropped files, warnings (no emit)
-                                          #    the compiler-free soundness check runs automatically (verify line)
-carve <dir> --config carve.toml           # 2. real carve -> outputDirectory/[<stage>/]carved + codecarver/
-cc -c out/carved/*.c -Iout/carved/        # 3. build the output (the only real guarantee)
+# in carve.toml: analysisOnly = true for the dry run; drop it (and add [stages]) for the real emit.
+codecarver carve <dir> --config carve.toml   # 1. analysisOnly: stats, dropped files, warnings, verify (no emit)
+codecarver carve <dir> --config carve.toml   # 2. real carve -> outputDirectory/[<stage>/]carved + codecarver/
+cc -c out/carved/*.c -Iout/carved/           # 3. build the output (the only real guarantee)
 ```
 
 On a large tree it prints a **live, self-calibrating ETA** while parsing (the dominant phase) — e.g.
 `parsing : 22% (4,376/20,075 files, 1.2 MB/s) -- ETA ~6m 41s`. It's calculated, not guessed: measured
 throughput on this run × the known remaining source bytes, refined every few seconds (first estimate after
-a ~3 s warmup). Printed to stderr, so it never pollutes stdout. Reachability
-and emit are a short tail after parsing; emit scales with how much is *kept*.
+a ~3 s warmup). Printed to stderr, so it never pollutes stdout. Reachability and emit are a short tail after
+parsing; emit scales with how much is *kept*.
 
 It's built to survive a messy real tree: a file it can't read or can't parse is **skipped with a
-`warn:` line and kept whole** (never crashes the whole run), multi-GB generated headers are parsed-
-skipped (config `maxParseBytes`), and a file that blows the parse budget is kept whole (config `parseTimeout`).
+`warn:` line and kept whole** (never crashes the whole run), and files over `maxParseBytes`, over the
+`parseTimeout` budget or over `maxSymbolsPerFile` are kept whole too (reported on `big:`, `budget:` and
+`warn:` lines).
+The source is read byte-transparently: non-UTF-8 text is preserved, a UTF-8 BOM is kept, and UTF-16 files are
+copied whole.
 
 **Macro-dense register headers are handled automatically** — no flag, no magic number. A big chip/register
 map (a few MB of almost-nothing-but-`#define`s, transitively `#include`d) sits *under* the byte cap but
@@ -340,14 +394,21 @@ prints a per-phase + slow-file breakdown to stderr.
 ## Diagnostics
 
 ```
-carve <dir> --config carve.toml --why sym   # why a symbol was kept (its chain to a root) or that it was carved
+codecarver carve <dir> --config carve.toml --why sym   # why a symbol was kept (its chain to a root) or that it was carved
 ```
-(Per-symbol keep/drop detail also goes to `codecarver/report.txt` / `manifest.json` each run.)
+
+Per-symbol keep/drop detail for the whole tree is in `codecarver/decisions.txt`; file-level detail in
+`report.txt` / `manifest.json`. If the tool itself crashes (an unhandled exception), it writes a source-free
+diagnostic `.zip` and prints its path — see [`SUPPORT.md`](SUPPORT.md).
 
 ## What CodeCarver does not do
 
 - It doesn't *run* your program to carve it (no runtime, no hardware in the loop).
-- It errs toward keeping code when a reference is ambiguous (soundness over minimality), so pruned
-  output can carry a little unused code — but it should always build.
+- It errs toward keeping code when a reference is ambiguous (soundness over minimality), so output can carry
+  some unused code — but it should always build. Known looser spots: C++ constructors are rooted for every
+  class, used or not; a virtual call keeps every override of that name.
+- Linker scripts are read for `KEEP()` only in GNU ld form (`.ld`, `.lds`, `.ldscript`). IAR `.icf`, ARM
+  `.sct`, TI `.cmd` and preprocessed `.ld.S` scripts are copied but not read — name such sections' symbols in
+  `entryPoints`.
 - Correctness is bounded by input fidelity: wrong `defines` or a wrong `buildLogs` give a wrong carve.
   Feed it the real build's config.

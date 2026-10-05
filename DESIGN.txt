@@ -1,6 +1,14 @@
 CodeCarver
 ==========
 
+  NOTE — HISTORICAL. This is the pre-implementation design plan. Its reasoning (why a
+  single sound static carve, why over-approximate at indirect edges, why image size is
+  the metric) still holds, but the mechanics it describes were not all built as written:
+  there is no real-preprocessor (`cc -E`) front-end and no --preprocessed / --map /
+  --semantic / --roots / --trace flags. The built tool is driven by one TOML config;
+  see docs/USAGE.md for how it actually works and docs/TOOLING.md for what is built
+  versus planned.
+
 A tool that carves a huge, messy repo down to only the code needed to build and run
 one chosen thing — and removes the unnecessary code inside that thing too. Not merely
 dead-code removal; "unnecessary-code removal" relative to a specific entry set and build

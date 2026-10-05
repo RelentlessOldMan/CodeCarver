@@ -81,15 +81,17 @@ files as drop candidates:
 This example resolves its `#ifdef` world from a build log and lists its roots inline. Three config options
 cover the cases where that isn't enough — add them to `carve.toml` as needed:
 
-- **No build log?** Give the compiler instead — it's probed for its built-in macros — and/or list defines by
-  hand. CodeCarver still resolves `#ifdef`s closed-world:
+- **No build log?** Give the compiler instead — it's probed for its built-in macros, which makes the world
+  closed — and/or list defines by hand. `defines` alone does **not** close the world: macros it doesn't name
+  stay unknown and both branches are kept.
   ```toml
   [builds.main]
-  compiler = "arm-none-eabi-gcc"       # probed for built-in macros (__ARM_ARCH, etc.)
-  defines  = ["FEATURE_FAST=1", "CHIP=F4"]   # manual -D, when you have neither a log nor the compiler
+  compiler = "arm-none-eabi-gcc"       # probed (-dM -E); without a build log, flag-dependent built-ins such as __ARM_* stay unknown
+  defines  = ["FEATURE_FAST=1", "CHIP=F4"]   # manual -D, applied to every file
   ```
 - **Something the carve can't see it needs** (a prebuilt `.a`, a generated file, a resource) — pin it so it's
-  always kept, even if it sits under an excluded dir or looks unreferenced:
+  always kept, even if it sits under an excluded dir or looks unreferenced. A forced code file is a root, so
+  what it calls is kept too, and the run prints how many files each glob matched:
   ```toml
   [common]
   forceKeepFiles = ["prebuilt/*.a", "gen/version.h"]

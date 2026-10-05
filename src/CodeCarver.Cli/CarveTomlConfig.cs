@@ -254,7 +254,7 @@ public static class ConfigLoader
         forceKeepFiles = []              # globs to ALWAYS keep (even if excluded/auto-dropped), e.g. ["prebuilt/*.a"]
 
         carveSourceFileContents = false  # true = also drop unused functions WITHIN kept .c files (aggressive)
-        carveHeaderFileContents = false  # true = also strip unused #defines from kept headers (aggressive)
+        carveHeaderFileContents = false  # true = also strip unused #defines from kept BIG headers (over maxParseBytes, or macro-dense and 1 MB+)
 
         # ===== builds (how the real compiler sees the code) =====
         # One [builds.NAME] per build STEP; several steps/compilers UNION into one image. The build log is the

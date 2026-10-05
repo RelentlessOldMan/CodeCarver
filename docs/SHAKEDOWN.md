@@ -19,14 +19,16 @@ dotnet build CodeCarver.sln -c Release            # the CLI
 ```
 
 Use the built DLL directly to avoid `dotnet run` overhead on big repos:
-`dotnet src/CodeCarver.Cli/bin/Release/net8.0/codecarver.dll carve ...` (called `carve` below).
+`dotnet src/CodeCarver.Cli/bin/Release/net8.0/codecarver.dll carve ...` (`codecarver carve ...` is written
+`carve` below; the other commands are `codecarver init`, `codecarver version`, `codecarver scan-log`).
 
-**Record the version you tested.** `carve version` prints `CodeCarver <semver>+<git-sha>[-dirty]` — the
+**Record the version you tested.** `codecarver version` prints `CodeCarver <semver>+<git-sha>[-dirty]` — the
 commit is stamped into the build, so cite this exact string in any report (it also heads every carve's
 summary and is written to each carve's `codecarver/manifest.json` as `codecarverVersion`). `-dirty` means the built tree had
 uncommitted changes; a clean pulled build won't show it. Rebuild after a `git pull` so the stamp updates.
 
-Inputs live in a TOML `--config` file (`carve init carve.toml` writes an annotated template). Pick your inputs:
+Inputs live in a TOML `--config` file (`codecarver init` writes an annotated `carve.toml`; relative paths in it
+resolve against the config file's directory). Pick your inputs:
 - **entryPoints** — the entry symbols a build actually needs (ISRs, `main`, exported API, task entry points).
 - **languages** — `["c"]` or `["c","cpp"]`.
 - **excludeDirectories** — test/vendor/third-party dirs, and any *other* build variant (e.g. a second board's
@@ -37,15 +39,18 @@ Inputs live in a TOML `--config` file (`carve init carve.toml` writes an annotat
 ## 1. Smoke test
 
 ```
-carve init carve.toml          # then fill in entryPoints, languages, excludeDirectories, analysisOnly=true
+codecarver init                # then fill in entryPoints, languages, excludeDirectories, analysisOnly = true
 carve <repo> --config carve.toml
 ```
 
-Expect a summary: `roots`, `nodes`, `files`, `size`, `verify`, `world`, and `implicit:`/`asm:`/`section:`
+Expect a summary: `roots`, `nodes`, `files`, `verify`, `world`, a `size` line, and `implicit:`/`asm:`/`section:`
 lines for auto-kept embedded roots. **Red flags right here:**
-- `none of the requested roots were found` → the front-end didn't capture your entry symbols. Try
-  `--why <sym>`. If it's a macro-defined signature or a namespace-macro file, that's a
+- `requested root '<sym>' was NOT found as a symbol` → the run fails (exit 1). Check the "did you mean" names
+  for a typo; `--why <sym>` still works. If it's a macro-defined signature or a namespace-macro file, that's a
   real bug — capture the definition's exact text.
+- A configuration error (exit 2) — a build log with no recognised compile command, a trace with no path under
+  the carve root, a compiler that can't be probed, an existing output directory CodeCarver didn't create. The
+  message says what to change.
 - `0 files kept` / `100% smaller` with lots of `warn:` lines → the "silently resolved nothing" trap.
 - A crash / stack trace → always a bug (the tool is supposed to warn-and-skip, never throw). Capture it.
 
@@ -55,10 +60,12 @@ lines for auto-kept embedded roots. **Red flags right here:**
 carve <repo> --config carve.toml      # with a [stages.prune] (carveSourceFileContents = true)
 ```
 
-The **soundness check runs on every carve** (the `verify` line): it flags any **kept** function that calls
-an **in-scope** function the carve dropped (that wouldn't link) and exits non-zero. Check it with file-level
-AND an intra-file stage. Any violation is a concrete bug — note the `caller -> callee` pair and run
-`carve <repo> --config carve.toml --why <callee>`.
+The **`verify` check runs on every C/C++ carve**. It reads the **emitted** tree with its own tokenizer, independent
+of the carve's graph, and fails the run (**exit 3**) when emitted code uses a function that only a **dropped**
+file defines (the tree would not link). Uses on `#ifdef`-dead lines are notes, not failures. Details land in
+`codecarver/verify.txt`. Check it with file-level AND an intra-file stage. Any failure is a concrete bug — note
+the function and where it is used, and run `carve <repo> --config carve.toml --why <function>`. `verify` cannot
+see missing types, macros or headers; step 3 can.
 
 ## 3. The real test — build the carved output
 
@@ -73,7 +80,7 @@ carve <repo> --config carve.toml   # outputDirectory + a [stages.prune] in the c
   symbol / broken structure. These are the highest-value findings.
 - **Link errors** (`undefined reference`, `aliased to undefined symbol`) → an implicit root missed
   (vector table, weak alias, `KEEP()` section, constructor).
-- Compare `m.json` (kept/dropped lists) against what you *know* the build needs.
+- Compare `codecarver/manifest.json` (kept/dropped lists) against what you *know* the build needs.
 
 Also do a **file-level** run (`carveSourceFileContents = false`) — if that breaks, it's a more serious bug
 than an intra-file one (file-level should almost always build).
@@ -86,9 +93,9 @@ Vary one axis at a time and re-run steps 2–3. Each cell is a chance to break i
 |---|---|
 | entryPoints | one symbol · your full entry set · an obscure/rarely-used API · an ISR-only set |
 | granularity | file-level · `carveSourceFileContents` · + `carveHeaderFileContents` (via `[stages]`) |
-| config | none · `defines: ["X=1","Y"]` · `buildLogs: ["build.log"]` (from `make -n`) · `compiler: "<cc>"` |
-| exclude | none · `excludeDirectories: ["tests","vendor"]` · exclude other board/arch variants |
-| limits (`[advanced]`) | default · `maxParseBytes: 5000000` · `parseTimeout: 5` |
+| config | none · `defines = ["X=1","Y"]` · `buildLogs = ["build.log"]` (from `make -n`) · `compiler = "<cc>"` |
+| exclude | none · `excludeDirectories = ["tests","vendor"]` · exclude other board/arch variants |
+| limits (`[advanced]`) | default · `maxParseBytes = 5000000` · `parseTimeout = 5` |
 
 High-yield shapes to aim at (these are where past bugs came from): heavy macros, macro-opened namespaces
 (`FMT_BEGIN_NAMESPACE`-style), computed-goto interpreters, `try`/`catch` wrapped in macros, generated
@@ -133,14 +140,17 @@ gcc <carved>/*.c empty_main.c -Wl,--gc-sections -Wl,--undefined=<root>...
 mismatches (e.g. a repo's name-mangling macros). Feed the carve the real config (`buildLogs` / `defines` /
 `compiler`) so both see the same world.
 
-> **nm-comparison variant (`wsl-map-oracle.sh`) — needs a capability not currently exposed.** The original
-> oracle compared the carve's *per-symbol* kept/all function sets (nm) against the linker's. That dump was the
-> removed `--dump-spans` output; the CLI now exposes only `--why <sym>` and the file-level `manifest.json`, not
-> a per-symbol span dump. Until that's restored (a `codecarver/decisions.txt` artifact is the likely form),
-> prefer the link-the-carved-tree check above, which needs no per-symbol dump. If you do run `wsl-map-oracle.sh`:
-> it compiles with `-fvisibility=hidden` so the linker's kept set is *reachable-from-roots*, not *every exported
+> **nm-comparison variant (`wsl-map-oracle.sh`).** It compares the carve's per-symbol kept/all function sets
+> against the linker's. Make the two lists from the carve's `codecarver/decisions.txt` (a full ledger is
+> written for graphs up to 500,000 nodes):
+> ```bash
+> awk '$2=="Function"{print $3}' decisions.txt | sort -u > ccAll.txt
+> awk '$1=="KEPT" && $2=="Function"{print $3}' decisions.txt | sort -u > ccKept.txt
+> INC="-I. -Iinc" bash wsl-map-oracle.sh <repoDir> "$PWD/ccKept.txt" "$PWD/ccAll.txt" <root1,root2> <cfile...>
+> ```
+> It compiles with `-fvisibility=hidden` so the linker's kept set is *reachable-from-roots*, not *every exported
 > symbol* — treat a flagged function that is itself an unused top-level API (nothing kept calls it) as a false
-> positive; confirm with `--why`.
+> positive; confirm with `--why`. The link-the-carved-tree check above needs no lists at all.
 
 **C++ link oracle (one command).** `wsl-cpp-oracle.sh` automates the link-the-carved-output check for
 C++: carve the repo on Windows, then link the carved tree against a tiny driver `main()` that calls the
@@ -181,6 +191,12 @@ For each break, capture enough to reproduce:
 4. The **source** of the symbol + how it's referenced (the construct that tripped it — macro? template?
    table? asm? `#if`?).
 5. Reduce to a **minimal repro** if you can: a few-line `.c`/`.cpp` that carves wrong.
+
+**If the source can't leave the machine** (a proprietary repo), steps 1–5 stay local and what goes back is
+source-free: `codecarver/summary.txt` (or `summary.json`) — counts, booleans and fixed category names only,
+no path, file name or symbol — plus the exit code, the anonymized `codecarver/repro.graph.json`, and a
+description of the construct's *shape* rather than its names. On a crash, add the diagnostic `.zip` the tool
+prints. See [`SUPPORT.md`](SUPPORT.md).
 
 A good report is: *"carving `<repo>@<sha>` for roots `<x>` with an intra-file stage (`carveSourceFileContents`):
 `foo.c` fails — `get_bar` undeclared; `--why get_bar` says CARVED; it's called from a `FOO_TABLE(...)` macro

@@ -35,10 +35,12 @@ carve src --config carve.toml
 ```
 
 ```
-nodes   : 4/6 kept, 2 carved           (the C: main + driver kept, never_used dropped)
-files   : 2/3 kept, 1 dropped           dead.c
-cmm     : 4/6 script(s) kept (1 observed + 3 via DO/GOSUB closure), 2 dropped
-verify  : OK
+  nodes   : 4/6 kept (67%), 2 carved
+  files   : 2/3 kept, 1 dropped
+  dropped : dead.c
+  cmm     : 4/6 script(s) kept (1 observed + 3 via DO/GOSUB closure), 2 dropped
+  world   : open-world (both #ifdef branches kept) — no build log or compiler given
+  verify  : OK — emitted code uses no function defined only in a dropped file (3 file(s) checked)
 ```
 
 What happened, visible in [`carved/`](carved):

@@ -7,14 +7,17 @@ on the dev box) so results are reproducible on any machine and in CI.
 
 ## Two tiers
 
-### Tier 1 — pure engine (no toolchain, always runs)
-The reachability engine, graph model, root/edge model, and the scenario library run under plain
-`dotnet test` in ~tens of milliseconds. Hand-authored ground-truth (the `Scenarios/` library) needs
-no compiler. This is the fast inner loop; keep it green constantly.
+### Tier 1 — fast suite (no toolchain, always runs)
+The reachability engine, graph model, root/edge model, front-ends, preprocessor, emitters, the CLI driven
+in-process, and the hand-authored `Scenarios/` library — everything outside the `BuildVerify` namespace. No
+compiler needed; a full run takes a couple of minutes. This is the inner loop and what CI runs, on Windows
+and Ubuntu. CI also carves every example under `examples/` with the shipped CLI (each must exit 0, i.e.
+`verify` passes) and runs `shellcheck` on the shell scripts.
 
-### Tier 2 — real repos + real toolchains (fetched, runs on demand / in CI)
-The honest test: carve real code and let the actual toolchain judge it. Gated so a missing toolchain
-skips (with a notice) rather than failing.
+### Tier 2 — real repos + real toolchains (fetched, runs locally)
+The honest test: carve real code and let the actual toolchain judge it — the `BuildVerify` tests. They need
+the fetched toolchains and corpus, which CI does not have, so they run locally with `./check.ps1 -Big`. A
+missing toolchain or corpus repo skips (with a notice) rather than failing.
 
 ## The strongest test: build the carved output
 
@@ -33,17 +36,17 @@ our precision gap (measured, not gated — over-keeping is safe).
 
 ## Pinned toolchains (`.toolchains/`, gitignored)
 
-Fetched by a `fetch-toolchains.ps1` from pinned URLs/versions. The trio covers the cases that matter:
+Fetched by `fetch-toolchains.ps1` (Windows) from pinned URLs/versions:
 
 | Toolchain | Covers | Why this one |
 |---|---|---|
-| **arm-none-eabi-gcc** | embedded ELF: vector tables, `.init_array`, `--gc-sections`, maps | runs on Windows, cross-compiles to the target's actual world — no Linux box needed |
-| **LLVM/Clang** | host C/C++, the `-E` preprocessing engine, later the semantic tightener | one cross-platform download, gold-standard preprocessing |
-| **MinGW-w64 GCC** (optional) | a second host C compiler for cross-checking | catches compiler-specific assumptions |
-| **.NET SDK** (already present) | C# via Roslyn | already required to build CodeCarver |
+| **w64devkit gcc/g++** | host C/C++: compile and link carved output | one self-contained Windows download |
+| **arm-none-eabi-gcc** (xPack) | embedded ELF: vector tables, `.init_array`, `--gc-sections`, maps | runs on Windows, cross-compiles to the target's actual world — no Linux box needed |
+| **.NET SDK** (already present) | building and running carved C# (`examples/csharp-app`) | already required to build CodeCarver |
 
-Pinned by version + URL (and ideally hash) so every run/box gets identical tools. Toolchains are
-generated/fetched, never committed.
+LLVM/Clang and MinGW-w64 are **not** fetched. The Linux oracles (`wsl-*-oracle.sh`) use the gcc/g++ installed
+in WSL. Pinned by version + URL so every run/box gets identical tools (no hash check yet). Toolchains are
+fetched, never committed.
 
 ## Corpus (`.corpus/`, gitignored)
 
@@ -60,14 +63,22 @@ Two uses per repo: **buildable** ones feed the build-the-carved-output test (Tie
 build on the pinned toolchains still feed **parse-robustness** (the front-end must extract a graph
 without choking) — the scale/mess test.
 
-## Preprocessed inputs for tightness tests
+## `#ifdef` resolution tests
 
-To test the tightness ladder reproducibly, the pinned toolchain generates the resolved `.i` files
-(`-save-temps` / `-E`) that the `--preprocessed` mode consumes — so `#ifdef`-resolution tightening is
-tested against real, deterministic preprocessed output, not a hand-wave.
+There is no preprocessed-input (`.i`) mode: CodeCarver resolves `#ifdef`s itself, from the build log's
+per-file `-D` flags and an optional compiler probe. Its tests are compiler-free unit tests (`Preprocess/`,
+the build-log scraper tests) plus the carve-and-compile checks above, which catch a wrongly-taken branch as a
+build failure.
+
+## Synthetic corpora and oracles
+
+`tools/codespawner/codespawner.exe` generates compilable synthetic firmware trees with a manifest of the
+true reachable set (see `tools/codespawner/manifest-schema.md`). `carver-groundtruth-oracle.ps1` carves one
+and asserts kept ⊇ reachable plus measures over-keep, with no compiler; `carve-build-oracle.ps1` compiles and
+links the carved tree. These are heavy at scale and run locally, not in CI.
 
 ## Running
 
-- `dotnet test` — Tier 1 (fast, always).
-- `./check.ps1 -Big` (planned) — fetch toolchains + corpus, run Tier 2, assert carved output builds
-  and soundness holds. The before-you-push gate.
+- `./check.ps1` — Tier 1 (builds, then the fast suite).
+- `./check.ps1 -Big` — also Tier 2 (the build-verify tests).
+- `./check.ps1 -Big -Fetch` — fetch toolchains + corpus first, then everything. The before-you-push gate.

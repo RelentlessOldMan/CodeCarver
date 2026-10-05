@@ -8,7 +8,7 @@ strip the unnecessary code inside that thing too.**
 Not just dead-code removal: *unnecessary*-code removal relative to a chosen entry set and a
 specific build configuration. You say what you need (entry points / files, a build target +
 config, optionally a runtime trace); CodeCarver traces every dependency and emits the
-minimal slice that still **builds, links, and runs**.
+minimal slice that still **builds and links**.
 
 > **Adapting it to your own codebase?** You don't need to share any source. See
 > **[`docs/ADAPTING.md`](docs/ADAPTING.md)** — fill in a short anonymized *Codebase Profile* (patterns,
@@ -20,7 +20,7 @@ minimal slice that still **builds, links, and runs**.
 > proprietary target yet. Treat intra-file carving (`carveSourceFileContents`) as experimental; file-level
 > carving is the sound default.
 >
-> Status: **working for C, C++, C#, and TRACE32 `.cmm`.** Tree-sitter front-end, deterministic reachability engine,
+> Status: **working for C, C++, C#, and TRACE32 `.cmm`, on Windows and Linux.** Tree-sitter front-end, deterministic reachability engine,
 > `#ifdef` resolution, build-log scraping, and an emitter that does both **file-level** and
 > **intra-file** carving (unused functions *and* data tables). Scales to **multi-GB auto-generated
 > headers** — files past `maxParseBytes` skip the parser and are kept whole via `#include`-closure,
@@ -29,8 +29,10 @@ minimal slice that still **builds, links, and runs**.
 > bytes, in one test). Carve → prune → **compile-clean** is
 > verified on 20+ real repos (cJSON, SQLite, Lua, zlib, mongoose, mimalloc, monocypher, tiny-regex-c,
 > qrcodegen, rax, …), and **link-clean on real Cortex-M firmware** with `arm-none-eabi-gcc` — vector-table
-> ISRs and weak-alias handlers survive, dead code leaves the image. C# and `.cmm` carve file-level. See
-> [`docs/USAGE.md`](docs/USAGE.md) to use it, and [`DESIGN.txt`](DESIGN.txt) for the *why*.
+> ISRs and weak-alias handlers survive, dead code leaves the image. C# and `.cmm` carve file-level. Every carve
+> checks its own emitted tree for link errors (`verify`, exit 3 on failure). See
+> [`docs/USAGE.md`](docs/USAGE.md) to use it, and [`DESIGN.txt`](DESIGN.txt) for the original design rationale
+> (written before implementation; USAGE.md describes what was built).
 
 ## The idea in one paragraph
 
@@ -84,7 +86,7 @@ metric and roots are ISRs/vector-table/exported API — use the tailored
 ## Carve something
 
 ```powershell
-dotnet run --project src/CodeCarver.Cli -- init carve.toml          # write an annotated config, then edit it
+dotnet run --project src/CodeCarver.Cli -- init                     # write an annotated carve.toml, then edit it
 dotnet run --project src/CodeCarver.Cli -- carve <dir> --config carve.toml
 dotnet run --project src/CodeCarver.Cli -- demo                     # a narrated toy embedded carve
 ```
@@ -99,10 +101,14 @@ intra-file + table pruning on one small library).
 ```
 src/CodeCarver.Core       graph model · roots · reachability · #ifdef scanner · build-log scraper · emitter
 src/CodeCarver.Frontend   tree-sitter C/C++ extraction (calls, macros, globals, conservative edges)
-src/CodeCarver.Cli        the `carve` / `init` / `scan-log` / `demo` commands
+src/CodeCarver.Cli        the `codecarver` CLI: `carve` / `init` / `scan-log` / `version` / `demo` / `help`
 tests/CodeCarver.Tests    xUnit suite (fast) + build-verify (compiles carved output with gcc)
+examples/                 worked examples with configs and inputs; CI carves every one
+tools/capture/            capture build/run file-access traces (ProcMon / strace) for buildTraceFiles / runTraceFiles
 docs/USAGE.md             how to use it        DESIGN.txt   architecture + rationale
 docs/TOOLING.md           toolchain adapters   docs/TESTING.md   test strategy
+docs/SUPPORT.md           what to send when a carve goes wrong (source-free)
+check.ps1                 test gate: fast suite; -Big adds build-verify; -Fetch pulls toolchains + corpus
 fetch-*.ps1 · fuzz.ps1    fetch corpus/toolchains · carve-fuzz a repo (docs/REPRODUCE.md)
 docs/SHAKEDOWN.md         runbook to hammer it against your own repo and find issues
 docs/WORKREPO.md          tailored runbook for a real firmware image (size metric, ISR/vector roots)
@@ -110,8 +116,11 @@ presets/                  fill-in-the-blanks carve+build+size drivers (embedded-
 differential-carve.ps1    carve same repo from two paths (local vs network share); assert identical
 release.ps1               package a versioned zip ONLY for a commit already pushed to origin
 wsl-*-oracle.sh           Linux soundness oracles: linker-map (C) · link carved tree (C++) · object-symbol
+wsl-syntax-check.sh       gcc/g++ -fsyntax-only every file in a tree (used by corpus-compile-sweep.ps1)
 tools/codespawner/        vendored CodeSpawner generator (exe + manifest-schema.md + GENERATOR_VERSION)
 carver-groundtruth-oracle.ps1  soundness+precision oracle: reads a CodeSpawner v1 manifest, carves, asserts kept ⊇ reachable + measures over-keep (scales to 100 GB)
+carve-build-oracle.ps1    carve a CodeSpawner corpus, then compile + link it (positive) and prove indirect edges matter (negative)
+carve-perf-bench.ps1      parse-throughput + peak-memory benchmark on a deterministic synthetic tree
 carve-build-report.ps1    carve every corpus repo, BUILD the carved output (host gcc + ARM ELF), size table
 corpus-compile-sweep.ps1  carve every corpus repo, compile each file baseline-vs-carved, flag regressions
 cpp-oracle-sweep.ps1      link every carved C++ corpus repo against a root-calling driver (needs g++)

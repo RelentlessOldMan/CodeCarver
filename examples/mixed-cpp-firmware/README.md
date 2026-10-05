@@ -6,7 +6,8 @@ A self-contained firmware image whose code spans **three languages**, carved thr
   the C++ sensors call back **down into the C HAL** (`hal.c`). The carve is *one graph* whose reachability
   crosses the C ↔ C++ boundary in **both directions** (`languages = ["c","cpp"]` — the C++ grammar is a
   superset of C, so both parse together).
-- A **TRACE32 `.cmm` loader** is kept and tightened via the run trace (observed script + its `DO` closure).
+- A **TRACE32 `.cmm` loader** is audited by the run trace (observed script + its `DO` closure are reported;
+  every script is kept, because this config does not opt in to `dropUnobservedCmm`).
 
 It also demonstrates the two things a single-build/single-run example can't: the **union of multiple builds**
 and the **union of multiple runs**.
@@ -51,30 +52,35 @@ Two builds + two runs, all unioned by default (no `[use]`); the config shows a c
 | `src/unused.cpp` (C++) | **dead translation unit** — `diag::DebugSensor` is never referenced and overrides no called method, so the whole file is dropped |
 | `src/scripts/flash.cmm` | the `.cmm` loader — **observed** in the flash file-trace (kept) |
 | `src/scripts/common.cmm` | kept via the **`DO` closure** (`flash.cmm` does `DO common`), though the trace never named it directly |
-| `src/scripts/debug.cmm` | neither observed nor reached by a `DO` — **dropped** by the `.cmm` closure |
+| `src/scripts/debug.cmm` | neither observed nor reached by a `DO` — **kept**, and counted as "neither" on the `cmm` line: one run is one scenario. Adding `dropUnobservedCmm = true` to `[runs.flash]` would drop it (see [`cmm-trace`](../cmm-trace)) |
 | `src/Makefile`, `src/data/calib.bin` | infrastructure — copied verbatim so `carved/` is a complete buildable project |
 
 ## What a run prints (abridged)
 
 ```
   note    : languages [c, cpp] -> one graph via the C++ grammar (superset of C); reachability crosses the C/C++ boundary.
-  build   : 2 build-log(s), 4 compile command(s), 4 file(s)
+  build   : 2 build-log(s), 4 compile command(s), 4 file(s); per-file #ifdef config (universal 0/1 macro(s); the rest vary per TU -> both branches kept)
+  build   : 1 source file(s) appear in no compile command -> open-world for them (both #ifdef branches kept)
+  files   : 2 observed in-tree from 0 build + 1 run file-trace(s) (0 code file(s) rooted)
   roots   : main
   trace   : 5 function(s) from 1 trace(s) rooted; 5 resolved in-scope
-  files   : 2 observed in-tree from 0 build + 1 run file-trace(s)
   nodes   : 15/32 kept (47%), 17 carved
   files   : 8/9 kept, 1 dropped
   dropped : unused.cpp
-  cmm     : 2/3 script(s) kept (1 observed + 1 via DO/GOSUB closure), 1 dropped
-  verify  : OK — every in-scope callee of a kept function is kept
-  world   : closed-world (dead #ifdef branches dropped) — have 2 build log(s)
-  stage   : safe        size 6,062 B -> 5,445 B  (10% smaller)
-  stage   : aggressive  size 6,062 B -> 5,241 B  (14% smaller)
-  stage   : max         size 6,062 B -> 5,241 B  (14% smaller)
+  cmm     : 3 script(s) kept; 1 observed + 1 via DO/GOSUB closure, 1 neither (kept: one run is one scenario — set [runs.X] dropUnobservedCmm = true to drop them)
+  world   : closed-world (dead #ifdef branches dropped) — have 4 compile command(s); macros #defined in the tree and compiler built-ins not probed for the TU stay unknown
+  stage   : safe  [source-contents=whole, header-contents=whole]
+  verify  : OK — emitted code uses no function defined only in a dropped file (9 file(s) checked)
+  size    : 6,228 B -> 5,611 B  (10% smaller, saved 617 B)
+  stage   : aggressive  [source-contents=carved, header-contents=whole]
+  size    : 6,228 B -> 5,407 B  (13% smaller, saved 821 B)
+  stage   : max  [source-contents=carved, header-contents=carved]
+  size    : 6,228 B -> 5,407 B  (13% smaller, saved 821 B)
 ```
 
 `aggressive` beats `safe` by stripping `TempSensor::selftest` and `hal_unused_calibration` from their (kept)
-files. All three carved stages compile **and link** with real gcc/g++ (verified: `image.elf` ≈ 17 KB).
+files. `max` equals `aggressive` because header carving only touches big headers (over `maxParseBytes`, or
+macro-dense and 1 MB or more). The carved stages compile **and link** with real gcc/g++ (`verify-build.sh`).
 
 > `PressureSensor::sample()` stays kept even though its registration sits behind `#ifdef SENSOR_PRESSURE`:
 > the virtual call resolves by name, so the override is kept regardless — the over-approximation errs toward

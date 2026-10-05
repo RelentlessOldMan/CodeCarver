@@ -2,8 +2,8 @@
 
 `stringlib` is a tiny, self-contained C library (in [`src/`](src)) with four independent features, used
 here to show exactly what CodeCarver does. The **input** and the **carved output for each scenario** are
-both checked in, so you can read the before/after without running anything. (A test regenerates the
-outputs and diffs them, so they can never drift from the tool.)
+both checked in, so you can read the before/after without running anything. (A build-verify test,
+run by `./check.ps1 -Big`, regenerates the outputs and diffs them.)
 
 ```
 src/
@@ -32,7 +32,7 @@ entryPoints = ["sl_base64_encode"]
 carveSourceFileContents = true          # intra-file pruning (drop unused funcs + tables within kept files)
 ```
 ```
-carve src --config carve.toml           # -> out/base64-encode/carved/
+codecarver carve src --config carve.toml   # -> out/base64-encode/carved/
 ```
 
 ```
@@ -48,7 +48,8 @@ What happened, visible in [`carved-base64-encode/`](carved-base64-encode):
   lives there.
 - **Intra-file:** `base64.c` is rewritten. `sl_base64_encode` and its `ENC` table stay; **`sl_base64_decode`
   and the whole 256-entry `DEC` table are removed** — dead weight for an encode-only build.
-- The header is kept whole (the API surface; CodeCarver never prunes headers).
+- The header is kept whole (the API surface; only very large or macro-dense headers are ever trimmed, and
+  only with `carveHeaderFileContents`).
 
 ## Scenario B — an input **sanitizer** (trim + upper-case)
 
@@ -60,7 +61,7 @@ entryPoints = ["sl_trim", "sl_to_upper"]
 carveSourceFileContents = true
 ```
 ```
-carve src --config carve.toml           # -> out/sanitize/carved/
+codecarver carve src --config carve.toml   # -> out/sanitize/carved/
 ```
 
 ```
