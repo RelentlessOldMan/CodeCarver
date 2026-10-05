@@ -20,7 +20,12 @@ public static class SourceWalk
 {
     /// <summary>Enumerate full paths of every file under <paramref name="root"/>, applying the rules above.
     /// Lazy: safe to filter/stream. Returns empty if the root can't be enumerated at all.</summary>
-    public static IEnumerable<string> Files(string root)
+    public static IEnumerable<string> Files(string root) => Files(root, null);
+
+    /// <summary>As <see cref="Files(string)"/>; <paramref name="onSkippedLink"/> receives the full path of each
+    /// directory junction/symlink that was not entered, so a caller can say so instead of skipping silently
+    /// (review RB7).</summary>
+    public static IEnumerable<string> Files(string root, Action<string>? onSkippedLink)
     {
         var opts = new EnumerationOptions
         {
@@ -32,8 +37,13 @@ public static class SourceWalk
         {
             ShouldIncludePredicate = (ref FileSystemEntry e) => !e.IsDirectory,
             // Recurse into a subdirectory only if it is NOT a reparse point (junction/symlink).
-            ShouldRecursePredicate = (ref FileSystemEntry e) => (e.Attributes & FileAttributes.ReparsePoint) == 0
-                                                               && !IsVcsDir(e.FileName),
+            ShouldRecursePredicate = (ref FileSystemEntry e) =>
+            {
+                if (IsVcsDir(e.FileName)) return false;
+                if ((e.Attributes & FileAttributes.ReparsePoint) == 0) return true;
+                onSkippedLink?.Invoke(e.ToFullPath());
+                return false;
+            },
         };
     }
 

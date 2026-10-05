@@ -12,9 +12,14 @@ namespace CodeCarver.Tests.Util;
 /// </summary>
 public sealed class SourceWalkTests
 {
-    // Create a directory junction; returns false (test self-skips) if the OS refuses.
+    // Create a directory junction (Windows, no elevation needed) or a directory symlink (Linux/macOS).
     private static bool TryJunction(string link, string target)
     {
+        if (!OperatingSystem.IsWindows())
+        {
+            Directory.CreateSymbolicLink(link, target);
+            return true;
+        }
         try
         {
             var psi = new ProcessStartInfo("cmd", $"/c mklink /J \"{link}\" \"{target}\"")
@@ -41,7 +46,9 @@ public sealed class SourceWalkTests
         {
             if (!TryJunction(Path.Combine(root, "link"), real)) return; // skip: junctions not permitted here
 
-            var found = SourceWalk.Files(root).Select(f => Rel(root, f)).OrderBy(s => s).ToList();
+            var skipped = new List<string>();
+            var found = SourceWalk.Files(root, skipped.Add).Select(f => Rel(root, f)).OrderBy(s => s).ToList();
+            Assert.Equal(new[] { "link" }, skipped.Select(s => Rel(root, s)));   // reported, not silent (RB7)
 
             // Only the two canonical files, once each — the junction 'link/…' was neither returned nor recursed.
             Assert.Equal(new[] { "real/a.c", "real/sub/b.c" }, found);

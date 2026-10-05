@@ -527,10 +527,21 @@ public static class CarveCommand
             return excludeSegs.Any(seg => rel.Contains(seg, StringComparison.OrdinalIgnoreCase));
         }
         static long SafeLength(string p) { try { return new FileInfo(p).Length; } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return long.MaxValue; } }
-        var paths = CodeCarver.Core.Util.SourceWalk.Files(dir)
+        var skippedLinks = new List<string>();
+        var paths = CodeCarver.Core.Util.SourceWalk.Files(dir, skippedLinks.Add)
             .Where(p => exts.Any(e => p.EndsWith(e, StringComparison.OrdinalIgnoreCase)))
             .Where(p => !Excluded(p))
             .ToList();
+        // Directory junctions/symlinks are not followed (loops, double emit) — say so once (review RB7): code
+        // reached only through one is not carved and not copied.
+        skippedLinks.RemoveAll(Excluded);
+        if (skippedLinks.Count > 0)
+        {
+            err.WriteLine($"  warn    : {skippedLinks.Count} directory link(s) (junction/symlink) not followed, e.g. "
+                + $"{Path.GetRelativePath(dir, skippedLinks[0]).Replace('\\', '/')} — files only reachable through them are not in the carve; "
+                + "point the carve at the real directory, or add the target as its own tree");
+            summary["files.directoryLinksNotFollowed"] = skippedLinks.Count;
+        }
         if (paths.Count == 0)
         {
             err.WriteLine($"no {lang} source files found under {dir}");
@@ -794,6 +805,7 @@ public static class CarveCommand
 
         if (fe is TreeSitterFrontEnd tsfe)
         {
+            tsfe.Log = err;
             if (parseTimeoutMs is not null) tsfe.ParseBudgetMs = parseTimeoutMs.Value;
             if (maxSymbolsPerFile is not null) tsfe.PerFileSymbolBudget = maxSymbolsPerFile.Value;
             if (refIncludes.Count > 0) tsfe.ReferenceOnlyIncludes = refIncludes;

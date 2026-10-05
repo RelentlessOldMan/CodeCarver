@@ -312,6 +312,53 @@ public static class FileTreeEmitter
         return net;
     }
 
+    /// <summary>Does the span's first line hold code before the definition, or its last line code after it?
+    /// Before: a <c>;</c> or <c>}</c> ahead of the definition's first <c>(</c>, <c>=</c> or <c>{</c> ends some
+    /// other declaration. After: anything but <c>;</c>, whitespace and comments past the final <c>}</c>.</summary>
+    private static bool SharesLine(string[] lines, int s, int e)
+    {
+        if (s < 1 || e > lines.Length) return false;
+        foreach (var ch in CodeOnly(lines[s - 1]))
+        {
+            if (ch is '(' or '=' or '{') break;
+            if (ch is ';' or '}') return true;
+        }
+        var last = CodeOnly(lines[e - 1]);
+        var close = last.LastIndexOf('}');
+        if (close < 0) return false;   // no closing brace on the last line: nothing after it to lose
+        return last[(close + 1)..].Any(ch => !char.IsWhiteSpace(ch) && ch != ';');
+    }
+
+    /// <summary>A line with comments removed and string/char literals emptied (one line; a block comment opened
+    /// on an earlier line is not tracked — callers only use this to decide to keep MORE).</summary>
+    private static string CodeOnly(string line)
+    {
+        var sb = new StringBuilder(line.Length);
+        var quote = '\0';
+        for (var c = 0; c < line.Length; c++)
+        {
+            var ch = line[c];
+            if (quote != '\0')
+            {
+                if (ch == '\\') c++;
+                else if (ch == quote) { quote = '\0'; sb.Append(ch); }
+                continue;
+            }
+            if (ch is '"' or '\'') { quote = ch; sb.Append(ch); continue; }
+            if (ch == '/' && c + 1 < line.Length && line[c + 1] == '/') break;
+            if (ch == '/' && c + 1 < line.Length && line[c + 1] == '*')
+            {
+                var endC = line.IndexOf("*/", c + 2, StringComparison.Ordinal);
+                if (endC < 0) break;
+                c = endC + 1;
+                sb.Append(' ');
+                continue;
+            }
+            sb.Append(ch);
+        }
+        return sb.ToString();
+    }
+
     /// <summary>Remove the given 1-based inclusive line ranges from text, preserving the rest verbatim.</summary>
     private static string RemoveLineRanges(string text, List<(int Start, int End)> ranges)
     {
@@ -344,6 +391,11 @@ public static class FileTreeEmitter
             // mis-parsed/truncated it (e.g. `if mi_likely(cond) {` from a macro-wrapped condition) —
             // removing it would strip a head or leave a dangling tail. Keep it whole (sound).
             if (NetBraces(lines, s, e) != 0) continue;
+
+            // Removal is by whole lines, so a span whose first or last line also holds other code
+            // (`int g; int dead(void){...}`, `} int dead(...)`, `...} int h;`) would take that code with it
+            // (review RB9b). Keep such a span whole — sound, and EmitClosure then treats it as written.
+            if (SharesLine(lines, s, e)) continue;
 
             // A net-open brace in the lines just above the span can mean two very different things:
             //  (a) an `#if X / TYPE foo(...){ / #else / TYPE bar(...){ / #endif` dual-signature construct —

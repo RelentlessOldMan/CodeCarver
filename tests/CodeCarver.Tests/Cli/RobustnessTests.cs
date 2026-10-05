@@ -31,6 +31,23 @@ public sealed class RobustnessTests
     }
 
     [Fact]
+    public void Pruning_NeverTakesOtherCodeOnTheSameLine_RB9b()
+    {
+        using var w = new Work();
+        w.W("main.c",
+            "int g; int dead_a(void){ return 1; }\n"
+            + "int dead_b(void){ return 2; } int h;\n"
+            + "int dead_c(void)\n{\n  return 3;\n}\n"
+            + "int main(void){ return g + h; }\n");
+        var (code, o, e) = w.Carve("[stages.aggressive]\ncarveSourceFileContents = true\n");
+        Assert.Equal(0, code);
+        var text = File.ReadAllText(w.Out("aggressive/carved/main.c"));
+        Assert.Contains("int g;", text);
+        Assert.Contains("int h;", text);
+        Assert.DoesNotContain("dead_c", text);   // a span on its own lines is still removed
+    }
+
+    [Fact]
     public void PruneGarbageFalse_KeepsLogsAndScratch_RB15()
     {
         using var w = new Work();

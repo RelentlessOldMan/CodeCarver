@@ -139,6 +139,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// BEFORE any node is minted, so the blow-up allocation never happens. 0 disables the budget.</summary>
     public int PerFileSymbolBudget { get; set; } = 50_000;
 
+    /// <summary>Where progress notes (slow/big file) go. The CLI points it at its error writer; nothing
+    /// writes to the process console directly, so in-process callers and tests capture it (review RB12).</summary>
+    public TextWriter Log { get; set; } = TextWriter.Null;
+
     private readonly List<(string Path, int Symbols)> _symbolBudgetKeptWhole = new();
     /// <summary>Files kept whole because their definition count exceeded <see cref="PerFileSymbolBudget"/>
     /// — surfaced so the CLI can report/diag them, distinct from parse-failure <see cref="ForceKeepFiles"/>.</summary>
@@ -327,7 +331,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 _forceKeepFiles.Add(path);
             }
             if (timeFiles && fsw.ElapsedMilliseconds >= 300)
-                Console.Error.WriteLine($"  slowfile: {fsw.ElapsedMilliseconds,6} ms  {path} ({text.Length:N0} B)");
+                Log.WriteLine($"  slowfile: {fsw.ElapsedMilliseconds,6} ms  {path} ({text.Length:N0} B)");
 
             bytesDone += text.Length; filesDone++;
             OnParseProgress?.Invoke(filesDone, filesTotal, bytesDone, bytesTotal);
@@ -616,8 +620,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         // Breadcrumb BEFORE the parse: an AV is a corrupted-state exception we can't catch, so this stderr
         // line (flushed) is the only way a crash is attributable to a file instead of reading as a CI flake.
-        Console.Error.WriteLine($"  bigparse: {path} ({text.Length:N0} B, {ParseBudgetMs} ms budget) ...");
-        Console.Error.Flush();
+        Log.WriteLine($"  bigparse: {path} ({text.Length:N0} B, {ParseBudgetMs} ms budget) ...");
+        Log.Flush();
 
         Tree? result = null;
         Exception? failure = null;
