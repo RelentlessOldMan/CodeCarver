@@ -329,12 +329,45 @@ public static class CarveCommand
         // the #else branch a differently-configured TU compiles (the eval-#9 union bug, back under --probe —
         // eval-#11). The per-file consistent build-log defines are layered ON TOP of this base, per file.
         MacroTable? probeBase = null;
+        // Macro names #defined/#undef'd anywhere in the tree (filled after the file scan, before parsing). Shared
+        // by every table: such a name is UNKNOWN unless the table defines it (review PP1).
+        var ambientMacros = new HashSet<string>(StringComparer.Ordinal);
+        var probeMatchesBuild = false;
         if (probeCompiler is not null)
         {
-            probeBase = MacroProbe.Probe(probeCompiler, manualDefines.Select(d => "-D" + d));
-            if (probeBase is not null) closedWorld = true;
-            else err.WriteLine($"  warning : --probe '{probeCompiler}' could not run; ignoring it (no probe-based #ifdef resolution)");
+            if (cv.Compilers.Count > 1)
+                err.WriteLine($"  warn    : {cv.Compilers.Count} compilers configured; only '{probeCompiler}' is probed "
+                    + "(its target macros are treated as unknown where the builds could differ)");
+            // Probe with the build's target flags when every compile command agrees on them (then the probe
+            // matches each TU); otherwise probe plain and treat flag-dependent built-ins as unknown (PP2).
+            var sigs = buildCmds.Select(c => string.Join(" ", MacroProbe.TargetFlags(c.Arguments))).Distinct().ToList();
+            probeMatchesBuild = buildCmds.Count > 0 && sigs.Count == 1 && cv.Compilers.Count == 1;
+            var probeArgs = (probeMatchesBuild ? MacroProbe.TargetFlags(buildCmds[0].Arguments) : Enumerable.Empty<string>())
+                .Concat(manualDefines.Select(d => "-D" + d)).ToList();
+            probeBase = MacroProbe.Probe(probeCompiler, probeArgs);
+            if (probeBase is null)
+            {
+                // A named compiler that can't be probed is a configuration error (owner decision D-E): carving
+                // on without it would silently lose the resolution the user asked for.
+                err.WriteLine($"compiler '{probeCompiler}' could not be probed: the 'compiler' key needs a GCC/Clang-compatible "
+                    + "driver that answers '-dM -E' (it failed to run, exited non-zero, or printed no #define). Fix or remove it.");
+                return 2;
+            }
+            if (!probeMatchesBuild || lang == "cpp")
+                foreach (var n in MacroProbe.FlagDependentNames(probeBase)) probeBase.ForceUnknown(n);
+            probeBase.Ambient = ambientMacros;
         }
+        // Closed-world only when inputs that tell us the define set actually loaded (review PP4/BL3).
+        closedWorld = probeBase is not null || buildCmds.Count > 0;
+        var worldReason = closedWorld
+            ? "closed-world (dead #ifdef branches dropped) — have "
+              + string.Join(" + ", new[] { buildCmds.Count > 0 ? $"{buildCmds.Count} compile command(s)" : null,
+                                            probeBase is not null ? $"probed compiler {probeCompiler}" : null }.Where(x => x is not null))
+              + "; macros #defined in the tree and compiler built-ins not probed for the TU stay unknown"
+            : buildLogs.Count > 0
+                ? "open-world (both #ifdef branches kept) — the build log(s) yielded no compile command"
+                : "open-world (both #ifdef branches kept) — no build log or compiler given";
+        diag.Set("closedWorld", closedWorld);
 
         // Shared base for every file's table: the probed macros (if any) else the manual --define set. A group's
         // CONSISTENT specs are defined on top; its VARYING names are marked UNKNOWN so their #ifdef branches stay
@@ -342,6 +375,7 @@ public static class CarveCommand
         MacroTable BuildTable(List<string> consistent, List<string> varying)
         {
             var t = probeBase is not null ? probeBase.Clone() : MacroTable.FromDefines(manualDefines);
+            t.Ambient = ambientMacros;
             foreach (var s in consistent) t.Define(s);
             foreach (var n in varying) t.MarkUnknown(n);
             return t;
@@ -679,6 +713,43 @@ public static class CarveCommand
                 err.WriteLine($"  parsing : {100.0 * bytesDone / bytesTotal,3:N0}% "
                     + $"({filesDone:N0}/{filesTotal:N0} files, {rate / 1_000_000.0:N1} MB/s) -- ETA {FormatEta(etaSec)}");
             };
+        }
+        if (defines is not null && closedWorld && closureLang)
+        {
+            // PP1: every macro name #defined/#undef'd anywhere in the tree. Parsed files are read in full; the
+            // big/dense headers the parser skips are streamed, keeping only names some #if actually tests.
+            var defRe = new System.Text.RegularExpressions.Regex(@"^\s*#\s*(?:define|undef)\s+([A-Za-z_]\w*)",
+                System.Text.RegularExpressions.RegexOptions.Multiline);
+            var condRe = new System.Text.RegularExpressions.Regex(@"^\s*#\s*(?:if|ifdef|ifndef|elif)\b(.*(?:\\\r?\n.*)*)",
+                System.Text.RegularExpressions.RegexOptions.Multiline);
+            var identRe = new System.Text.RegularExpressions.Regex(@"[A-Za-z_]\w*");
+            var condIdents = new HashSet<string>(StringComparer.Ordinal);
+            void ScanText(string text)
+            {
+                if (!text.Contains('#')) return;
+                foreach (System.Text.RegularExpressions.Match m in defRe.Matches(text)) ambientMacros.Add(m.Groups[1].Value);
+                foreach (System.Text.RegularExpressions.Match m in condRe.Matches(text))
+                    foreach (System.Text.RegularExpressions.Match id in identRe.Matches(m.Groups[1].Value)) condIdents.Add(id.Value);
+            }
+            foreach (var rel in parseRels) ScanText(ReadRel(rel));
+            foreach (var (_, text) in refIncludes) ScanText(text);
+            foreach (var rel in skipParse)
+            {
+                try
+                {
+                    foreach (var line in File.ReadLines(fullByRel[rel]))
+                    {
+                        var m = defRe.Match(line);
+                        if (m.Success && condIdents.Contains(m.Groups[1].Value)) ambientMacros.Add(m.Groups[1].Value);
+                    }
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Can't see its defines: every tested name might come from it.
+                    ambientMacros.UnionWith(condIdents);
+                }
+            }
+            err.WriteLine($"  config  : {ambientMacros.Count:N0} macro name(s) #defined in the tree stay unknown unless the build defines them");
         }
         var graph = fe.BuildGraph(parseRels, ReadRel, defines, closedWorld);
         Mark("build-graph");
@@ -1068,7 +1139,7 @@ public static class CarveCommand
                 @out.WriteLine($"  verify  : note — {r.FilesSkipped} file(s) over {maxParseBytes:N0} B or unreadable were not checked");
             return hard.Count > 0;
         }
-        @out.WriteLine($"  world   : {cv.WorldReason}");
+        @out.WriteLine($"  world   : {worldReason}");
 
         void WriteArtifact(string path, string content, string what)
         {
@@ -1257,7 +1328,7 @@ public static class CarveCommand
             WriteArtifact(Path.Combine(ccDir, "manifest.json"),
                 System.Text.Json.JsonSerializer.Serialize(manifest, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), "manifest");
             WriteArtifact(Path.Combine(ccDir, "resolved-config.toml"),
-                $"# CodeCarver resolved config — stage '{stage.Name}'\n# {cv.WorldReason}\n"
+                $"# CodeCarver resolved config — stage '{stage.Name}'\n# {worldReason}\n"
                 + $"# entryPoints={roots.Length}  languages={string.Join(",", cv.Languages)}  buildLogs={buildLogs.Count}  "
                 + $"runTraceFiles={runFileTraces.Count}  runTraceLogs={traceList.Count}\n\n{configText}", "config");
             WriteDecisions(ccDir, stage.Name, splan);

@@ -28,7 +28,11 @@ public enum Tri { False, True, Unknown }
 /// </summary>
 public static class PreprocessorScanner
 {
-    private readonly record struct Frame(bool ParentActive, bool Taken, bool BranchActive)
+    // Certain: this branch is live in EVERY configuration that reaches its parent (no earlier branch of the
+    // chain was unknown, and the parent itself is certain). A #define in a live but uncertain branch only
+    // POSSIBLY happens, so it makes the name unknown rather than defined (review PP3).
+    private readonly record struct Frame(bool ParentActive, bool ParentCertain, bool Taken, bool BranchActive,
+                                         bool SawUnknown, bool Certain)
     {
         public bool Active => ParentActive && BranchActive;
     }
@@ -40,13 +44,17 @@ public static class PreprocessorScanner
         var dead = new bool[lines.Length + 1];
         var table = defines.Clone();
         var stack = new Stack<Frame>();
+        var guardLine = IncludeGuardLine(lines);
+        var inComment = false;
 
         for (var idx = 0; idx < lines.Length; idx++)
         {
             var active = stack.Count == 0 || stack.Peek().Active;
             var trimmed = lines[idx].TrimStart();
+            var startsInComment = inComment;
+            inComment = EndsInComment(lines[idx], inComment);
 
-            if (trimmed.Length > 0 && trimmed[0] == '#')
+            if (!startsInComment && trimmed.Length > 0 && trimmed[0] == '#')
             {
                 var last = idx;
                 var joined = lines[idx].TrimEnd('\r');
@@ -56,7 +64,10 @@ public static class PreprocessorScanner
                     joined = joined[..^1] + " " + lines[++last].TrimEnd('\r');
                 }
                 for (var k = idx; k <= last; k++) dead[k + 1] = !active;
-                HandleDirective(joined.TrimStart().TrimStart('#').TrimStart(), active, table, stack, closedWorld);
+                for (var k = idx + 1; k <= last; k++) inComment = EndsInComment(lines[k], inComment);
+                var body = StripComments(joined.TrimStart().TrimStart('#'));
+                if (idx == guardLine) Push(stack, active, true, Tri.True);   // include guard: true on first inclusion
+                else HandleDirective(body, active, table, stack, closedWorld);
                 idx = last;
                 continue;
             }
@@ -70,18 +81,19 @@ public static class PreprocessorScanner
     private static void HandleDirective(string body, bool active, MacroTable table, Stack<Frame> stack, bool closedWorld)
     {
         var (keyword, rest) = SplitKeyword(body);
+        var certain = stack.Count == 0 || stack.Peek().Certain;
         switch (keyword)
         {
             case "ifdef":
                 // Known-defined => True; explicitly-unknown (e.g. varies per TU) => Unknown even under closed
                 // world; otherwise absent => False only under closed world, else Unknown (a header may define it).
-                Push(stack, active, DefinedTri(table, FirstToken(rest), closedWorld, whenDefined: Tri.True, whenAbsent: Tri.False));
+                Push(stack, active, certain, DefinedTri(table, FirstToken(rest), closedWorld, whenDefined: Tri.True, whenAbsent: Tri.False));
                 break;
             case "ifndef":
-                Push(stack, active, DefinedTri(table, FirstToken(rest), closedWorld, whenDefined: Tri.False, whenAbsent: Tri.True));
+                Push(stack, active, certain, DefinedTri(table, FirstToken(rest), closedWorld, whenDefined: Tri.False, whenAbsent: Tri.True));
                 break;
             case "if":
-                Push(stack, active, EvaluateCondition(rest, table, closedWorld));
+                Push(stack, active, certain, EvaluateCondition(rest, table, closedWorld));
                 break;
             case "elif":
                 Elif(stack, EvaluateCondition(rest, table, closedWorld));
@@ -93,11 +105,17 @@ public static class PreprocessorScanner
                 if (stack.Count > 0) stack.Pop();
                 break;
             case "define" when active:
-                var (name, value) = SplitKeyword(rest);
-                table.Set(ObjectMacroName(name), value.Trim());
+            {
+                var name = FirstToken(rest);
+                var after = rest[name.Length..];
+                if (after.StartsWith('(')) { var close = after.IndexOf(')'); after = close < 0 ? "" : after[(close + 1)..]; }
+                if (certain) table.Set(name, after.Trim());
+                else table.ForceUnknown(name);
                 break;
+            }
             case "undef" when active:
-                table.Undef(FirstToken(rest));
+                if (certain) table.UndefCertain(FirstToken(rest));
+                else table.ForceUnknown(FirstToken(rest));
                 break;
         }
     }
@@ -112,41 +130,117 @@ public static class PreprocessorScanner
         return closedWorld ? whenAbsent : Tri.Unknown;
     }
 
-    private static void Push(Stack<Frame> stack, bool parentActive, Tri cond)
+    private static void Push(Stack<Frame> stack, bool parentActive, bool parentCertain, Tri cond)
     {
-        bool branchActive, taken;
+        bool branchActive, taken, sawUnknown = false;
         if (!parentActive) { branchActive = false; taken = true; }
         else
             switch (cond)
             {
                 case Tri.True: branchActive = true; taken = true; break;
                 case Tri.False: branchActive = false; taken = false; break;
-                default: branchActive = true; taken = false; break; // Unknown: keep, allow other branches too
+                default: branchActive = true; taken = false; sawUnknown = true; break; // Unknown: keep, allow other branches too
             }
-        stack.Push(new Frame(parentActive, taken, branchActive));
+        stack.Push(new Frame(parentActive, parentCertain, taken, branchActive, sawUnknown,
+                             parentCertain && branchActive && !sawUnknown));
     }
 
     private static void Elif(Stack<Frame> stack, Tri cond)
     {
         if (stack.Count == 0) return;
         var top = stack.Pop();
-        bool branchActive, taken = top.Taken;
+        bool branchActive, taken = top.Taken, sawUnknown = top.SawUnknown;
         if (!top.ParentActive || top.Taken) branchActive = false;
         else
             switch (cond)
             {
                 case Tri.True: branchActive = true; taken = true; break;
                 case Tri.False: branchActive = false; break;
-                default: branchActive = true; break;
+                default: branchActive = true; sawUnknown = true; break;
             }
-        stack.Push(new Frame(top.ParentActive, taken, branchActive));
+        stack.Push(new Frame(top.ParentActive, top.ParentCertain, taken, branchActive, sawUnknown,
+                             top.ParentCertain && branchActive && !sawUnknown));
     }
 
     private static void Else(Stack<Frame> stack)
     {
         if (stack.Count == 0) return;
         var top = stack.Pop();
-        stack.Push(new Frame(top.ParentActive, true, top.ParentActive && !top.Taken));
+        var branchActive = top.ParentActive && !top.Taken;
+        stack.Push(new Frame(top.ParentActive, top.ParentCertain, true, branchActive, top.SawUnknown,
+                             top.ParentCertain && branchActive && !top.SawUnknown));
+    }
+
+    /// <summary>0-based index of an include-guard <c>#ifndef X</c> (or <c>#if !defined(X)</c>) that is the
+    /// file's first directive and is followed directly by <c>#define X</c>; -1 if none. On first inclusion the
+    /// guard is certainly true — without this, a guard macro #defined in the tree would read as unknown and make
+    /// every #define in the header uncertain.</summary>
+    private static int IncludeGuardLine(string[] lines)
+    {
+        int first = -1, second = -1;
+        var inComment = false;
+        for (var i = 0; i < lines.Length && second < 0; i++)
+        {
+            var starts = inComment;
+            inComment = EndsInComment(lines[i], inComment);
+            var t = lines[i].TrimStart();
+            if (starts || t.Length == 0 || t[0] != '#') continue;
+            if (first < 0) first = i; else second = i;
+        }
+        if (first < 0 || second < 0) return -1;
+        var (k1, r1) = SplitKeyword(StripComments(lines[first].TrimStart().TrimStart('#')));
+        var (k2, r2) = SplitKeyword(StripComments(lines[second].TrimStart().TrimStart('#')));
+        if (k2 != "define") return -1;
+        string? guard = null;
+        if (k1 == "ifndef") guard = FirstToken(r1);
+        else if (k1 == "if")
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(r1, @"^!\s*defined\s*\(?\s*(\w+)\s*\)?$");
+            if (m.Success) guard = m.Groups[1].Value;
+        }
+        return guard is { Length: > 0 } && FirstToken(r2) == guard ? first : -1;
+    }
+
+    /// <summary>Is a block comment open at the end of this line? (Strings are skipped so "/*" in a literal
+    /// does not count.)</summary>
+    private static bool EndsInComment(string line, bool inComment)
+    {
+        var quote = '\0';
+        for (var i = 0; i < line.Length; i++)
+        {
+            var c = line[i];
+            if (inComment) { if (c == '*' && i + 1 < line.Length && line[i + 1] == '/') { inComment = false; i++; } continue; }
+            if (quote != '\0') { if (c == '\\') i++; else if (c == quote) quote = '\0'; continue; }
+            if (c is '"' or '\'') quote = c;
+            else if (c == '/' && i + 1 < line.Length && line[i + 1] == '/') return false;
+            else if (c == '/' && i + 1 < line.Length && line[i + 1] == '*') { inComment = true; i++; }
+        }
+        return inComment;
+    }
+
+    /// <summary>Remove /* */ and // comments from a joined directive line.</summary>
+    private static string StripComments(string s)
+    {
+        if (!s.Contains('/')) return s;
+        var sb = new System.Text.StringBuilder(s.Length);
+        var quote = '\0';
+        for (var i = 0; i < s.Length; i++)
+        {
+            var c = s[i];
+            if (quote != '\0') { sb.Append(c); if (c == '\\' && i + 1 < s.Length) sb.Append(s[++i]); else if (c == quote) quote = '\0'; continue; }
+            if (c is '"' or '\'') { quote = c; sb.Append(c); continue; }
+            if (c == '/' && i + 1 < s.Length && s[i + 1] == '/') break;
+            if (c == '/' && i + 1 < s.Length && s[i + 1] == '*')
+            {
+                var end = s.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                sb.Append(' ');
+                if (end < 0) break;
+                i = end + 1;
+                continue;
+            }
+            sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     // ---- #if expression evaluation ------------------------------------------------------------
@@ -315,10 +409,14 @@ public static class PreprocessorScanner
     private static bool TryParseNumber(string tok, out long value)
     {
         value = 0;
-        var s = tok.TrimEnd('u', 'U', 'l', 'L');
+        // An unsigned literal changes comparison semantics (-1 < 0u is false in C); don't evaluate it.
+        if (tok.Length > 0 && char.IsDigit(tok[0]) && (tok.Contains('u') || tok.Contains('U'))) return false;
+        var s = tok.TrimEnd('l', 'L');
         if (s.Length == 0) return false;
         try
         {
+            // Hex beyond long.MaxValue is an unsigned value in C; Convert.ToInt64 would wrap it negative.
+            if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase) && Convert.ToUInt64(s[2..], 16) > long.MaxValue) return false;
             value = s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
                 ? Convert.ToInt64(s[2..], 16)
                 : (s.Length > 1 && s[0] == '0' && s.All(char.IsDigit) ? Convert.ToInt64(s, 8) : long.Parse(s));
@@ -360,11 +458,14 @@ public static class PreprocessorScanner
         return tokens;
     }
 
+    // The keyword is the identifier run after '#' (and optional whitespace); everything after it is the
+    // argument. "#if(X)", "#elif(X)", "#if!defined(X)", "#endif/*x*/" are directives too (review PP5).
     private static (string Keyword, string Remainder) SplitKeyword(string s)
     {
+        s = s.TrimStart();
         var i = 0;
-        while (i < s.Length && !char.IsWhiteSpace(s[i])) i++;
-        return (s[..i], i < s.Length ? s[(i + 1)..].Trim() : "");
+        while (i < s.Length && (char.IsLetterOrDigit(s[i]) || s[i] == '_')) i++;
+        return (s[..i], s[i..].Trim());
     }
 
     private static string FirstToken(string s)
@@ -375,9 +476,4 @@ public static class PreprocessorScanner
         return t[..i];
     }
 
-    private static string ObjectMacroName(string lhs)
-    {
-        var paren = lhs.IndexOf('(');
-        return (paren < 0 ? lhs : lhs[..paren]).Trim();
-    }
 }
