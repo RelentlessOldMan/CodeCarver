@@ -35,11 +35,32 @@ public sealed class ExplicitRootProvider : IRootProvider
 
     public IEnumerable<Root> Discover(CodeGraph graph)
     {
-        var wantSym = new HashSet<string>(_symbols, StringComparer.Ordinal);
+        // "path/file.c:symbol" qualifies a symbol by its file (review P4): `main` alone roots every main in a
+        // multi-target tree; `app/a/main.c:main` roots one. The path matches the end of the node's file path.
+        var wantSym = new HashSet<string>(StringComparer.Ordinal);
+        var qualified = new Dictionary<string, List<(string File, string Spec)>>(StringComparer.Ordinal);
+        foreach (var s in _symbols)
+        {
+            var colon = s.LastIndexOf(':');
+            if (colon > 0 && colon < s.Length - 1 && s[colon - 1] != ':' && (s[..colon].Contains('/') || s[..colon].Contains('.')))
+            {
+                var name = s[(colon + 1)..];
+                if (!qualified.TryGetValue(name, out var l)) qualified[name] = l = new List<(string, string)>();
+                l.Add((s[..colon].Replace('\\', '/').TrimStart('/'), s));
+            }
+            else wantSym.Add(s);
+        }
         var wantFile = new HashSet<string>(_files, StringComparer.Ordinal);
 
         foreach (var node in graph.Nodes)
         {
+            if (node.Kind != NodeKind.File && qualified.TryGetValue(node.Name, out var quals) && node.FilePath is { } fp)
+            {
+                var f = "/" + fp.Replace('\\', '/');
+                foreach (var (file, spec) in quals)
+                    if (f.EndsWith("/" + file, StringComparison.OrdinalIgnoreCase))
+                        yield return new Root(node.Id, RootKind.ExplicitSymbol, spec);
+            }
             if (node.Kind != NodeKind.File && wantSym.Contains(node.Name))
                 yield return new Root(node.Id, RootKind.ExplicitSymbol, node.Name);
             else if (node.FilePath is { } f && wantFile.Contains(f))

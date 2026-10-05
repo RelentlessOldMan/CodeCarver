@@ -20,6 +20,15 @@ namespace CodeCarver.Frontend;
 public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 {
     private const string IdentQuery = "(identifier) @id";
+    // Names a function declares for itself — parameters and locals (P3). An identifier inside the body that
+    // refers to one of these is not a reference to a same-named function elsewhere.
+    private const string LocalQuery = """
+        (declaration declarator: (identifier) @local)
+        (init_declarator declarator: (identifier) @local)
+        (pointer_declarator declarator: (identifier) @local)
+        (array_declarator declarator: (identifier) @local)
+        (parameter_declaration declarator: (identifier) @local)
+        """;
 
     /// <summary><c>#include "x"</c> or <c>#include &lt;x&gt;</c>, scanned from text (line-oriented) so it
     /// catches includes tree-sitter misses — e.g. inside an array initializer (the data-fragment case).</summary>
@@ -87,6 +96,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private readonly Query _idents;
     private readonly Query _initRefs;
     private readonly Query _globals;
+    private readonly Query _locals;
+    // Functions with internal linkage (`static` at file scope in a .c/.cpp): only their own translation unit
+    // can call them (P2). Filled while parsing, consulted when uses are resolved.
+    private readonly HashSet<NodeId> _fileLocal = new();
     // Reused across the sequential parse loop: a native TSParser is cheap to re-use but not free to
     // create/destroy, and BuildGraph parses thousands of files one at a time on this thread. The budgeted
     // (large-file) path still uses its OWN parser on the worker thread — this instance is single-threaded,
@@ -218,7 +231,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _idents = new Query(_lang, IdentQuery);
         _initRefs = new Query(_lang, InitRefQuery);
         _globals = new Query(_lang, GlobalQuery);
+        _locals = new Query(_lang, LocalQuery);
     }
+
+    /// <summary>
+    /// Optional include search path for a file (review P1): the carve-relative directories its compile command
+    /// passes with -I/-iquote/-isystem, in order, and whether they are EXACT for this file (its own command) or
+    /// a union (a header, or a file with no command). Null = no build information: includes resolve beside the
+    /// includer, else by basename.
+    /// </summary>
+    public Func<string, (IReadOnlyList<string> Dirs, bool Exact)?>? IncludeSearch { get; set; }
 
     /// <summary>
     /// Build the dependency graph for the given files. When <paramref name="defines"/> is supplied, the
@@ -249,6 +271,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     {
         _warnings.Clear();
         _forceKeepFiles.Clear();
+        _fileLocal.Clear();
         _symbolBudgetKeptWhole.Clear();
         var graph = new CodeGraph();
         var (bytesTotal, filesTotal) = BuildScopeMacros(paths, read); // pre-pass: scope macros + parse work totals
@@ -320,10 +343,26 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 if (seen.Add(m.Value)) pendingRefs.Add((incNode, m.Value));
         }
 
+        // P2: a file that is #included by another (unity build, "#include the .c") shares its statics with the
+        // includer, so its statics are not restricted.
+        var includedFiles = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var n in graph.Nodes)
+            if (n.Kind == NodeKind.File)
+                foreach (var e in graph.OutEdges(n.Id))
+                    if (e.Kind == EdgeKind.Includes) includedFiles.Add(graph.GetNode(e.To).Name);
+        bool Visible(NodeId from, NodeId target)
+        {
+            if (!_fileLocal.Contains(target)) return true;
+            var tf = graph.GetNode(target).FilePath;
+            var ff = graph.GetNode(from).FilePath;
+            // Only a use from ANOTHER translation unit is ruled out; a header or table can be included into the
+            // static's own TU, and an included .c is part of its includer.
+            return ff is null || tf is null || ff == tf || !IsTranslationUnit(ff) || includedFiles.Contains(tf);
+        }
         foreach (var (from, name) in pendingCalls)
-            ResolveUse(graph, from, name, functionsByName, macrosByName, globalsByName, EdgeKind.Calls);
+            ResolveUse(graph, from, name, functionsByName, macrosByName, globalsByName, EdgeKind.Calls, Visible);
         foreach (var (from, name) in pendingRefs)
-            ResolveUse(graph, from, name, functionsByName, macrosByName, globalsByName, EdgeKind.AddressTaken);
+            ResolveUse(graph, from, name, functionsByName, macrosByName, globalsByName, EdgeKind.AddressTaken, Visible);
         // A macro that expands to a call/another macro reaches those — so a function or global used ONLY
         // through a macro body (e.g. `#define getSBox(n) sbox[n]`) is not lost when its callers are pruned.
         foreach (var (from, name) in pendingMacroRefs)
@@ -624,6 +663,101 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         return total >= 50 && data >= total * 0.9;
     }
 
+    /// <summary>`static` on a function DEFINITION at file scope (not a class member, not inside a namespace
+    /// block where it could still be a member) — internal linkage.</summary>
+    private static bool IsFileScopeStatic(TsNode nameNode)
+    {
+        TsNode? def = nameNode;
+        for (var i = 0; i < 12 && def is not null && def.Type != "function_definition"; i++)
+        {
+            if (def.Type is "qualified_identifier" or "field_identifier") return false;   // Class::method
+            def = def.Parent;
+        }
+        if (def is null || def.Type != "function_definition") return false;
+        if (def.Parent?.Type is not ("translation_unit" or "preproc_if" or "preproc_ifdef" or "preproc_else" or "preproc_elif"))
+            return false;
+        foreach (var ch in def.Children)
+            if (ch.Type == "storage_class_specifier" && ch.Text == "static") return true;
+        return false;
+    }
+
+    /// <summary>Resolve an #include the way the compiler would (P1). Quoted: beside the includer first (gcc's
+    /// rule, exact even without a build log). Then the file's -I directories: for a TU with its own command the
+    /// FIRST hit is what the compiler opens; with a union of directories every hit is kept (sound).</summary>
+    private List<string> ResolveInclude(string includer, string raw, bool quoted, Dictionary<string, NodeId> files)
+    {
+        var hits = new List<string>();
+        var inc = raw.Replace('\\', '/');
+        if (quoted)
+        {
+            var dir = includer.Contains('/') ? includer[..includer.LastIndexOf('/')] : "";
+            if (NormRel(dir.Length == 0 ? inc : dir + "/" + inc) is { } beside && files.ContainsKey(beside)) { hits.Add(beside); return hits; }
+        }
+        if (IncludeSearch?.Invoke(includer) is not { } search) return hits;
+        foreach (var d in search.Dirs)
+        {
+            if (NormRel(d.Length == 0 ? inc : d.TrimEnd('/') + "/" + inc) is not { } cand || !files.ContainsKey(cand)) continue;
+            if (!hits.Contains(cand)) hits.Add(cand);
+            if (search.Exact && IsTranslationUnit(includer)) break;
+        }
+        return hits;
+    }
+
+    private static string? NormRel(string rel)
+    {
+        var parts = new List<string>();
+        foreach (var seg in rel.Split('/'))
+        {
+            if (seg.Length == 0 || seg == ".") continue;
+            if (seg == "..") { if (parts.Count == 0) return null; parts.RemoveAt(parts.Count - 1); continue; }
+            parts.Add(seg);
+        }
+        return string.Join('/', parts);
+    }
+
+    /// <summary>Parameters and locals by name, each with where its scope starts (the declaration) and ends
+    /// (the enclosing block, or the whole function for a parameter).</summary>
+    private Dictionary<string, List<((int, int) From, (int, int) To)>> CollectLocals(TsNode root)
+    {
+        var r = new Dictionary<string, List<((int, int), (int, int))>>(StringComparer.Ordinal);
+        foreach (var cap in _locals.Execute(root).Captures)
+        {
+            var n = cap.Node;
+            TsNode? scope = null;
+            if (InsideFunctionBody(n))
+            {
+                // A block-scope `extern int g;` names the GLOBAL g — its uses are references, not locals.
+                var decl = n.Parent;
+                for (var i = 0; i < 4 && decl is not null && decl.Type != "declaration"; i++) decl = decl.Parent;
+                if (decl is not null && decl.Children.Any(c => c.Type == "storage_class_specifier" && c.Text == "extern")) continue;
+                for (var p = n.Parent; p is not null; p = p.Parent)
+                    if (p.Type is "compound_statement" or "for_statement" or "for_range_loop" or "function_definition") { scope = p; break; }
+            }
+            else
+            {
+                // A parameter of a function DEFINITION: in scope for that function's body.
+                var p = n.Parent;
+                for (var i = 0; i < 8 && p is not null; i++, p = p.Parent)
+                {
+                    if (p.Type == "function_definition") { scope = p; break; }
+                    if (p.Type is "declaration" or "field_declaration" or "translation_unit") break;
+                }
+            }
+            if (scope is null) continue;
+            if (!r.TryGetValue(n.Text, out var l)) r[n.Text] = l = new List<((int, int), (int, int))>();
+            l.Add(((n.StartPosition.Row, n.StartPosition.Column), (scope.EndPosition.Row, scope.EndPosition.Column)));
+        }
+        return r;
+    }
+
+    private static bool IsLocalUse(Dictionary<string, List<((int, int) From, (int, int) To)>> locals, string name, (int, int) pos)
+    {
+        if (!locals.TryGetValue(name, out var l)) return false;
+        foreach (var (from, to) in l)
+            if (pos.CompareTo(from) >= 0 && pos.CompareTo(to) < 0) return true;   // the declaration itself, and every use after it
+        return false;
+    }
+
     /// <summary>A .c/.cc/.cpp/.cxx/.c++ source file — a translation unit we must always parse.</summary>
     private static bool IsTranslationUnit(string path)
     {
@@ -660,7 +794,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                                    Dictionary<string, List<NodeId>> functionsByName,
                                    Dictionary<string, List<NodeId>> macrosByName,
                                    Dictionary<string, List<NodeId>> globalsByName,
-                                   EdgeKind functionEdge)
+                                   EdgeKind functionEdge, Func<NodeId, NodeId, bool>? visible = null)
     {
         // Link the name to EVERY kind that defines it. One tree holds many targets/configurations, so a name
         // can be a function in one place and a macro or a global in another; picking the first kind found
@@ -669,6 +803,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         {
             foreach (var target in fns)
             {
+                if (visible is not null && !visible(from, target)) continue;
                 graph.AddEdge(from, target, functionEdge);
                 if (functionEdge == EdgeKind.AddressTaken)
                     graph.AddFlag(target, NodeFlags.AddressTaken);
@@ -777,6 +912,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(fid, fileNode, EdgeKind.DefinedIn);
                 Add(functionsByName, name, fid);
                 funcSpans.Add((span.Value.Start, span.Value.End, fid));
+                if (IsTranslationUnit(path) && IsFileScopeStatic(node)) _fileLocal.Add(fid);
             }
             else if (cap.Name == "macro")
             {
@@ -819,8 +955,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (dead is not null && li + 1 < dead.Length && dead[li + 1]) continue;
             var m = IncludeLine.Match(srcLines[li]);
             if (!m.Success) continue;
-            var target = BaseName(m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value);
-            if (!pathsByBasename.TryGetValue(target, out var targets)) continue;
+            var raw = m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value;
+            // P1: resolve like the compiler — beside the includer (quoted form), then the TU's -I dirs in order —
+            // and only when that finds nothing fall back to every file with the basename (sound, may over-keep).
+            var exact = ResolveInclude(path, raw, m.Groups[1].Success, fileNodeByPath);
+            IEnumerable<string> targets;
+            if (exact.Count > 0) targets = exact;
+            else if (pathsByBasename.TryGetValue(BaseName(raw), out var byBase)) targets = byBase;
+            else continue;
             foreach (var tp in targets)
                 if (tp != path)
                     graph.AddEdge(fileNode, fileNodeByPath[tp], EdgeKind.Includes);
@@ -878,11 +1020,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // InsideError only matters when the file actually has a parse error somewhere; checking once
         // avoids a costly ancestor walk per file-scope identifier in the common (clean-parse) case.
         var treeHasError = root.HasError;
+        var locals = CollectLocals(root);
         foreach (var cap in _idents.Execute(root).Captures)
         {
             if (IsDead(cap.Node)) continue;
             var pos = (cap.Node.StartPosition.Row, cap.Node.StartPosition.Column);
             if (defNamePositions.Contains(pos) || calleePositions.Contains(pos)) continue;
+            if (IsLocalUse(locals, cap.Node.Text, pos)) continue;
             var from = Enclosing(cap.Node.StartPosition.Row + 1);
             if (from is { } f)
                 pendingRefs.Add((f, cap.Node.Text));
@@ -1274,6 +1418,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public void Dispose()
     {
         _inlineParser?.Dispose();
+        _locals.Dispose();
         _globals.Dispose();
         _initRefs.Dispose();
         _idents.Dispose();

@@ -36,7 +36,7 @@ public static class BuildLogScraper
         { "gcc", "g++", "cc", "c++", "clang", "clang++", "cl" };
 
     private static readonly string[] SourceExtensions =
-        { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
+        { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm", ".s", ".S", ".sx", ".asm" };
 
     // Toolchain tools that SHARE a compiler prefix but are NOT compilers (gcc-ar, arm-none-eabi-ld,
     // clang-tidy, clang-format). Without this the loose "starts with gcc/clang" match below flags them, and

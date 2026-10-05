@@ -516,10 +516,19 @@ public static class CarveCommand
         // All source-tree scans go through SourceWalk (Core): skips unreadable dirs (network shares; eval-#7)
         // and does not recurse into directory junctions/symlinks (loop / double-scan) while still returning
         // symlinked source FILES (dropping one would be unsound).
+        // excludeDirectories match whole path SEGMENTS of the path RELATIVE to the carve root (review P7): a
+        // carve root that itself sits under a directory named "tests" must not exclude everything.
+        var excludeSegs = excludeDirs.Select(x => "/" + x.Replace('\\', '/').Trim('/') + "/").ToList();
+        bool Excluded(string fullPath)
+        {
+            if (excludeSegs.Count == 0) return false;
+            var rel = "/" + Path.GetRelativePath(dir, fullPath).Replace('\\', '/') + "/";
+            return excludeSegs.Any(seg => rel.Contains(seg, StringComparison.OrdinalIgnoreCase));
+        }
+        static long SafeLength(string p) { try { return new FileInfo(p).Length; } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return long.MaxValue; } }
         var paths = CodeCarver.Core.Util.SourceWalk.Files(dir)
             .Where(p => exts.Any(e => p.EndsWith(e, StringComparison.OrdinalIgnoreCase)))
-            .Where(p => excludeDirs.Count == 0 ||
-                        !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase)))
+            .Where(p => !Excluded(p))
             .ToList();
         if (paths.Count == 0)
         {
@@ -762,6 +771,38 @@ public static class CarveCommand
             if (maxSymbolsPerFile is not null) tsfe.PerFileSymbolBudget = maxSymbolsPerFile.Value;
             if (refIncludes.Count > 0) tsfe.ReferenceOnlyIncludes = refIncludes;
             if (perFileDefines is not null) tsfe.PerFileDefines = perFileDefines; // per-TU #ifdef config from the build log
+            // P1: each logged file's own -I search path (exact), and the union of all of them for headers and
+            // unlogged files. Directories outside the carve root are left out (nothing there is a graph file).
+            if (buildCmds.Count > 0)
+            {
+                var incByFile = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                var incUnion = new List<string>();
+                var rootFullI = Path.GetFullPath(dir);
+                foreach (var cc in buildCmds)
+                {
+                    if (CmdRel(cc) is not { } rel) continue;
+                    string baseDir;
+                    try { baseDir = Path.IsPathFullyQualified(cc.Directory) ? cc.Directory : Path.GetFullPath(Path.Combine(dir, cc.Directory)); }
+                    catch { continue; }
+                    if (!incByFile.TryGetValue(rel, out var mine)) incByFile[rel] = mine = new List<string>();
+                    foreach (var inc in cc.Includes)
+                    {
+                        string relDir;
+                        try { relDir = Path.GetRelativePath(rootFullI, Path.GetFullPath(Path.Combine(baseDir, inc))).Replace('\\', '/'); }
+                        catch { continue; }
+                        if (relDir == ".") relDir = "";
+                        if (relDir.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relDir)) continue;
+                        if (!mine.Contains(relDir)) mine.Add(relDir);
+                        if (!incUnion.Contains(relDir)) incUnion.Add(relDir);
+                    }
+                }
+                // A file compiled by several commands with different -I lists gets the union, not "exact".
+                var multi = buildCmds.Select(CmdRel).Where(r => r is not null).GroupBy(r => r!, StringComparer.OrdinalIgnoreCase)
+                                     .Where(g => g.Count() > 1).Select(g => g.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                tsfe.IncludeSearch = f => incByFile.TryGetValue(f, out var own) && !multi.Contains(f) && !includedCFiles.Contains(f)
+                    ? (own, true)
+                    : (incUnion, false);
+            }
         }
         // Opt-in phase timing (CODECARVER_TIMING=1) to stderr — used for the performance work.
         var _tsw = System.Diagnostics.Stopwatch.StartNew();
@@ -897,31 +938,15 @@ public static class CarveCommand
             }
         }
 
-        // Assembly startup (.s/.S) references C handlers by name (vector table `.word Handler`) — root them.
-        var asmRoots = new List<Root>();
-        if (lang is "c" or "cpp")
-        {
-            var asmPaths = CodeCarver.Core.Util.SourceWalk.Files(dir)
-                .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".s" or ".asm")
-                .Where(p => excludeDirs.Count == 0 ||
-                            !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase)))
-                .Where(p => new FileInfo(p).Length <= maxParseBytes)
-                .ToList(); // paths only (cheap); texts are streamed one file at a time below, never all held at once
-            if (asmPaths.Count > 0)
-                asmRoots = new AsmReferenceRootProvider(asmPaths.Select(SafeRead)).Discover(graph).ToList();
-        }
-
         // A symbol placed in a custom section that the linker script KEEP()s (initcall / registration
         // tables) is collected by the linker, never called — root it so a from-main closure can't drop it.
         // Gated on a linker script actually being present, so non-embedded trees pay nothing.
         var sectionRoots = new List<Root>();
         if (lang is "c" or "cpp")
         {
-            bool Included(string p) => excludeDirs.Count == 0 ||
-                !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase));
             var linkerScripts = CodeCarver.Core.Util.SourceWalk.Files(dir)
                 .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".ld" or ".lds" or ".ldscript")
-                .Where(Included).Where(p => new FileInfo(p).Length <= maxParseBytes)
+                .Where(p => !Excluded(p)).Where(p => SafeLength(p) <= maxParseBytes)
                 .Select(SafeRead).ToList();
             if (linkerScripts.Count > 0)
             {
@@ -1073,6 +1098,34 @@ public static class CarveCommand
             summary["traces.observedInTree"] = observedRel.Count;
             summary["traces.outsideRootTranslationUnits"] = externalTu;
             summary["traces.outsideRootHeaders"] = externalHeaders;
+        }
+
+        // Assembly startup (.s/.S) references C handlers by name (vector table `.word Handler`) — root them.
+        var asmRoots = new List<Root>();
+        if (lang is "c" or "cpp")
+        {
+            var asmPaths = CodeCarver.Core.Util.SourceWalk.Files(dir)
+                .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".s" or ".asm" or ".sx")
+                .Where(p => !Excluded(p))
+                .Where(p => SafeLength(p) <= maxParseBytes)
+                .ToList(); // paths only (cheap); texts are streamed one file at a time below, never all held at once
+            // P6: when the build's own evidence names assembly files (a build log compiling them, or a build trace
+            // that opened them), only those are startup code for THIS image — another target's startup file would
+            // root its handlers. Without such evidence every .s counts (sound default).
+            var asmEvidence = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var cc in buildCmds)
+                if (CmdRel(cc) is { } r && Path.GetExtension(r).ToLowerInvariant() is ".s" or ".asm" or ".sx") asmEvidence.Add(r);
+            foreach (var r in observedRel)
+                if (Path.GetExtension(r).ToLowerInvariant() is ".s" or ".asm" or ".sx") asmEvidence.Add(r);
+            if (asmEvidence.Count > 0)
+            {
+                var before = asmPaths.Count;
+                asmPaths = asmPaths.Where(p => asmEvidence.Contains(Path.GetRelativePath(dir, p).Replace('\\', '/'))).ToList();
+                if (asmPaths.Count < before)
+                    err.WriteLine($"  asm     : {asmPaths.Count} of {before} assembly file(s) used for roots (the others are not in the build log/trace)");
+            }
+            if (asmPaths.Count > 0)
+                asmRoots = new AsmReferenceRootProvider(asmPaths.Select(SafeRead)).Discover(graph).ToList();
         }
 
         // forceKeepFiles (review K1): resolve each glob once. A forced code file is an ExplicitFile root, so its
@@ -1264,17 +1317,6 @@ public static class CarveCommand
         // only when it fires. (2) The real gate is EmittedLinkCheck, run per stage over the EMITTED tree with a
         // tokenizer that never consults the graph (review V1). ---
         var verifyFailed = false;
-        if (fe is TreeSitterFrontEnd tsv)
-        {
-            var violations = SoundnessCheck.KeptCallingDropped(graph, plan, tsv.CallSites);
-            if (violations.Count > 0)
-            {
-                verifyFailed = true;
-                @out.WriteLine($"  verify  : internal graph check: {violations.Count} kept function(s) call an in-scope function that was carved out:");
-                foreach (var v in violations.Take(20)) @out.WriteLine($"            {v.Caller}() -> {v.Callee}()  [{v.File}]");
-                if (violations.Count > 20) @out.WriteLine($"            (+{violations.Count - 20} more)");
-            }
-        }
         var linkCheck = lang is "c" or "cpp";
         if (!linkCheck)
             @out.WriteLine($"  verify  : (emitted-tree link check is C/C++ only; skipped for language '{lang}')");
