@@ -14,7 +14,13 @@ public sealed class CodeGraph
 {
     private readonly List<Node> _nodes = new();
     private readonly List<List<Edge>> _out = new();
-    private readonly Dictionary<string, int> _intern = new(StringComparer.Ordinal);
+    // Keyed by a tuple of references to strings the nodes already hold — not a formatted string per node, which
+    // cost a fresh "kind name path line" copy for every node (gigabytes at 13M nodes; review RB2).
+    private readonly Dictionary<(NodeKind, string, string?, int), int> _intern = new();
+    // Out-edges are de-duplicated: a function calling another 50 times needs one edge. Small lists are scanned;
+    // a node whose out-degree passes EdgeSetThreshold gets a set.
+    private const int EdgeSetThreshold = 16;
+    private readonly Dictionary<int, HashSet<(int, EdgeKind)>> _edgeSets = new();
 
     public int NodeCount => _nodes.Count;
     public IEnumerable<Node> Nodes => _nodes;
@@ -46,7 +52,23 @@ public sealed class CodeGraph
     {
         Validate(from);
         Validate(to);
-        _out[from.Value].Add(new Edge(from, to, kind));
+        var list = _out[from.Value];
+        if (list.Count < EdgeSetThreshold)
+        {
+            foreach (var e in list)
+                if (e.To == to && e.Kind == kind) return;
+        }
+        else
+        {
+            if (!_edgeSets.TryGetValue(from.Value, out var set))
+            {
+                set = new HashSet<(int, EdgeKind)>();
+                foreach (var e in list) set.Add((e.To.Value, e.Kind));
+                _edgeSets[from.Value] = set;
+            }
+            if (!set.Add((to.Value, kind))) return;
+        }
+        list.Add(new Edge(from, to, kind));
     }
 
     /// <summary>Merge additional flags onto an existing node (e.g. mark a function address-taken once a
@@ -87,6 +109,6 @@ public sealed class CodeGraph
             throw new ArgumentOutOfRangeException(nameof(id), $"node {id} is not in this graph");
     }
 
-    private static string Key(NodeKind kind, string name, string? file, int line)
-        => $"{(int)kind} {name} {file} {line}";
+    private static (NodeKind, string, string?, int) Key(NodeKind kind, string name, string? file, int line)
+        => (kind, name, file, line);
 }

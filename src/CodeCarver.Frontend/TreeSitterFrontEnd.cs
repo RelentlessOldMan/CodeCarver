@@ -295,9 +295,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var functionsByName = new Dictionary<string, List<NodeId>>(StringComparer.Ordinal);
         var macrosByName = new Dictionary<string, List<NodeId>>(StringComparer.Ordinal);
         var globalsByName = new Dictionary<string, List<NodeId>>(StringComparer.Ordinal);
-        var pendingCalls = new List<(NodeId From, string Name)>();
-        var pendingRefs = new List<(NodeId From, string Name)>();
-        var pendingMacroRefs = new List<(NodeId From, string Name)>();
+        var namePool = new Dictionary<string, string>(StringComparer.Ordinal);   // one string per distinct name (RB2)
+        var pendingCalls = new UseList(namePool);
+        var pendingRefs = new UseList(namePool);
+        var pendingMacroRefs = new UseList(namePool);
         var pendingPastes = new List<(NodeId Macro, PasteKind Kind, string Frag)>();
 
         var keepNames = new HashSet<string>(StringComparer.Ordinal);
@@ -428,7 +429,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// either kind also keeps the symbol it decorates (<c>RAMFUNC void f(void)</c>), found like an attribute.
     /// </summary>
     private void ScanKeepMacroUses(CodeGraph graph, string text, NodeId fileNode, HashSet<string> keepNames,
-                                   List<(NodeId, string)> pendingRefs)
+                                   UseList pendingRefs)
     {
         foreach (Match m in _keepMacroUse!.Matches(text))
         {
@@ -831,9 +832,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                              Dictionary<string, List<NodeId>> functionsByName,
                              Dictionary<string, List<NodeId>> macrosByName,
                              Dictionary<string, List<NodeId>> globalsByName,
-                             List<(NodeId, string)> pendingCalls,
-                             List<(NodeId, string)> pendingRefs,
-                             List<(NodeId, string)> pendingMacroRefs,
+                             UseList pendingCalls,
+                             UseList pendingRefs,
+                             UseList pendingMacroRefs,
                              List<(NodeId, PasteKind, string)> pendingPastes,
                              MacroTable? defines,
                              bool closedWorldDefines)
