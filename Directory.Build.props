@@ -8,6 +8,15 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!-- Reproducible builds (review SC-E5). Deterministic is the SDK default; stated so it cannot be lost. -->
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <!-- On CI (and for release.ps1, which passes -p:ContinuousIntegrationBuild=true) map source paths to /_/ so
+       PDBs and embedded paths do not carry the build machine's directory layout. Not set for local dev builds,
+       where real paths keep the debugger's source lookup working. -->
+  <PropertyGroup Condition="'$(GITHUB_ACTIONS)' == 'true'">
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
   </PropertyGroup>
 
 </Project>

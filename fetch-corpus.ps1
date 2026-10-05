@@ -58,30 +58,45 @@ function FullyFetched([string]$d) { (Test-Path $d) -and (Test-Path (Join-Path $d
 $failed = @()
 foreach ($r in $repos) {
     $dest = Join-Path $corpus $r.name
-    if (FullyFetched $dest) { Write-Host "$($r.name) already present."; continue }
-    if (Test-Path $dest) { Write-Host "$($r.name): partial/incomplete - re-fetching."; Remove-Item -Recurse -Force $dest }
+    if (FullyFetched $dest) {
+        # Present - but at the pinned commit? Warn only (never delete a checkout someone may be working in).
+        $head = @(& git -C $dest rev-parse HEAD 2>$null) -join ''
+        if ("$head".Trim() -eq $r.sha) { Write-Host "$($r.name) already present." }
+        else { Write-Host "$($r.name) present but at '$head', not the pinned $($r.sha) - delete it to re-fetch." -ForegroundColor Yellow }
+        continue
+    }
+    if (Test-Path $dest) { Write-Host "$($r.name): partial/incomplete (no .git) - re-fetching." }
     Write-Host "Fetching $($r.name)@$($r.sha.Substring(0,10))  [$($r.tier)]..."
-    New-Item -ItemType Directory -Force -Path $dest | Out-Null
-    Push-Location $dest
+    # Fetch into a temp sibling and rename into place only on success (review SC-F5): an interrupted fetch
+    # (Ctrl-C, power loss) can then never leave a $dest that a later run treats as complete.
+    $tmp = Join-Path $corpus (".fetch-" + $r.name + "-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    Push-Location $tmp
     try {
-        # Gate each step on $LASTEXITCODE (git writes progress to stderr; don't rely on throw). Any
-        # failure removes the partial dir so the next run retries cleanly rather than skipping it.
+        # Gate each step on $LASTEXITCODE (git writes progress to stderr; don't rely on throw).
         & git init -q;                                      if ($LASTEXITCODE) { throw "git init" }
         & git remote add origin $r.url;                     if ($LASTEXITCODE) { throw "git remote add" }
         & git fetch -q --depth 1 origin $r.sha;             if ($LASTEXITCODE) { throw "git fetch $($r.sha)" }
         & git -c advice.detachedHead=false checkout -q FETCH_HEAD; if ($LASTEXITCODE) { throw "git checkout" }
+        Pop-Location
+        if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }   # the stale / partial copy
+        Move-Item -LiteralPath $tmp -Destination $dest
     }
     catch {
-        Pop-Location
-        Write-Host "  FAILED ($($r.name)): $_ - removing partial dir." -ForegroundColor Yellow
-        Remove-Item -Recurse -Force $dest -ErrorAction SilentlyContinue
+        if ((Get-Location).Path -eq $tmp) { Pop-Location }
+        Write-Host "  FAILED ($($r.name)): $_ - removing partial temp dir." -ForegroundColor Yellow
+        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
         $failed += $r.name
         continue
     }
-    Pop-Location
 }
+# Leftover temp dirs from a hard-killed earlier run.
+Get-ChildItem -Directory -Force -Path $corpus -Filter '.fetch-*' -ErrorAction SilentlyContinue |
+    ForEach-Object { Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue }
 if ($failed.Count -gt 0) {
-    Write-Host "`n$($failed.Count) repo(s) failed to fetch (network?): $($failed -join ', '). Re-run to retry just those." -ForegroundColor Yellow
+    Write-Host "`n$($failed.Count) repo(s) failed to fetch (network?): $($failed -join ', '). Re-run to retry just those." -ForegroundColor Red
+    exit 1
 }
 
 Write-Host "Corpus ready in $corpus (all commit-pinned)"
+exit 0

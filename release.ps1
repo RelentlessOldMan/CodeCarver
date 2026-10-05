@@ -37,13 +37,16 @@ $short  = $sha.Substring(0,9)
 
 # --- 2. ensure HEAD is on origin (the whole point) ---
 RunGit fetch origin $branch | Out-Null
-$onOrigin = & git branch -r --contains $sha 2>$null | Where-Object { $_ -match "origin/$([regex]::Escape($branch))\b" }
+# Exact ref match: `origin/main\b` also matched origin/main-x (and origin/main.bak), so a commit pushed
+# only to a sibling branch passed the check (review SC-F2). `git branch -r` lines are "  origin/<name>".
+$originRe = '^\s*origin/' + [regex]::Escape($branch) + '\s*$'
+$onOrigin = & git branch -r --contains $sha 2>$null | Where-Object { $_ -match $originRe }
 if (-not $onOrigin) {
     if ($Push) {
         Write-Host "HEAD not on origin/$branch -- pushing first..." -ForegroundColor Yellow
         RunGit push origin $branch | Out-Null
         RunGit fetch origin $branch | Out-Null
-        $onOrigin = & git branch -r --contains $sha 2>$null | Where-Object { $_ -match "origin/$([regex]::Escape($branch))\b" }
+        $onOrigin = & git branch -r --contains $sha 2>$null | Where-Object { $_ -match $originRe }
     }
     if (-not $onOrigin) {
         Write-Host "REFUSING: HEAD ($short) is NOT on origin/$branch -- its commits are unpushed." -ForegroundColor Red
@@ -56,9 +59,10 @@ Write-Host "OK: $short is on origin/$branch -- safe to package." -ForegroundColo
 
 # --- 3. test gate (a release should be green) ---
 if (-not $SkipTests) {
-    Write-Host "== Test gate ==" -ForegroundColor Cyan
-    & (Join-Path $root 'check.ps1')
-    if ($LASTEXITCODE -ne 0) { throw "tests failed -- not packaging" }
+    # Test the configuration that ships (Release); the gate used to test Debug and ship Release.
+    Write-Host "== Test gate (Release) ==" -ForegroundColor Cyan
+    & (Join-Path $root 'check.ps1') -Configuration Release
+    if (-not $?) { throw "tests failed -- not packaging" }
 } else { Write-Host "(skipping tests -- -SkipTests)" -ForegroundColor DarkGray }
 
 # --- 4. build + publish the CLI ---
@@ -66,35 +70,39 @@ if (-not $Version) { $Version = (Get-Date -Format 'yyyyMMdd') + "-$short" }
 $pub = Join-Path $env:TEMP "cc-publish-$short"
 if (Test-Path $pub) { Remove-Item -Recurse -Force $pub }
 Write-Host "== Publishing CLI (Release) ==" -ForegroundColor Cyan
-& dotnet publish (Join-Path $root 'src\CodeCarver.Cli\CodeCarver.Cli.csproj') -c Release -o $pub --nologo
+& dotnet publish (Join-Path $root 'src\CodeCarver.Cli\CodeCarver.Cli.csproj') -c Release -o $pub --nologo -p:ContinuousIntegrationBuild=true
 if ($LASTEXITCODE -ne 0) { throw "publish failed" }
 # Stamp the exact commit into the artifact so a loose zip is always traceable to a pushed commit.
 "CodeCarver $Version`ncommit $sha`nbranch $branch`nbuilt  $(Get-Date -Format o)" |
     Set-Content -Encoding UTF8 (Join-Path $pub 'RELEASE.txt')
 
 # Ship the user-facing docs INSIDE the release, not just in the dev repo. A user who hits a problem needs
-# SUPPORT.md (how to run --diag, what the package does/doesn't contain) and USAGE.md at hand. Copy the docs
-# folder, and surface SUPPORT.md + USAGE.md at the zip root so they're impossible to miss.
+# SUPPORT.md (how to run --diag, what the package does/doesn't contain) and USAGE.md at hand; both are also
+# surfaced at the zip root so they're impossible to miss. ALLOWLIST, not the whole folder: the internal
+# runbooks and review notes (REVIEW-HANDOFF, SHAKEDOWN, WORKREPO, REPRODUCE, TESTING) describe the dev repo's
+# own scripts and must not ship (review SC-F2). Add a doc here deliberately when it is user-facing.
+$shipDocs = @('USAGE.md', 'SUPPORT.md', 'ADAPTING.md', 'TOOLING.md')
 $docsSrc = Join-Path $root 'docs'
-if (Test-Path $docsSrc) {
-    Copy-Item -Recurse -Force $docsSrc (Join-Path $pub 'docs')
-    foreach ($top in @('SUPPORT.md', 'USAGE.md', 'README.md')) {
-        $p = Join-Path $docsSrc $top
-        if (Test-Path $p) { Copy-Item -Force $p (Join-Path $pub $top) }
-    }
-    Write-Host "  bundled docs/ (+ SUPPORT.md/USAGE.md at root) into the release" -ForegroundColor DarkGray
-} else {
-    Write-Host "  WARN: no docs/ folder found to bundle" -ForegroundColor Yellow
+New-Item -ItemType Directory -Force (Join-Path $pub 'docs') | Out-Null
+foreach ($d in $shipDocs) {
+    $p = Join-Path $docsSrc $d
+    if (-not (Test-Path $p)) { throw "release doc missing: docs\$d" }
+    Copy-Item -Force $p (Join-Path $pub "docs\$d")
 }
-# The repo README lives at the root (not under docs/), and USAGE.md tells users to run the capture scripts.
-$readme = Join-Path $root 'README.md'
-if (Test-Path $readme) { Copy-Item -Force $readme (Join-Path $pub 'README.md') }
+foreach ($top in @('SUPPORT.md', 'USAGE.md')) { Copy-Item -Force (Join-Path $docsSrc $top) (Join-Path $pub $top) }
+Write-Host "  bundled docs/ ($($shipDocs -join ', ')) + SUPPORT.md/USAGE.md at the root" -ForegroundColor DarkGray
+# The repo README and LICENSE live at the root. A release without its licence is not redistributable.
+foreach ($top in @('README.md', 'LICENSE')) {
+    $p = Join-Path $root $top
+    if (-not (Test-Path $p)) { throw "release file missing: $top" }
+    Copy-Item -Force $p (Join-Path $pub $top)
+}
+# USAGE.md tells users to run the capture scripts, so they ship too (review SC-C2).
 $capture = Join-Path $root 'tools\capture'
-if (Test-Path $capture) {
-    New-Item -ItemType Directory -Force (Join-Path $pub 'tools') | Out-Null
-    Copy-Item -Recurse -Force $capture (Join-Path $pub 'tools\capture')
-    Write-Host "  bundled tools/capture/ into the release" -ForegroundColor DarkGray
-}
+if (-not (Test-Path $capture)) { throw "tools\capture missing - USAGE.md tells users to run it" }
+New-Item -ItemType Directory -Force (Join-Path $pub 'tools') | Out-Null
+Copy-Item -Recurse -Force $capture (Join-Path $pub 'tools\capture')
+Write-Host "  bundled README.md, LICENSE, tools/capture/ into the release" -ForegroundColor DarkGray
 
 # --- 5. zip (only reached AFTER push is confirmed) ---
 if (-not $Output) { $Output = Join-Path $root 'dist' }
@@ -103,8 +111,14 @@ $zip = Join-Path $Output "codecarver-$Version.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 # Not Compress-Archive: on Windows PowerShell 5.1 it writes backslash entry names, which several Linux
 # extractors turn into flat files (the native tree-sitter libraries are then not found).
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.IO.Compression.ZipFile]::CreateFromDirectory($pub, $zip)
+# .NET Framework before 4.6.1 (or the UseBackslash compat switch) still writes '\' here: verify, never assume.
+$za = [System.IO.Compression.ZipFile]::OpenRead($zip)
+try { $bad = @($za.Entries | Where-Object { $_.FullName.Contains('\') } | Select-Object -First 3 | ForEach-Object { $_.FullName }) }
+finally { $za.Dispose() }
+if ($bad.Count -gt 0) { Remove-Item -Force $zip; throw "zip has backslash entry names (e.g. $($bad -join ', ')) - not packaging" }
 Remove-Item -Recurse -Force $pub -ErrorAction SilentlyContinue
 
 Write-Host "`nPACKAGED: $zip" -ForegroundColor Green

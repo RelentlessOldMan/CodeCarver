@@ -39,7 +39,7 @@ that compiled before but fails after is a carve bug (dropped symbol, shattered c
 
 ```powershell
 ./fuzz.ps1 -Repo .corpus/<name> -Roots "sym1,sym2" [-Lang c|cpp] [-Inc dir1,dir2]
-# exit code = number of carve bugs (0 = CLEAN; 2 = repo needs its own build config, not fuzzable here)
+# exit code: 0 = CLEAN, 1 = carve bugs found, 2 = repo needs its own build config (not fuzzable here), 3 = the carve itself failed
 ```
 
 ### Invocations that replay each finding

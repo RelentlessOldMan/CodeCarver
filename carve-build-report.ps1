@@ -16,9 +16,10 @@ param([switch]$NoArm, [string[]]$Only)
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-$dll = Join-Path $root 'src\CodeCarver.Cli\bin\Debug\net8.0\codecarver.dll'
-if (-not (Test-Path $dll)) { $dll = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\codecarver.dll' }
-if (-not (Test-Path $dll)) { Write-Host 'CLI not built. Run: dotnet build -c Debug'; exit 1 }
+# Exit: 0 = every carved tree built; 1 = a carve or build failed; 2 = nothing was built (no repo present, or no
+# compiler to judge with) - never a silent success (review SC-D17).
+. (Join-Path $root 'tools\CarverScriptLib.ps1')
+try { $dll = Resolve-CarverDll -RepoRoot $root } catch { Write-Host "$_" -ForegroundColor Red; exit 1 }
 
 $gcc    = Join-Path $root '.toolchains\w64devkit\bin\gcc.exe'
 $arm    = Join-Path $root '.toolchains\xpack-arm-none-eabi-gcc-13.3.1-1.1\bin\arm-none-eabi-gcc.exe'
@@ -69,18 +70,17 @@ foreach ($r in $repos) {
   if (-not (Test-Path $dir)) { Write-Host ("skip {0,-14} (not in .corpus)" -f $r.name); continue }
   Write-Host ("carving {0} ..." -f $r.name) -NoNewline
   $out = Join-Path $env:TEMP ("ccbr-" + $r.name.Replace('\','_') + "-" + [guid]::NewGuid().ToString('N').Substring(0,8))
-  $eps = '["' + (($r.roots -split ',') -join '","') + '"]'
-  $exc = if ($r.exclude) { '["' + (($r.exclude -split ',') -join '","') + '"]' } else { '[]' }
   $cfg = "$out.toml"
-  @"
-outputDirectory = "$($out -replace '\\','/')"
-[common]
-entryPoints = $eps
-languages = ["c"]
-excludeDirectories = $exc
-carveSourceFileContents = true
-"@ | Set-Content -Encoding utf8 $cfg
+  @(
+    "outputDirectory = $(ConvertTo-TomlPath $out)"
+    '[common]'
+    "entryPoints = $(ConvertTo-TomlArray $r.roots)"
+    'languages = ["c"]'
+    "excludeDirectories = $(ConvertTo-TomlArray $r.exclude)"
+    'carveSourceFileContents = true'
+  ) -join "`n" | Set-Content -Encoding utf8 $cfg
   $o = (& dotnet $dll carve $dir --config $cfg 2>&1 | Out-String)
+  $carveExit = $LASTEXITCODE
   Remove-Item $cfg -Force -ErrorAction SilentlyContinue
 
   $orig = 0; $carved = 0; $pct = 0; $files = 0
@@ -90,7 +90,8 @@ carveSourceFileContents = true
     }
     if ($line -match 'emitted\s*:\s*(\d+)\s*files') { $files = [int]$matches[1] }
   }
-  $builds = if ($haveGcc) { if (Compile-Carved (Join-Path $out 'carved')) { 'YES' } else { 'NO' } } else { 'no-gcc' }
+  $builds = if ($carveExit -ne 0) { "CARVE-FAIL($carveExit)" }
+            elseif ($haveGcc) { if (Compile-Carved (Join-Path $out 'carved')) { 'YES' } else { 'NO' } } else { 'no-gcc' }
   Write-Host ("  {0}  ({1}% smaller, {2} files, builds={3})" -f $r.name, $pct, $files, $builds)
   $rows += [pscustomobject]@{ Repo=$r.name; Lang='c'; Orig=$orig; Carved=$carved; Pct=$pct; Files=$files; Builds=$builds }
   Remove-Item -Recurse -Force $out -ErrorAction SilentlyContinue
@@ -103,14 +104,15 @@ if (-not $NoArm -and $haveArm -and (-not $Only -or $Only -contains 'cortexm')) {
     Write-Host 'carving cortexm-firmware (ARM) ...' -NoNewline
     $out = Join-Path $env:TEMP ("ccbr-arm-" + [guid]::NewGuid().ToString('N').Substring(0,8))
     $cfg = "$out.toml"
-    @"
-outputDirectory = "$($out -replace '\\','/')"
-[common]
-entryPoints = ["Reset_Handler","main"]
-languages = ["c"]
-carveSourceFileContents = true
-"@ | Set-Content -Encoding utf8 $cfg
+    @(
+      "outputDirectory = $(ConvertTo-TomlPath $out)"
+      '[common]'
+      'entryPoints = ["Reset_Handler","main"]'
+      'languages = ["c"]'
+      'carveSourceFileContents = true'
+    ) -join "`n" | Set-Content -Encoding utf8 $cfg
     $o = (& dotnet $dll carve $fix --config $cfg 2>&1 | Out-String)
+    $carveExit = $LASTEXITCODE
     Remove-Item $cfg -Force -ErrorAction SilentlyContinue
     $orig = 0; $carved = 0; $pct = 0; $files = 0
     foreach ($line in ($o -split "`n")) {
@@ -118,12 +120,16 @@ carveSourceFileContents = true
       if ($line -match 'emitted\s*:\s*(\d+)\s*files') { $files = [int]$matches[1] }
     }
     $carvedDir = Join-Path $out 'carved'
-    $cfiles = @(Get-ChildItem $carvedDir -Filter *.c | ForEach-Object { $_.FullName })
-    $ld = (Get-ChildItem $carvedDir -Filter *.ld | Select-Object -First 1).FullName
     $elf = Join-Path $out 'firmware.elf'
-    $aa = @('-mcpu=cortex-m4','-mthumb','-nostartfiles','-ffunction-sections','-Wl,--gc-sections','-T',$ld,'-o',$elf) + $cfiles
-    & $arm @aa *> $null
-    $builds = if ($LASTEXITCODE -eq 0 -and (Test-Path $elf)) { 'YES(ELF)' } else { 'NO' }
+    if ($carveExit -ne 0 -or -not (Test-Path $carvedDir)) {
+      $builds = "CARVE-FAIL($carveExit)"
+    } else {
+      $cfiles = @(Get-ChildItem $carvedDir -Filter *.c | ForEach-Object { $_.FullName })
+      $ld = (Get-ChildItem $carvedDir -Filter *.ld | Select-Object -First 1).FullName
+      $aa = @('-mcpu=cortex-m4','-mthumb','-nostartfiles','-ffunction-sections','-Wl,--gc-sections','-T',$ld,'-o',$elf) + $cfiles
+      & $arm @aa *> $null
+      $builds = if ($LASTEXITCODE -eq 0 -and (Test-Path $elf)) { 'YES(ELF)' } else { 'NO' }
+    }
     Write-Host ("  cortexm-firmware  (links={0})" -f $builds)
     if ($builds -eq 'YES(ELF)' -and (Test-Path $armSz)) { & $armSz $elf }
     $rows += [pscustomobject]@{ Repo='cortexm-firmware'; Lang='c/arm'; Orig=$orig; Carved=$carved; Pct=$pct; Files=$files; Builds=$builds }
@@ -144,3 +150,7 @@ $totalOrig = ($rows | Measure-Object -Property Orig -Sum).Sum
 $totalCarved = ($rows | Measure-Object -Property Carved -Sum).Sum
 Write-Host ('-' * 78)
 Write-Host ("{0}/{1} carved trees build clean.  Total: {2:N0} B -> {3:N0} B" -f $built, $rows.Count, $totalOrig, $totalCarved)
+$failed = @($rows | Where-Object { $_.Builds -eq 'NO' -or $_.Builds -like 'CARVE-FAIL*' }).Count
+if ($failed -gt 0) { Write-Host "$failed carve/build failure(s)." -ForegroundColor Red; exit 1 }
+if ($built -eq 0) { Write-Host "NOTHING WAS BUILT (no repo present, or no compiler) - this is not a pass." -ForegroundColor Red; exit 2 }
+exit 0

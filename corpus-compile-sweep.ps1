@@ -6,12 +6,23 @@
 # hunts new bugs. Needs: dotnet build -c Release; WSL Ubuntu with gcc+g++; .corpus fetched.
 #
 #   ./corpus-compile-sweep.ps1            # sweep all configured repos present under .corpus
+#
+# Exit: 0 = every present repo compared and clean; 1 = regressions or a carve failed; 2 = nothing could be
+# compared (WSL/gcc missing, or no repo had a standalone-compilable baseline) - never a silent "0 regressions".
 $ErrorActionPreference = 'Continue'   # native stderr (carve warns) must not abort the sweep
 $root = $PSScriptRoot
-$cli  = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\codecarver.dll'
-if (-not (Test-Path $cli)) { throw "build the CLI first: dotnet build -c Release" }
+. (Join-Path $root 'tools\CarverScriptLib.ps1')
+$cli  = Resolve-CarverDll -RepoRoot $root
 function ToWsl([string]$p) { $f=[IO.Path]::GetFullPath($p); if ($f -notmatch '^([A-Za-z]):[\\/](.*)$'){throw "bad path $p"}; "/mnt/$($Matches[1].ToLower())/$($Matches[2] -replace '\\','/')" }
 $sh = ToWsl (Join-Path $root 'wsl-syntax-check.sh')
+
+# Preflight: without WSL + gcc/g++ every baseline is empty and the sweep would compare nothing.
+$probe = wsl -d Ubuntu -- bash -c 'command -v gcc >/dev/null && command -v g++ >/dev/null && echo TOOLCHAIN_OK' 2>&1
+if (-not (@($probe) | Where-Object { "$_".Trim() -eq 'TOOLCHAIN_OK' })) {
+    Write-Host "WSL Ubuntu with gcc + g++ is not available - nothing can be compared:" -ForegroundColor Red
+    @($probe) | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
+    exit 2
+}
 
 # repo | lang | roots | include dirs (rel) | inc string for syntax-check
 $cases = @(
@@ -39,7 +50,7 @@ $cases = @(
   @{ n='simdjson';     lang='cpp'; roots='parse,iterate,load,load_many';                         inc='singleheader' }
 )
 
-$totalBugs = 0; $tested = 0
+$totalBugs = 0; $tested = 0; $compared = 0; $carveFailed = 0
 foreach ($t in $cases) {
     $src = Join-Path $root ".corpus\$($t.n)"
     if (-not (Test-Path $src)) { Write-Host ("SKIP {0} (absent)" -f $t.n) -ForegroundColor DarkGray; continue }
@@ -47,24 +58,34 @@ foreach ($t in $cases) {
     Write-Host ("=== {0} ({1}) ===" -f $t.n, $t.lang) -ForegroundColor Cyan
     $srcW = ToWsl $src
     $base = wsl -d Ubuntu -- bash $sh $srcW $t.lang $t.inc
+    if ($LASTEXITCODE -ne 0) { Write-Host "  baseline syntax-check failed to run (exit $LASTEXITCODE)" -ForegroundColor Red; $carveFailed++; continue }
     $baseOK = @($base | Where-Object { $_ -like 'OK *' } | ForEach-Object { $_.Substring(3) })
-    if ($baseOK.Count -eq 0) { Write-Host "  (0 baseline compile standalone - needs build config; skipped)" -ForegroundColor DarkGray; continue }
+    if ($baseOK.Count -eq 0) { Write-Host "  (0 baseline compile standalone - needs build config; NOT compared)" -ForegroundColor Yellow; continue }
 
+    # The output dir is script-owned (.oracle-cpp is gitignored scratch). Delete it first so a crashed carve
+    # can never leave the PREVIOUS run's tree to be compiled and reported clean (review SC-D4).
     $outBase = Join-Path $root ".oracle-cpp\sweep-$($t.n)"
+    if (Test-Path $outBase) { Remove-Item -Recurse -Force $outBase }
     $cfg = "$outBase.toml"
-    @"
-outputDirectory = "$($outBase -replace '\\','/')"
-[common]
-entryPoints = ["$(($t.roots -split ',') -join '","')"]
-languages = ["$($t.lang)"]
-carveSourceFileContents = true
-"@ | Set-Content -Encoding utf8 $cfg
+    @(
+        "outputDirectory = $(ConvertTo-TomlPath $outBase)"
+        '[common]'
+        "entryPoints = $(ConvertTo-TomlArray $t.roots)"
+        "languages = $(ConvertTo-TomlArray $t.lang)"
+        'carveSourceFileContents = true'
+    ) -join "`n" | Set-Content -Encoding utf8 $cfg
     & dotnet $cli carve $src --config $cfg 2>&1 |
-        Select-String 'nodes|UNRESOLVED' | ForEach-Object { Write-Host "  $_" }
+        Select-String 'nodes|UNRESOLVED|error|fail' | ForEach-Object { Write-Host "  $_" }
+    $carveExit = $LASTEXITCODE
     Remove-Item $cfg -Force -ErrorAction SilentlyContinue
     $out = Join-Path $outBase 'carved'   # carved tree under <outputDirectory>/carved
+    if ($carveExit -ne 0 -or -not (Test-Path $out)) {
+        Write-Host "  !!! CARVE FAILED (exit $carveExit) - not compared" -ForegroundColor Red; $carveFailed++; continue
+    }
     $outW = ToWsl $out
     $carved = wsl -d Ubuntu -- bash $sh $outW $t.lang $t.inc
+    if ($LASTEXITCODE -ne 0) { Write-Host "  carved syntax-check failed to run (exit $LASTEXITCODE)" -ForegroundColor Red; $carveFailed++; continue }
+    $compared++
     $carvedOK = @{}; foreach ($l in ($carved | Where-Object { $_ -like 'OK *' })) { $carvedOK[$l.Substring(3)] = $true }
 
     $bugs = 0
@@ -79,5 +100,7 @@ carveSourceFileContents = true
     $totalBugs += $bugs
 }
 Write-Host ""
-Write-Host ("Swept $tested repo(s). Total carve regressions: $totalBugs") -ForegroundColor $(if ($totalBugs -eq 0) { 'Green' } else { 'Red' })
-if ($totalBugs -gt 0) { exit 1 }
+$ok = ($totalBugs -eq 0 -and $carveFailed -eq 0 -and $compared -gt 0)
+Write-Host ("Present: $tested repo(s); compared: $compared; carve/check failures: $carveFailed; carve regressions: $totalBugs") -ForegroundColor $(if ($ok) { 'Green' } else { 'Red' })
+if ($totalBugs -gt 0 -or $carveFailed -gt 0) { exit 1 }
+if ($compared -eq 0) { Write-Host "NOTHING WAS COMPARED - this is not a pass." -ForegroundColor Red; exit 2 }

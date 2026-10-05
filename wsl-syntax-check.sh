@@ -11,6 +11,8 @@ dir="$1"; lang="$2"; incs="${3:-}"
 [ -d "$dir" ] || { echo "no dir: $dir" >&2; exit 3; }
 cc=gcc; std=""; pat=( -name '*.c' )
 if [ "$lang" = cpp ]; then cc=g++; std="-std=c++17"; pat=( -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' ); fi
+# A missing compiler would make every file "not OK" and the caller would compare nothing: fail instead.
+command -v "$cc" >/dev/null 2>&1 || { echo "$cc not installed" >&2; exit 4; }
 
 incflags=""
 IFS=',' read -ra ID <<< "$incs"
@@ -19,7 +21,7 @@ incflags="$incflags -I$dir"
 
 cd "$dir" || exit 3
 # skip the usual non-buildable trees
-find . \( "${pat[@]}" \) 2>/dev/null | grep -viE '/(test|tests|example|examples|doc|docs|bench|fuzz|tool|tools|sample|samples)/' | while read -r f; do
+find . \( "${pat[@]}" \) 2>/dev/null | grep -viE '/(test|tests|example|examples|doc|docs|bench|fuzz|tool|tools|sample|samples)/' | while IFS= read -r f; do
     if $cc $std -fsyntax-only -w $incflags "$f" >/dev/null 2>&1; then
         echo "OK ${f#./}"
     fi

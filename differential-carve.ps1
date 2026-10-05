@@ -28,8 +28,8 @@ param(
     [int]$ParseTimeout = 0
 )
 $ErrorActionPreference = 'Stop'
-$cli = Join-Path $PSScriptRoot 'src\CodeCarver.Cli\bin\Release\net8.0\codecarver.dll'
-if (-not (Test-Path $cli)) { throw "build the CLI first: dotnet build -c Release  (missing $cli)" }
+. (Join-Path $PSScriptRoot 'tools\CarverScriptLib.ps1')
+$cli = Resolve-CarverDll -RepoRoot $PSScriptRoot
 if (-not $RepoB) { $RepoB = $RepoA; Write-Host "(determinism mode: carving $RepoA twice)" -ForegroundColor DarkGray }
 
 $work = Join-Path $env:TEMP ("cc-diff-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
@@ -42,25 +42,31 @@ function CarveTo([string]$repo, [string]$out) {
     # Everything goes in a per-call TOML config. The carved tree lands at <out>/carved, the manifest at
     # <out>/codecarver/manifest.json.
     $lines = @()
-    $lines += 'outputDirectory = "' + ($out -replace '\\','/') + '"'
+    $lines += 'outputDirectory = ' + (ConvertTo-TomlPath $out)
     $lines += '[common]'
-    $lines += 'entryPoints = ["' + (($Roots -split ',') -join '","') + '"]'
-    $lines += 'languages = ["' + $Lang + '"]'
-    if ($Exclude)      { $lines += 'excludeDirectories = ["' + (($Exclude -split ',') -join '","') + '"]' }
+    $lines += 'entryPoints = ' + (ConvertTo-TomlArray $Roots)
+    $lines += 'languages = ' + (ConvertTo-TomlArray $Lang)
+    if ($Exclude)      { $lines += 'excludeDirectories = ' + (ConvertTo-TomlArray $Exclude) }
     if ($Prune)        { $lines += 'carveSourceFileContents = true' }
     if ($PruneHeaders) { $lines += 'carveHeaderFileContents = true' }
     if ($BuildLog -or $Defines) {
         $lines += '[builds.main]'
-        if ($BuildLog) { $lines += 'buildLogs = ["' + ($BuildLog -replace '\\','/') + '"]' }
-        if ($Defines)  { $lines += 'defines = ["' + (($Defines -split ',') -join '","') + '"]' }
+        if ($BuildLog) { $lines += 'buildLogs = [' + (ConvertTo-TomlPath $BuildLog) + ']' }
+        if ($Defines)  { $lines += 'defines = ' + (ConvertTo-TomlArray $Defines) }
     }
     $lines += '[advanced]'; $lines += "parseTimeout = $ParseTimeout"   # 0 = disabled (isolate path from timing)
     $cfgPath = "$out.toml"
     ($lines -join "`n") | Set-Content -Encoding utf8 $cfgPath
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    & dotnet $cli carve $repo --config $cfgPath 2>&1 | Select-String 'nodes|files|size|verify|warn|world' | ForEach-Object { Write-Host "    $_" }
+    # stderr carries progress/warnings: under 'Stop', PowerShell 5.1 turns a native stderr line merged by
+    # 2>&1 into a terminating error even on exit 0 (review SC-D2). Continue for the call; gate on exit code.
+    $ErrorActionPreference = 'Continue'
+    & dotnet $cli carve $repo --config $cfgPath 2>&1 | Select-String 'nodes|files|size|verify|warn|world|error' | ForEach-Object { Write-Host "    $_" }
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
     $sw.Stop()
     Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
+    if ($code -ne 0) { throw "carve of $repo failed (exit $code)" }
     return $sw.Elapsed.TotalSeconds
 }
 
@@ -71,16 +77,27 @@ $tB = CarveTo $RepoB $oB
 Write-Host ("`nwall-clock:  A = {0:N1}s   B = {1:N1}s   (B/A = {2:N2}x)" -f $tA, $tB, ($tB / [Math]::Max($tA, 0.001)))
 
 # --- 1. manifest decisions (ignore the absolute `root` line) ---
-$linesA = (Get-Content $mA) | Where-Object { $_ -notmatch '^\s*"root":' }
-$linesB = (Get-Content $mB) | Where-Object { $_ -notmatch '^\s*"root":' }
-$mdiff = Compare-Object $linesA $linesB
+# ORDER matters (review SC-D8): Compare-Object treats the lines as a set, so a reordered keptFiles list -
+# exactly the nondeterminism this script exists to catch - compared equal. Hash the ordered text instead.
+if (-not (Test-Path $mA) -or -not (Test-Path $mB)) { throw "carve produced no manifest ($mA / $mB)" }
+$linesA = @((Get-Content $mA) | Where-Object { $_ -notmatch '^\s*"root":' })
+$linesB = @((Get-Content $mB) | Where-Object { $_ -notmatch '^\s*"root":' })
+function TextHash([string[]]$lines) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+    return ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes))) -replace '-', ''
+}
 $fail = 0
-if ($mdiff) {
-    Write-Host "`n!!! MANIFEST DECISIONS DIFFER (source location changed the carve) -- BUG:" -ForegroundColor Red
-    $mdiff | Select-Object -First 40 | ForEach-Object { "    {0} {1}" -f $_.SideIndicator, $_.InputObject }
+if ((TextHash $linesA) -ne (TextHash $linesB)) {
+    Write-Host "`n!!! MANIFEST DECISIONS DIFFER (source location or run order changed the carve) -- BUG:" -ForegroundColor Red
+    $n = [Math]::Max($linesA.Count, $linesB.Count); $shown = 0
+    for ($i = 0; $i -lt $n -and $shown -lt 20; $i++) {
+        $a = if ($i -lt $linesA.Count) { $linesA[$i] } else { '<end>' }
+        $b = if ($i -lt $linesB.Count) { $linesB[$i] } else { '<end>' }
+        if ($a -cne $b) { Write-Host ("    line {0}:`n      A: {1}`n      B: {2}" -f ($i + 1), $a, $b); $shown++ }
+    }
     $fail++
 } else {
-    Write-Host "`nOK: manifest decisions identical (roots, defines, stats, kept/dropped file sets)." -ForegroundColor Green
+    Write-Host "`nOK: manifest decisions identical, in the same order (roots, defines, stats, kept/dropped file lists)." -ForegroundColor Green
 }
 
 # --- 2. emitted trees byte-for-byte ---

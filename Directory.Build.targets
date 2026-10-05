@@ -1,0 +1,38 @@
+<Project>
+
+  <!-- Stamp the git commit into EVERY assembly (CLI, Core, Frontend, tests) so `carve version` / the carve summary /
+       the manifest report EXACTLY what was built - a pulled build can be cited by version, not just "some commit".
+       This lived in CodeCarver.Cli.csproj, so Core and Frontend were stamped 0.0+<sha> (review SC-E2).
+       .NET appends SourceRevisionId to AssemblyInformationalVersion as `<Version>+<sha>`. ContinueOnError so an
+       offline / no-git build still succeeds (version is then the project's own <Version>/<VersionPrefix>).
+       -dirty flags an uncommitted tree. -->
+  <Target Name="StampGitSha" BeforeTargets="GetAssemblyVersion;GenerateAssemblyInfo" Condition="'$(SourceRevisionId)' == ''">
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; rev-parse --short=9 HEAD"
+          ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitSha" />
+    </Exec>
+    <!-- Monotonic patch number = total commit count, so it increments on every commit/push (CodeCompass
+         style). Needs full history: a shallow CI clone would count 1 (CI sets fetch-depth: 0). -->
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; rev-list --count HEAD"
+          ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitCount" />
+    </Exec>
+    <!-- The untracked-files=no flag: only TRACKED modifications mean "dirty". A plain porcelain status also
+         lists untracked files (a scratch dir, build output), so it falsely stamped dirty on a clean
+         checkout (eval 3/5), and a marker that fires on nearly every tree gets ignored. -->
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; status --porcelain --untracked-files=no"
+          ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GitDirty" />
+    </Exec>
+    <PropertyGroup>
+      <!-- Only well-formed values: when git fails, ConsoleOutput holds its ERROR text, which must not become the
+           version ("1.0.fatal: ambiguous argument ..."; review SC-E1). -->
+      <_GitCountOk>$([System.Text.RegularExpressions.Regex]::IsMatch('$(_GitCount)', '^[0-9]+$'))</_GitCountOk>
+      <_GitShaOk>$([System.Text.RegularExpressions.Regex]::IsMatch('$(_GitSha)', '^[0-9a-f]{7,40}$'))</_GitShaOk>
+      <Version Condition="'$(_GitCountOk)' == 'True'">1.0.$(_GitCount)</Version>
+      <SourceRevisionId Condition="'$(_GitShaOk)' == 'True' and '$(_GitDirty)' == ''">$(_GitSha)</SourceRevisionId>
+      <SourceRevisionId Condition="'$(_GitShaOk)' == 'True' and '$(_GitDirty)' != ''">$(_GitSha)-dirty</SourceRevisionId>
+    </PropertyGroup>
+  </Target>
+
+</Project>

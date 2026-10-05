@@ -7,14 +7,19 @@ on:
   pull_request_target:
     types: [opened, reopened]
 
+# Least privilege: commenting on and closing a PR both need only pull-requests:write.
+# pull_request_target runs with the base repo's token, so the action is pinned by commit SHA and no PR
+# code is checked out or run.
 permissions:
+  contents: read
   pull-requests: write
 
 jobs:
   close:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/github-script@v7
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
           script: |
             await github.rest.issues.createComment({

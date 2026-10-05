@@ -5,12 +5,14 @@
 #
 #   ./cpp-oracle-sweep.ps1                # sweep all repos present under .corpus
 # Prereqs: dotnet build -c Release; WSL Ubuntu with g++ (sudo apt install -y g++); .corpus fetched.
+#
+# Exit: 0 = every present repo SOUND; 1 = a repo FAILED (or its carve failed); 2 = nothing was checked.
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$cli  = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\codecarver.dll'
+. (Join-Path $root 'tools\CarverScriptLib.ps1')
+$cli  = Resolve-CarverDll -RepoRoot $root
 $c    = Join-Path $root '.corpus'
 $o    = Join-Path $root '.oracle-cpp'
-if (-not (Test-Path $cli)) { throw "build the CLI first: dotnet build -c Release  (missing $cli)" }
 
 # Windows path -> WSL /mnt path, derived from $root so the sweep works from ANY clone location
 # (was hardcoded to /mnt/c/Playground/CodeCarver, which broke on any other checkout).
@@ -38,34 +40,45 @@ $cases = @(
 # NativeCommandError even on exit 0, aborting the sweep. Drop to 'Continue' for the loop; failures are
 # handled explicitly via the SOUND/FAILED check and the $fail counter.
 $ErrorActionPreference = 'Continue'
-$fail = 0
+$fail = 0; $checked = 0
 foreach ($t in $cases) {
     $inPath = Join-Path $c $t.in
     if (-not (Test-Path $inPath)) { Write-Host ("SKIP {0} (not under .corpus)" -f $t.n) -ForegroundColor DarkGray; continue }
     $outPath = Join-Path $o $t.n
     Write-Host ("=== {0} ===" -f $t.n) -ForegroundColor Cyan
+    # Script-owned scratch (.oracle-cpp is gitignored): delete first so a crashed carve can never leave the
+    # previous run's tree to be linked and reported SOUND (review SC-D4).
+    if (Test-Path $outPath) { Remove-Item -Recurse -Force $outPath }
     $tl = @()
-    $tl += 'outputDirectory = "' + ($outPath -replace '\\','/') + '"'
+    $tl += 'outputDirectory = ' + (ConvertTo-TomlPath $outPath)
     $tl += '[common]'
-    $tl += 'entryPoints = ["' + (($t.roots -split ',') -join '","') + '"]'
+    $tl += 'entryPoints = ' + (ConvertTo-TomlArray $t.roots)
     $tl += 'languages = ["cpp"]'
     $tl += 'carveSourceFileContents = true'
-    if ($t.cfg.ContainsKey('exclude'))      { $tl += 'excludeDirectories = ["' + ($t.cfg.exclude -join '","') + '"]' }
+    if ($t.cfg.ContainsKey('exclude'))      { $tl += 'excludeDirectories = ' + (ConvertTo-TomlArray $t.cfg.exclude) }
     if ($t.cfg.ContainsKey('pruneHeaders')) { $tl += 'carveHeaderFileContents = true' }
     $cfgPath = "$outPath.toml"
     ($tl -join "`n") | Set-Content -Encoding utf8 $cfgPath
     & dotnet $cli carve $inPath --config $cfgPath 2>&1 |
-        Select-String 'nodes|files|UNRESOLVED' | ForEach-Object { Write-Host "  $_" }
+        Select-String 'nodes|files|UNRESOLVED|error|fail' | ForEach-Object { Write-Host "  $_" }
+    $carveExit = $LASTEXITCODE
     Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
     # Carved tree is at <outPath>/carved now.
-    $env:INC = "-I$ow/$($t.n)/carved$($t.inc)"
-    if ($t.excl) { $env:EXCLUDE = $t.excl } else { Remove-Item Env:\EXCLUDE -ErrorAction SilentlyContinue }
-    $res = wsl -d Ubuntu -- bash -c "INC='$env:INC' EXCLUDE='$($t.excl)' bash $sh $ow/$($t.n)/carved $drv/$($t.drv)"
-    $line = ($res | Select-String 'SOUND|FAILED').Line
-    if ($line -match 'SOUND') { Write-Host "  $line" -ForegroundColor Green }
-    else { Write-Host "  $line" -ForegroundColor Red; $res | Select-Object -Last 12 | ForEach-Object { "    $_" }; $fail++ }
+    if ($carveExit -ne 0 -or -not (Test-Path (Join-Path $outPath 'carved'))) {
+        Write-Host "  !!! CARVE FAILED (exit $carveExit)" -ForegroundColor Red; $fail++; continue
+    }
+    # INC / EXCLUDE go to the oracle as environment for that one bash invocation (nothing is left in this
+    # process's environment). The values come from the table above; refuse a quote that would break out.
+    $inc = "-I$ow/$($t.n)/carved$($t.inc)"
+    foreach ($v in @($inc, $t.excl)) { if ("$v" -match "'") { throw "quote in oracle argument: $v" } }
+    $res = wsl -d Ubuntu -- bash -c "INC='$inc' EXCLUDE='$($t.excl)' bash '$sh' '$ow/$($t.n)/carved' '$drv/$($t.drv)'"
+    $oracleExit = $LASTEXITCODE
+    $checked++
+    $line = ($res | Select-String '^(SOUND|!!!)' | Select-Object -First 1).Line
+    if ($oracleExit -eq 0 -and $line -match '^SOUND') { Write-Host "  $line" -ForegroundColor Green }
+    else { Write-Host "  oracle exit $oracleExit : $line" -ForegroundColor Red; $res | Select-Object -Last 12 | ForEach-Object { "    $_" }; $fail++ }
 }
-Remove-Item Env:\INC,Env:\EXCLUDE -ErrorAction SilentlyContinue
 Write-Host ""
-if ($fail -eq 0) { Write-Host "ALL C++ CARVES SOUND under the g++ oracle." -ForegroundColor Green }
-else { Write-Host ("$fail repo(s) FAILED - dropped-symbol soundness bug(s).") -ForegroundColor Red; exit 1 }
+if ($fail -gt 0) { Write-Host ("$fail repo(s) FAILED - dropped-symbol soundness bug(s) or a failed carve.") -ForegroundColor Red; exit 1 }
+if ($checked -eq 0) { Write-Host "NOTHING WAS CHECKED (no corpus repo present) - this is not a pass." -ForegroundColor Red; exit 2 }
+Write-Host "ALL $checked C++ CARVES SOUND under the g++ oracle." -ForegroundColor Green

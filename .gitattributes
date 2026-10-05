@@ -1,6 +1,33 @@
-# Shell scripts must stay LF — CRLF breaks the `#!/usr/bin/env bash` shebang under WSL/Linux
+# Text files are stored with LF in the repository (every tracked text file already is, so this needs no
+# renormalisation commit); the working-tree line ending follows core.autocrlf unless pinned below.
+* text=auto
+
+# Shell scripts must stay LF - CRLF breaks the `#!/usr/bin/env bash` shebang under WSL/Linux
 # (`bad interpreter: .../bash^M`). These are run inside WSL by the linker-map / C++ link oracles.
 *.sh text eol=lf
 
-# The vendored CodeSpawner generator is a native-AOT binary — never apply text/EOL normalization.
+# PowerShell scripts check out as CRLF on every platform (Windows PowerShell 5.1 is the target; pwsh reads
+# either). They must also stay ASCII-only: 5.1 reads a BOM-less file as ANSI and misparses e.g. an em dash.
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+
+# Visual Studio solution files are CRLF by convention.
+*.sln text eol=crlf
+
+# Binaries: never apply text/EOL normalisation or text diffs.
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.dylib binary
+*.zip   binary
+*.7z    binary
+*.pml   binary
+*.bin   binary
+*.pyc   binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
+
+# The vendored CodeSpawner generator is a native-AOT binary (also covered by *.exe above).
 tools/codespawner/*.exe binary

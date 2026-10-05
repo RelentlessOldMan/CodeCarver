@@ -4,7 +4,7 @@
   carves it, and measures wall-clock, parse-phase time, parse throughput (MB/s of source), and peak
   working set. Prints a JSON result; optionally compares against a committed baseline with regression
   thresholds. This is the harness that PROVES a performance change (e.g. parallel parsing) helped and
-  that it didn't regress — before/after on the SAME machine (absolute numbers are machine-dependent).
+  that it didn't regress - before/after on the SAME machine (absolute numbers are machine-dependent).
 
 .DESCRIPTION
   The synthetic tree is fully deterministic (seeded by file/func counts), so repeated runs are
@@ -12,7 +12,7 @@
   shared header included by every TU (realistic include-closure fan-out).
 
   ComputeWarden: a DEFAULT-size run (a single carve of a few thousand files) is a single `carve` and is
-  NOT machine-saturating. A LARGE run (-Files in the tens of thousands) approaches a build sweep — gate
+  NOT machine-saturating. A LARGE run (-Files in the tens of thousands) approaches a build sweep - gate
   it via computewarden_acquire/release before starting, per this repo's CLAUDE.md.
 
 .PARAMETER Files        Number of .c translation units to generate (default 2000).
@@ -40,13 +40,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 
-# --- Locate the CLI dll (build Release if missing) --------------------------------------------------
-$dll = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\codecarver.dll'
-if (-not (Test-Path $dll)) {
-    Write-Host 'Building CodeCarver (Release)...'
-    dotnet build (Join-Path $root 'CodeCarver.sln') -c Release -v q | Out-Null
-}
-if (-not (Test-Path $dll)) { throw "CLI dll not found after build: $dll" }
+# --- Locate the CLI dll (incremental Release build + version check against HEAD) -------------------
+. (Join-Path $root 'tools\CarverScriptLib.ps1')
+$dll = Resolve-CarverDll -RepoRoot $root
 
 # --- Generate a deterministic synthetic tree -------------------------------------------------------
 $work = Join-Path ([IO.Path]::GetTempPath()) ("cc-perf-" + [Guid]::NewGuid().ToString('N'))
@@ -101,41 +97,46 @@ $psi.RedirectStandardOutput = $true
 $psi.RedirectStandardError = $true
 $psi.UseShellExecute = $false
 $psi.EnvironmentVariables['CODECARVER_TIMING'] = '1'
-# Windows PowerShell 5.1 runs on .NET Framework, which has no ProcessStartInfo.ArgumentList — use the
+# Windows PowerShell 5.1 runs on .NET Framework, which has no ProcessStartInfo.ArgumentList - use the
 # single Arguments string with quoted paths. Inputs go in a TOML config; analysisOnly => measure the carve
 # decision (parse/reachability) without the emit.
-$benchCfg = Join-Path $env:TEMP ("cc-perf-" + [Guid]::NewGuid().ToString('N').Substring(0,8) + ".toml")
-@"
-outputDirectory = "$(($benchCfg + '.out') -replace '\\','/')"
-analysisOnly = true
-[common]
-entryPoints = ["main"]
-languages = ["c"]
-"@ | Set-Content -Encoding utf8 $benchCfg
+# Config and its analysis output live INSIDE $work, so the single cleanup below removes them too (they
+# used to be left behind in %TEMP% on every run; review SC-D16).
+$benchCfg = Join-Path $work 'bench.toml'
+@(
+    "outputDirectory = $(ConvertTo-TomlPath (Join-Path $work 'out'))"
+    'analysisOnly = true'
+    '[common]'
+    'entryPoints = ["main"]'
+    'languages = ["c"]'
+) -join "`n" | Set-Content -Encoding utf8 $benchCfg
 $psi.Arguments = '"{0}" carve "{1}" --config "{2}"' -f $dll, $src, $benchCfg
 
-$sw = [Diagnostics.Stopwatch]::StartNew()
-$proc = [Diagnostics.Process]::Start($psi)
-# Read the streams async so we can poll peak memory without deadlocking on a full pipe. PeakWorkingSet64
-# is monotonic and can't be read once the process has exited, so sample it while running and keep the max.
-$outTask = $proc.StandardOutput.ReadToEndAsync()
-$errTask = $proc.StandardError.ReadToEndAsync()
-$peakBytes = [int64]0
-while (-not $proc.HasExited) {
-    try { $proc.Refresh(); if ($proc.PeakWorkingSet64 -gt $peakBytes) { $peakBytes = $proc.PeakWorkingSet64 } } catch { }
-    Start-Sleep -Milliseconds 50
-}
-$proc.WaitForExit()
-$sw.Stop()
-$stdout = $outTask.Result
-$stderr = $errTask.Result
-$peakMB = [Math]::Round($peakBytes / 1MB, 1)
-$wallSec = [Math]::Round($sw.Elapsed.TotalSeconds, 2)
+try {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $proc = [Diagnostics.Process]::Start($psi)
+    # Read the streams async so we can poll peak memory without deadlocking on a full pipe. PeakWorkingSet64
+    # is monotonic and can't be read once the process has exited, so sample it while running and keep the max.
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    $peakBytes = [int64]0
+    while (-not $proc.HasExited) {
+        try { $proc.Refresh(); if ($proc.PeakWorkingSet64 -gt $peakBytes) { $peakBytes = $proc.PeakWorkingSet64 } } catch { }
+        Start-Sleep -Milliseconds 50
+    }
+    $proc.WaitForExit()
+    $sw.Stop()
+    $stdout = $outTask.Result
+    $stderr = $errTask.Result
+    $peakMB = [Math]::Round($peakBytes / 1MB, 1)
+    $wallSec = [Math]::Round($sw.Elapsed.TotalSeconds, 2)
 
-if ($proc.ExitCode -ne 0) {
-    Write-Host $stdout; Write-Host $stderr
+    if ($proc.ExitCode -ne 0) {
+        Write-Host $stdout; Write-Host $stderr
+        throw "carve failed (exit $($proc.ExitCode))"
+    }
+} finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
-    throw "carve failed (exit $($proc.ExitCode))"
 }
 
 # Parse-phase ms from the CODECARVER_TIMING 'build-graph' line: "  timing  : build-graph     12345 ms"
@@ -144,8 +145,6 @@ $m = [Regex]::Match($stderr, 'build-graph\s+(\d+)\s+ms')
 if ($m.Success) { $parseMs = [int]$m.Groups[1].Value }
 $parseSec = if ($parseMs -gt 0) { [Math]::Round($parseMs / 1000.0, 2) } else { $wallSec }
 $throughput = if ($parseSec -gt 0) { [Math]::Round($srcMB / $parseSec, 2) } else { 0 }
-
-Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 
 $result = [ordered]@{
     files          = $Files + 1

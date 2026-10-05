@@ -1,7 +1,16 @@
-﻿CodeSpawner generator vendored into this repo.
+CodeSpawner generator vendored into this repo.
 
-generatorVersion : 1.0.9
+generatorVersion : 1.0.9            (`codespawner version` prints 1.0.9; the manifest's _meta.generatorVersion)
+peProductVersion : 1.0.0+d9402bf99f5899e86ad4c0a8a26c5979c660fc00
+                   (the PE version resource still carries the csproj default 1.0.0; the +<sha> suffix is the
+                   source commit. The 1.0.0 is a CodeSpawner build-stamp gap, not a different binary.)
 manifestVersion  : 1
-vendoredFrom     : C:\Playground\CodeSpawner
-note             : Vendored, not a submodule. To bump: copy the published exe from vendoredFrom and update this file.
+sourceRepo       : https://github.com/RelentlessOldMan/CodeSpawner
+sourceCommit     : d9402bf99f5899e86ad4c0a8a26c5979c660fc00  ("Release v1.0.9", 2026-09-30)
+sha256           : 3c0036210f239371d5d114036c0501b347914b4d4d7841ea23e1679a40368f19  (codespawner.exe, 2924032 bytes)
+signed           : no (Authenticode: NotSigned) - verify the sha256 above before running a re-vendored copy
+licence          : MIT (Copyright (c) 2026 RelentlessOldMan), per LICENSE in the source repo at that commit
+vendoredFrom     : a local CodeSpawner checkout (published release build)
+note             : Vendored, not a submodule. To bump: copy the published exe, then update generatorVersion,
+                   peProductVersion, sourceCommit and sha256 here (Get-FileHash -Algorithm SHA256).
                    Consumers MUST assert _meta.manifestVersion == 1 before trusting a manifest.
