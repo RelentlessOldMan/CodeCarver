@@ -16,7 +16,8 @@ public sealed class ResolvedCarve
     public string OutputDirectory = "";
     public bool AnalysisOnly;
     public List<string> BuildLogs = new();
-    public List<string> CompilerNames = new();    // extra driver names for text build logs
+    public List<string> CompilerNames = new();
+    public bool DropUnobservedCmm;                  // every selected run with a file trace opted in (D-C)    // extra driver names for text build logs
     public List<string> Compilers = new();        // from each selected build that named one
     public List<string> Defines = new();
     public List<string> BuildTraceFiles = new();
@@ -106,6 +107,8 @@ public static class CarveResolver
             if (!string.IsNullOrWhiteSpace(bs.Compiler)) r.Compilers.Add(bs.Compiler!);
             r.CompilerNames.AddRange(bs.CompilerNames);
         }
+        var traced = runNames.Where(rn => cfg.Runs.TryGetValue(rn, out var x) && x.RunTraceFiles.Count > 0).ToList();
+        r.DropUnobservedCmm = traced.Count > 0 && traced.All(rn => cfg.Runs[rn].DropUnobservedCmm);
         foreach (var rn in runNames)
         {
             if (!cfg.Runs.TryGetValue(rn, out var rs)) continue;

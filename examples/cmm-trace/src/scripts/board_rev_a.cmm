@@ -1,5 +1,4 @@
-; board_rev_a.cmm — one of the board variants init.cmm picks via `DO &board`. Because that dispatch is
-; dynamic, the carve can't prove this script is needed: it's dropped, but the run output WARNS about the
-; unresolved `DO &board` so you can widen the trace or forceKeepFiles it.
+; board_rev_a.cmm — a board variant only debug_dump.cmm can reach (through its dynamic `DO &board`).
+; No run opened it and no kept script DOs it, so it is dropped.
 RevA:
   RETURN

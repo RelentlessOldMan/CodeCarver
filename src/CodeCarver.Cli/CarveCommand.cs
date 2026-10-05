@@ -1153,10 +1153,15 @@ public static class CarveCommand
                 var observedCmm = observedRel.Where(r => r.EndsWith(".cmm", StringComparison.OrdinalIgnoreCase))
                     .Concat(forcedRel.Where(r => r.EndsWith(".cmm", StringComparison.OrdinalIgnoreCase)))
                     .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-                var cc = CmmTraceClosure.Compute(allCmm, observedCmm, rel => File.ReadAllText(relToFull[rel]), maxParseBytes);
+                var cc = CmmTraceClosure.Compute(allCmm, observedCmm, rel => File.ReadAllText(relToFull[rel]), maxParseBytes,
+                                                 cv.DropUnobservedCmm);
                 cmmDropped = cc.Dropped.ToList();
+                var unobserved = cc.Total - cc.ObservedSeeds - cc.ClosureAdded;
                 if (cc.ObservedSeeds == 0)
                     @out.WriteLine($"  cmm     : {allCmm.Count} .cmm kept whole — run trace opened none, can't tighten without an observed seed");
+                else if (!cv.DropUnobservedCmm)
+                    @out.WriteLine($"  cmm     : {cc.Total} script(s) kept; {cc.ObservedSeeds} observed + {cc.ClosureAdded} via DO/GOSUB closure, "
+                        + $"{unobserved} neither (kept: one run is one scenario — set [runs.X] dropUnobservedCmm = true to drop them)");
                 else
                     @out.WriteLine($"  cmm     : {cc.Kept.Count}/{cc.Total} script(s) kept ({cc.ObservedSeeds} observed + {cc.ClosureAdded} via DO/GOSUB closure), {cc.Dropped.Count} dropped"
                         + (cc.OversizedKeptWhole > 0 ? $"; {cc.OversizedKeptWhole} oversized kept-whole" : ""));

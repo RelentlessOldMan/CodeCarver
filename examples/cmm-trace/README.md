@@ -3,7 +3,8 @@
 A real firmware tree carries hundreds or thousands of TRACE32 PRACTICE (`.cmm`) scripts — flash sequences,
 board bring-up, test harnesses. They're **orchestration, not linked code**, so CodeCarver keeps them as
 infrastructure. But a given image's run only ever touches a few of them. This example shows how a **run
-trace** lets CodeCarver keep just the scripts that run (plus everything they `DO`), and drop the rest.
+trace** lets CodeCarver keep just the scripts that run (plus everything they `DO`), and — when you opt in
+with `dropUnobservedCmm = true` — drop the rest.
 
 Both the input (`src/`) and the carved result (`carved/`) are checked in, and a test regenerates and
 byte-diffs them so they can never drift from the tool.
@@ -14,11 +15,11 @@ src/
   Makefile
   scripts/
     flash.cmm       the flash sequence the run executes  (DO init; GOSUB Program -> DO write_image)
-    init.cmm        DO common; DO &board   (the &board dispatch is dynamic)
+    init.cmm        DO common
     write_image.cmm DO common
     common.cmm      shared leaf
-    debug_dump.cmm  a maintenance script no run touches
-    board_rev_a.cmm a board variant, selected only via init.cmm's dynamic `DO &board`
+    debug_dump.cmm  a maintenance script no run touches; it does a dynamic `DO &board`
+    board_rev_a.cmm a board variant, reachable only through debug_dump.cmm's dynamic `DO &board`
 ```
 
 ## The input
@@ -37,7 +38,6 @@ carve src --config carve.toml
 nodes   : 4/6 kept, 2 carved           (the C: main + driver kept, never_used dropped)
 files   : 2/3 kept, 1 dropped           dead.c
 cmm     : 4/6 script(s) kept (1 observed + 3 via DO/GOSUB closure), 2 dropped
-warn    : cmm scripts/init.cmm: `DO &board` uses a variable path (dynamic dispatch) — unresolved …
 verify  : OK
 ```
 
@@ -48,13 +48,16 @@ What happened, visible in [`carved/`](carved):
   `flash → init` (`DO init`), `flash.Program → write_image` (a `DO` *inside* a subroutine still counts — the
   closure is file-level), and both `init` and `write_image` `DO common`.
 - **`debug_dump.cmm` dropped** — nothing `DO`s it and no run opened it.
-- **`board_rev_a.cmm` dropped, but the run WARNS** — it's reachable only through `init.cmm`'s `DO &board`,
-  a runtime-chosen path CodeCarver can't resolve statically. Rather than silently drop a maybe-needed script,
-  it flags the unresolved dynamic `DO` so you can widen the trace (run the other board) or `forceKeepFiles` it.
+- **`board_rev_a.cmm` dropped** — only `debug_dump.cmm`'s dynamic `DO &board` could reach it, and that script
+  is itself dropped.
+- **The dynamic-`DO` rule:** had a *kept* script (say `init.cmm`) contained `DO &board`, CodeCarver could not
+  know which scripts it runs, so it would drop **no** `.cmm` at all and say why.
 - **`dead.c` dropped** — ordinary C dead-code removal, alongside the `.cmm` tightening, in one carve.
 
-With **no** run trace, every `.cmm` is kept (CodeCarver can't prove which run — the sound default). The trace
-is what turns "keep all the scripts" into "keep the ones this image needs."
+With **no** run trace, every `.cmm` is kept (CodeCarver can't prove which run — the sound default). With a
+trace but **without** `dropUnobservedCmm = true`, every `.cmm` is still kept and the run reports how many the
+trace and its closure account for: one run is one scenario, and a script another flash mode or menu uses would
+otherwise be lost. The opt-in is what turns "keep all the scripts" into "keep the ones this image needs."
 
 ## Try it
 
@@ -63,4 +66,4 @@ is what turns "keep all the scripts" into "keep the ones this image needs."
 ```
 
 Then compare `out/carved/scripts/` (what the trace proved you need) with `src/scripts/` (everything). The
-`.cmm` keep/drop decision, with the dynamic-`DO` warning, is in `out/codecarver/report.txt`.
+dropped scripts are listed in `out/codecarver/manifest.json` under `droppedCmm`.

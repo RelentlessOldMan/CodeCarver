@@ -23,32 +23,39 @@ public sealed class CmmFrontEnd : ICarveFrontEnd
     private static readonly Regex SubroutineDef = new(@"^\s*SUBROUTINE\s+([A-Za-z_][A-Za-z0-9_]*)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex Gosub = new(@"\bGOSUB\s+([A-Za-z_][A-Za-z0-9_]*)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex Goto = new(@"\bGOTO\s+([A-Za-z_][A-Za-z0-9_]*)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex DoCmd = new(@"\bDO\s+(\S+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DoCmd = new(@"\bDO\s+(""[^""]*""|\S+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private readonly List<string> _warnings = new();
     /// <inheritdoc/>
     public IReadOnlyList<string> Warnings => _warnings;
 
-    // .cmm carving is file-level over PRACTICE scripts (not the huge-firmware case), so the streaming overload
-    // just materializes (reads each path once) and delegates to the tuple form.
-    public CodeGraph BuildGraph(IReadOnlyList<string> paths, Func<string, string> read,
-                                MacroTable? defines = null, bool closedWorldDefines = false)
-        => BuildGraph(paths.Select(p => (p, read(p))), defines, closedWorldDefines);
-
     public CodeGraph BuildGraph(IEnumerable<(string Path, string Text)> files,
+                                MacroTable? defines = null, bool closedWorldDefines = false)
+    {
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        var order = new List<string>();
+        foreach (var (p, t) in files) { if (map.TryAdd(p, t)) order.Add(p); }
+        return BuildGraph(order, p => map[p], defines, closedWorldDefines);
+    }
+
+    // Streaming: each script is read, scanned and released before the next, so a tree of ~1,600 scripts and
+    // ~12 GB never has more than one script's text resident (review RB1).
+    public CodeGraph BuildGraph(IReadOnlyList<string> paths, Func<string, string> read,
                                 MacroTable? defines = null, bool closedWorldDefines = false)
     {
         _warnings.Clear();
         var graph = new CodeGraph();
-        var inputs = files.ToList();
+        var inputs = paths.Distinct(StringComparer.Ordinal).ToList();
 
         var fileNodeByPath = new Dictionary<string, NodeId>(StringComparer.Ordinal);
         // Basename → all files with that stem. DO resolves by basename, so duplicate stems are AMBIGUOUS
         // (Finding B: silently binding to one wrong file). Keep the list to warn instead of guessing.
         var filesByStem = new Dictionary<string, List<NodeId>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var (path, _) in inputs)
+        var fileByRel = new Dictionary<string, NodeId>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in inputs)
         {
             var fn = graph.GetOrAddNode(NodeKind.File, path);
+            fileByRel[path.Replace('\\', '/')] = fn;
             fileNodeByPath[path] = fn;
             if (!filesByStem.TryGetValue(Stem(path), out var list))
                 filesByStem[Stem(path)] = list = new List<NodeId>();
@@ -59,9 +66,12 @@ public sealed class CmmFrontEnd : ICarveFrontEnd
         var pendingCalls = new List<(NodeId From, string Name)>();          // GOSUB/GOTO
         var pendingIncludes = new List<(NodeId From, string FromPath, string RawArg)>(); // DO
 
-        foreach (var (path, text) in inputs)
+        foreach (var path in inputs)
+        {
+            var text = read(path);
             if (text.Length > 0) // oversized/empty file: File node already registered; nothing to parse
                 ProcessFile(graph, path, text, fileNodeByPath[path], subsByName, pendingCalls, pendingIncludes);
+        }
 
         foreach (var (from, name) in pendingCalls)
             if (subsByName.TryGetValue(name, out var targets))
@@ -74,22 +84,38 @@ public sealed class CmmFrontEnd : ICarveFrontEnd
         // trees — one file `DO std_utils` ~13x), and N copies of the same line is noise, not signal.
         var warned = new HashSet<string>(StringComparer.Ordinal);
         void Warn(string m) { if (warned.Add(m)) _warnings.Add(m); }
-        foreach (var (from, fromPath, rawArg) in pendingIncludes)
+        foreach (var (from, fromPath, rawArg0) in pendingIncludes)
         {
+            var rawArg = rawArg0.Trim('"');
             if (rawArg.Contains('&'))
             {
                 Warn($"{fromPath}: `DO {rawArg}` uses a variable path (dynamic dispatch) — unresolved; scripts reached only this way may be wrongly dropped (prefer file-level carve here)");
                 continue;
             }
-            var stem = Stem(rawArg);
-            if (!filesByStem.TryGetValue(stem, out var targets) || targets.Count == 0)
+            // Resolve as a PATH first — beside the calling script, then from the carve root — and only then by
+            // basename, binding to EVERY match (review CM1: binding the first match dropped the right script).
+            var arg = rawArg.Replace('\\', '/');
+            if (!arg.EndsWith(".cmm", StringComparison.OrdinalIgnoreCase) && Path.GetExtension(arg).Length == 0) arg += ".cmm";
+            var fromDir = Path.GetDirectoryName(fromPath.Replace('\\', '/'))?.Replace('\\', '/') ?? "";
+            NodeId? exact = null;
+            foreach (var cand in new[] { NormalizeRel(fromDir.Length == 0 ? arg : fromDir + "/" + arg), NormalizeRel(arg) })
+                if (cand is not null && fileByRel.TryGetValue(cand, out var hit)) { exact = hit; break; }
+            List<NodeId> targets;
+            if (exact is { } e) targets = new List<NodeId> { e };
+            else
             {
-                Warn($"{fromPath}: `DO {rawArg}` — no '{stem}.cmm' among the carved inputs; target unresolved (outside the carve root?)");
-                continue;
+                var stem = Stem(rawArg);
+                if (!filesByStem.TryGetValue(stem, out var byStem) || byStem.Count == 0)
+                {
+                    Warn($"{fromPath}: `DO {rawArg}` — no '{stem}.cmm' among the carved inputs; target unresolved (outside the carve root?)");
+                    continue;
+                }
+                targets = byStem;
+                if (targets.Count > 1)
+                    Warn($"{fromPath}: `DO {rawArg}` — ambiguous basename '{stem}' matches {targets.Count} files; bound to all of them");
             }
-            if (targets.Count > 1)
-                Warn($"{fromPath}: `DO {rawArg}` — ambiguous basename '{stem}' matches {targets.Count} files; bound to the first");
-            if (!targets[0].Equals(from)) graph.AddEdge(from, targets[0], EdgeKind.Includes);
+            foreach (var t in targets)
+                if (!t.Equals(from)) graph.AddEdge(from, t, EdgeKind.Includes);
         }
 
         return graph;
@@ -136,6 +162,19 @@ public sealed class CmmFrontEnd : ICarveFrontEnd
             foreach (Match g in Goto.Matches(line)) pendingCalls.Add((from, g.Groups[1].Value));
             foreach (Match d in DoCmd.Matches(line)) pendingIncludes.Add((from, path, d.Groups[1].Value));
         }
+    }
+
+    /// <summary>"a/./b/../c.cmm" → "a/c.cmm"; null when it climbs above the root.</summary>
+    private static string? NormalizeRel(string rel)
+    {
+        var parts = new List<string>();
+        foreach (var seg in rel.Split('/'))
+        {
+            if (seg.Length == 0 || seg == ".") continue;
+            if (seg == "..") { if (parts.Count == 0) return null; parts.RemoveAt(parts.Count - 1); continue; }
+            parts.Add(seg);
+        }
+        return string.Join('/', parts);
     }
 
     /// <summary>The innermost subroutine whose span contains the line, or null for top-level code.</summary>

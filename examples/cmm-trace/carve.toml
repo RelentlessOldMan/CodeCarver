@@ -1,8 +1,8 @@
 # Worked example: a C firmware whose TRACE32 .cmm scripts are tightened by a RUN trace.
 #   carve src --config carve.toml
 # The run trace (inputs/run.trace) records that the flash sequence opened scripts/flash.cmm. CodeCarver
-# seeds the DO/GOSUB closure from that script and keeps only what it (transitively) reaches — dropping the
-# scripts no run needs. See README.md for the before/after.
+# seeds the DO/GOSUB closure from that script and keeps what it (transitively) reaches; with dropUnobservedCmm
+# it drops the rest. See README.md for the before/after.
 
 outputDirectory = "out"
 
@@ -13,3 +13,6 @@ languages   = ["c"]           # .cmm is NOT a language here — it's infrastruct
 [runs.smoke]
 # Paths in a trace resolve against the carve root (src/), so this is "src/scripts/flash.cmm was opened".
 runTraceFiles = ["inputs/run.trace"]
+# Opt in to DROPPING scripts the run neither opened nor reaches by DO/GOSUB. Without it they are kept (one run is
+# one scenario). Even with it, nothing is dropped while a kept script uses a dynamic `DO &var`.
+dropUnobservedCmm = true

@@ -46,6 +46,7 @@ public sealed class RunSection
 {
     public List<string> RunTraceFiles = new();
     public List<string> RunTraceLogs = new();
+    public bool DropUnobservedCmm;
 }
 
 public sealed class StageSection
@@ -67,7 +68,7 @@ public static class ConfigLoader
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
     private static readonly string[] BuildKeys = { "buildLogs", "compiler", "compilerNames", "defines", "buildTraceFiles" };
-    private static readonly string[] RunKeys = { "runTraceFiles", "runTraceLogs" };
+    private static readonly string[] RunKeys = { "runTraceFiles", "runTraceLogs", "dropUnobservedCmm" };
     private static readonly string[] StageKeys = { "carveSourceFileContents", "carveHeaderFileContents" };
     private static readonly string[] UseKeys = { "builds", "runs" };
 
@@ -138,6 +139,7 @@ public static class ConfigLoader
             {
                 RunTraceFiles = GetStringList(t, "runTraceFiles", $"[runs.{name}]", ctx),
                 RunTraceLogs = GetStringList(t, "runTraceLogs", $"[runs.{name}]", ctx),
+                DropUnobservedCmm = GetBool(t, "dropUnobservedCmm", $"[runs.{name}]", ctx) ?? false,
             };
         }
 
@@ -223,7 +225,9 @@ public static class ConfigLoader
         buildTraceFiles = []             # optional: files opened while BUILDING (ProcMon/strace capture)
 
         # ===== runs (what a real execution actually touched) — all OPTIONAL =====
-        # One [runs.NAME] per captured scenario. Tightens + audits; never drops what it didn't see.
+        # One [runs.NAME] per captured scenario. Tightens + audits: observed files are kept and never auto-excluded.
+        # Unobserved .cmm scripts are only DROPPED with dropUnobservedCmm = true (and never while a kept script
+        # uses a dynamic DO &var) — one run is one scenario.
         # [runs.smoke]
         # runTraceFiles = ["flash.csv"]  # files opened while RUNNING/flashing; catches the loader/.cmm/data layer
         # runTraceLogs  = ["run.log"]    # functions that actually ran (one name per line, or "name file:line")

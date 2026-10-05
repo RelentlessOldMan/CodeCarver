@@ -294,7 +294,7 @@ public sealed class CarveTomlRunTests
         try
         {
             var cfg = Config(work, outDir,
-                $"[common]\nentryPoints = [\"main\"]\n[runs.smoke]\nrunTraceFiles = [\"{Fwd(trace)}\"]\n");
+                $"[common]\nentryPoints = [\"main\"]\n[runs.smoke]\nrunTraceFiles = [\"{Fwd(trace)}\"]\ndropUnobservedCmm = true\n");
             var (code, o, _) = Run("carve", src, "--config", cfg);
             Assert.Equal(0, code);
 
@@ -310,6 +310,53 @@ public sealed class CarveTomlRunTests
 
             var manifest = File.ReadAllText(Path.Combine(outDir, "codecarver", "manifest.json"));
             Assert.Contains("scripts/orphan.cmm", manifest.Replace("\\/", "/"));       // recorded as droppedCmm
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Carve_RunTrace_WithoutOptIn_KeepsUnobservedCmm()
+    {
+        // Owner decision D-C: one run is one scenario. Without dropUnobservedCmm nothing is dropped; the count is reported.
+        var (work, src, outDir) = NewWork();
+        BasicTree(src);
+        var scripts = Path.Combine(src, "scripts");
+        Directory.CreateDirectory(scripts);
+        File.WriteAllText(Path.Combine(scripts, "main.cmm"), "DO flash\n");
+        File.WriteAllText(Path.Combine(scripts, "flash.cmm"), "Flash:\n  RETURN\n");
+        File.WriteAllText(Path.Combine(scripts, "menu.cmm"), "Menu:\n  RETURN\n");     // reached from a dialog, not this run
+        var trace = Path.Combine(work, "run.trace");
+        File.WriteAllText(trace, Fwd(Path.Combine(scripts, "main.cmm")) + "\n");
+        try
+        {
+            var cfg = Config(work, outDir, $"[common]\nentryPoints = [\"main\"]\n[runs.smoke]\nrunTraceFiles = [\"{Fwd(trace)}\"]\n");
+            var (code, o, _) = Run("carve", src, "--config", cfg);
+            Assert.Equal(0, code);
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", "scripts", "menu.cmm")));
+            Assert.Contains("1 neither (kept", o);
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Carve_RunTrace_DynamicDoInKeptScript_DropsNothing()
+    {
+        var (work, src, outDir) = NewWork();
+        BasicTree(src);
+        var scripts = Path.Combine(src, "scripts");
+        Directory.CreateDirectory(scripts);
+        File.WriteAllText(Path.Combine(scripts, "main.cmm"), "DO &board\n");
+        File.WriteAllText(Path.Combine(scripts, "board_a.cmm"), "A:\n  RETURN\n");
+        var trace = Path.Combine(work, "run.trace");
+        File.WriteAllText(trace, Fwd(Path.Combine(scripts, "main.cmm")) + "\n");
+        try
+        {
+            var cfg = Config(work, outDir,
+                $"[common]\nentryPoints = [\"main\"]\n[runs.smoke]\nrunTraceFiles = [\"{Fwd(trace)}\"]\ndropUnobservedCmm = true\n");
+            var (code, _, e) = Run("carve", src, "--config", cfg);
+            Assert.Equal(0, code);
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", "scripts", "board_a.cmm")));
+            Assert.Contains("dropping nothing", e);
         }
         finally { Cleanup(work); }
     }
@@ -366,7 +413,7 @@ public sealed class CarveTomlRunTests
         {
             var trace = Fwd(Path.Combine(ex, "inputs", "run.trace"));
             var cfg = Config(work, outDir,
-                $"[common]\nentryPoints = [\"main\"]\nlanguages = [\"c\"]\n[runs.smoke]\nrunTraceFiles = [\"{trace}\"]\n");
+                $"[common]\nentryPoints = [\"main\"]\nlanguages = [\"c\"]\n[runs.smoke]\nrunTraceFiles = [\"{trace}\"]\ndropUnobservedCmm = true\n");
             var (code, o, _) = Run("carve", Path.Combine(ex, "src"), "--config", cfg);
             Assert.Equal(0, code);
             Assert.Contains("cmm     : 4/6 script(s) kept (1 observed + 3 via DO/GOSUB closure), 2 dropped", o);

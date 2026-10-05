@@ -43,10 +43,10 @@ public class CmmTraceClosureTests
         Assert.Contains("scripts/flash.cmm", r.Kept);
         Assert.Contains("scripts/common.cmm", r.Kept);
 
-        // orphan + the two boards (only reachable via the dynamic DO &board) are dropped.
-        Assert.Contains("scripts/orphan.cmm", r.Dropped);
-        Assert.Contains("boards/board_a.cmm", r.Dropped);
-        Assert.Contains("boards/board_b.cmm", r.Dropped);
+        // init.cmm is KEPT and does `DO &board` (dynamic): we can't see what it runs, so nothing is dropped
+        // (owner decision D-C) and the reason is surfaced.
+        Assert.Empty(r.Dropped);
+        Assert.Contains(r.Warnings, w => w.Contains("dropping nothing"));
 
         Assert.Equal(1, r.ObservedSeeds);
         Assert.Equal(3, r.ClosureAdded);              // init, flash, common

@@ -1,3 +1,6 @@
 ; debug_dump.cmm — a maintenance script no run executes and nothing DOs. Dropped: reached by nobody.
+; Its `DO &board` is a dynamic (runtime-chosen) path. It does not hold the carve back because this script
+; is itself dropped; the same line in a KEPT script would make the carve drop no .cmm at all.
 Dump:
+  DO &board
   RETURN

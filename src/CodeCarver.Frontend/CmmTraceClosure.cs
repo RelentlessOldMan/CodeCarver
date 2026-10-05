@@ -28,11 +28,15 @@ public static class CmmTraceClosure
     /// <param name="observedCmm">The subset a run file-trace observed being opened (the seeds).</param>
     /// <param name="read">Reads a script's text by rel path (only called for under-cap files).</param>
     /// <param name="maxParseBytes">Scripts larger than this are kept whole and NOT DO-parsed (memory backstop).</param>
+    /// <param name="dropUnobserved">Owner decision D-C: scripts are only DROPPED when the user opted in
+    /// (<c>[runs.X] dropUnobservedCmm = true</c>); otherwise the closure is computed for the report and every
+    /// script is kept. Even when opted in, nothing is dropped while a kept script has a dynamic <c>DO &amp;var</c>.</param>
     public static CmmClosureResult Compute(
         IReadOnlyList<(string Rel, long Bytes)> allCmm,
         IReadOnlyCollection<string> observedCmm,
         Func<string, string> read,
-        long maxParseBytes)
+        long maxParseBytes,
+        bool dropUnobserved = true)
     {
         var observed = new HashSet<string>(observedCmm, StringComparer.OrdinalIgnoreCase);
         var seeds = allCmm.Where(c => observed.Contains(c.Rel)).Select(c => c.Rel).ToList();
@@ -46,18 +50,20 @@ public static class CmmTraceClosure
         // Oversized scripts are registered but handed EMPTY text so CmmFrontEnd keeps the file node without
         // splitting a 300 MB file into lines — the same keep-whole backstop big C headers get. Their DO/GOSUB
         // closure is therefore not followed; we warn below if such a script ends up kept.
+        // Streamed: the front-end reads one script at a time (review RB1). An unreadable script is kept whole
+        // like an oversized one and said so — never silently treated as having no DO.
         var oversized = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var inputs = new List<(string, string)>(allCmm.Count);
-        foreach (var (rel, bytes) in allCmm)
+        var unreadable = new List<string>();
+        foreach (var (rel, bytes) in allCmm) if (bytes > maxParseBytes) oversized.Add(rel);
+        string ReadOne(string rel)
         {
-            if (bytes > maxParseBytes) { oversized.Add(rel); inputs.Add((rel, "")); continue; }
-            string text;
-            try { text = read(rel); } catch { text = ""; }
-            inputs.Add((rel, text));
+            if (oversized.Contains(rel)) return "";
+            try { return read(rel); }
+            catch (Exception) { unreadable.Add(rel); oversized.Add(rel); return ""; }
         }
 
         var fe = new CmmFrontEnd();
-        var graph = fe.BuildGraph(inputs);
+        var graph = fe.BuildGraph(allCmm.Select(c => c.Rel).ToList(), ReadOne);
 
         // File-level dependency: script X depends on script Y when ANY node in X does `DO Y` (an Includes edge).
         // We keep whole .cmm files (never carve inside a script), so the closure is over FILES, not subroutines
@@ -83,6 +89,13 @@ public static class CmmTraceClosure
                 foreach (var t in outs)
                     if (kept.Add(t)) queue.Enqueue(t);
 
+        var closureCount = kept.Count;
+        // D-C: drop only on explicit opt-in, and never while a kept script dispatches dynamically (we can't
+        // see what it runs). Otherwise everything stays; the closure is still reported.
+        var dynamicInKept = fe.Warnings.Any(w => w.Contains("variable path", StringComparison.Ordinal)
+                                                 && w.IndexOf(':') is > 0 and var c && kept.Contains(w[..c]));
+        var holdBack = !dropUnobserved || dynamicInKept || unreadable.Any(kept.Contains);
+        if (holdBack) foreach (var x in allCmm) kept.Add(x.Rel);
         var keptList = allCmm.Where(c => kept.Contains(c.Rel)).Select(c => c.Rel).OrderBy(x => x, StringComparer.Ordinal).ToList();
         var dropped = allCmm.Where(c => !kept.Contains(c.Rel)).Select(c => c.Rel).OrderBy(x => x, StringComparer.Ordinal).ToList();
 
@@ -99,12 +112,16 @@ public static class CmmTraceClosure
             if (prefix.Length > 0 && allRel.Contains(prefix) && !kept.Contains(prefix)) continue; // attributed to a dropped script
             warnings.Add(w);
         }
+        foreach (var u in unreadable)
+            warnings.Add($"{u}: could not be read — kept whole; DO/GOSUB closure not computed for it");
+        if (dropUnobserved && dynamicInKept)
+            warnings.Add($"a kept script uses a dynamic `DO &var`: dropping nothing ({allCmm.Count - closureCount} unobserved script(s) kept)");
         var oversizedKept = keptList.Where(oversized.Contains).ToList();
         foreach (var o in oversizedKept)
             warnings.Add($"{o}: kept whole (over {maxParseBytes:N0} B) — DO/GOSUB closure not computed; "
                 + "scripts it reaches may be missing (widen the trace or forceKeep them)");
 
         return new CmmClosureResult(keptList, dropped, warnings, allCmm.Count,
-            seeds.Count, keptList.Count - seeds.Count, oversizedKept.Count);
+            seeds.Count, closureCount - seeds.Count, oversizedKept.Count);
     }
 }
