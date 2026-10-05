@@ -37,6 +37,7 @@ public sealed class BuildSection
 {
     public List<string> BuildLogs = new();
     public string? Compiler;
+    public List<string> CompilerNames = new();
     public List<string> Defines = new();
     public List<string> BuildTraceFiles = new();
 }
@@ -65,7 +66,7 @@ public static class ConfigLoader
     private static readonly string[] CommonKeys =
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
-    private static readonly string[] BuildKeys = { "buildLogs", "compiler", "defines", "buildTraceFiles" };
+    private static readonly string[] BuildKeys = { "buildLogs", "compiler", "compilerNames", "defines", "buildTraceFiles" };
     private static readonly string[] RunKeys = { "runTraceFiles", "runTraceLogs" };
     private static readonly string[] StageKeys = { "carveSourceFileContents", "carveHeaderFileContents" };
     private static readonly string[] UseKeys = { "builds", "runs" };
@@ -124,6 +125,7 @@ public static class ConfigLoader
             {
                 BuildLogs = GetStringList(t, "buildLogs", $"[builds.{name}]", ctx),
                 Compiler = GetString(t, "compiler", $"[builds.{name}]", ctx),
+                CompilerNames = GetStringList(t, "compilerNames", $"[builds.{name}]", ctx),
                 Defines = GetStringList(t, "defines", $"[builds.{name}]", ctx),
                 BuildTraceFiles = GetStringList(t, "buildTraceFiles", $"[builds.{name}]", ctx),
             };
@@ -215,7 +217,8 @@ public static class ConfigLoader
         # best input: it pins the exact -D/-I per file so #ifdefs resolve like your real build.
         [builds.main]
         buildLogs = ["make-n.log"]       # a `make -n` log, build console capture, or compile_commands.json (list several; unioned)
-        compiler = ""                    # optional: your compiler exe (e.g. "arm-none-eabi-gcc"), probed for its built-in macros
+        compiler = ""                    # optional: your compiler exe (e.g. "arm-none-eabi-gcc"), probed for its built-in macros (must answer -dM -E)
+        compilerNames = []               # optional: vendor compiler names in a TEXT log, e.g. ["armcc","iccarm"] (gcc/clang/cl are known)
         defines = []                     # RARE manual override, only if you have no build log: ["CHIP=F4","FEATURE_X=1"]
         buildTraceFiles = []             # optional: files opened while BUILDING (ProcMon/strace capture)
 

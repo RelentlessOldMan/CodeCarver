@@ -211,15 +211,16 @@ public sealed class PreprocessorSoundnessTests
     }
 
     [Fact]
-    public void Cli_BuildLogWithNoCommands_IsOpenWorld_NotLabelledClosed()
+    public void Cli_VendorCompilerLog_IsUsed_NotSilentlyIgnored()
     {
+        // BL3: an armcc log used to yield zero commands while the run claimed closed-world. Now it is parsed.
         var (code, o, _, work) = Carve(s => File.WriteAllText(Path.Combine(s, "main.c"), "int main(void){return 0;}\n"),
             "[builds.m]\nbuildLogs = [\"@WORK@/make.log\"]\n",
             w => File.WriteAllText(Path.Combine(w, "make.log"), "armcc -DX=1 -c main.c\n"));
         try
         {
-            Assert.DoesNotContain("closed-world", o);
-            Assert.Contains("open-world", o);
+            Assert.Equal(0, code);
+            Assert.Contains("1 compile command(s)", o);
         }
         finally { try { Directory.Delete(work, true); } catch { } }
     }

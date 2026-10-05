@@ -249,11 +249,37 @@ public static class CarveCommand
 
         // Preprocessor config: explicit --define plus -D flags scraped from EVERY --build-log (parsed once here
         // and reused for include-dir resolution below). A named-but-missing log is a silent-config trap -> warn.
+        // Macro names #defined/#undef'd anywhere in the tree (filled after the file scan, before parsing). Shared
+        // by every table: such a name is UNKNOWN unless the table defines it (review PP1).
+        var ambientMacros = new HashSet<string>(StringComparer.Ordinal);
         var buildCmds = new List<CompileCommand>();
+        var scrape = new BuildLogScraper.ScrapeOptions
+        {
+            CompilerNames = cv.CompilerNames,
+            // @response files resolve against the command's directory, like the compile itself.
+            ReadResponseFile = (cmdDir, path) =>
+            {
+                try
+                {
+                    var bd = Path.IsPathFullyQualified(cmdDir) ? cmdDir : Path.Combine(dir, cmdDir);
+                    var full = Path.IsPathFullyQualified(path) ? path : Path.Combine(bd, path);
+                    return File.Exists(full) ? File.ReadAllText(full) : null;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return null; }
+            },
+        };
         foreach (var bl in buildLogs.Distinct())
         {
-            if (!File.Exists(bl)) { err.WriteLine($"  warn    : --build-log file not found: {bl} (skipped)"); continue; }
-            buildCmds.AddRange(BuildLogScraper.Parse(File.ReadAllText(bl)));
+            var cmds = BuildLogScraper.Parse(File.ReadAllText(bl), scrape);
+            // A configured build log that yields nothing is a configuration error, not "no #ifdef config" (BL3).
+            if (cmds.Count == 0)
+            {
+                err.WriteLine($"build log '{bl}' contains no compile command CodeCarver recognises. If the compiler is not "
+                    + "gcc/clang/cl-like, name it in [builds.X] compilerNames = [\"armcc\"]; a compile_commands.json must be a "
+                    + "JSON array of {directory, file, command|arguments}.");
+                return 2;
+            }
+            buildCmds.AddRange(cmds);
         }
         // Per-TU preprocessor config from the build log. A build can compile the SAME file in multiple configs;
         // unioning all TUs' -D and applying it globally would mark a macro "defined" for a file that was compiled
@@ -306,6 +332,7 @@ public static class CarveCommand
         // Per-file (consistent, varying) define sets from the build log (manual --define joins the shared base
         // below, so it is applied to every file regardless).
         var perFileSpecs = new Dictionary<string, (List<string> Consistent, List<string> Varying)>(StringComparer.OrdinalIgnoreCase);
+        var openWorldFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // logged with an incomplete define set
         var universalConsistent = new List<string>();
         var universalVarying = new List<string>();
         var byFileCount = 0;
@@ -322,6 +349,34 @@ public static class CarveCommand
             foreach (var kv in byFile) perFileSpecs[kv.Key] = AnalyzeDefines(kv.Value);
             (universalConsistent, universalVarying) = AnalyzeDefines(buildCmds);
             byFileCount = byFile.Count;
+            if (byFile.Count == 0)
+            {
+                err.WriteLine($"none of the {buildCmds.Count} compile command(s) in the build log(s) names a file under '{Path.GetFullPath(dir)}' "
+                    + "— the log was probably captured from a different checkout location (its 'directory'/file paths don't map here).");
+                return 2;
+            }
+            // Forced includes (-include/-imacros//FI) define macros for their TU; an unreadable one, or an
+            // unreadable @response file, leaves the file's define set incomplete -> open-world (BL2).
+            foreach (var kv in byFile)
+                foreach (var cc in kv.Value)
+                {
+                    if (cc.Incomplete) openWorldFiles.Add(kv.Key);
+                    foreach (var fi in cc.ForcedIncludes)
+                    {
+                        string? text = null;
+                        try
+                        {
+                            var bd = Path.IsPathFullyQualified(cc.Directory) ? cc.Directory : Path.Combine(dir, cc.Directory);
+                            var full = Path.IsPathFullyQualified(fi) ? fi : Path.Combine(bd, fi);
+                            if (File.Exists(full)) text = File.ReadAllText(full);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
+                        if (text is null) { openWorldFiles.Add(kv.Key); continue; }
+                        foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(text,
+                                     @"^\s*#\s*(?:define|undef)\s+([A-Za-z_]\w*)", System.Text.RegularExpressions.RegexOptions.Multiline))
+                            ambientMacros.Add(m.Groups[1].Value);
+                    }
+                }
         }
 
         // --probe: ask a real compiler for its PREDEFINED + target macros (plus manual --define) as a closed-world
@@ -329,9 +384,6 @@ public static class CarveCommand
         // the #else branch a differently-configured TU compiles (the eval-#9 union bug, back under --probe —
         // eval-#11). The per-file consistent build-log defines are layered ON TOP of this base, per file.
         MacroTable? probeBase = null;
-        // Macro names #defined/#undef'd anywhere in the tree (filled after the file scan, before parsing). Shared
-        // by every table: such a name is UNKNOWN unless the table defines it (review PP1).
-        var ambientMacros = new HashSet<string>(StringComparer.Ordinal);
         var probeMatchesBuild = false;
         if (probeCompiler is not null)
         {
@@ -395,8 +447,16 @@ public static class CarveCommand
             var universalTable = BuildTable(universalConsistent, universalVarying);
             var perFile = perFileSpecs.ToDictionary(kv => kv.Key, kv => BuildTable(kv.Value.Consistent, kv.Value.Varying),
                                                     StringComparer.OrdinalIgnoreCase);
+            // D-B: a translation unit no compile command covers is open-world; so is a logged file whose define
+            // set may be incomplete. Headers take the universal table (they are configured by their includers).
+            var openTable = universalTable.Clone();
+            openTable.OpenWorld = true;
+            var srcExt = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
             perFileDefines = f => includedCFiles.Contains(f) ? universalTable
-                                  : (perFile.TryGetValue(f, out var t) ? t : universalTable);
+                                  : openWorldFiles.Contains(f) ? openTable
+                                  : perFile.TryGetValue(f, out var t) ? t
+                                  : srcExt.Any(e => f.EndsWith(e, StringComparison.OrdinalIgnoreCase)) ? openTable
+                                  : universalTable;
             defines = universalTable;                 // fallback (files absent from the log; non-TreeSitter paths)
             defineSpecs = manualDefines.Concat(universalConsistent).Distinct().ToList(); // summary/manifest
 
@@ -488,6 +548,17 @@ public static class CarveCommand
         // Both populations skip the parser and are kept whole via include-closure.
         var skipParse = new HashSet<string>(bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)),
                                             StringComparer.Ordinal);
+        if (perFileSpecs.Count > 0)
+        {
+            // D-B: translation units no compile command covers are resolved open-world; say how many.
+            var tuExt = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
+            var unlogged = parseRels.Count(r => tuExt.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !perFileSpecs.ContainsKey(r));
+            diag.Set("unloggedSourceFiles", unlogged);
+            if (unlogged > 0)
+                err.WriteLine($"  build   : {unlogged} source file(s) appear in no compile command -> open-world for them (both #ifdef branches kept)");
+            if (openWorldFiles.Count > 0)
+                err.WriteLine($"  build   : {openWorldFiles.Count} logged file(s) have an incomplete define set (unreadable @response or forced include) -> open-world");
+        }
 
         // STREAMING ingestion: instead of reading the whole tree's text into a list up front (peak memory = every
         // source byte at once), we read each file ON DEMAND via ReadRel and release it before the next. Returns ""

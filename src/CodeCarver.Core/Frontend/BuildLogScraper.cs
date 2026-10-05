@@ -22,6 +22,16 @@ namespace CodeCarver.Core.Frontend;
 /// </summary>
 public static class BuildLogScraper
 {
+    /// <summary>Optional inputs for <see cref="Parse(string, ScrapeOptions?)"/>.</summary>
+    public sealed record ScrapeOptions
+    {
+        /// <summary>Extra compiler driver names for text logs (e.g. armcc, iccarm) — matched like gcc.</summary>
+        public IReadOnlyList<string> CompilerNames { get; init; } = Array.Empty<string>();
+
+        /// <summary>Reads an <c>@response</c> file: (command directory, path as written) → text, or null.</summary>
+        public Func<string, string, string?>? ReadResponseFile { get; init; }
+    }
+
     private static readonly string[] KnownCompilers =
         { "gcc", "g++", "cc", "c++", "clang", "clang++", "cl" };
 
@@ -35,10 +45,13 @@ public static class BuildLogScraper
         { "ar", "nm", "ranlib", "objcopy", "objdump", "size", "strip", "gcov", "gprof",
           "ld", "as", "gdb", "tidy", "format", "check", "cpp", "cov" };
 
-    public static IReadOnlyList<CompileCommand> Parse(string log)
+    public static IReadOnlyList<CompileCommand> Parse(string log) => Parse(log, null);
+
+    public static IReadOnlyList<CompileCommand> Parse(string log, ScrapeOptions? options)
     {
+        options ??= new ScrapeOptions();
         if (string.IsNullOrEmpty(log)) return Array.Empty<CompileCommand>();
-        if (LooksLikeCompileDb(log)) return ParseCompileDb(log);   // compile_commands.json
+        if (LooksLikeCompileDb(log)) return ParseCompileDb(log, options);   // compile_commands.json
 
         var results = new List<CompileCommand>();
         // Track the working directory across lines the way the shell/make would: a standalone `cd DIR`, and
@@ -58,32 +71,127 @@ public static class BuildLogScraper
             var tokens = Tokenize(line);
             if (tokens.Count == 0) continue;
 
-            // Standalone `cd DIR` (no compiler on the line): update the tracked directory.
-            if (tokens[0].Equals("cd", StringComparison.Ordinal) && tokens.Count >= 2 && IndexOfCompiler(tokens) < 0)
-            { currentDir = CombineDir(currentDir, tokens[1]); continue; }
-
-            var lead = ExtractLeadingCd(tokens, out var rest);
-            var ci = IndexOfCompiler(rest);
-            if (ci < 0) continue;
-            var dir = lead == "." ? currentDir : CombineDir(currentDir, lead); // same-line cd, relative to tracked dir
-
-            var args = rest.GetRange(ci + 1, rest.Count - ci - 1);
-            var sources = args.Where(IsSourceFile).ToList();
-            if (sources.Count == 0) continue; // link-only or non-compile invocation
-
-            var (defines, includes) = ExtractFlags(args);
-            foreach (var src in sources)
-                results.Add(new CompileCommand
-                {
-                    File = src,
-                    Directory = dir,
-                    Arguments = args,
-                    Defines = defines,
-                    Includes = includes,
-                });
+            // One log line can hold several shell commands (`gcc a.c && gcc -DFOO b.c`, `cd x; cc ...`): each is
+            // its own compile with its own flags (review BL1). A `cd DIR` carries forward to the commands after
+            // it on the same line; a line holding nothing but `cd DIR` updates the tracked directory.
+            var simple = SplitCommands(tokens);
+            if (simple.Count == 1 && simple[0].Count >= 2 && simple[0][0] == "cd")
+            { currentDir = CombineDir(currentDir, simple[0][1]); continue; }
+            var dir = currentDir;
+            foreach (var cmd in simple)
+            {
+                if (cmd.Count == 0) continue;
+                if (cmd[0] == "cd") { if (cmd.Count >= 2) dir = CombineDir(dir, cmd[1]); continue; }
+                var ci = DriverIndex(cmd, options, allowGeneric: true);
+                if (ci < 0) continue;
+                AddCommand(results, cmd[ci], cmd.GetRange(ci + 1, cmd.Count - ci - 1), dir, file: null, options);
+            }
         }
         return results;
     }
+
+    static void AddCommand(List<CompileCommand> results, string driver, List<string> args, string dir, string? file,
+                           ScrapeOptions options)
+    {
+        var incomplete = false;
+        args = ExpandResponseFiles(args, dir, options, ref incomplete, depth: 0);
+        var sources = file is not null ? new List<string> { file } : args.Where(IsSourceFile).ToList();
+        if (sources.Count == 0) return; // link-only or non-compile invocation
+        var (defines, includes, forced) = ExtractFlags(args, IsMsvcDriver(driver));
+        foreach (var src in sources)
+            results.Add(new CompileCommand
+            {
+                File = src,
+                Directory = dir,
+                Arguments = args,
+                Defines = defines,
+                Includes = includes,
+                ForcedIncludes = forced,
+                Incomplete = incomplete,
+            });
+    }
+
+    /// <summary>Splice <c>@file</c> response files into the argument list (recursively, depth-capped). An
+    /// unreadable one marks the command incomplete (review BL2).</summary>
+    static List<string> ExpandResponseFiles(List<string> args, string dir, ScrapeOptions options, ref bool incomplete, int depth)
+    {
+        if (!args.Any(a => a.Length > 1 && a[0] == '@')) return args;
+        var r = new List<string>(args.Count);
+        foreach (var a in args)
+        {
+            if (a.Length < 2 || a[0] != '@') { r.Add(a); continue; }
+            var text = depth < 8 ? options.ReadResponseFile?.Invoke(dir, a[1..]) : null;
+            if (text is null) { incomplete = true; continue; }
+            r.AddRange(ExpandResponseFiles(Tokenize(text.Replace('\n', ' ').Replace('\r', ' ')).Where(t => !IsOp(t)).ToList(),
+                                           dir, options, ref incomplete, depth + 1));
+        }
+        return r;
+    }
+
+    // Shell control operators, kept as single tokens by Tokenize when unquoted.
+    const char OpMark = '\u0001';
+    static bool IsOp(string t) => t.Length > 0 && t[0] == OpMark;
+
+    static List<List<string>> SplitCommands(List<string> tokens)
+    {
+        var r = new List<List<string>> { new() };
+        foreach (var t in tokens)
+        {
+            if (IsOp(t)) { r.Add(new List<string>()); continue; }
+            r[^1].Add(t);
+        }
+        r.RemoveAll(c => c.Count == 0);
+        return r;
+    }
+
+    // Programs that run another command (their own options/arguments come first).
+    static readonly string[] Wrappers = { "ccache", "sccache", "distcc", "icecc", "buildcache", "time", "nice", "nohup",
+                                          "env", "stdbuf", "chrt", "taskset", "xcrun" };
+    // First words that are never a compile, even with a source name and -c/-D after them.
+    static readonly string[] NeverCompiler = { "echo", "printf", "cp", "mv", "rm", "ln", "cat", "sed", "awk", "grep",
+        "python", "python3", "perl", "sh", "bash", "make", "gmake", "cmake", "ninja", "ar", "ld", "mkdir", "touch",
+        "test", "install", "git", "tar", "zip", "objcopy", "strip", "doxygen", "clang-tidy", "clang-format" };
+
+    /// <summary>Index of the compiler driver in one simple command, or -1. The driver is the first word after
+    /// environment assignments, a ninja progress tag and known wrappers (ccache, distcc, ...). A recognised
+    /// compiler name, or a configured one, qualifies; with <paramref name="allowGeneric"/> any other program
+    /// qualifies when the command names a source file and has -c or a -D/-I flag (vendor compilers: armcc,
+    /// iccarm, cl2000, ... — review BL3).</summary>
+    static int DriverIndex(List<string> cmd, ScrapeOptions options, bool allowGeneric)
+    {
+        var i = 0;
+        while (i < cmd.Count)
+        {
+            var t = cmd[i];
+            if (System.Text.RegularExpressions.Regex.IsMatch(t, @"^\[\d+/\d+\]$")) { i++; continue; }        // ninja [3/10]
+            if (System.Text.RegularExpressions.Regex.IsMatch(t, @"^[A-Za-z_][A-Za-z0-9_]*=")) { i++; continue; } // VAR=x
+            var name = DriverName(t);
+            if (Wrappers.Contains(name, StringComparer.OrdinalIgnoreCase))
+            {
+                i++;
+                while (i < cmd.Count && cmd[i].StartsWith('-')) i++;   // the wrapper's own options
+                continue;
+            }
+            break;
+        }
+        if (i >= cmd.Count) return -1;
+        var driver = DriverName(cmd[i]);
+        if (IsCompiler(cmd[i]) || options.CompilerNames.Any(n => driver.Equals(DriverName(n), StringComparison.OrdinalIgnoreCase)))
+            return i;
+        if (!allowGeneric || NeverCompiler.Contains(driver, StringComparer.OrdinalIgnoreCase) || cmd[i].StartsWith('-')) return -1;
+        var rest = cmd.Skip(i + 1).ToList();
+        var looksLikeCompile = rest.Any(IsSourceFile)
+            && rest.Any(a => a is "-c" or "/c" || a.StartsWith("-D", StringComparison.Ordinal) || a.StartsWith("-I", StringComparison.Ordinal));
+        return looksLikeCompile ? i : -1;
+    }
+
+    static string DriverName(string token)
+    {
+        var name = FileNameOf(token);
+        return name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? name[..^4] : name;
+    }
+
+    static bool IsMsvcDriver(string token) => DriverName(token).ToLowerInvariant() is "cl" or "clang-cl" or "icl" or "icx-cl";
 
     private static readonly System.Text.RegularExpressions.Regex EnteringDir =
         new(@"Entering directory\s+[`'""]?(.+?)[`'""]?\s*$", System.Text.RegularExpressions.RegexOptions.Compiled);
@@ -102,10 +210,13 @@ public static class BuildLogScraper
     /// build log never starts that way). BOM-tolerant.</summary>
     private static bool LooksLikeCompileDb(string text)
     {
+        // "[" then "{" or "]" — a ninja progress tag "[3/10] gcc ..." also starts with "[".
+        var seenBracket = false;
         foreach (var ch in text)
         {
             if (ch == '﻿' || char.IsWhiteSpace(ch)) continue; // skip BOM + leading whitespace
-            return ch == '[';
+            if (!seenBracket) { if (ch != '[') return false; seenBracket = true; continue; }
+            return ch is '{' or ']';
         }
         return false;
     }
@@ -116,7 +227,7 @@ public static class BuildLogScraper
     /// authoritative translation unit. Same <c>-D</c>/<c>-I</c>/<c>-isystem</c> extraction as the text path.
     /// Tolerant: malformed JSON, a non-array root, or an odd entry is skipped, never fatal.
     /// </summary>
-    private static IReadOnlyList<CompileCommand> ParseCompileDb(string json)
+    private static IReadOnlyList<CompileCommand> ParseCompileDb(string json, ScrapeOptions options)
     {
         var results = new List<CompileCommand>();
         JsonDocument doc;
@@ -143,22 +254,14 @@ public static class BuildLogScraper
                 }
 
                 // Drop the driver token (and any wrapper before it) like the text path; if none is
-                // recognised, keep all tokens so an explicit "file" entry still yields its flags.
-                var ci = IndexOfCompiler(tokens);
+                // recognised, keep all tokens so an explicit "file" entry still yields its flags. A DB entry is
+                // one command, so the first word is the driver even if its name is not one we know.
+                tokens = tokens.Where(t => !IsOp(t)).ToList();
+                var ci = DriverIndex(tokens, options, allowGeneric: false);
+                if (ci < 0 && tokens.Count > 0 && !tokens[0].StartsWith('-')) ci = 0;
+                var driver = ci >= 0 ? tokens[ci] : "";
                 var args = ci >= 0 ? tokens.GetRange(ci + 1, tokens.Count - ci - 1) : tokens;
-                var (defines, includes) = ExtractFlags(args);
-
-                var sources = file is not null ? new List<string> { file } : args.Where(IsSourceFile).ToList();
-                if (sources.Count == 0) continue;
-                foreach (var src in sources)
-                    results.Add(new CompileCommand
-                    {
-                        File = src,
-                        Directory = dir,
-                        Arguments = args,
-                        Defines = defines,
-                        Includes = includes,
-                    });
+                AddCommand(results, driver, args, dir, file, options);
             }
         }
         return results;
@@ -167,7 +270,8 @@ public static class BuildLogScraper
     private static string? GetString(JsonElement obj, string name)
         => obj.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
 
-    private static (IReadOnlyList<string> Defines, IReadOnlyList<string> Includes) ExtractFlags(List<string> args)
+    private static (IReadOnlyList<string> Defines, IReadOnlyList<string> Includes, IReadOnlyList<string> Forced)
+        ExtractFlags(List<string> args, bool msvc)
     {
         // Effective defines with LAST-WINS semantics: the compiler applies -D/-U left to right, so
         // `-DFEATURE -UFEATURE` leaves FEATURE UNDEFINED (and `-UX -DX=1` leaves it defined). Model it with a
@@ -175,6 +279,7 @@ public static class BuildLogScraper
         // wrongly kept the #ifdef branch of a macro the build explicitly undefined (eval-#9).
         var eff = new Dictionary<string, string?>(StringComparer.Ordinal);
         var includes = new List<string>();
+        var forced = new List<string>();
         void Define(string spec)
         {
             if (spec.Length == 0) return;
@@ -182,36 +287,50 @@ public static class BuildLogScraper
             if (eq < 0) eff[spec] = null; else eff[spec[..eq]] = spec[(eq + 1)..];
         }
         void Undef(string name) { if (name.Length > 0) eff.Remove(name); }
+        // MSVC-style /D /U /I only for an MSVC driver: for gcc, /Users/x/a.c or /Include/... are paths (BL3).
+        bool Flag(string a, char f) => a.Length >= 2 && (a[0] == '-' || (msvc && a[0] == '/')) && a[1] == f;
         for (var i = 0; i < args.Count; i++)
         {
             var a = args[i];
-            if (a is "-D" or "/D") { if (i + 1 < args.Count) Define(args[++i]); }
-            else if (a.StartsWith("-D", StringComparison.Ordinal) || a.StartsWith("/D", StringComparison.Ordinal))
-                Define(a[2..]);
-            else if (a is "-U" or "/U") { if (i + 1 < args.Count) Undef(args[++i]); }
-            else if (a.StartsWith("-U", StringComparison.Ordinal) || a.StartsWith("/U", StringComparison.Ordinal))
-                Undef(a[2..]);
-            else if (a is "-I" or "/I") { if (i + 1 < args.Count) includes.Add(args[++i]); }
+            // Preprocessor flags passed through the driver: -Wp,-DFOO,-UBAR and -Xpreprocessor -DFOO.
+            if (a.StartsWith("-Wp,", StringComparison.Ordinal))
+            {
+                foreach (var w in a[4..].Split(','))
+                    if (w.StartsWith("-D", StringComparison.Ordinal)) Define(w[2..]);
+                    else if (w.StartsWith("-U", StringComparison.Ordinal)) Undef(w[2..]);
+                continue;
+            }
+            if (a == "-Xpreprocessor" && i + 1 < args.Count)
+            {
+                var w = args[++i];
+                if (w.StartsWith("-D", StringComparison.Ordinal)) Define(w[2..]);
+                else if (w.StartsWith("-U", StringComparison.Ordinal)) Undef(w[2..]);
+                continue;
+            }
+            if (a == "--define-macro" && i + 1 < args.Count) { Define(args[++i]); continue; }
+            if (a.StartsWith("--define-macro=", StringComparison.Ordinal)) { Define(a[15..]); continue; }
+            if (a == "--undefine-macro" && i + 1 < args.Count) { Undef(args[++i]); continue; }
+            // Forced includes: their macros are part of the TU's configuration (review BL2).
+            if (a is "-include" or "-imacros" && i + 1 < args.Count) { forced.Add(args[++i]); continue; }
+            if (msvc && (a is "/FI" or "-FI") && i + 1 < args.Count) { forced.Add(args[++i]); continue; }
+            if (msvc && (a.StartsWith("/FI", StringComparison.Ordinal) || a.StartsWith("-FI", StringComparison.Ordinal)) && a.Length > 3)
+            { forced.Add(a[3..]); continue; }
+            if (a is "-include" or "-imacros") continue;
+
+            if (a.Length == 2 && Flag(a, 'D')) { if (i + 1 < args.Count) Define(args[++i]); }
+            else if (Flag(a, 'D')) Define(a[2..]);
+            else if (a.Length == 2 && Flag(a, 'U')) { if (i + 1 < args.Count) Undef(args[++i]); }
+            else if (Flag(a, 'U')) Undef(a[2..]);
+            else if (a.Length == 2 && Flag(a, 'I')) { if (i + 1 < args.Count) includes.Add(args[++i]); }
             // -isystem / -iquote / -idirafter DIR: the other GCC/Clang include-search forms, used heavily by
             // embedded builds for toolchain / CMSIS / HAL headers. They take the dir as the NEXT token. Feeding
             // these to include resolution matters -- a non-sibling .inc reached via -isystem otherwise falls to
             // the (over-approximate, warning) basename fallback.
             else if (a is "-isystem" or "-iquote" or "-idirafter") { if (i + 1 < args.Count) includes.Add(args[++i]); }
-            else if (a.StartsWith("-I", StringComparison.Ordinal) || a.StartsWith("/I", StringComparison.Ordinal))
-                includes.Add(a[2..]);
+            else if (Flag(a, 'I')) includes.Add(a[2..]);
         }
         var defines = eff.Select(kv => kv.Value is null ? kv.Key : $"{kv.Key}={kv.Value}").ToList();
-        return (defines, includes);
-    }
-
-    /// <summary>Index of the compiler driver token in a command, or -1. Handles paths and cross/versioned
-    /// names (arm-none-eabi-gcc, gcc-12, /usr/bin/clang++, cl.exe).</summary>
-    private static int IndexOfCompiler(List<string> tokens)
-    {
-        for (var i = 0; i < tokens.Count; i++)
-            if (IsCompiler(tokens[i]))
-                return i;
-        return -1;
+        return (defines, includes, forced);
     }
 
     private static bool IsCompiler(string token)
@@ -244,23 +363,6 @@ public static class BuildLogScraper
             if (token.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
                 return true;
         return false;
-    }
-
-    /// <summary>If the command begins with <c>cd DIR &amp;&amp;</c> (or <c>cd DIR;</c>), return DIR and put the
-    /// remaining tokens in <paramref name="rest"/>; otherwise return "." and the tokens unchanged.</summary>
-    private static string ExtractLeadingCd(List<string> tokens, out List<string> rest)
-    {
-        if (tokens.Count >= 3 && tokens[0].Equals("cd", StringComparison.Ordinal))
-        {
-            var sep = tokens[2];
-            if (sep is "&&" or ";")
-            {
-                rest = tokens.GetRange(3, tokens.Count - 3);
-                return tokens[1];
-            }
-        }
-        rest = tokens;
-        return ".";
     }
 
     private static string FileNameOf(string path)
@@ -317,6 +419,13 @@ public static class BuildLogScraper
             else if (char.IsWhiteSpace(ch))
             {
                 if (cur.Length > 0) { tokens.Add(cur.ToString()); cur.Clear(); }
+            }
+            else if (ch is ';' or '|' || (ch == '&' && i + 1 < line.Length && line[i + 1] == '&'))
+            {
+                // Unquoted shell control operator (;, |, ||, &&), even when attached to a word (dir&&gcc).
+                if (cur.Length > 0) { tokens.Add(cur.ToString()); cur.Clear(); }
+                if (i + 1 < line.Length && line[i + 1] == ch) i++;
+                tokens.Add(OpMark + ch.ToString());
             }
             else
             {

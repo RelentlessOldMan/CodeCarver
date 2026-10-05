@@ -45,6 +45,10 @@ public sealed class MacroTable
     /// includes may define it.</summary>
     public IReadOnlySet<string>? Ambient { get; set; }
 
+    /// <summary>Every absent name is unknown (the build log does not cover this file, or its define set may be
+    /// incomplete) — closed-world resolution never applies to such a file (owner decision D-B).</summary>
+    public bool OpenWorld { get; set; }
+
     /// <summary>Build from <c>-D</c>-style specs: "NAME" (defined as 1) or "NAME=VALUE".</summary>
     public static MacroTable FromDefines(IEnumerable<string> defines)
     {
@@ -108,7 +112,7 @@ public sealed class MacroTable
         if (_macros.ContainsKey(name)) return false;
         if (_unknown.Contains(name)) return true;
         if (_undefined.Contains(name)) return false;
-        return IsReserved(name) || name is "true" or "false" || (Ambient?.Contains(name) ?? false);
+        return OpenWorld || IsReserved(name) || name is "true" or "false" || (Ambient?.Contains(name) ?? false);
     }
 
     /// <summary>Reserved to the implementation: <c>__x</c> or <c>_</c> + uppercase — compiler built-ins.</summary>
@@ -122,5 +126,5 @@ public sealed class MacroTable
 
     public MacroTable Clone() => new(new Dictionary<string, string>(_macros, StringComparer.Ordinal),
                                      new HashSet<string>(_unknown, StringComparer.Ordinal),
-                                     new HashSet<string>(_undefined, StringComparer.Ordinal), Ambient);
+                                     new HashSet<string>(_undefined, StringComparer.Ordinal), Ambient) { OpenWorld = OpenWorld };
 }

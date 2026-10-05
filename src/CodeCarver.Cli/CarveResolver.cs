@@ -16,6 +16,7 @@ public sealed class ResolvedCarve
     public string OutputDirectory = "";
     public bool AnalysisOnly;
     public List<string> BuildLogs = new();
+    public List<string> CompilerNames = new();    // extra driver names for text build logs
     public List<string> Compilers = new();        // from each selected build that named one
     public List<string> Defines = new();
     public List<string> BuildTraceFiles = new();
@@ -103,6 +104,7 @@ public static class CarveResolver
             r.Defines.AddRange(bs.Defines);
             r.BuildTraceFiles.AddRange(bs.BuildTraceFiles);
             if (!string.IsNullOrWhiteSpace(bs.Compiler)) r.Compilers.Add(bs.Compiler!);
+            r.CompilerNames.AddRange(bs.CompilerNames);
         }
         foreach (var rn in runNames)
         {
