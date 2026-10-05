@@ -60,7 +60,7 @@ public sealed class AttributeRootProvider : IRootProvider
     public IEnumerable<Root> Discover(CodeGraph graph)
     {
         foreach (var node in graph.Nodes)
-            if (node.Kind is NodeKind.Function or NodeKind.Global && (node.Flags & NodeFlags.Keep) != 0)
+            if (node.Kind is NodeKind.Function or NodeKind.Global or NodeKind.File && (node.Flags & NodeFlags.Keep) != 0)
                 yield return new Root(node.Id, RootKind.LinkerKeep, node.Name);
     }
 }

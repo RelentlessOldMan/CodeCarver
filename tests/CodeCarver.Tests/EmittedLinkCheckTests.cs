@@ -200,7 +200,7 @@ public sealed class EmittedLinkCheckTests
             W(s, "b/main.c", "void uart_write(int x);\nint main(void){ uart_write(1); return 0; }\n");
             W(s, "b/uart.c", "void uart_write(int x){ (void)x; }\n");
         });
-        if (code == 0) Assert.Contains("verify  : OK", o);          // fixed: b/uart.c kept
-        else { Assert.Equal(3, code); Assert.Contains("uart_write", o); }
+        Assert.Equal(0, code);                       // N1 fixed in step 4: b/uart.c is kept
+        Assert.Contains("verify  : OK", o);
     }
 }

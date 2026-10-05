@@ -36,7 +36,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // Keep-attributes: symbols the runtime/linker keep regardless of any call — implicit roots a
     // from-main closure would silently drop (a self-registering `constructor`, an initcall-section entry).
     private static readonly Regex AttrBlock = new(
-        @"__attribute__\s*\(\((?<body>(?:[^()]|\([^()]*\))*)\)\)", RegexOptions.Compiled);
+        @"__attribute(?:__)?\s*\(\((?<body>(?:[^()]|\([^()]*\))*)\)\)|\[\[\s*(?<body>gnu::(?:[^\[\]]|\[[^\]]*\])*)\]\]",
+        RegexOptions.Compiled);
     private static readonly Regex KeepKeyword = new(
         @"\b(?:constructor|destructor|used|retain)\b|section\s*\(\s*""\.(?:init_array|preinit_array|fini_array)",
         RegexOptions.Compiled);
@@ -166,6 +167,17 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // (`#define adler32 z_adler32`, zlib's Z_PREFIX) CAN coincide with a real function name, so those must
     // NOT reject the definition — doing so dropped adler32 and broke the link (caught by the map oracle).
     private HashSet<string> _funcLikeMacroNames = new(StringComparer.Ordinal);
+    // Macros whose body places a symbol in a section or marks it used/retained/constructor (directly or via
+    // another such macro): `#define INITCALL(fn) static void (*__init_##fn)(void) __attribute__((section(".initcalls"),
+    // used)) = fn`. A use of one registers something the linker keeps although nothing calls it (review R1).
+    private HashSet<string> _keepMacros = new(StringComparer.Ordinal);
+    private HashSet<string> _keepMacrosFnLike = new(StringComparer.Ordinal);
+    private Regex? _keepMacroUse;
+    private static readonly Regex AnyDefine = new(
+        @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(\()?((?:[^\n\\]|\\\r?\n|\\.)*)", RegexOptions.Compiled | RegexOptions.Multiline);
+    private static readonly Regex KeepBody = new(
+        @"\bsection\s*\(|\b(?:used|retain|constructor|destructor|__root)\b|#\s*pragma\s+location|_Pragma\s*\(\s*""location"
+        + @"|gnu::(?:used|section|retain|constructor|destructor)|__declspec\s*\(\s*allocate", RegexOptions.Compiled);
     private static readonly Regex FuncLikeDefine = new(@"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(", RegexOptions.Compiled | RegexOptions.Multiline);
 
     /// <summary>
@@ -283,6 +295,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                             functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
                             pendingMacroRefs, pendingPastes, fileDefines, closedWorldDefines);
                 foreach (var n in ScanKeepAttributes(text)) keepNames.Add(n);
+                if (_keepMacroUse is not null && fileNodeByPath.TryGetValue(path, out var kfile))
+                    ScanKeepMacroUses(graph, text, kfile, keepNames, pendingRefs);
             }
             catch (Exception ex)   // never let one pathological file sink a whole-repo carve
             {
@@ -365,11 +379,48 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
     }
 
+    /// <summary>
+    /// Uses of keep macros (see <see cref="_keepMacros"/>) outside preprocessor lines. A function-like use
+    /// (<c>INITCALL(drv_init);</c>) roots its file and takes the address of every identifier in its arguments;
+    /// either kind also keeps the symbol it decorates (<c>RAMFUNC void f(void)</c>), found like an attribute.
+    /// </summary>
+    private void ScanKeepMacroUses(CodeGraph graph, string text, NodeId fileNode, HashSet<string> keepNames,
+                                   List<(NodeId, string)> pendingRefs)
+    {
+        foreach (Match m in _keepMacroUse!.Matches(text))
+        {
+            var lineStart = text.LastIndexOf('\n', Math.Max(0, m.Index - 1)) + 1;
+            if (text.AsSpan(lineStart, m.Index - lineStart).TrimStart().StartsWith("#")) continue; // the #define itself
+            var end = m.Index + m.Length;
+            if (_keepMacrosFnLike.Contains(m.Value))
+            {
+                var i = end;
+                while (i < text.Length && char.IsWhiteSpace(text[i])) i++;
+                if (i >= text.Length || text[i] != '(') continue;
+                var depth = 0; var start = i;
+                for (; i < text.Length; i++)
+                {
+                    if (text[i] == '(') depth++;
+                    else if (text[i] == ')' && --depth == 0) { i++; break; }
+                }
+                graph.AddFlag(fileNode, NodeFlags.Keep);
+                foreach (Match id in Identifier.Matches(text[start..i])) pendingRefs.Add((fileNode, id.Value));
+                end = i;
+            }
+            var before = text.AsSpan(0, m.Index);
+            var mb = NameBeforeAttr.Match(before.Length > 200 ? before[^200..].ToString() : before.ToString());
+            if (mb.Success && mb.Groups[1].Value is var bn && !_keepMacros.Contains(bn)) keepNames.Add(bn);
+            var after = text.AsSpan(end);
+            var ma = NameAfterAttr.Match(after.Length > 200 ? after[..200].ToString() : after.ToString());
+            if (ma.Success) keepNames.Add(ma.Groups[1].Value);
+        }
+    }
+
     /// <summary>Names decorated with a keep-attribute (constructor/destructor/used/retain/init-array
     /// section), resolving the decorated symbol whether the attribute leads or trails the declaration.</summary>
     private static IEnumerable<string> ScanKeepAttributes(string text)
     {
-        if (!text.Contains("__attribute__")) yield break; // cheap guard: no attributes -> skip the regex
+        if (!text.Contains("__attribute") && !text.Contains("[[")) yield break; // cheap guard: no attributes -> skip the regex
         foreach (Match m in AttrBlock.Matches(text))
         {
             if (!KeepKeyword.IsMatch(m.Groups["body"].Value)) continue;
@@ -400,6 +451,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
         var defs = new Dictionary<string, string>(StringComparer.Ordinal);
         var fnLike = new HashSet<string>(StringComparer.Ordinal);
+        var bodies = new Dictionary<string, (bool FnLike, List<string> Bodies)>(StringComparer.Ordinal);
         long bytesTotal = 0; var filesTotal = 0;
 
         // Single streaming pass: read each file once and run every collector on it, so the whole tree's text
@@ -433,7 +485,30 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 if (!defs.ContainsKey(n)) defs[n] = "";
             }
             foreach (Match m in FuncLikeDefine.Matches(text)) fnLike.Add(m.Groups[1].Value);
+            if (text.Contains("define", StringComparison.Ordinal))
+                foreach (Match m in AnyDefine.Matches(text))
+                {
+                    var name = m.Groups[1].Value;
+                    if (!bodies.TryGetValue(name, out var b)) bodies[name] = b = (m.Groups[2].Success, new List<string>());
+                    if (b.Bodies.Count < 8) b.Bodies.Add(m.Groups[3].Value);
+                }
         }
+
+        // Keep macros: a keep construct in the body, or (transitively) a use of another keep macro.
+        var keep = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var kv in bodies)
+            if (kv.Value.Bodies.Any(b => KeepBody.IsMatch(b))) keep.Add(kv.Key);
+        for (var changed = keep.Count > 0; changed;)
+        {
+            changed = false;
+            foreach (var kv in bodies)
+                if (!keep.Contains(kv.Key) && kv.Value.Bodies.Any(b => Identifier.Matches(b).Any(id => keep.Contains(id.Value))))
+                { keep.Add(kv.Key); changed = true; }
+        }
+        _keepMacros = keep;
+        _keepMacrosFnLike = new HashSet<string>(keep.Where(k => bodies[k].FnLike), StringComparer.Ordinal);
+        _keepMacroUse = keep.Count == 0 ? null
+            : new Regex(@"\b(?:" + string.Join("|", keep.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
 
         _scopeMacros = map;
         _scopeRegex = map.Count == 0 ? null
@@ -452,8 +527,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             foreach (var kv in defs)
                 if (!blank.Contains(kv.Key) && blank.Contains(kv.Value)) { blank.Add(kv.Key); changed = true; }
         }
+        // Never blank an occurrence followed by "(": a valueless #define NAME in one target must not erase calls
+        // to another target's real function NAME (review N1).
         _blankRegex = blank.Count == 0 ? null
-            : new Regex(@"\b(?:" + string.Join("|", blank.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
+            : new Regex(@"\b(?:" + string.Join("|", blank.Select(Regex.Escape)) + @")\b(?!\s*\()", RegexOptions.Compiled);
 
         _funcLikeMacroNames = fnLike;
         return (bytesTotal, filesTotal);
@@ -585,6 +662,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                                    Dictionary<string, List<NodeId>> globalsByName,
                                    EdgeKind functionEdge)
     {
+        // Link the name to EVERY kind that defines it. One tree holds many targets/configurations, so a name
+        // can be a function in one place and a macro or a global in another; picking the first kind found
+        // dropped the others (review N1).
         if (functionsByName.TryGetValue(name, out var fns))
         {
             foreach (var target in fns)
@@ -594,12 +674,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     graph.AddFlag(target, NodeFlags.AddressTaken);
             }
         }
-        else if (macrosByName.TryGetValue(name, out var macros))
+        if (macrosByName.TryGetValue(name, out var macros))
         {
             foreach (var target in macros)
                 graph.AddEdge(from, target, EdgeKind.Expands);
         }
-        else if (globalsByName.TryGetValue(name, out var globals))
+        if (globalsByName.TryGetValue(name, out var globals))
         {
             foreach (var target in globals)
                 graph.AddEdge(from, target, EdgeKind.References);
@@ -1066,7 +1146,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // real is lost. Object-like RENAME macros (`#define adler32 z_adler32`, zlib Z_PREFIX) are NOT in
         // this set — they legitimately coincide with a real function name, and rejecting those dropped
         // the real function and broke the link (a bug the map oracle caught).
-        if (_funcLikeMacroNames.Contains(nameNode.Text)) return null;
+        var macroNamed = _funcLikeMacroNames.Contains(nameNode.Text);
 
         var n = nameNode;
         for (var i = 0; i < 12; i++)
@@ -1086,6 +1166,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 // top-level function that cascading error-recovery merely nested keeps a valid parameter
                 // list, so it is still captured (crypto libraries with macro-heavy bodies rely on this).
                 if (InsideFunctionBody(parent) && HasCallShapedParameters(parent)) return null;
+                // A name that is ALSO a function-like macro somewhere in the tree: in a multi-target tree that is
+                // often another target's macro, and the real function here must not be lost (review N1). Reject
+                // only the misparse shape the rule exists for — a macro invocation `FMT_CATCH(x) {}`: no return
+                // type, call-shaped "parameters", or nested inside a body.
+                if (macroNamed && (ChildForField(parent, "type") is null || HasCallShapedParameters(parent)
+                                   || InsideFunctionBody(parent))) return null;
                 var start = parent.StartPosition.Row + 1;
                 // Include a leading `template<...>` (possibly several, nested) so pruning a templated
                 // function/method removes the whole thing — otherwise the `template<int N>` line is left

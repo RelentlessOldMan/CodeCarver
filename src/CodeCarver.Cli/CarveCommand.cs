@@ -1513,9 +1513,11 @@ public static class CarveCommand
 // report; set at the start of the carve.
 static class DiagState
 {
-    public static DiagnosticReport? Report;
-    public static string? Path;
+    // Per thread: a carve runs start-to-finish on one thread, and in-process callers (the test suite) run
+    // carves in parallel — a shared static let one run's crash package carry another run's report (review TS8).
+    [ThreadStatic] public static DiagnosticReport? Report;
+    [ThreadStatic] public static string? Path;
     /// <summary>Where an auto-written package lands when the user gave no --diag path (unhandled crash, or
     /// --diag-repro/--diag-verbose used alone). Session-stamped; set at the start of the carve.</summary>
-    public static string? DefaultPath;
+    [ThreadStatic] public static string? DefaultPath;
 }
