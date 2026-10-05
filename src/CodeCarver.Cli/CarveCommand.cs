@@ -182,6 +182,21 @@ public static class CarveCommand
         { err.WriteLine($"outputDirectory must be OUTSIDE the source tree (source '{Path.GetFullPath(dir)}' overlaps '{outputFull}')."); return 2; }
         if (File.Exists(outputFull))
         { err.WriteLine($"outputDirectory '{outputFull}' is a file, not a directory."); return 2; }
+        // Never replace a directory CodeCarver did not create (review O1): each stage writes <base>/carved and
+        // <base>/codecarver; an existing non-empty one is only ours if <base> carries the output marker. Checked
+        // before any work so a long analysis can't end by destroying someone's files.
+        foreach (var st in cv.AnalysisOnly ? new[] { "" } : cv.Stages.Select(x => x.Name).ToArray())
+        {
+            var b = st.Length == 0 ? outputFull : Path.Combine(outputFull, st);
+            foreach (var sub in new[] { "carved", "codecarver" })
+            {
+                var d = Path.Combine(b, sub);
+                if (StagedOutput.IsSafeToReplace(d)) continue;
+                err.WriteLine($"outputDirectory: '{d}' exists, is not empty, and was not written by CodeCarver "
+                    + $"(no {StagedOutput.MarkerName} in '{b}') — refusing to replace it. Choose another outputDirectory or remove it yourself.");
+                return 2;
+            }
+        }
 
         // Diagnostic collector for this run: a source-free snapshot (version/env/params/stats/warnings/timings)
         // written to ONE shareable .zip on request via --diag, or automatically on an unhandled failure (the
@@ -220,6 +235,10 @@ public static class CarveCommand
         // their values elided (which flags were used is the useful debug signal), classify the source root instead
         // of storing it, and record only the ROOT COUNT — never the names. (Redact() is a further backstop for any
         // stray path in free text like exception messages.)
+        // Strings from THIS run that free text (exception messages) could carry: scrubbed at write time (D1).
+        diag.AddSensitive(roots.Concat(new[] { dir, Path.GetFullPath(dir), configPath, outputDirectory, outputFull })
+            .Concat(buildLogs).Concat(traceList).Concat(buildFileTraces).Concat(runFileTraces).Concat(defineSpecs)
+            .Concat(cv.ForceKeepFiles).Concat(cv.ExcludeDirectories));
         diag.Set("commandLine", SanitizeCommandLine(args));
         diag.Set("sourceRootKind", ClassifyRoot(dir));
         diag.Set("lang", lang);
@@ -863,6 +882,33 @@ public static class CarveCommand
         Mark("reachability");
         var s = plan.Stats;
 
+        // Close each stage's plan over what that stage's emitter WRITES (review F1, owner decision D-A): an
+        // unreached definition the emitter keeps anyway (whole kept file; a span the pruner can't remove) is
+        // rooted, so everything it uses is kept and the carved tree links without --gc-sections. C/C++ only
+        // (C# carves file-level with its own front-end; .cmm is not linked code).
+        var closeOverEmit = lang is "c" or "cpp";
+        var defsByFile = closeOverEmit ? EmitClosure.DefinitionsByFile(graph) : null;
+        string? SourceText(string rel)
+        {
+            try
+            {
+                var full = Path.Combine(dir, rel);
+                var fi = new FileInfo(full);
+                return fi.Exists && fi.Length <= maxParseBytes ? File.ReadAllText(full, System.Text.Encoding.Latin1) : null;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
+        }
+        var stagePlans = new Dictionary<bool, CarvePlan>();
+        CarvePlan PlanFor(bool pruned)
+        {
+            if (!closeOverEmit) return plan;
+            if (stagePlans.TryGetValue(pruned, out var sp)) return sp;
+            sp = EmitClosure.Close(graph, rootSet,
+                (f, kept) => FileTreeEmitter.RetainedWhenEmitted(f, defsByFile!.GetValueOrDefault(f), kept, SourceText, pruned));
+            return stagePlans[pruned] = sp;
+        }
+        var whyPlan = PlanFor(!cv.AnalysisOnly && cv.Stages.Count > 0 && cv.Stages[0].CarveSourceFileContents);
+
         if (dumpSpans)
         {
             foreach (var n in graph.Nodes
@@ -884,7 +930,7 @@ public static class CarveCommand
                 return 1;
             }
             foreach (var n in matches.OrderBy(n => n.FilePath, StringComparer.Ordinal).ThenBy(n => n.Span.StartLine))
-                @out.WriteLine($"  {n.Kind} {n.Name} @ {n.FilePath}:{n.Span}\n    {plan.Explain(n.Id)}");
+                @out.WriteLine($"  {n.Kind} {n.Name} @ {n.FilePath}:{n.Span}\n    {whyPlan.Explain(n.Id)}");
             return 0;
         }
 
@@ -966,28 +1012,62 @@ public static class CarveCommand
         }
         // Dropped .cmm are infrastructure, not modelled code — fold them into the emitter's drop set so they
         // aren't copied, but keep plan.DroppedFiles (dead CODE) distinct for the report's accounting.
-        IReadOnlyCollection<string> infraDropped = cmmDropped.Count == 0
-            ? plan.DroppedFiles
-            : plan.DroppedFiles.Concat(cmmDropped).ToList();
+        IReadOnlyCollection<string> InfraDropped(CarvePlan p) => cmmDropped.Count == 0
+            ? p.DroppedFiles
+            : p.DroppedFiles.Concat(cmmDropped).ToList();
 
-        // --- Soundness check (plan-based; identical for every stage): a KEPT fn must not call an in-scope DROPPED
-        // fn (it wouldn't link). Always on now; folded into the normal output + each stage's report. ---
+        // --- Soundness checks. (1) The internal graph check: a kept function calling an in-scope dropped one.
+        // It shares the call list the edges were built from, so it is a consistency check only and is printed
+        // only when it fires. (2) The real gate is EmittedLinkCheck, run per stage over the EMITTED tree with a
+        // tokenizer that never consults the graph (review V1). ---
         var verifyFailed = false;
         if (fe is TreeSitterFrontEnd tsv)
         {
             var violations = SoundnessCheck.KeptCallingDropped(graph, plan, tsv.CallSites);
-            if (violations.Count == 0)
-                @out.WriteLine("  verify  : OK — every in-scope callee of a kept function is kept");
-            else
+            if (violations.Count > 0)
             {
                 verifyFailed = true;
-                @out.WriteLine($"  verify  : {violations.Count} UNSOUND call(s) — a kept function calls an in-scope function that was carved out:");
+                @out.WriteLine($"  verify  : internal graph check: {violations.Count} kept function(s) call an in-scope function that was carved out:");
                 foreach (var v in violations.Take(20)) @out.WriteLine($"            {v.Caller}() -> {v.Callee}()  [{v.File}]");
                 if (violations.Count > 20) @out.WriteLine($"            (+{violations.Count - 20} more)");
             }
         }
-        else
-            @out.WriteLine($"  verify  : (soundness check is C/C++ only; skipped for language '{lang}')");
+        var linkCheck = lang is "c" or "cpp";
+        if (!linkCheck)
+            @out.WriteLine($"  verify  : (emitted-tree link check is C/C++ only; skipped for language '{lang}')");
+        // Dead-line classification for the link check: the same #ifdef model the front-end used per file.
+        Func<string, string, bool[]?>? deadLinesFor = defines is null && perFileDefines is null ? null
+            : (rel, text) => (perFileDefines?.Invoke(rel) ?? defines) is { } t ? PreprocessorScanner.DeadLineMap(text, t, closedWorld) : null;
+        // Runs the emitted-tree check, prints the verdict, writes codecarver/verify.txt; true when it failed.
+        bool VerifyEmitted(CarvePlan p, IEnumerable<(string Rel, string Path)> emittedFiles, string ccDir)
+        {
+            if (!linkCheck) return false;
+            var droppedForCheck = p.DroppedFiles.Select(r => (r, Path.Combine(dir, r)));
+            var r = EmittedLinkCheck.Run(emittedFiles, droppedForCheck, deadLinesFor, maxParseBytes);
+            var hard = r.Hard;
+            var soft = r.DeadOnly;
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"# CodeCarver emitted-tree verify — {r.FilesChecked} file(s) checked, {r.FilesSkipped} too large/unreadable");
+            sb.AppendLine("# A violation: emitted code uses a function that only a DROPPED file defines.");
+            foreach (var v in hard) sb.AppendLine($"FAIL {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined only in dropped {v.DefinedIn}");
+            foreach (var v in soft) sb.AppendLine($"DEAD {v.Name}\tused {v.ReferencedIn}:{v.Line} (#ifdef-dead line)\tdefined only in dropped {v.DefinedIn}");
+            Directory.CreateDirectory(ccDir);
+            WriteArtifact(Path.Combine(ccDir, "verify.txt"), sb.ToString(), "verify");
+            if (hard.Count == 0)
+                @out.WriteLine($"  verify  : OK — emitted code uses no function defined only in a dropped file ({r.FilesChecked} file(s) checked)");
+            else
+            {
+                @out.WriteLine($"  verify  : FAILED — emitted code uses {hard.Count} function(s) defined only in dropped files (the carved tree will not link):");
+                foreach (var v in hard.Take(20)) @out.WriteLine($"            {v.Name}  used {v.ReferencedIn}:{v.Line}, defined only in dropped {v.DefinedIn}");
+                if (hard.Count > 20) @out.WriteLine($"            (+{hard.Count - 20} more in verify.txt)");
+            }
+            if (soft.Count > 0)
+                @out.WriteLine($"  verify  : note — {soft.Count} function(s) used only on #ifdef-dead lines are defined only in dropped files "
+                    + "(correct if the #ifdef world is; see verify.txt)");
+            if (r.FilesSkipped > 0)
+                @out.WriteLine($"  verify  : note — {r.FilesSkipped} file(s) over {maxParseBytes:N0} B or unreadable were not checked");
+            return hard.Count > 0;
+        }
         @out.WriteLine($"  world   : {cv.WorldReason}");
 
         void WriteArtifact(string path, string content, string what)
@@ -1002,7 +1082,7 @@ public static class CarveCommand
         // straight to the file (no in-memory graph/string), so it scales to any size — we report the bytes so a
         // large one is visible. Any write failure degrades to a warning (and removes the partial file) — a
         // diagnostic aid must never fail the carve.
-        void WriteRepro(string ccDir)
+        void WriteRepro(string ccDir, CarvePlan plan)
         {
             var path = Path.Combine(ccDir, "repro.graph.json");
             try
@@ -1024,14 +1104,14 @@ public static class CarveCommand
         // giant human ledger has no value, so above this cap we write a short note and defer to manifest.json /
         // `--why`. (The cap is only about the ledger now; the repro bundle streams uncapped.)
         const int decisionsNodeCap = 500_000;
-        void WriteDecisions(string ccDir, string stageName)
+        void WriteDecisions(string ccDir, string stageName, CarvePlan plan)
         {
             if (graph.NodeCount > decisionsNodeCap)
             {
                 WriteArtifact(Path.Combine(ccDir, "decisions.txt"),
                     $"# CodeCarver decisions — per-symbol ledger omitted: graph too large "
                     + $"({graph.NodeCount:N0} nodes > {decisionsNodeCap:N0} cap).\n"
-                    + $"# {s.ReachedNodes}/{s.TotalNodes} nodes kept. See manifest.json for file-level keep/drop, "
+                    + $"# {plan.Stats.ReachedNodes}/{plan.Stats.TotalNodes} nodes kept. See manifest.json for file-level keep/drop, "
                     + "or use `--why <symbol>` for a single symbol.\n", "decisions");
                 return;
             }
@@ -1042,16 +1122,21 @@ public static class CarveCommand
         // huge) emit. The WORKREPO "dry run" and the ground-truth oracle use this to inspect kept/dropped fast.
         if (cv.AnalysisOnly)
         {
+            var aplan = PlanFor(false);   // what a file-level emit would write, closed over (D-A)
+            if (aplan.KeptFiles.Count > plan.KeptFiles.Count)
+                @out.WriteLine($"  closure : +{aplan.KeptFiles.Count - plan.KeptFiles.Count} file(s) kept because kept files' unreached code uses them (file-level output must link)");
             var ccDir = Path.Combine(outputDirectory, "codecarver");
             Directory.CreateDirectory(ccDir);
+            try { File.WriteAllText(Path.Combine(outputDirectory, StagedOutput.MarkerName), "CodeCarver output area.\n"); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* advisory */ }
             @out.WriteLine("  mode    : analysis only — plan + report + manifest, no carved tree emitted");
-            var carvedCode = plan.KeptFiles.Sum(f => sizeByRel.TryGetValue(f, out var b) ? b : 0);
+            var carvedCode = aplan.KeptFiles.Sum(f => sizeByRel.TryGetValue(f, out var b) ? b : 0);
             @out.WriteLine($"  size    : {originalBytes:N0} B scanned, {carvedCode:N0} B in kept code files");
-            @out.WriteLine($"  buckets : {plan.KeptFiles.Count:N0} reachable-code + {plan.DroppedFiles.Count:N0} dead-code file(s) "
+            @out.WriteLine($"  buckets : {aplan.KeptFiles.Count:N0} reachable-code + {aplan.DroppedFiles.Count:N0} dead-code file(s) "
                 + "(infrastructure + include closure are enumerated only when emitting)");
             var report = CarveReport.Render(new CarveReport.Inputs(
-                SourceRoot: dir, Roots: roots, BuildRequired: plan.KeptFiles, KeptCode: plan.KeptFiles,
-                RemovedDeadCode: plan.DroppedFiles, Infrastructure: Array.Empty<string>(), ExcludedDirs: excludeDirs,
+                SourceRoot: dir, Roots: roots, BuildRequired: aplan.KeptFiles, KeptCode: aplan.KeptFiles,
+                RemovedDeadCode: aplan.DroppedFiles, Infrastructure: Array.Empty<string>(), ExcludedDirs: excludeDirs,
                 CodeBytesBefore: originalBytes, CodeBytesAfter: carvedCode, InfraBytes: 0, InfraEnumerated: false,
                 RemovedGarbage: Array.Empty<string>(), GarbageBytes: 0, Observed: observedRel.ToList()));
             WriteArtifact(Path.Combine(ccDir, "report.txt"), report, "report");
@@ -1059,17 +1144,18 @@ public static class CarveCommand
             {
                 codecarverVersion = Version(), root = dir, roots, lang, analysisOnly = true,
                 defines = defineSpecs.Distinct().ToArray(), closedWorld,
-                stats = new { s.TotalNodes, s.ReachedNodes, s.DroppedNodes, s.TotalFiles, s.KeptFiles, s.DroppedFiles },
-                keptFiles = plan.KeptFiles, droppedFiles = plan.DroppedFiles, droppedCmm = cmmDropped,
+                stats = new { aplan.Stats.TotalNodes, aplan.Stats.ReachedNodes, aplan.Stats.DroppedNodes, aplan.Stats.TotalFiles, aplan.Stats.KeptFiles, aplan.Stats.DroppedFiles },
+                keptFiles = aplan.KeptFiles, droppedFiles = aplan.DroppedFiles, droppedCmm = cmmDropped,
                 observedFiles = observedRel.OrderBy(f => f, StringComparer.Ordinal).ToArray(),
             };
             WriteArtifact(Path.Combine(ccDir, "manifest.json"),
                 System.Text.Json.JsonSerializer.Serialize(m, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), "manifest");
-            WriteDecisions(ccDir, "");
-            WriteRepro(ccDir);
+            WriteDecisions(ccDir, "", aplan);
+            WriteRepro(ccDir, aplan);
+            if (VerifyEmitted(aplan, aplan.KeptFiles.Select(r => (r, Path.Combine(dir, r))), ccDir)) verifyFailed = true;
             Mark("analyze");
             diag.Set("analysisOnly", true);
-            diag.Set("totalNodes", s.TotalNodes); diag.Set("keptFiles", s.KeptFiles); diag.Set("droppedFiles", s.DroppedFiles);
+            diag.Set("totalNodes", aplan.Stats.TotalNodes); diag.Set("keptFiles", aplan.Stats.KeptFiles); diag.Set("droppedFiles", aplan.Stats.DroppedFiles);
             diag.Set("verifyFailed", verifyFailed); diag.Event("run complete");
             return verifyFailed ? 3 : 0;
         }
@@ -1084,6 +1170,7 @@ public static class CarveCommand
         {
             prune = stage.CarveSourceFileContents;
             pruneHeaders = stage.CarveHeaderFileContents;
+            var splan = PlanFor(prune);
             var baseDir = stage.Name.Length == 0 ? outputDirectory : Path.Combine(outputDirectory, stage.Name);
             var outDir = Path.Combine(baseDir, "carved");
             var ccDir = Path.Combine(baseDir, "codecarver");
@@ -1095,7 +1182,9 @@ public static class CarveCommand
             var stageDir = staged.Dir;
             Console.CancelKeyPress += (_, _) => { try { staged.Dispose(); } catch { } };
 
-            var res = prune ? FileTreeEmitter.EmitPruned(plan, graph, dir, stageDir) : FileTreeEmitter.Emit(plan, dir, stageDir);
+            if (splan.KeptFiles.Count > plan.KeptFiles.Count)
+                @out.WriteLine($"  closure : +{splan.KeptFiles.Count - plan.KeptFiles.Count} file(s) kept because code this stage writes uses them (the output must link)");
+            var res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir) : FileTreeEmitter.Emit(splan, dir, stageDir);
             var carvedBytes = res.BytesWritten;
             var buildRequiredFiles = res.Written;
             @out.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{(prune ? "intra-file (unused functions removed)" : "file-level (whole kept files)")}]");
@@ -1103,7 +1192,7 @@ public static class CarveCommand
 
             if (pruneHeaders && lang is "c" or "cpp")
             {
-                var keptBig = bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)).Where(plan.KeptFiles.Contains).ToList();
+                var keptBig = bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)).Where(splan.KeptFiles.Contains).ToList();
                 if (keptBig.Count > 0)
                 {
                     var hc = HeaderCarver.Carve(stageDir, keptBig);
@@ -1114,9 +1203,11 @@ public static class CarveCommand
                 }
             }
 
+            if (VerifyEmitted(splan, res.Written.Select(r => (r, Path.Combine(stageDir, r))).ToList(), ccDir)) verifyFailed = true;
+
             // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
             // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
-            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, infraDropped, excludeDirs, auxGlobs, pruneGarbage, observedRel);
+            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel);
             carvedBytes += infra.Bytes;
             var origTotal = originalCodeBytes + infra.Bytes;   // delta-neutral passthrough (both sides)
             if (infra.Count > 0)
@@ -1140,13 +1231,13 @@ public static class CarveCommand
             var pct = origTotal > 0 ? (double)saved / origTotal : 0;
             @out.WriteLine($"  size    : {origTotal:N0} B -> {carvedBytes:N0} B  ({pct:P0} smaller, saved {saved:N0} B)");
             @out.WriteLine($"  buckets : {buildRequiredFiles.Count:N0} required-to-build + {infra.Count:N0} infrastructure kept, "
-                + $"{plan.DroppedFiles.Count:N0} dead-code" + (infra.Garbage.Count > 0 ? $" + {infra.Garbage.Count:N0} auto-excluded" : "") + " file(s) removed");
+                + $"{splan.DroppedFiles.Count:N0} dead-code" + (infra.Garbage.Count > 0 ? $" + {infra.Garbage.Count:N0} auto-excluded" : "") + " file(s) removed");
 
             // Always write report + manifest + resolved-config into codecarver/.
             Directory.CreateDirectory(ccDir);
             var report = CarveReport.Render(new CarveReport.Inputs(
-                SourceRoot: dir, Roots: roots, BuildRequired: buildRequiredFiles, KeptCode: plan.KeptFiles,
-                RemovedDeadCode: plan.DroppedFiles, Infrastructure: infra.Files, ExcludedDirs: excludeDirs,
+                SourceRoot: dir, Roots: roots, BuildRequired: buildRequiredFiles, KeptCode: splan.KeptFiles,
+                RemovedDeadCode: splan.DroppedFiles, Infrastructure: infra.Files, ExcludedDirs: excludeDirs,
                 CodeBytesBefore: origTotal - infra.Bytes, CodeBytesAfter: carvedBytes - infra.Bytes,
                 InfraBytes: infra.Bytes, InfraEnumerated: true, RemovedGarbage: infra.Garbage, GarbageBytes: infra.GarbageBytes,
                 Observed: observedRel.ToList()));
@@ -1157,9 +1248,9 @@ public static class CarveCommand
                 codecarverVersion = Version(), root = dir, roots, lang,
                 defines = defineSpecs.Distinct().ToArray(), closedWorld,
                 stage = stage.Name, carveSourceFileContents = prune, carveHeaderFileContents = pruneHeaders,
-                stats = new { s.TotalNodes, s.ReachedNodes, s.DroppedNodes, s.TotalFiles, s.KeptFiles, s.DroppedFiles,
-                    originalBytes = origTotal, carvedBytes, savedBytes = saved },
-                keptFiles = plan.KeptFiles, droppedFiles = plan.DroppedFiles, droppedCmm = cmmDropped,
+                stats = new { splan.Stats.TotalNodes, splan.Stats.ReachedNodes, splan.Stats.DroppedNodes, splan.Stats.TotalFiles,
+                    splan.Stats.KeptFiles, splan.Stats.DroppedFiles, originalBytes = origTotal, carvedBytes, savedBytes = saved },
+                keptFiles = splan.KeptFiles, droppedFiles = splan.DroppedFiles, droppedCmm = cmmDropped,
                 infrastructureFiles = infra.Files, removedGarbageFiles = infra.Garbage,
                 observedFiles = observedRel.OrderBy(f => f, StringComparer.Ordinal).ToArray(),
             };
@@ -1169,8 +1260,8 @@ public static class CarveCommand
                 $"# CodeCarver resolved config — stage '{stage.Name}'\n# {cv.WorldReason}\n"
                 + $"# entryPoints={roots.Length}  languages={string.Join(",", cv.Languages)}  buildLogs={buildLogs.Count}  "
                 + $"runTraceFiles={runFileTraces.Count}  runTraceLogs={traceList.Count}\n\n{configText}", "config");
-            WriteDecisions(ccDir, stage.Name);
-            WriteRepro(ccDir);
+            WriteDecisions(ccDir, stage.Name, splan);
+            WriteRepro(ccDir, splan);
         }
         Mark("emit");
 

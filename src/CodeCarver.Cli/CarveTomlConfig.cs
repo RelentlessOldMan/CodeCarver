@@ -268,6 +268,10 @@ public static class ConfigLoader
         if (GetTable(root, parent, ctx) is not { } p) yield break;
         foreach (var k in p.Keys)
         {
+            // Names become path segments (stage output directories) and appear in messages: restrict them so
+            // [stages."../../x"] can never write outside outputDirectory (review D2).
+            if (k.Length == 0 || !k.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-'))
+            { ctx.Errors.Add($"[{parent}.{k}]: section names may use only letters, digits, '_' and '-'."); continue; }
             if (p[k] is TomlTable t) yield return (k, t);
             else ctx.Errors.Add($"[{parent}.{k}] must be a section/table.");
         }

@@ -29,7 +29,10 @@ public sealed class DiagnosticReport
     private readonly DateTimeOffset _started;
     private readonly System.Diagnostics.Stopwatch _sw = System.Diagnostics.Stopwatch.StartNew();
     private readonly List<(long Ms, string Message)> _events = new();
-    private readonly List<string> _warnings = new();
+    // Warnings are recorded as CATEGORY counts only: their text names files, .cmm arguments and symbols, which
+    // must never ship in a package the tool calls safe to send (review D1).
+    private readonly SortedDictionary<string, int> _warnings = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _sensitive = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, object?> _fields = new(StringComparer.Ordinal);
     private readonly List<Attachment> _attachments = new();
 
@@ -51,8 +54,44 @@ public sealed class DiagnosticReport
     /// <summary>Record a breadcrumb with the elapsed time since start (phase transitions, milestones).</summary>
     public void Event(string message) => _events.Add((_sw.ElapsedMilliseconds, message));
 
-    /// <summary>Record a warning surfaced during the run (kept-whole fragments, unresolved includes, …).</summary>
-    public void Warn(string warning) => _warnings.Add(warning);
+    /// <summary>Record a warning surfaced during the run (kept-whole fragments, unresolved includes, …). Only
+    /// its <see cref="WarningCategory"/> is kept — never the text.</summary>
+    public void Warn(string warning)
+    {
+        var c = WarningCategory(warning);
+        _warnings[c] = _warnings.GetValueOrDefault(c) + 1;
+    }
+
+    /// <summary>Register run-specific strings (relative paths, file names, entry-point names, config values)
+    /// that must never appear in the package; they are replaced at write time.</summary>
+    public void AddSensitive(IEnumerable<string> values)
+    {
+        foreach (var v in values)
+        {
+            if (string.IsNullOrWhiteSpace(v) || v.Length < 3) continue;
+            _sensitive.Add(v);
+            var fwd = v.Replace('\\', '/');
+            _sensitive.Add(fwd);
+            var leaf = Path.GetFileName(fwd);
+            if (leaf.Length >= 3) _sensitive.Add(leaf);
+        }
+    }
+
+    /// <summary>A fixed, name-free category for a warning text.</summary>
+    public static string WarningCategory(string w)
+    {
+        if (w.Contains("extraction failed", StringComparison.Ordinal)) return "frontend.extraction-failed";
+        if (w.Contains("parse threw", StringComparison.Ordinal)) return "frontend.parse-threw";
+        if (w.Contains("data fragment", StringComparison.Ordinal)) return "frontend.include-fragment";
+        if (w.Contains("ms budget", StringComparison.Ordinal)) return "frontend.parse-timeout";
+        if (w.Contains("symbols (>", StringComparison.Ordinal)) return "frontend.symbol-budget";
+        if (w.Contains("variable path", StringComparison.Ordinal)) return "cmm.dynamic-do";
+        if (w.Contains("ambiguous basename", StringComparison.Ordinal)) return "cmm.ambiguous-do";
+        if (w.Contains("target unresolved", StringComparison.Ordinal)) return "cmm.unresolved-do";
+        if (w.Contains("kept whole", StringComparison.Ordinal)) return "kept-whole";
+        if (w.Contains("could not read", StringComparison.Ordinal)) return "unreadable";
+        return "other";
+    }
 
     /// <summary>Add or overwrite a structured field (version, lang, roots, stats, …).</summary>
     public void Set(string key, object? value) => _fields[key] = value;
@@ -73,7 +112,7 @@ public sealed class DiagnosticReport
     {
         _fields["failed"] = true;
         _fields["exceptionType"] = ex.GetType().FullName;
-        _fields["exceptionMessage"] = ex.Message;
+        _fields["exceptionMessage"] = ex.Message;            // scrubbed at write time (quotes, paths, names)
         _fields["exceptionStack"] = ex.StackTrace;
         if (ex.InnerException is { } inner)
             _fields["innerException"] = $"{inner.GetType().FullName}: {inner.Message}";
@@ -94,10 +133,16 @@ public sealed class DiagnosticReport
     /// /mnt/… path — anywhere, not just under home) is reduced to <c>&lt;path&gt;</c>. The CLI already elides
     /// the structured path/name fields at the source; this catches stray paths in free text (exceptions).
     /// Returns the input unchanged when it contains nothing to redact.</summary>
-    public static string Redact(string? text)
+    public static string Redact(string? text) => Redact(text, freeText: true);
+
+    /// <param name="freeText">Also scrub quoted text, relative paths and file names (messages). False for
+    /// structured attachments (JSON), where quotes are syntax: only absolute paths are scrubbed there.</param>
+    public static string Redact(string? text, bool freeText)
     {
         if (string.IsNullOrEmpty(text)) return text ?? "";
         var result = text;
+        // A path under home is removed entirely by the relative-path pass below — not left as
+        // %USERPROFILE%\work\SecretProj\x.c, which still names the project.
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         if (!string.IsNullOrEmpty(home))
         {
@@ -109,8 +154,36 @@ public sealed class DiagnosticReport
                 result = result.Replace(homeFwd, placeholder, StringComparison.OrdinalIgnoreCase);
         }
         // Defense in depth: strip any remaining absolute path token (outside home) that free text may carry.
-        return AbsolutePath.Replace(result, "<path>");
+        result = AbsolutePath.Replace(result, "<path>");
+        if (!freeText) return result;
+        // Quoted text in free-form messages ('foo', "bar") is where exceptions put keys and names.
+        result = Quoted.Replace(result, m => m.Value[0] + "<redacted>" + m.Value[0]);
+        // Any remaining token that contains a path separator next to a letter (a relative path), or that ends
+        // in a known source/build extension (a file name), is removed.
+        result = RelPathToken.Replace(result, "<path>");
+        return FileToken.Replace(result, "<file>");
     }
+
+    /// <summary><see cref="Redact"/> plus every string registered with <see cref="AddSensitive"/>.</summary>
+    public string Scrub(string? text, bool freeText = true)
+    {
+        var r = Redact(text, freeText);
+        if (_sensitive.Count == 0 || r.Length == 0) return r;
+        foreach (var v in _sensitive.OrderByDescending(v => v.Length))
+            if (r.Contains(v, StringComparison.OrdinalIgnoreCase))
+                r = r.Replace(v, "<redacted>", StringComparison.OrdinalIgnoreCase);
+        return r;
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex Quoted = new(
+        @"'[^'\r\n]{1,400}'|""[^""\r\n]{1,400}""|`[^`\r\n]{1,400}`", System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex RelPathToken = new(
+        @"[^\s""'<>|(),;]*[A-Za-z_][^\s""'<>|(),;]*[\\/][^\s""'<>|(),;]*|[^\s""'<>|(),;]*[\\/][^\s""'<>|(),;]*[A-Za-z_][^\s""'<>|(),;]*",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex FileToken = new(
+        @"\b[\w.+-]+\.(?:c|h|cc|cpp|cxx|c\+\+|hpp|hh|hxx|inl|ipp|tcc|tpp|inc|def|s|asm|cmm|ld|lds|ldscript|icf|sct|cs|"
+        + @"mk|cmake|txt|json|toml|log|rsp|py|o|obj|a|lib|elf|bin|hex|map|d|i|ii|sh|bat|ps1)\b",
+        System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
     /// <summary>Human-readable overview a developer can read WITHOUT unzipping the raw artifacts.</summary>
     public string BuildSummaryText()
@@ -125,15 +198,15 @@ public sealed class DiagnosticReport
         sb.AppendLine();
         sb.AppendLine("== Fields ==");
         foreach (var kv in _fields)
-            sb.AppendLine($"{kv.Key}: {Redact(FormatValue(kv.Value))}");
+            sb.AppendLine($"{kv.Key}: {Scrub(FormatValue(kv.Value))}");
         sb.AppendLine();
         sb.AppendLine($"== Events ({_events.Count}) ==");
         foreach (var (ms, msg) in _events)
-            sb.AppendLine($"[{ms,7} ms] {Redact(msg)}");
+            sb.AppendLine($"[{ms,7} ms] {Scrub(msg)}");
         sb.AppendLine();
-        sb.AppendLine($"== Warnings ({_warnings.Count}) ==");
-        foreach (var w in _warnings)
-            sb.AppendLine($"- {Redact(w)}");
+        sb.AppendLine($"== Warnings by category ({_warnings.Values.Sum()}) ==");
+        foreach (var (cat, n) in _warnings)
+            sb.AppendLine($"- {cat}: {n}");
         return sb.ToString();
     }
 
@@ -147,9 +220,9 @@ public sealed class DiagnosticReport
             ["createdUtc"] = DateTimeOffset.UtcNow.ToString("o"),
             ["startedUtc"] = _started.ToString("o"),
             ["durationMs"] = _sw.ElapsedMilliseconds,
-            ["fields"] = _fields.ToDictionary(kv => kv.Key, kv => (object?)Redact(FormatValue(kv.Value))),
-            ["events"] = _events.Select(e => new Dictionary<string, object?> { ["ms"] = e.Ms, ["message"] = Redact(e.Message) }).ToList(),
-            ["warnings"] = _warnings.Select(Redact).ToList(),
+            ["fields"] = _fields.ToDictionary(kv => kv.Key, kv => (object?)Scrub(FormatValue(kv.Value))),
+            ["events"] = _events.Select(e => new Dictionary<string, object?> { ["ms"] = e.Ms, ["message"] = Scrub(e.Message) }).ToList(),
+            ["warningCategories"] = _warnings.ToDictionary(kv => kv.Key, kv => (object?)kv.Value),
         };
         return JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true });
     }
@@ -178,6 +251,8 @@ public sealed class DiagnosticReport
         sb.AppendLine("- The source-tree path, --out/--build-log/etc. paths, and root symbol names");
         sb.AppendLine("  (elided at the source; the command line is recorded as flags-with-values-elided)");
         sb.AppendLine("- Absolute paths anywhere (home, other drives, UNC shares, WSL) redacted to a placeholder");
+        sb.AppendLine("- Warning texts (they name files and symbols): only per-category counts are kept");
+        sb.AppendLine("- Quoted text, relative paths, file names and this run's own paths/entry points in free text");
         sb.AppendLine();
 
         var named = _attachments.Where(a => a.ContainsNames).Select(a => a.Name).ToList();
@@ -219,7 +294,7 @@ public sealed class DiagnosticReport
                 WriteEntry(zip, "summary.txt", BuildSummaryText());
                 WriteEntry(zip, "diagnostics.json", BuildDiagnosticsJson());
                 WriteEntry(zip, "manifest.txt", BuildManifestText());
-                foreach (var a in _attachments) WriteEntry(zip, a.Name, Redact(a.Content));
+                foreach (var a in _attachments) WriteEntry(zip, a.Name, Scrub(a.Content, freeText: false));
             }
             if (File.Exists(target)) File.Delete(target);
             File.Move(tmp, target);

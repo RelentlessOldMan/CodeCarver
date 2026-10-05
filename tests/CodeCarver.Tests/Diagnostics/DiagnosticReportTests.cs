@@ -86,10 +86,13 @@ public sealed class DiagnosticReportTests
             report.TryWritePackage(Path.Combine(work, "p.zip"), out var zipPath, out _);
             var (summary, json, _) = ReadPackage(zipPath);
 
-            // The literal home path (hence the username) must not appear; the placeholder must.
+            // Neither the home path (hence the username) nor anything under it may appear (review D1: a path under
+            // home used to become %USERPROFILE%/secret-project/src, which still names the project).
             Assert.DoesNotContain(home, summary);
             Assert.DoesNotContain(home, json);
-            Assert.True(summary.Contains("%USERPROFILE%") || summary.Contains("$HOME"));
+            Assert.DoesNotContain("secret-project", summary + json);
+            Assert.DoesNotContain("private", summary + json);
+            Assert.Contains("<path>", summary);
         }
         finally { Cleanup(work); }
     }
@@ -318,5 +321,39 @@ public sealed class DiagnosticReportTests
     private static void Cleanup(string work)
     {
         try { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); } catch { }
+    }
+
+    [Fact]
+    public void Redact_PathWithSpacesAndRelativePaths_FullyRemoved()
+    {
+        var r = DiagnosticReport.Redact(@"failed on src/secret_dir/secret_blob.h and boards\acme\x.c in 'secret_entry'");
+        Assert.DoesNotContain("secret_dir", r);
+        Assert.DoesNotContain("secret_blob", r);
+        Assert.DoesNotContain("acme", r);
+        Assert.DoesNotContain("secret_entry", r);
+        Assert.DoesNotContain("acme", DiagnosticReport.Redact("open /work/acme/fw/main.c failed"));
+        Assert.DoesNotContain("SecretProj", DiagnosticReport.Redact(@"read C:\Users\bob\work\SecretProj\x.c"));
+        Assert.Equal("24/24 passed", DiagnosticReport.Redact("24/24 passed"));
+    }
+
+    [Fact]
+    public void Warnings_AreRecordedAsCategoryCountsOnly()
+    {
+        var work = Path.Combine(Path.GetTempPath(), "cc-diag-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            var report = DiagnosticReport.Start();
+            report.Warn("boards/acme_secret/flash.cmm: `DO acme_init.cmm` — ambiguous basename 'acme_init' matches 2 files; bound to the first");
+            report.Warn("acme_secret/regs.c: parse exceeded the 20000 ms budget — kept whole, not carved");
+            report.AddSensitive(new[] { "acme_entry_point" });
+            report.Event("about acme_entry_point");
+            report.TryWritePackage(Path.Combine(work, "p.zip"), out var zipPath, out _);
+            var (summary, json, _) = ReadPackage(zipPath);
+            Assert.DoesNotContain("acme", summary + json);
+            Assert.Contains("cmm.ambiguous-do: 1", summary);
+            Assert.Contains("frontend.parse-timeout: 1", summary);
+        }
+        finally { Cleanup(work); }
     }
 }

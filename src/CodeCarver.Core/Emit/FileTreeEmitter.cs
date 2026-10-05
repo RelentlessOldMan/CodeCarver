@@ -67,8 +67,6 @@ public static class FileTreeEmitter
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(graph);
 
-        // Gather ALL prunable definition spans per file — functions AND initialized globals (data
-        // tables) — kept + dropped, so we can detect misparse/overlap and remove unreached ones.
         // HEADERS are never pruned: a header is the API surface, and its inline/template definitions may
         // be used by any translation unit — including code OUTSIDE the carve (the app that consumes the
         // carved library). Removing an unreached inline method from a header (C++ especially) silently
@@ -77,46 +75,7 @@ public static class FileTreeEmitter
         // Constructors are never pruned — but that's handled soundly upstream by ConstructorRootProvider,
         // which ROOTS them so reachability keeps the constructor AND everything it calls (its
         // member-initializer list / body). Here they simply appear as reached nodes.
-        var spansByFile = new Dictionary<string, List<(int Start, int End, bool Drop)>>(StringComparer.Ordinal);
-        foreach (var n in graph.Nodes)
-        {
-            if (n.Kind is not (NodeKind.Function or NodeKind.Global)) continue;
-            if (n.FilePath is not { } f || !n.Span.IsKnown || IsHeader(f)) continue;
-            if (!spansByFile.TryGetValue(f, out var list))
-                spansByFile[f] = list = new List<(int, int, bool)>();
-            list.Add((n.Span.StartLine, n.Span.EndLine, !plan.IsKept(n.Id)));
-        }
-
-        // A dropped function is only safe to remove if its span does not overlap another function's.
-        // Overlapping spans mean a mis-parse (unusual macro-prefixed or heavily #ifdef'd declarations);
-        // removing one would corrupt the other, so keep both — a sound over-approximation.
-        var dropByFile = new Dictionary<string, List<(int Start, int End)>>(StringComparer.Ordinal);
-        foreach (var (f, list) in spansByFile)
-        {
-            list.Sort((a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.End.CompareTo(b.End));
-
-            // If a DROPPED function's span overlaps a KEPT one, the parse nested/mis-grouped this file —
-            // e.g. a local class or lambda defined INSIDE a big function, whose method is reached (by name /
-            // virtual dispatch) while the enclosing function is not. The enclosing function is then kept
-            // whole (its span can't be cleanly removed), but it may CALL other top-level functions in the
-            // file that reachability dropped — pruning those would leave the kept-whole function dangling
-            // (real tinyxml2 xmltest.cpp: a visitor class inside main() is reached via Accept, main is kept,
-            // and its helper example_1() was wrongly pruned -> "example_1 was not declared"). We can't tell
-            // what the kept-whole function references, so keep the WHOLE FILE (sound over-approximation).
-            var kept = list.Where(x => !x.Drop).ToList();
-            var droppedOverlapsKept = list.Any(d => d.Drop && kept.Any(k => k.Start <= d.End && d.Start <= k.End));
-            if (droppedOverlapsKept) continue;
-
-            var drops = new List<(int, int)>();
-            for (var i = 0; i < list.Count; i++)
-            {
-                if (!list[i].Drop) continue;
-                var overlaps = (i > 0 && list[i - 1].End >= list[i].Start)
-                            || (i + 1 < list.Count && list[i + 1].Start <= list[i].End);
-                if (!overlaps) drops.Add((list[i].Start, list[i].End));
-            }
-            if (drops.Count > 0) dropByFile[f] = drops;
-        }
+        var defsByFile = EmitClosure.DefinitionsByFile(graph);
 
         var written = new List<string>();
         long bytes = 0;
@@ -137,7 +96,8 @@ public static class FileTreeEmitter
             // Only files with something to prune are read+rewritten. Everything else — including
             // multi-GB headers kept whole — is stream-copied, so a big kept file never becomes a
             // >2GB string in memory (it would throw) and is emitted in bounded memory.
-            if (dropByFile.TryGetValue(rel, out var ranges) && ranges.Count > 0)
+            var ranges = !IsHeader(rel) && defsByFile.TryGetValue(rel, out var defs) ? DropRangesFor(defs, plan.IsKept) : null;
+            if (ranges is { Count: > 0 })
                 File.WriteAllText(dst, RemoveLineRanges(File.ReadAllText(src), ranges));
             else
                 File.Copy(src, dst, overwrite: true);
@@ -147,6 +107,65 @@ public static class FileTreeEmitter
 
         CopyUnscannedIncludes(plan, sourceRoot, outDir, written, ref bytes);
         return new EmitResult(written.Count, bytes, written);
+    }
+
+    /// <summary>
+    /// The definition spans the pruned emitter would like to remove from one implementation file: unreached
+    /// functions and initialized globals whose span overlaps no other definition. Null when the file must be
+    /// written whole (a dropped span overlaps a kept one — a mis-parse; see below).
+    /// </summary>
+    static List<(int Start, int End)>? DropRangesFor(IReadOnlyList<Node> defs, Func<NodeId, bool> isKept)
+    {
+        var list = defs.Where(n => n.Span.IsKnown)
+                       .Select(n => (Start: n.Span.StartLine, End: n.Span.EndLine, Drop: !isKept(n.Id))).ToList();
+        list.Sort((a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.End.CompareTo(b.End));
+
+        // If a DROPPED function's span overlaps a KEPT one, the parse nested/mis-grouped this file —
+        // e.g. a local class or lambda defined INSIDE a big function, whose method is reached (by name /
+        // virtual dispatch) while the enclosing function is not. The enclosing function is then kept
+        // whole (its span can't be cleanly removed), but it may CALL other top-level functions in the
+        // file that reachability dropped — pruning those would leave the kept-whole function dangling
+        // (real tinyxml2 xmltest.cpp: a visitor class inside main() is reached via Accept, main is kept,
+        // and its helper example_1() was wrongly pruned -> "example_1 was not declared"). We can't tell
+        // what the kept-whole function references, so keep the WHOLE FILE (sound over-approximation).
+        var kept = list.Where(x => !x.Drop).ToList();
+        if (list.Any(d => d.Drop && kept.Any(k => k.Start <= d.End && d.Start <= k.End))) return null;
+
+        // A dropped function is only safe to remove if its span does not overlap another function's.
+        // Overlapping spans mean a mis-parse (unusual macro-prefixed or heavily #ifdef'd declarations);
+        // removing one would corrupt the other, so keep both — a sound over-approximation.
+        var drops = new List<(int, int)>();
+        for (var i = 0; i < list.Count; i++)
+        {
+            if (!list[i].Drop) continue;
+            var overlaps = (i > 0 && list[i - 1].End >= list[i].Start)
+                        || (i + 1 < list.Count && list[i + 1].Start <= list[i].End);
+            if (!overlaps) drops.Add((list[i].Start, list[i].End));
+        }
+        return drops;
+    }
+
+    /// <summary>
+    /// The unreached definitions in <paramref name="rel"/> that the emitter will nevertheless WRITE — the
+    /// policy <see cref="EmitClosure"/> roots so a carved tree links (review F1). File-level: every unreached
+    /// definition in a kept implementation file. Pruned: those whose span the pruner keeps (overlap, unbalanced
+    /// braces, the whole-file fallback). Headers, either way: only definitions a compiler emits code for.
+    /// </summary>
+    public static IEnumerable<NodeId> RetainedWhenEmitted(string rel, IReadOnlyList<Node>? defs, Func<NodeId, bool> isKept,
+                                                          Func<string, string?> readText, bool pruned)
+    {
+        if (defs is null || defs.Count == 0) return Array.Empty<NodeId>();
+        if (IsHeader(rel))
+            return EmitClosure.RetainedInHeader(defs, readText(rel)).Where(id => !isKept(id)).ToList();
+        var unreached = defs.Where(n => !isKept(n.Id)).ToList();
+        if (!pruned || unreached.Count == 0) return unreached.Select(n => n.Id).ToList();
+
+        var ranges = DropRangesFor(defs, isKept);
+        var text = ranges is { Count: > 0 } ? readText(rel) : null;
+        if (text is null) return unreached.Select(n => n.Id).ToList();        // written whole
+        var applied = AppliedRanges(text.Split('\n'), ranges!);
+        return unreached.Where(n => !(n.Span.IsKnown && applied.Contains((n.Span.StartLine, n.Span.EndLine))))
+                        .Select(n => n.Id).ToList();
     }
 
     /// <summary>Do these two paths resolve to the same file on disk? Used to refuse writing a carved file
@@ -269,6 +288,27 @@ public static class FileTreeEmitter
     private static string RemoveLineRanges(string text, List<(int Start, int End)> ranges)
     {
         var lines = text.Split('\n');
+        var drop = DropLines(lines, ranges, null);
+        var sb = new StringBuilder(text.Length);
+        for (var i = 1; i <= lines.Length; i++)
+        {
+            if (drop[i]) continue;
+            sb.Append(lines[i - 1]);
+            if (i < lines.Length) sb.Append('\n');
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>The requested ranges that <see cref="RemoveLineRanges"/> actually removes.</summary>
+    private static HashSet<(int, int)> AppliedRanges(string[] lines, List<(int Start, int End)> ranges)
+    {
+        var applied = new HashSet<(int, int)>();
+        DropLines(lines, ranges, applied);
+        return applied;
+    }
+
+    private static bool[] DropLines(string[] lines, List<(int Start, int End)> ranges, HashSet<(int, int)>? applied)
+    {
         var drop = new bool[lines.Length + 2];
         foreach (var (s, e) in ranges)
         {
@@ -312,6 +352,7 @@ public static class FileTreeEmitter
             }
             for (var i = Math.Max(1, start); i <= e && i <= lines.Length; i++)
                 drop[i] = true;
+            applied?.Add((s, e));
         }
 
         // Never delete a preprocessor directive (or its backslash-continuation) even inside a dropped
@@ -328,14 +369,6 @@ public static class FileTreeEmitter
                 if (j <= lines.Length) drop[j] = false;
             }
         }
-
-        var sb = new StringBuilder(text.Length);
-        for (var i = 1; i <= lines.Length; i++)
-        {
-            if (drop[i]) continue;
-            sb.Append(lines[i - 1]);
-            if (i < lines.Length) sb.Append('\n');
-        }
-        return sb.ToString();
+        return drop;
     }
 }

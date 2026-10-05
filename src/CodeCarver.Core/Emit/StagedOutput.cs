@@ -44,6 +44,22 @@ public sealed class StagedOutput : IDisposable
         catch { return false; }
     }
 
+    /// <summary>
+    /// May a carve write <paramref name="outDir"/> (a carved tree or the <c>codecarver/</c> metadata directory)?
+    /// Yes if it does not exist or is empty, or if its parent carries the marker (a prior CodeCarver output).
+    /// Anything else is a directory CodeCarver did not create, and replacing it would destroy user data (review O1).
+    /// </summary>
+    public static bool IsSafeToReplace(string outDir)
+    {
+        try
+        {
+            var full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outDir));
+            if (!Directory.Exists(full) || !Directory.EnumerateFileSystemEntries(full).Any()) return true;
+            return Path.GetDirectoryName(full) is { } parent && IsCodeCarverOutput(parent);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return false; }
+    }
+
     private StagedOutput(string dir, string finalOut, string token)
     {
         Dir = dir;
@@ -62,6 +78,12 @@ public sealed class StagedOutput : IDisposable
         var finalOut = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outDir));
         var parent = Path.GetDirectoryName(finalOut)
                      ?? throw new ArgumentException($"--out '{outDir}' has no parent directory", nameof(outDir));
+        // Never replace a directory CodeCarver did not create (review O1). The CLI checks this up front with a
+        // friendly message; this is the last line of defence for direct library callers.
+        if (!IsSafeToReplace(finalOut))
+            throw new PromoteFailedException(
+                $"'{finalOut}' exists, is not empty, and is not a CodeCarver output (no {MarkerName} beside it) "
+                + "— refusing to replace it. Choose another outputDirectory or remove it yourself.", torn: false);
         Directory.CreateDirectory(parent); // the final tree's parent must exist for the promote rename
         // Reap orphans from prior runs that were HARD-killed (Ctrl-C / power loss / OOM kill) before Dispose
         // could clean up: a staging or backup sibling for THIS same --out. Left alone they accumulate a full
@@ -264,11 +286,14 @@ public sealed class StagedOutput : IDisposable
         {
             var stagingPrefix = $".ccstaging-{finalName}-";
             var backupPrefix = $"{finalName}.ccold-";
+            // Exact shape only (prefix + 8-hex token): ".ccstaging-out-" must not match ".ccstaging-out-2-<token>",
+            // the live staging dir of a sibling output named "out-2".
+            static bool Token(string rest) => rest.Length == 8 && rest.All(char.IsAsciiHexDigitLower);
             foreach (var d in Directory.EnumerateDirectories(parent))
             {
                 var name = Path.GetFileName(d);
-                if (name.StartsWith(stagingPrefix, StringComparison.Ordinal) ||
-                    name.StartsWith(backupPrefix, StringComparison.Ordinal))
+                if ((name.StartsWith(stagingPrefix, StringComparison.Ordinal) && Token(name[stagingPrefix.Length..])) ||
+                    (name.StartsWith(backupPrefix, StringComparison.Ordinal) && Token(name[backupPrefix.Length..])))
                     TryDelete(d);
             }
         }

@@ -17,6 +17,25 @@ public sealed class StagedOutputTests
         return w;
     }
 
+    private static void MarkPriorOutput(string outDir) =>
+        File.WriteAllText(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(outDir))!, StagedOutput.MarkerName), "x");
+
+    [Fact]
+    public void Begin_RefusesForeignNonEmptyDirectory()
+    {
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            Directory.CreateDirectory(outDir);
+            File.WriteAllText(Path.Combine(outDir, "IMPORTANT.txt"), "keep");
+            Assert.Throws<PromoteFailedException>(() => StagedOutput.Begin(outDir));
+            Assert.Equal("keep", File.ReadAllText(Path.Combine(outDir, "IMPORTANT.txt")));
+            Assert.False(File.Exists(Path.Combine(work, StagedOutput.MarkerName)));
+        }
+        finally { Cleanup(work); }
+    }
+
     [Fact]
     public void Begin_CreatesEmptyStaging_BesideOut_NotTheOutDir()
     {
@@ -67,6 +86,7 @@ public sealed class StagedOutputTests
         {
             var outDir = Path.Combine(work, "out");
             Directory.CreateDirectory(outDir);
+            MarkPriorOutput(outDir); // a prior CodeCarver output (review O1: unmarked dirs are refused)
             File.WriteAllText(Path.Combine(outDir, "a.c"), "old-a");
             File.WriteAllText(Path.Combine(outDir, "b.c"), "old-b");   // will be dropped by the new carve
 
@@ -92,6 +112,7 @@ public sealed class StagedOutputTests
         {
             var outDir = Path.Combine(work, "out");
             Directory.CreateDirectory(outDir);
+            MarkPriorOutput(outDir); // a prior CodeCarver output (review O1: unmarked dirs are refused)
             File.WriteAllText(Path.Combine(outDir, "keep.c"), "known-good");
 
             string stagingDir;
@@ -117,6 +138,7 @@ public sealed class StagedOutputTests
         {
             var outDir = Path.Combine(work, "out");
             Directory.CreateDirectory(outDir);
+            MarkPriorOutput(outDir); // a prior CodeCarver output (review O1: unmarked dirs are refused)
             File.WriteAllText(Path.Combine(outDir, "a.c"), "old");
             using (var staged = StagedOutput.Begin(outDir))
             {

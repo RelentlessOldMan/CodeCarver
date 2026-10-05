@@ -33,6 +33,10 @@ public enum RootKind
 
     /// <summary>Externally visible symbol of a library image (its public surface is a root set).</summary>
     Exported,
+
+    /// <summary>Unreached, but the emitter writes it anyway (a whole kept file, or a span the pruner cannot
+    /// remove) — rooted so everything it uses is kept and the carved tree links (see EmitClosure).</summary>
+    EmittedWhole,
 }
 
 /// <summary>A seed node for the reachability closure, tagged with why it was seeded (for reporting).</summary>
