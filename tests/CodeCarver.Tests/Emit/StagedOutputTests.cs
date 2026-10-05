@@ -189,13 +189,13 @@ public sealed class StagedOutputTests
         finally { Cleanup(work); }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Promote_WhenRenameBlockedByOpenHandle_FallsBackToCopy()
     {
         // Reproduces the Windows AV/indexer failure: a handle held open on a just-written staged file blocks
         // the directory rename. Promote must retry and then fall back to copying the tree in, so the carve
         // still lands instead of exiting with a spurious failure.
-        if (!OperatingSystem.IsWindows()) return; // the sharing-violation-on-rename behavior is Windows-specific
+        Skip.IfNot(OperatingSystem.IsWindows(), "sharing-violation-on-rename is Windows lock semantics");
         var work = NewWork();
         try
         {
@@ -215,13 +215,13 @@ public sealed class StagedOutputTests
         finally { Cleanup(work); }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Promote_PriorOutHasOpenFile_StillLands_ViaInPlaceFallback()
     {
         // eval-#9 MEDIUM: a process holding a file open in the prior --out (or a shell cwd'd there) blocks the
         // directory move-aside. Promote must fall back to replacing contents IN PLACE so the carve still
         // lands, instead of failing every re-carve. (Windows lock semantics; skip elsewhere.)
-        if (!OperatingSystem.IsWindows()) return;
+        Skip.IfNot(OperatingSystem.IsWindows(), "an open handle blocking a directory move is Windows lock semantics");
         var work = NewWork();
         try
         {
@@ -251,8 +251,8 @@ public sealed class StagedOutputTests
     {
         // eval-#10 HIGH (Perforce): read-only files in the prior --out blocked backup deletion, leaking a
         // full .ccold copy per re-carve. Now ReadOnly is cleared before deleting, and the carved output is
-        // emitted writable. (Read-only-blocks-delete is Windows behavior; skip elsewhere.)
-        if (!OperatingSystem.IsWindows()) return;
+        // emitted writable. Read-only-blocks-delete is Windows behaviour, but the contract asserted here (no leaked
+        // backup, output updated and writable) is platform-neutral, so it runs everywhere (review TS3).
         var work = NewWork();
         try
         {
@@ -277,13 +277,13 @@ public sealed class StagedOutputTests
         finally { Cleanup(work); }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Promote_PriorOutHasExclusiveLock_PreflightBails_LeavesPriorUnchanged()
     {
         // eval-#10 MEDIUM: a no-share lock must NOT leave a torn tree. The in-place pre-flight opens every
         // destination for write BEFORE mutating; a locked file bails with the prior output byte-for-byte
         // unchanged and a Torn=false failure ("unchanged"), not a half-replaced tree.
-        if (!OperatingSystem.IsWindows()) return;
+        Skip.IfNot(OperatingSystem.IsWindows(), "FileShare.None locks are Windows lock semantics");
         var work = NewWork();
         try
         {
@@ -361,13 +361,13 @@ public sealed class StagedOutputTests
         finally { Cleanup(work); }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Promote_InPlaceFallback_UndeletableStaleFile_SurfacesTornError()
     {
         // eval-#10: when the in-place fallback runs and a file the new carve DROPPED cannot be removed (held
         // open without delete-share), the tree is left STALE/unsound. That must be surfaced as a torn failure
         // — NOT a silent exit 0 that hands back an output still carrying the dropped file.
-        if (!OperatingSystem.IsWindows()) return; // relies on Windows open-handle-blocks-delete/rename semantics
+        Skip.IfNot(OperatingSystem.IsWindows(), "open-handle-blocks-delete/rename is Windows lock semantics");
         var work = NewWork();
         try
         {
@@ -397,12 +397,12 @@ public sealed class StagedOutputTests
         finally { Cleanup(work); }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Promote_FreshOut_RenameBlocked_CopyFallbackPreservesNestedSubdirs()
     {
         // When the staging->final rename is blocked (AV/indexer holding a just-written file) the copy fallback
         // must reproduce the FULL tree, including nested subdirectories — a carved source tree is not flat.
-        if (!OperatingSystem.IsWindows()) return; // sharing-violation-on-rename is Windows-specific
+        Skip.IfNot(OperatingSystem.IsWindows(), "sharing-violation-on-rename is Windows lock semantics");
         var work = NewWork();
         try
         {

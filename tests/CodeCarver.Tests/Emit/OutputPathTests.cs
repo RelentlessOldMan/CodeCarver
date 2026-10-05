@@ -47,9 +47,12 @@ public sealed class OutputPathTests
     }
 
     [Fact]
-    public void WindowsCaseInsensitivity()
+    public void CaseHandling_MatchesPlatformFilesystem()
     {
-        if (!OperatingSystem.IsWindows()) return;
-        Assert.True(OutputPath.Overlaps(@"C:\Work\Proj\SRC", @"C:\work\proj\src"));
+        // Review TS3: runs on every OS. Windows/macOS file systems are case-insensitive by default, so differently
+        // cased forms of one directory overlap there; elsewhere they are different directories.
+        var expected = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS();
+        Assert.Equal(expected, OutputPath.Overlaps(J("Proj", "SRC"), J("proj", "src")));
+        Assert.Equal(expected, OutputPath.Overlaps(J("src"), J("SRC", "carved")));
     }
 }

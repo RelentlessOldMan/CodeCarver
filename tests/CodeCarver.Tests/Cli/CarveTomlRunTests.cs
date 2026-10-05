@@ -129,8 +129,12 @@ public sealed class CarveTomlRunTests
     [Fact]
     public void Carve_Stages_RunAll_ToSubdirs()
     {
+        // Review TS7: the tree must make the stages DIFFER, or the per-stage EmitPruned dispatch is unverified.
+        // helper.c carries an unreached function: kept whole at safe (file-level), pruned at aggressive.
         var (work, src, outDir) = NewWork();
         BasicTree(src);
+        File.WriteAllText(Path.Combine(src, "helper.c"),
+            "int helper(void){return 1;}\nint helper_unused(void){return 2;}\n");
         try
         {
             var cfg = Config(work, outDir, """
@@ -141,11 +145,25 @@ public sealed class CarveTomlRunTests
                 [stages.aggressive]
                 carveSourceFileContents = true
                 """);
-            var (code, _, _) = Run("carve", src, "--config", cfg);
+            var (code, o, _) = Run("carve", src, "--config", cfg);
             Assert.Equal(0, code);
-            Assert.True(File.Exists(Path.Combine(outDir, "safe", "carved", "main.c")));
-            Assert.True(File.Exists(Path.Combine(outDir, "aggressive", "carved", "main.c")));
-            Assert.True(File.Exists(Path.Combine(outDir, "safe", "codecarver", "manifest.json")));
+            foreach (var stage in new[] { "safe", "aggressive" })
+            {
+                Assert.True(File.Exists(Path.Combine(outDir, stage, "carved", "main.c")));
+                Assert.False(File.Exists(Path.Combine(outDir, stage, "carved", "dead.c")));   // file-level drop at both
+                Assert.True(File.Exists(Path.Combine(outDir, stage, "codecarver", "manifest.json")));
+            }
+            Assert.False(File.Exists(Path.Combine(outDir, "carved", "main.c")));            // nothing outside the stage dirs
+
+            var safeHelper = File.ReadAllText(Path.Combine(outDir, "safe", "carved", "helper.c"));
+            var aggrHelper = File.ReadAllText(Path.Combine(outDir, "aggressive", "carved", "helper.c"));
+            Assert.Contains("helper_unused", safeHelper);       // safe = whole kept files
+            Assert.DoesNotContain("helper_unused", aggrHelper); // aggressive = EmitPruned removed it
+            Assert.Contains("int helper(void)", aggrHelper);    // ...and kept what is reached
+            Assert.Contains("\"carveSourceFileContents\": true",
+                File.ReadAllText(Path.Combine(outDir, "aggressive", "codecarver", "manifest.json")));
+            Assert.Contains("stage   : safe", o);
+            Assert.Contains("stage   : aggressive", o);
         }
         finally { Cleanup(work); }
     }
@@ -243,7 +261,29 @@ public sealed class CarveTomlRunTests
             var cfg = Config(work, outDir, "[common]\nentryPoints = [\"main\"]\n");
             var (code, o, _) = Run("carve", src, "--config", cfg, "--why", "helper");
             Assert.Equal(0, code);
-            Assert.Contains("helper", o);
+            // Review TS7: "helper" alone would pass on a CARVED verdict too. Assert the actual explanation: the
+            // keep chain from helper back through its caller to the root, and no carved verdict.
+            Assert.Contains("Function 'helper' @ helper.c", o);
+            Assert.Contains("<= [Calls] Function 'main' @ main.c", o);
+            Assert.Contains("ROOT[", o);
+            Assert.DoesNotContain("CARVED", o);
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact]
+    public void Carve_Why_CarvedSymbol_SaysCarved()
+    {
+        var (work, src, outDir) = NewWork();
+        BasicTree(src);
+        try
+        {
+            var cfg = Config(work, outDir, "[common]\nentryPoints = [\"main\"]\n");
+            var (code, o, _) = Run("carve", src, "--config", cfg, "--why", "never");
+            Assert.Equal(0, code);
+            Assert.Contains("Function 'never' @ dead.c", o);
+            Assert.Contains("CARVED (not reachable)", o);
+            Assert.DoesNotContain("ROOT[", o);
         }
         finally { Cleanup(work); }
     }
@@ -272,6 +312,69 @@ public sealed class CarveTomlRunTests
             Assert.Equal(0, code);
             Assert.Contains("closed-world", o);                                       // build log => closed-world derived
             Assert.True(File.Exists(Path.Combine(outDir, "carved", "widget.c")));     // #else branch kept => reachable
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Theory]
+    [InlineData(false)]   // FEATURE absent from every compile command: the #ifdef branch is dead
+    [InlineData(true)]    // -DFEATURE on every compile command: the #else branch is dead
+    public void Carve_BuildLog_ClosedWorld_UniformMacro_DropsDeadBranchCallee(bool defined)
+    {
+        // Review TS7: the CLI closed-world test above covers only the "varies per TU" case, where nothing may be
+        // dropped. Here the build log pins FEATURE the same way for every TU, so closed-world resolves it and the
+        // file only the dead branch calls is dropped — while the live branch's callee is kept.
+        var (work, src, outDir) = NewWork();
+        File.WriteAllText(Path.Combine(src, "main.c"),
+            "#ifdef FEATURE\nint feature_impl(void);\nint main(void){return feature_impl();}\n"
+            + "#else\nint fallback_impl(void);\nint main(void){return fallback_impl();}\n#endif\n");
+        File.WriteAllText(Path.Combine(src, "feature.c"), "int feature_impl(void){return 1;}\n");
+        File.WriteAllText(Path.Combine(src, "fallback.c"), "int fallback_impl(void){return 2;}\n");
+        var db = Path.Combine(work, "cc.json");
+        var d = Fwd(src);
+        // The absent case still passes one unrelated -D: with ZERO -D in the whole log the product currently skips
+        // #ifdef resolution entirely (see Carve_BuildLog_NoDefinesAtAll_StillResolvesIfdefs below).
+        var flag = defined ? "\"-DFEATURE\"," : "\"-DUNRELATED=1\",";
+        File.WriteAllText(db, "[" + string.Join(",", new[] { "main.c", "feature.c", "fallback.c" }.Select(f =>
+            "{\"directory\":\"" + d + "\",\"file\":\"" + f + "\",\"arguments\":[\"gcc\"," + flag + "\"-c\",\"" + f + "\"]}")) + "]");
+        try
+        {
+            var cfg = Config(work, outDir, $"[common]\nentryPoints = [\"main\"]\n[builds.main]\nbuildLogs = [\"{Fwd(db)}\"]\n");
+            var (code, o, e) = Run("carve", src, "--config", cfg);
+            Assert.True(code == 0, o + e);
+            Assert.Contains("closed-world", o);
+            var live = defined ? "feature.c" : "fallback.c";
+            var dead = defined ? "fallback.c" : "feature.c";
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", live)), $"{live} (live branch's callee) must be kept");
+            Assert.False(File.Exists(Path.Combine(outDir, "carved", dead)), $"{dead} (dead branch's callee) must be dropped");
+            Assert.Contains($"dropped : {dead}", o);
+            Assert.Contains("verify  : OK", o);
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact(Skip = "PRODUCT BUG: a build log whose commands carry no -D at all leaves haveDefines false "
+               + "(CarveCommand.cs ~473-502), so no #ifdef resolution runs, yet the run reports 'closed-world (dead #ifdef "
+               + "branches dropped)'. Sound but imprecise and the world line is wrong. Un-skip when fixed.")]
+    public void Carve_BuildLog_NoDefinesAtAll_StillResolvesIfdefs()
+    {
+        var (work, src, outDir) = NewWork();
+        File.WriteAllText(Path.Combine(src, "main.c"),
+            "#ifdef FEATURE\nint feature_impl(void);\nint main(void){return feature_impl();}\n"
+            + "#else\nint fallback_impl(void);\nint main(void){return fallback_impl();}\n#endif\n");
+        File.WriteAllText(Path.Combine(src, "feature.c"), "int feature_impl(void){return 1;}\n");
+        File.WriteAllText(Path.Combine(src, "fallback.c"), "int fallback_impl(void){return 2;}\n");
+        var db = Path.Combine(work, "cc.json");
+        var d = Fwd(src);
+        File.WriteAllText(db, "[" + string.Join(",", new[] { "main.c", "feature.c", "fallback.c" }.Select(f =>
+            "{\"directory\":\"" + d + "\",\"file\":\"" + f + "\",\"arguments\":[\"gcc\",\"-c\",\"" + f + "\"]}")) + "]");
+        try
+        {
+            var cfg = Config(work, outDir, $"[common]\nentryPoints = [\"main\"]\n[builds.main]\nbuildLogs = [\"{Fwd(db)}\"]\n");
+            var (code, o, _) = Run("carve", src, "--config", cfg);
+            Assert.Equal(0, code);
+            Assert.Contains("closed-world", o);
+            Assert.False(File.Exists(Path.Combine(outDir, "carved", "feature.c")));   // kept today
         }
         finally { Cleanup(work); }
     }
@@ -383,28 +486,15 @@ public sealed class CarveTomlRunTests
         finally { Cleanup(work); }
     }
 
-    // Walk up from the test binary to the repo and return <repo>/examples/<name>, or null if not found.
-    private static string? FindExample(string name)
-    {
-        var dir = AppContext.BaseDirectory;
-        for (var i = 0; i < 8 && dir is not null; i++)
-        {
-            var cand = Path.Combine(dir, "examples", name);
-            if (Directory.Exists(cand)) return cand;
-            dir = Path.GetDirectoryName(dir.TrimEnd(Path.DirectorySeparatorChar));
-        }
-        return null;
-    }
-
     [Fact]
     public void Example_CmmTrace_CheckedInCarveIsUpToDate()
     {
         // The examples/cmm-trace carved tree is checked in as documentation of the trace-seeded .cmm closure.
         // Regenerate it through the real CLI and assert it matches byte-for-byte, so it can't drift from the tool.
-        var ex = FindExample("cmm-trace");
-        if (ex is null) return;                       // example not present (packaged build) — skip
+        // Review TS3: the example is committed, so a missing fixture is a FAILURE, not a silent pass.
+        var ex = TestRepo.Example("cmm-trace");
         var golden = Path.Combine(ex, "carved");
-        if (!Directory.Exists(golden)) return;
+        Assert.True(Directory.Exists(golden), "examples/cmm-trace/carved (the checked-in golden tree) is missing");
 
         var work = Path.Combine(Path.GetTempPath(), "cc-cmmex-" + Guid.NewGuid().ToString("N"));
         var outDir = Path.Combine(work, "out");
@@ -473,14 +563,45 @@ public sealed class CarveTomlRunTests
             extern "C" int cpp_api(int x){ return cpp_helper(x); }
             struct Unused { int dead() const { return 9; } };
             """);
+        // A dead C++ translation unit: a class nothing reachable refers to.
+        File.WriteAllText(Path.Combine(src, "unused.cpp"),
+            "class DeadClass {\npublic:\n  int idle() const { return 1; }\n};\nint dead_free(){ DeadClass d; return d.idle(); }\n");
         try
         {
-            var cfg = Config(work, outDir, "[common]\nentryPoints = [\"main\"]\nlanguages = [\"c\",\"cpp\"]\n");
+            var cfg = Config(work, outDir, """
+                [common]
+                entryPoints = ["main"]
+                languages = ["c","cpp"]
+                [stages.safe]
+                carveSourceFileContents = false
+                [stages.aggressive]
+                carveSourceFileContents = true
+                """);
             var (code, o, err) = Run("carve", src, "--config", cfg);
             Assert.Equal(0, code);
             Assert.Contains("one graph via the C++ grammar", err);                  // the merge note (stderr)
-            Assert.True(File.Exists(Path.Combine(outDir, "carved", "main.c")));     // C root
-            Assert.True(File.Exists(Path.Combine(outDir, "carved", "engine.cpp"))); // reached across the boundary
+            foreach (var stage in new[] { "safe", "aggressive" })
+            {
+                var carved = Path.Combine(outDir, stage, "carved");
+                Assert.True(File.Exists(Path.Combine(carved, "main.c")));           // C root
+                Assert.True(File.Exists(Path.Combine(carved, "engine.cpp")));       // reached across the boundary
+                Assert.False(File.Exists(Path.Combine(carved, "unused.cpp")));      // dead class's TU dropped
+                Assert.Contains("unused.cpp", File.ReadAllText(Path.Combine(outDir, stage, "codecarver", "manifest.json")));
+                var decisions = File.ReadAllText(Path.Combine(outDir, stage, "codecarver", "decisions.txt"));
+                Assert.Matches(@"KEPT\s+Function\s+cpp_helper\b", decisions);       // C++-only helper reached from C
+                Assert.Matches(@"CARVED\s+Type\s+Unused\b", decisions);             // the dead class is carved...
+                Assert.Matches(@"CARVED\s+Type\s+DeadClass\b", decisions);
+                // Its method: at safe, engine.cpp is emitted whole, so what it contains is rooted (EmittedWhole);
+                // at aggressive the method is genuinely carved.
+                Assert.Matches(stage == "safe" ? @"KEPT\s+Function\s+dead\b.*EmittedWhole" : @"CARVED\s+Function\s+dead\b", decisions);
+            }
+            Assert.Contains("dropped : unused.cpp", o);
+            // ...and at aggressive it is physically gone from the kept engine.cpp, while the live code stays.
+            var engine = File.ReadAllText(Path.Combine(outDir, "aggressive", "carved", "engine.cpp"));
+            Assert.DoesNotContain("Unused", engine);
+            Assert.Contains("cpp_api", engine);
+            Assert.Contains("cpp_helper", engine);
+            Assert.Contains("struct Unused", File.ReadAllText(Path.Combine(outDir, "safe", "carved", "engine.cpp"))); // safe = whole file
             Assert.Contains("verify  : OK", o);
         }
         finally { Cleanup(work); }
@@ -498,6 +619,32 @@ public sealed class CarveTomlRunTests
             var (code, _, err) = Run("carve", src, "--config", cfg);
             Assert.Equal(2, code);
             Assert.Contains("C family", err);
+        }
+        finally { Cleanup(work); }
+    }
+
+    [Fact(Skip = "PRODUCT GAP (review 8c 'Examples'): a file copied by FileTreeEmitter.CopyUnscannedIncludes is emitted "
+               + "but recorded in no manifest list (the manifest records plan.KeptFiles, not what was written). "
+               + "Un-skip when the manifest lists it.")]
+    public void Carve_UnscannedIncludeInExcludedDir_IsListedInManifest()
+    {
+        // main.c includes a header that lives in an excluded directory. The emitter rightly copies it (the tree would
+        // not compile without it), but manifest.json lists it nowhere: not keptFiles, not infrastructureFiles.
+        var (work, src, outDir) = NewWork();
+        Directory.CreateDirectory(Path.Combine(src, "vendor"));
+        File.WriteAllText(Path.Combine(src, "main.c"), "#include \"vendor/cfg.h\"\nint main(void){return CFG;}\n");
+        File.WriteAllText(Path.Combine(src, "vendor", "cfg.h"), "#define CFG 1\n");
+        try
+        {
+            var cfg = Config(work, outDir, "[common]\nentryPoints = [\"main\"]\nexcludeDirectories = [\"vendor\"]\n");
+            var (code, _, _) = Run("carve", src, "--config", cfg);
+            Assert.Equal(0, code);
+            Assert.True(File.Exists(Path.Combine(outDir, "carved", "vendor", "cfg.h")));   // emitted (correct)
+            using var m = System.Text.Json.JsonDocument.Parse(File.ReadAllText(Path.Combine(outDir, "codecarver", "manifest.json")));
+            var listed = new[] { "keptFiles", "infrastructureFiles" }
+                .SelectMany(p => m.RootElement.GetProperty(p).EnumerateArray().Select(e => e.GetString()))
+                .ToList();
+            Assert.Contains("vendor/cfg.h", listed);                                         // fails today
         }
         finally { Cleanup(work); }
     }

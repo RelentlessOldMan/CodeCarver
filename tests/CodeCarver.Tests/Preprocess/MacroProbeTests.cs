@@ -3,8 +3,9 @@ using Xunit;
 
 namespace CodeCarver.Tests.Preprocess;
 
-/// <summary>Probes the pinned gcc for its macro set and checks #ifdef resolution runs against it.
-/// Skips when the toolchain isn't fetched.</summary>
+/// <summary>Probes a real gcc for its macro set and checks #ifdef resolution runs against it. Uses the pinned
+/// toolchain when fetched, otherwise a gcc/cc on PATH (CI images have one); reports SKIPPED — not Passed — only
+/// when neither exists.</summary>
 public class MacroProbeTests
 {
     private static string? Gcc()
@@ -16,17 +17,30 @@ public class MacroProbeTests
             if (File.Exists(cand)) return cand;
             dir = dir.Parent;
         }
+        // Fall back to a compiler on PATH, so the success path is exercised wherever one is installed.
+        var exts = OperatingSystem.IsWindows() ? new[] { ".exe" } : new[] { "" };
+        foreach (var name in new[] { "gcc", "cc" })
+            foreach (var p in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+            {
+                if (string.IsNullOrWhiteSpace(p)) continue;
+                foreach (var ext in exts)
+                {
+                    string cand;
+                    try { cand = Path.Combine(p.Trim(), name + ext); } catch (ArgumentException) { continue; }
+                    if (File.Exists(cand)) return cand;
+                }
+            }
         return null;
     }
 
-    [Fact]
+    [SkippableFact]
     public void Probe_ReturnsCompilerPredefinedMacros()
     {
         var gcc = Gcc();
-        if (gcc is null) return;
-        var table = MacroProbe.Probe(gcc);
+        Skip.If(gcc is null, "no gcc: neither the pinned toolchain (.toolchains/w64devkit) nor gcc/cc on PATH");
+        var table = MacroProbe.Probe(gcc!);
         Assert.NotNull(table);
-        Assert.True(table!.IsDefined("__GNUC__")); // every gcc predefines this
+        Assert.True(table!.IsDefined("__GNUC__")); // every gcc (and clang-as-cc) predefines this
     }
 
     [Fact]
@@ -39,12 +53,12 @@ public class MacroProbeTests
         Assert.Null(table);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Probe_HonoursDashD_AndDrivesClosedWorldResolution()
     {
         var gcc = Gcc();
-        if (gcc is null) return;
-        var table = MacroProbe.Probe(gcc, new[] { "-DMY_FEATURE=1" });
+        Skip.If(gcc is null, "no gcc: neither the pinned toolchain (.toolchains/w64devkit) nor gcc/cc on PATH");
+        var table = MacroProbe.Probe(gcc!, new[] { "-DMY_FEATURE=1" });
         Assert.NotNull(table);
 
         Assert.True(table!.IsDefined("MY_FEATURE"));

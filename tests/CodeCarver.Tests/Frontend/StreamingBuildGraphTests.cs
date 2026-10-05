@@ -15,6 +15,17 @@ public sealed class StreamingBuildGraphTests
     private static HashSet<string> FuncNames(CodeGraph g) =>
         g.Nodes.Where(n => n.Kind == NodeKind.Function).Select(n => n.Name).ToHashSet();
 
+    /// <summary>The graph as sorted, id-free node and edge descriptors, so two graphs compare structurally.</summary>
+    private static (List<string> Nodes, List<string> Edges) Shape(CodeGraph g)
+    {
+        string N(Node n) => $"{n.Kind}|{n.Name}|{n.File}|{n.Span}|{n.Flags}";
+        var nodes = g.Nodes.Select(N).OrderBy(s => s, StringComparer.Ordinal).ToList();
+        var edges = g.Nodes.SelectMany(n => g.OutEdges(n.Id))
+            .Select(e => $"{N(g.GetNode(e.From))} -{e.Kind}-> {N(g.GetNode(e.To))}")
+            .OrderBy(s => s, StringComparer.Ordinal).ToList();
+        return (nodes, edges);
+    }
+
     [Fact]
     public void StreamingOverload_MatchesTupleOverload_AndReadsViaCallback()
     {
@@ -34,8 +45,16 @@ public sealed class StreamingBuildGraphTests
             files.Select(f => f.Item1).ToList(),
             p => { reads.Add(p); return map[p]; }));
 
-        // Identical result: same set of function definitions discovered.
+        // Identical result: same set of function definitions discovered...
         Assert.Equal(eager.OrderBy(x => x), stream.OrderBy(x => x));
+        // ...and (review TS7) the same GRAPH: every node with its kind, file, span and flags, and every edge.
+        using var feEager2 = new CFrontEnd();
+        using var feStream2 = new CFrontEnd();
+        var g1 = feEager2.BuildGraph(files);
+        var g2 = feStream2.BuildGraph(files.Select(f => f.Item1).ToList(), p => map[p]);
+        Assert.Equal(Shape(g1).Nodes, Shape(g2).Nodes);
+        Assert.Equal(Shape(g1).Edges, Shape(g2).Edges);
+        Assert.Contains(Shape(g1).Edges, e => e.Contains("root") && e.Contains("helper")); // the call edge is there
         Assert.Contains("helper", stream);
         Assert.Contains("root", stream);
         Assert.Contains("only_in_b", stream);

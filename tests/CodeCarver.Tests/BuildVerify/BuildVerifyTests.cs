@@ -6,6 +6,7 @@ using CodeCarver.Core.Preprocess;
 using CodeCarver.Core.Reachability;
 using CodeCarver.Core.Roots;
 using CodeCarver.Frontend;
+using CodeCarver.Tests.Cli;
 using Xunit;
 
 namespace CodeCarver.Tests.BuildVerify;
@@ -21,187 +22,53 @@ public class BuildVerifyTests
     private readonly Xunit.Abstractions.ITestOutputHelper _out;
     public BuildVerifyTests(Xunit.Abstractions.ITestOutputHelper output) => _out = output;
 
-    private const string AppC = """
-        #include "util.h"
+    // TS2 split: the compiler-free halves of the next six cases live in Cli/CarveOutcomeTests.cs (always run,
+    // outside this CI-excluded namespace). Setup is shared through CarveCases, so each _Builds test below compiles
+    // exactly the tree its _Carve twin asserts on.
 
-        int used(void) {
-            return helper();
-        }
-
-        int unused(void) {
-            return 999;
-        }
-
-        int main(void) {
-            return used();
-        }
-        """;
-
-    private const string UtilH = """
-        #ifndef UTIL_H
-        #define UTIL_H
-        int helper(void);
-        int used(void);
-        #endif
-        """;
-
-    private const string UtilC = """
-        #include "util.h"
-
-        int helper(void) {
-            return 1;
-        }
-
-        int orphan(void) {
-            return 7;
-        }
-        """;
-
-    [Theory]
+    [SkippableTheory]
     [InlineData("carved-base64-encode", "sl_base64_encode")]
     [InlineData("carved-sanitize", "sl_trim,sl_to_upper")]
-    public void Example_Stringlib_CheckedInCarveIsUpToDate_AndCompiles(string outName, string roots)
-    {
-        // The examples/stringlib carved trees are checked in as documentation. Regenerate them and assert
-        // they match byte-for-byte (so they can never silently drift from the tool), then compile them.
-        var ex = FindUp(Path.Combine("examples", "stringlib"));
-        if (ex is null) return;
-        var src = Path.Combine(ex, "src");
-        var golden = Path.Combine(ex, outName);
-        if (!Directory.Exists(golden)) return;
-
-        var work = Path.Combine(Path.GetTempPath(), "codecarver-ex-" + Guid.NewGuid().ToString("N"));
-        try
-        {
-            var inputs = Directory.EnumerateFiles(src, "*.*")
-                .Where(p => p.EndsWith(".c") || p.EndsWith(".h"))
-                .Select(p => (Path.GetFileName(p)!, File.ReadAllText(p))).ToList();
-            using var fe = new CFrontEnd();
-            var graph = fe.BuildGraph(inputs);
-            var plan = ReachabilityEngine.Compute(graph,
-                new ExplicitRootProvider(symbols: roots.Split(',')).Discover(graph).ToList());
-            FileTreeEmitter.EmitPruned(plan, graph, src, work);
-
-            static string Norm(string s) => s.Replace("\r\n", "\n");
-            var checkedIn = Directory.EnumerateFiles(golden, "*.*", SearchOption.AllDirectories).ToList();
-            foreach (var f in checkedIn)
-            {
-                var rel = Path.GetRelativePath(golden, f);
-                var regen = Path.Combine(work, rel);
-                Assert.True(File.Exists(regen), $"{outName}/{rel} is checked in but the carve no longer emits it — regenerate the example");
-                Assert.True(Norm(File.ReadAllText(f)) == Norm(File.ReadAllText(regen)),
-                    $"{outName}/{rel} is stale — re-run the carve and commit the updated example");
-            }
-            var regenCount = Directory.EnumerateFiles(work, "*.*", SearchOption.AllDirectories).Count();
-            Assert.Equal(checkedIn.Count, regenCount); // no files emitted that aren't checked in
-
-            var gcc = FindGcc();
-            if (gcc is not null)
-            {
-                var obj = Path.Combine(work, "o.o");   // output to temp so the checked-in dir stays clean
-                foreach (var c in Directory.EnumerateFiles(golden, "*.c"))
-                {
-                    var (code, output) = Run(gcc, new[] { "-c", Path.GetFileName(c), "-I.", "-o", obj }, golden);
-                    Assert.True(code == 0, $"checked-in example {outName}/{Path.GetFileName(c)} does not compile:\n{output}");
-                }
-            }
-        }
-        finally { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); }
-    }
-
-    [Fact]
-    public void PrunedCarve_StillCompilesAndLinks()
+    public void Example_Stringlib_CheckedInCarveIsUpToDate_Builds(string outName, string roots)
     {
         var gcc = FindGcc();
-        if (gcc is null) return; // toolchain not fetched — skip (pure-engine suite still covers logic)
+        Skip.If(gcc is null, "pinned gcc (.toolchains/w64devkit) not fetched");
+        using var c = CarveCases.StringlibGolden(outName, roots);
 
-        var work = Path.Combine(Path.GetTempPath(), "codecarver-bv-" + Guid.NewGuid().ToString("N"));
-        var srcDir = Path.Combine(work, "src");
-        var outDir = Path.Combine(work, "out");
-        Directory.CreateDirectory(srcDir);
-        try
+        // Compile the fresh carve (the _Carve twin proves it equals the checked-in tree). Objects go to the temp
+        // work dir, so the checked-in example stays clean.
+        var obj = c.Work.Sub("o.o");
+        foreach (var f in Directory.EnumerateFiles(c.Out, "*.c"))
         {
-            File.WriteAllText(Path.Combine(srcDir, "app.c"), AppC);
-            File.WriteAllText(Path.Combine(srcDir, "util.h"), UtilH);
-            File.WriteAllText(Path.Combine(srcDir, "util.c"), UtilC);
-
-            using var fe = new CFrontEnd();
-            var graph = fe.BuildGraph(new[]
-            {
-                ("app.c", AppC), ("util.h", UtilH), ("util.c", UtilC),
-            });
-            var main = graph.Nodes.First(n => n.Name == "main").Id;
-            var plan = ReachabilityEngine.Compute(graph, new[] { new Root(main, RootKind.EntryPoint) });
-
-            FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
-
-            // The pruning actually happened...
-            var prunedApp = File.ReadAllText(Path.Combine(outDir, "app.c"));
-            Assert.DoesNotContain("unused", prunedApp);
-            Assert.DoesNotContain("orphan", File.ReadAllText(Path.Combine(outDir, "util.c")));
-
-            // ...and the result still builds and links.
-            var (code, output) = Run(gcc, new[] { "app.c", "util.c", "-I.", "-o", "out.exe" }, outDir);
-            Assert.True(code == 0, $"pruned carve failed to build:\n{output}");
-            Assert.True(File.Exists(Path.Combine(outDir, "out.exe")));
-        }
-        finally
-        {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            var (code, output) = Run(gcc!, new[] { "-c", Path.GetFileName(f), "-I.", "-o", obj }, c.Out);
+            Assert.True(code == 0, $"carved example {outName}/{Path.GetFileName(f)} does not compile:\n{output}");
         }
     }
 
-    private const string DispatchC = """
-        typedef void (*fn_t)(void);
-
-        static int g_count;
-        static void handler_a(void) { g_count += 1; }
-        static void handler_b(void) { g_count += 2; }
-        static void never_used(void) { g_count += 999; }
-
-        static fn_t table[] = { handler_a, handler_b };
-
-        void run(void) {
-            for (int i = 0; i < 2; i++) table[i]();
-        }
-        """;
-
-    [Fact]
-    public void PrunedCarve_KeepsFileScopeTableHandlers_AndBuilds()
+    [SkippableFact]
+    public void PrunedCarve_StillCompilesAndLinks_Builds()
     {
-        // Regression for the embedded vector/dispatch-table case: handlers referenced only from a
-        // file-scope table must not be pruned, or the table initializer references a missing symbol.
         var gcc = FindGcc();
-        if (gcc is null) return;
+        Skip.If(gcc is null, "pinned gcc (.toolchains/w64devkit) not fetched");
+        using var c = CarveCases.PrunedAppUtil();
 
-        var work = Path.Combine(Path.GetTempPath(), "codecarver-disp-" + Guid.NewGuid().ToString("N"));
-        var srcDir = Path.Combine(work, "src");
-        var outDir = Path.Combine(work, "out");
-        Directory.CreateDirectory(srcDir);
-        try
-        {
-            File.WriteAllText(Path.Combine(srcDir, "dispatch.c"), DispatchC);
+        var (code, output) = Run(gcc!, new[] { "app.c", "util.c", "-I.", "-o", "out.exe" }, c.Out);
+        Assert.True(code == 0, $"pruned carve failed to build:\n{output}");
+        Assert.True(File.Exists(Path.Combine(c.Out, "out.exe")));
+    }
 
-            using var fe = new CFrontEnd();
-            var graph = fe.BuildGraph(new[] { ("dispatch.c", DispatchC) });
-            var run = graph.Nodes.First(n => n.Name == "run").Id;
-            var plan = ReachabilityEngine.Compute(graph, new[] { new Root(run, RootKind.ExplicitSymbol) });
+    [SkippableFact]
+    public void PrunedCarve_KeepsFileScopeTableHandlers_Builds()
+    {
+        // Regression for the embedded vector/dispatch-table case: the pruned table must still link.
+        var gcc = FindGcc();
+        Skip.If(gcc is null, "pinned gcc (.toolchains/w64devkit) not fetched");
+        using var c = CarveCases.DispatchTable();
 
-            FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
-
-            var pruned = File.ReadAllText(Path.Combine(outDir, "dispatch.c"));
-            Assert.DoesNotContain("never_used", pruned);   // genuinely dead → pruned
-            Assert.Contains("handler_a", pruned);          // kept via the table
-
-            File.WriteAllText(Path.Combine(outDir, "_verify.c"),
-                "void run(void); int main(void){ run(); return 0; }\n");
-            var (code, output) = Run(gcc, new[] { "dispatch.c", "_verify.c", "-o", "v.exe" }, outDir);
-            Assert.True(code == 0, $"pruned dispatch table failed to build:\n{output}");
-        }
-        finally
-        {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
-        }
+        File.WriteAllText(Path.Combine(c.Out, "_verify.c"),
+            "void run(void); int main(void){ run(); return 0; }\n");
+        var (code, output) = Run(gcc!, new[] { "dispatch.c", "_verify.c", "-o", "v.exe" }, c.Out);
+        Assert.True(code == 0, $"pruned dispatch table failed to build:\n{output}");
     }
 
     [Fact]
@@ -486,53 +353,16 @@ public class BuildVerifyTests
         return cols.Length >= 2 && long.TryParse(cols[0], out var t) && long.TryParse(cols[1], out var d) ? t + d : 0;
     }
 
-    [Fact]
-    public void HeaderCarve_OfBigRegisterHeader_ShrinksAndStillCompiles()
+    [SkippableFact]
+    public void HeaderCarve_OfBigRegisterHeader_ShrinksAndStillCompiles_Builds()
     {
-        // End-to-end: a big auto-generated register header (passed empty = "too big to parse", kept whole
-        // via #include-closure) then carved down to only the #defines the code transitively needs — and
-        // the result must still compile. Offsets built from a base address exercise the closure.
+        // The header-carved output (see the _Carve twin for the shrink and kept/dropped #defines) must compile.
         var gcc = FindGcc();
-        if (gcc is null) return;
+        Skip.If(gcc is null, "pinned gcc (.toolchains/w64devkit) not fetched");
+        using var c = CarveCases.BigRegisterHeader();
 
-        var sb = new System.Text.StringBuilder();
-        sb.Append("#ifndef CHIP_H\n#define CHIP_H\n#define CHIP_BASE 0x40000000\n");
-        for (var i = 0; i < 5000; i++) sb.Append($"#define REG_{i} (CHIP_BASE + 0x{i * 4:X})\n");
-        sb.Append("#endif\n");
-        var chipH = sb.ToString();
-        const string appC = "#include \"chip.h\"\nint use(void){ return REG_2000; }\nint dead(void){ return 0; }\n";
-
-        var work = Path.Combine(Path.GetTempPath(), "codecarver-hc-" + Guid.NewGuid().ToString("N"));
-        var src = Path.Combine(work, "src");
-        var outDir = Path.Combine(work, "out");
-        Directory.CreateDirectory(src);
-        try
-        {
-            File.WriteAllText(Path.Combine(src, "app.c"), appC);
-            File.WriteAllText(Path.Combine(src, "chip.h"), chipH);
-
-            using var fe = new CFrontEnd();
-            var graph = fe.BuildGraph(new[] { ("app.c", appC), ("chip.h", "") }); // chip.h empty = not parsed
-            var plan = ReachabilityEngine.Compute(graph,
-                new ExplicitRootProvider(symbols: new[] { "use" }).Discover(graph).ToList());
-            FileTreeEmitter.EmitPruned(plan, graph, src, outDir); // copies chip.h whole, prunes app.c's dead()
-
-            var before = new FileInfo(Path.Combine(outDir, "chip.h")).Length;
-            var res = HeaderCarver.Carve(outDir, new[] { "chip.h" });
-            var carved = File.ReadAllText(Path.Combine(outDir, "chip.h"));
-
-            Assert.Contains("#define REG_2000", carved);   // needed
-            Assert.Contains("#define CHIP_BASE", carved);  // pulled in by REG_2000's body
-            Assert.DoesNotContain("#define REG_2001", carved); // unused -> dropped
-            Assert.True(res.BytesAfter < before / 10, $"expected big shrink, {before} -> {res.BytesAfter}");
-
-            var (code, output) = Run(gcc, new[] { "-c", "-I.", "app.c", "-o", "o.o" }, outDir);
-            Assert.True(code == 0, $"carved-header output failed to compile:\n{output}");
-        }
-        finally
-        {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
-        }
+        var (code, output) = Run(gcc!, new[] { "-c", "-I.", "app.c", "-o", "o.o" }, c.Out);
+        Assert.True(code == 0, $"carved-header output failed to compile:\n{output}");
     }
 
     [Fact]
@@ -677,63 +507,26 @@ public class BuildVerifyTests
         }
     }
 
-    [Fact]
-    public void LinkerKeepSection_SurvivesCarve_AndLinksWithArmGcc()
+    [SkippableFact]
+    public void LinkerKeepSection_SurvivesCarve_AndLinksWithArmGcc_Builds()
     {
-        // A symbol kept ONLY by the linker script's KEEP(*(.init_calls*)) — not `used`, not in an
-        // .init_array-family section, reached by no call. Carve from main/Reset_Handler alone drops it
-        // unless LinkerSectionRootProvider unions the .ld's KEEP'd sections with the symbol's
-        // section(...) attribute. Prove it end-to-end: the table survives, links, and its hook target
-        // comes with it, while a dead symbol in the same file is still carved.
+        // The _Carve twin proves reg_table/boot_step_a are kept and boot_step_dead is carved. Here: the carved
+        // image links with arm-none-eabi-gcc, and the symbols are (or are not) in the ELF accordingly.
         var armgcc = FindArmGcc();
-        if (armgcc is null) return;
-        var fixture = FindUp(Path.Combine("examples", "cortexm-firmware"));
-        if (fixture is null || !File.Exists(Path.Combine(fixture, "registry.c"))) return;
+        Skip.If(armgcc is null, "arm-none-eabi-gcc (.toolchains) not fetched");
+        using var c = CarveCases.CortexmKeepSection();
 
-        var work = Path.Combine(Path.GetTempPath(), "codecarver-keep-" + Guid.NewGuid().ToString("N"));
-        var outDir = Path.Combine(work, "out");
-        Directory.CreateDirectory(work);
-        try
-        {
-            var srcs = new[] { "startup.c", "main.c", "handlers.c", "registry.c" };
-            var inputs = srcs.Select(f => (f, File.ReadAllText(Path.Combine(fixture, f)))).ToList();
-            var linker = File.ReadAllText(Path.Combine(fixture, "firmware.ld"));
+        var args = new[] { "-mcpu=cortex-m3", "-mthumb", "-ffreestanding", "-nostdlib",
+                           "-Wl,-T,firmware.ld", "-o", "carved.elf" }
+                   .Concat(CarveCases.CortexmSources).ToArray();
+        var (code, output) = Run(armgcc!, args, c.Out);
+        Assert.True(code == 0, $"carved firmware with KEEP'd section failed to link:\n{output}");
 
-            using var fe = new CFrontEnd();
-            var graph = fe.BuildGraph(inputs);
-
-            // Compose the same roots the CLI does for an embedded C carve: explicit entry + the implicit
-            // linker/runtime keeps, INCLUDING the KEEP'd-section provider driven by firmware.ld.
-            var roots = new ExplicitRootProvider(symbols: new[] { "Reset_Handler", "main" }).Discover(graph)
-                .Concat(new AttributeRootProvider().Discover(graph))
-                .Concat(new LinkerSectionRootProvider(inputs.Select(i => i.Item2), new[] { linker }).Discover(graph))
-                .ToList();
-            var plan = ReachabilityEngine.Compute(graph, roots);
-
-            // The KEEP'd table (and its hook target) must be kept; the dead sibling must not be.
-            Assert.Contains(graph.Nodes.First(n => n.Name == "reg_table").Id, plan.Reached);
-            Assert.Contains(graph.Nodes.First(n => n.Name == "boot_step_a").Id, plan.Reached);
-            Assert.DoesNotContain(graph.Nodes.First(n => n.Name == "boot_step_dead").Id, plan.Reached);
-
-            FileTreeEmitter.EmitPruned(plan, graph, fixture, outDir);
-            BuildSupportEmitter.Copy(fixture, outDir, plan.KeptFiles, System.Array.Empty<string>(), System.Array.Empty<string>()); // emit .ld like the CLI
-
-            var args = new[] { "-mcpu=cortex-m3", "-mthumb", "-ffreestanding", "-nostdlib",
-                               "-Wl,-T,firmware.ld", "-o", "carved.elf" }
-                       .Concat(srcs).ToArray();
-            var (code, output) = Run(armgcc, args, outDir);
-            Assert.True(code == 0, $"carved firmware with KEEP'd section failed to link:\n{output}");
-
-            var nm = Path.Combine(Path.GetDirectoryName(armgcc)!, "arm-none-eabi-nm.exe");
-            var (_, syms) = Run(nm, new[] { "carved.elf" }, outDir);
-            Assert.Contains("reg_table", syms);          // in the KEEP'd section — survives
-            Assert.Contains("boot_step_a", syms);        // reached via the table's initializer
-            Assert.DoesNotContain("boot_step_dead", syms); // unreferenced sibling — carved out
-        }
-        finally
-        {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
-        }
+        var nm = Path.Combine(Path.GetDirectoryName(armgcc)!, "arm-none-eabi-nm.exe");
+        var (_, syms) = Run(nm, new[] { "carved.elf" }, c.Out);
+        Assert.Contains("reg_table", syms);          // in the KEEP'd section — survives
+        Assert.Contains("boot_step_a", syms);        // reached via the table's initializer
+        Assert.DoesNotContain("boot_step_dead", syms); // unreferenced sibling — carved out
     }
 
     [Fact]
@@ -826,118 +619,32 @@ public class BuildVerifyTests
     private static string? FindGcc() => FindUp(Path.Combine(".toolchains", "w64devkit", "bin", "gcc.exe"), file: true);
     private static string? FindGxx() => FindUp(Path.Combine(".toolchains", "w64devkit", "bin", "g++.exe"), file: true);
 
-    [Fact]
-    public void Cpp_ControlFlowMacro_TryCatch_NotPrunedAsNestedFunction()
+    [SkippableFact]
+    public void Cpp_ControlFlowMacro_TryCatch_NotPrunedAsNestedFunction_Builds()
     {
-        // fmt wraps try/catch in macros: `FMT_TRY { … } FMT_CATCH(...) {}`. tree-sitter parses
-        // `FMT_CATCH(...) {}` as a nested function definition; capturing it truncated the enclosing
-        // function and PRUNED the `catch`, leaving `try { }` with no handler → won't compile. The
-        // front-end rejects a nested "definition" whose name is a known macro. Build with g++ to prove
-        // the try/catch survives.
+        // fmt wraps try/catch in macros; pruning the `catch` leaves `try { }` with no handler -> won't compile.
+        // The _Carve twin checks the emitted text; this proves it compiles with g++.
         var gxx = FindGxx();
-        if (gxx is null) return;
+        Skip.If(gxx is null, "pinned g++ (.toolchains/w64devkit) not fetched");
+        using var c = CarveCases.CppTryCatch();
 
-        var work = Path.Combine(Path.GetTempPath(), "codecarver-cpptc-" + Guid.NewGuid().ToString("N"));
-        var srcDir = Path.Combine(work, "src");
-        var outDir = Path.Combine(work, "out");
-        Directory.CreateDirectory(srcDir);
-        try
-        {
-            const string hdr = "#define APP_TRY try\n#define APP_CATCH(x) catch (x)\n";
-            const string appCpp = """
-                #include "macros.h"
-                int risky();
-                int handle(int x) {
-                    APP_TRY {
-                        return risky();
-                    }
-                    APP_CATCH(...) {}
-                    return -1;
-                }
-                int risky() { return 1; }
-                int dead() { return 99; }
-                """;
-            File.WriteAllText(Path.Combine(srcDir, "macros.h"), hdr);
-            File.WriteAllText(Path.Combine(srcDir, "app.cpp"), appCpp);
-
-            using var fe = new CppFrontEnd();
-            var graph = fe.BuildGraph(new[] { ("macros.h", hdr), ("app.cpp", appCpp) });
-            var plan = ReachabilityEngine.Compute(graph,
-                new ExplicitRootProvider(symbols: new[] { "handle" }).Discover(graph).ToList());
-            FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
-
-            var carved = File.ReadAllText(Path.Combine(outDir, "app.cpp"));
-            Assert.Contains("APP_CATCH", carved);        // the catch macro survived (not pruned)
-            Assert.DoesNotContain("dead", carved);       // genuine dead code still pruned
-
-            var (code, output) = Run(gxx, new[] { "-std=c++17", "-c", "app.cpp", "-I.", "-o", "app.o" }, outDir);
-            Assert.True(code == 0, $"carved C++ with try/catch macros failed to compile:\n{output}");
-        }
-        finally
-        {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
-        }
+        var (code, output) = Run(gxx!, new[] { "-std=c++17", "-c", "app.cpp", "-I.", "-o", "app.o" }, c.Out);
+        Assert.True(code == 0, $"carved C++ with try/catch macros failed to compile:\n{output}");
     }
 
-    [Fact]
-    public void Cpp_PruneFirstClassMember_AndHeaderInline_StillCompiles()
+    [SkippableFact]
+    public void Cpp_PruneFirstClassMember_AndHeaderInline_StillCompiles_Builds()
     {
-        // Two C++ pruning-soundness regressions in one build:
-        //  1) pruning a class's FIRST member (a constructor) must not delete the enclosing `class X {` /
-        //     `public:` — the shared-brace heuristic used to swallow it (tinyxml2's html5-printer).
-        //  2) an unreached inline method in a HEADER must NOT be pruned — a caller in another TU (or the
-        //     app that consumes the carved library) needs it (tinyxml2's XMLDocument::ErrorID).
         var gxx = FindGxx();
-        if (gxx is null) return;
+        Skip.If(gxx is null, "pinned g++ (.toolchains/w64devkit) not fetched");
+        using var c = CarveCases.CppFirstClassMember();
 
-        var work = Path.Combine(Path.GetTempPath(), "codecarver-cpp-" + Guid.NewGuid().ToString("N"));
-        var srcDir = Path.Combine(work, "src");
-        var outDir = Path.Combine(work, "out");
-        Directory.CreateDirectory(srcDir);
-        try
-        {
-            const string widgetH = """
-                #ifndef WIDGET_H
-                #define WIDGET_H
-                class Widget {
-                public:
-                    Widget() {}                 // first member — unreached; must not break the class
-                    int unused_inline() const { return 42; }  // header inline — must NOT be pruned
-                    int keep() const { return 7; }
-                };
-                #endif
-                """;
-            const string appCpp = """
-                #include "widget.h"
-                int run(Widget* w) { return w->keep(); }
-                int dead(Widget* w) { return w->keep() + 1; } // unreached — pruned from this TU
-                """;
-            File.WriteAllText(Path.Combine(srcDir, "widget.h"), widgetH);
-            File.WriteAllText(Path.Combine(srcDir, "app.cpp"), appCpp);
-
-            using var fe = new CppFrontEnd();
-            var graph = fe.BuildGraph(new[] { ("widget.h", widgetH), ("app.cpp", appCpp) });
-            var plan = ReachabilityEngine.Compute(graph,
-                new ExplicitRootProvider(symbols: new[] { "run" }).Discover(graph).ToList());
-            FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
-
-            // The header is emitted whole (inline method retained); the class opening survived.
-            var hdr = File.ReadAllText(Path.Combine(outDir, "widget.h"));
-            Assert.Contains("class Widget", hdr);
-            Assert.Contains("unused_inline", hdr);                        // header not pruned
-            Assert.DoesNotContain("dead", File.ReadAllText(Path.Combine(outDir, "app.cpp"))); // TU still pruned
-
-            // A driver using run() and the header inline directly must compile+link.
-            File.WriteAllText(Path.Combine(outDir, "_verify.cpp"),
-                "#include \"widget.h\"\nint run(Widget*);\n"
-                + "int main(){ Widget w; return run(&w) + w.unused_inline(); }\n");
-            var (code, output) = Run(gxx, new[] { "-std=c++17", "app.cpp", "_verify.cpp", "-I.", "-o", "v.exe" }, outDir);
-            Assert.True(code == 0, $"carved C++ failed to build:\n{output}");
-        }
-        finally
-        {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
-        }
+        // A driver using run() and the header inline directly must compile+link.
+        File.WriteAllText(Path.Combine(c.Out, "_verify.cpp"),
+            "#include \"widget.h\"\nint run(Widget*);\n"
+            + "int main(){ Widget w; return run(&w) + w.unused_inline(); }\n");
+        var (code, output) = Run(gxx!, new[] { "-std=c++17", "app.cpp", "_verify.cpp", "-I.", "-o", "v.exe" }, c.Out);
+        Assert.True(code == 0, $"carved C++ failed to build:\n{output}");
     }
 
     /// <summary>Find the fetched portable arm-none-eabi-gcc (version is in the folder name), if present.</summary>

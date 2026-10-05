@@ -75,9 +75,24 @@ public sealed class ReproBundleTests
     {
         var (graph, plan) = SampleCarve();
         var json = ReproBundle.Build(graph, plan);
-        // 4 defined functions/types + the file nodes their defs create; assert the reported node count equals
-        // the graph's actual node count (the snapshot is complete, not a sample).
-        Assert.Contains($"\"nodes\": {graph.NodeCount}", json);
+        // 4 defined functions/types + the file nodes their defs create; assert the reported node AND edge counts
+        // equal the graph's (the snapshot is complete, not a sample), and that the arrays hold that many entries.
+        var graphEdges = graph.Nodes.Sum(n => graph.OutEdges(n.Id).Count);
+        Assert.True(graphEdges >= 2, "the sample graph must have edges for this to mean anything");
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        var counts = root.GetProperty("counts");
+        Assert.Equal(graph.NodeCount, counts.GetProperty("nodes").GetInt32());
+        Assert.Equal(graphEdges, counts.GetProperty("edges").GetInt32());
+        Assert.Equal(graph.NodeCount, root.GetProperty("nodes").GetArrayLength());
+        Assert.Equal(graphEdges, root.GetProperty("edges").GetArrayLength());
+        // Each serialized edge is one of the graph's edges (by endpoint ids and kind).
+        var expected = graph.Nodes.SelectMany(n => graph.OutEdges(n.Id))
+            .Select(e => $"{e.From.Value}->{e.To.Value}:{e.Kind}").OrderBy(s => s, StringComparer.Ordinal).ToList();
+        var actual = root.GetProperty("edges").EnumerateArray()
+            .Select(e => $"{e.GetProperty("from").GetInt32()}->{e.GetProperty("to").GetInt32()}:{e.GetProperty("kind").GetString()}")
+            .OrderBy(s => s, StringComparer.Ordinal).ToList();
+        Assert.Equal(expected, actual);
     }
 
     [Fact]
@@ -93,10 +108,11 @@ public sealed class ReproBundleTests
     }
 
     [Fact]
-    public void Write_ScalesToLargeGraph_WithoutMaterializing()
+    public void Write_LargeChainGraph_CompletesWithCorrectCounts()
     {
-        // A chain of many nodes — exercises the streaming path on a graph far past the old 500k-node cap would
-        // have been meaningful, bounded only by the token maps. We assert it completes and the counts are right.
+        // Review TS7: this used to be named "..._WithoutMaterializing", which it cannot observe. What it does
+        // check: a 60k-node chain is written completely, with the right node and edge counts. Whether the writer
+        // streams is pinned separately by Write_StreamsIncrementally_DoesNotBufferWholeDocument.
         var b = new GraphBuilder();
         const int n = 60_000;
         var prev = b.Func("f0", "f0.c", line: 1);
@@ -116,5 +132,56 @@ public sealed class ReproBundleTests
         var counts = doc.RootElement.GetProperty("counts");
         Assert.Equal(b.Graph.NodeCount, counts.GetProperty("nodes").GetInt32());
         Assert.Equal(n - 1, counts.GetProperty("edges").GetInt32());        // a chain of n nodes has n-1 edges
+    }
+
+    [Fact(Skip = "PRODUCT BUG: ReproBundle.Write wraps the stream in a Utf8JsonWriter and flushes only at the end, so the "
+               + "whole document is buffered in memory and reaches the stream in ONE write (2.7 MB for 20k nodes). "
+               + "Fix: w.Flush() periodically (e.g. when w.BytesPending > 64 KB). Un-skip when fixed.")]
+    public void Write_StreamsIncrementally_DoesNotBufferWholeDocument()
+    {
+        // What "without materializing" means observably: the bytes reach the output stream in many bounded
+        // writes while the document is produced, not as one write of the whole document at the final Flush.
+        var b = new GraphBuilder();
+        const int n = 20_000;
+        var prev = b.Func("f0", "f0.c", line: 1);
+        for (var i = 1; i < n; i++)
+        {
+            var cur = b.Func($"f{i}", $"f{i}.c", line: 1);
+            b.Calls(prev, cur);
+            prev = cur;
+        }
+        var plan = ReachabilityEngine.Compute(b.Graph,
+            new List<Root> { new(b.Graph.Nodes.First().Id, RootKind.EntryPoint) }, ReachabilityOptions.Safe);
+
+        using var sink = new WriteRecordingStream();
+        ReproBundle.Write(sink, b.Graph, plan, indented: false);
+        Assert.True(sink.Length > 1_000_000, $"expected a multi-MB document, got {sink.Length} B");
+        Assert.True(sink.LargestWrite < sink.Length / 4,
+            $"the whole {sink.Length:N0} B document reached the stream in writes of up to {sink.LargestWrite:N0} B " +
+            $"({sink.Writes} write(s)) — it was buffered in memory, not streamed");
+    }
+
+    /// <summary>A write-only sink that records how the bytes arrive.</summary>
+    private sealed class WriteRecordingStream : Stream
+    {
+        public int Writes { get; private set; }
+        public long LargestWrite { get; private set; }
+        private long _length;
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => _length;
+        public override long Position { get => _length; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => Write(buffer.AsSpan(offset, count));
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            Writes++;
+            LargestWrite = Math.Max(LargestWrite, buffer.Length);
+            _length += buffer.Length;
+        }
     }
 }

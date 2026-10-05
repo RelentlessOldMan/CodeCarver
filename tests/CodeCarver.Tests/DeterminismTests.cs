@@ -44,15 +44,18 @@ public sealed class DeterminismTests
             #endif
             """),
         ("handler.c", "int handler(void){ return 3; }\nint also_dead(void){ return 0; }\n"),
+        ("unused.c", "int unused_module(void){ return 5; }\n"),   // a whole dead file: dropped
     };
 
-    private static CarvePlan Carve()
+    private static (CodeGraph Graph, CarvePlan Plan) CarveWithGraph()
     {
         using var fe = new CFrontEnd();
         var graph = fe.BuildGraph(Program);
         var roots = new ExplicitRootProvider(symbols: new[] { "main" }).Discover(graph).ToList();
-        return ReachabilityEngine.Compute(graph, roots);
+        return (graph, ReachabilityEngine.Compute(graph, roots));
     }
+
+    private static CarvePlan Carve() => CarveWithGraph().Plan;
 
     [Fact]
     public void SameInput_ProducesIdenticalKeptAndDroppedOrder()
@@ -73,13 +76,24 @@ public sealed class DeterminismTests
     {
         // Also pins the actual behavior the determinism test rests on, so "identical" can't mean
         // "identically wrong": dead code is dropped, macro/function-pointer-reached code is kept.
-        var plan = Carve();
+        var (graph, plan) = CarveWithGraph();
         var kept = new HashSet<string>(plan.KeptFiles, StringComparer.Ordinal);
 
         Assert.Contains("main.c", kept);
         Assert.Contains("api.c", kept);       // api_entry reachable from run()
         Assert.Contains("handler.c", kept);   // reached only via address-taken dispatch pointer
-        // handler.c also contains also_dead(); file-level carve keeps the whole file, so we assert at
-        // file granularity here — the intra-file drop of dead functions is covered by the prune tests.
+
+        // The drop half of the name (review TS7): the dead file is dropped...
+        Assert.Equal(new[] { "unused.c" }, plan.DroppedFiles);
+        Assert.DoesNotContain("unused.c", kept);
+
+        // ...and at symbol level every dead function is unreached while every live one is reached, including
+        // those reached only through a macro (leaf_impl) or an address-taken pointer (handler).
+        bool Reached(string name) => graph.Nodes.Where(n => n.Name == name && n.Kind == NodeKind.Function)
+            .Any(n => plan.Reached.Contains(n.Id));
+        foreach (var live in new[] { "main", "run", "helper", "api_entry", "leaf_impl", "handler" })
+            Assert.True(Reached(live), $"{live} should be reached");
+        foreach (var dead in new[] { "dead_a", "dead_b", "also_dead", "unused_module" })
+            Assert.False(Reached(dead), $"{dead} should be dropped");
     }
 }
