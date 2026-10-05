@@ -8,7 +8,7 @@
 #   ./corpus-compile-sweep.ps1            # sweep all configured repos present under .corpus
 $ErrorActionPreference = 'Continue'   # native stderr (carve warns) must not abort the sweep
 $root = $PSScriptRoot
-$cli  = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\CodeCarver.Cli.dll'
+$cli  = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\codecarver.dll'
 if (-not (Test-Path $cli)) { throw "build the CLI first: dotnet build -c Release" }
 function ToWsl([string]$p) { $f=[IO.Path]::GetFullPath($p); if ($f -notmatch '^([A-Za-z]):[\\/](.*)$'){throw "bad path $p"}; "/mnt/$($Matches[1].ToLower())/$($Matches[2] -replace '\\','/')" }
 $sh = ToWsl (Join-Path $root 'wsl-syntax-check.sh')

@@ -80,7 +80,30 @@ public static class ConfigLoader
         try { text = File.ReadAllText(path); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         { return new Result(null, new[] { $"--config '{path}': could not read ({ex.GetType().Name}: {ex.Message})" }, new List<string>()); }
-        return Parse(text, path);
+        var r = Parse(text, path);
+        if (r.Config is { } cfg) ResolveRelativePaths(cfg, Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".");
+        return r;
+    }
+
+    /// <summary>Owner decision D-F: input/output paths in a config file are relative to the CONFIG FILE's directory,
+    /// not the shell's current directory — so `carve repo/src --config repo/carve.toml` works from anywhere. Globs
+    /// (excludeDirectories, forceKeepFiles) stay relative to the carve root; a bare compiler name still uses PATH.</summary>
+    public static void ResolveRelativePaths(CarveTomlConfig cfg, string baseDir)
+    {
+        string R(string p) => string.IsNullOrWhiteSpace(p) || Path.IsPathFullyQualified(p) ? p : Path.GetFullPath(Path.Combine(baseDir, p));
+        if (cfg.OutputDirectory is { } o) cfg.OutputDirectory = R(o);
+        if (cfg.Common.EntryPointsFile is { } e) cfg.Common.EntryPointsFile = R(e);
+        foreach (var b in cfg.Builds.Values)
+        {
+            b.BuildLogs = b.BuildLogs.Select(R).ToList();
+            b.BuildTraceFiles = b.BuildTraceFiles.Select(R).ToList();
+            if (b.Compiler is { } c && (c.Contains('/') || c.Contains('\\'))) b.Compiler = R(c);
+        }
+        foreach (var run in cfg.Runs.Values)
+        {
+            run.RunTraceFiles = run.RunTraceFiles.Select(R).ToList();
+            run.RunTraceLogs = run.RunTraceLogs.Select(R).ToList();
+        }
     }
 
     public static Result Parse(string text, string path)
@@ -206,17 +229,20 @@ public static class ConfigLoader
         """
         # CodeCarver config. Fill in what you have, delete what you don't. Run with:
         #   codecarver carve <source-dir> --config carve.toml
-        # Comments start with #. Values are typed: "strings", [arrays], true/false (yes/no also accepted).
-        # Every INPUT and OPTION lives here, so the command line stays short.
+        # Comments start with #. Values are typed: "strings", [arrays], true/false.
+        # Inputs and options live here, so the command line stays short. Relative paths are relative to THIS
+        # file's directory; globs (excludeDirectories, forceKeepFiles) are relative to the source dir.
+        # Rarely needed: analysisOnly = true (top level: plan + reports, no carved tree) and an [advanced]
+        # section (maxParseBytes, parseTimeout, maxSymbolsPerFile, pathMap, allowUnmatchedTraces) — see USAGE.md.
 
-        # Where the carved project + reports go. CodeCarver manages a carved/ + codecarver/ layout under it,
-        # always writes a report + manifest, and ignores its own output when scanning source.
+        # Where the carved project + reports go — must be OUTSIDE the source tree. CodeCarver manages a
+        # carved/ + codecarver/ layout under it, and never replaces an existing directory it did not create.
         outputDirectory = "D:/carved/myimage"
 
         # ===== common to every build/run of this carve =====
         [common]
         # Entry symbols the image truly needs (ISRs, main, exported API). A missing named one FAILS the run.
-        entryPoints = ["main", "Reset_Handler"]
+        entryPoints = ["main"]           # add startup/ISR/exported symbols, e.g. "Reset_Handler"
         # entryPointsFile = "roots.txt"   # alternative: one symbol per line (for long curated lists)
 
         # The linked code to carve: "c", "cpp", "csharp". A mixed C+C++ tree -> ["c","cpp"] carves both into ONE
@@ -224,7 +250,7 @@ public static class ConfigLoader
         # asm (.s) is auto-scanned for roots; .cmm is handled via run traces, not here.
         languages = ["c"]
 
-        excludeDirectories = ["tests", "other_board"]   # dirs NOT in this image (variants, host tools, tests)
+        excludeDirectories = []          # dirs NOT in this image (variants, host tools, tests), e.g. ["tests", "other_board"]
         forceKeepFiles = []              # globs to ALWAYS keep (even if excluded/auto-dropped), e.g. ["prebuilt/*.a"]
 
         carveSourceFileContents = false  # true = also drop unused functions WITHIN kept .c files (aggressive)
@@ -234,7 +260,7 @@ public static class ConfigLoader
         # One [builds.NAME] per build STEP; several steps/compilers UNION into one image. The build log is the
         # best input: it pins the exact -D/-I per file so #ifdefs resolve like your real build.
         [builds.main]
-        buildLogs = ["make-n.log"]       # a `make -n` log, build console capture, or compile_commands.json (list several; unioned)
+        # buildLogs = ["make-n.log"]     # a `make -n` log, build console capture, or compile_commands.json (list several; unioned)
         compiler = ""                    # optional: your compiler exe (e.g. "arm-none-eabi-gcc"), probed for its built-in macros (must answer -dM -E)
         compilerNames = []               # optional: vendor compiler names in a TEXT log, e.g. ["armcc","iccarm"] (gcc/clang/cl are known)
         defines = []                     # RARE manual override, only if you have no build log: ["CHIP=F4","FEATURE_X=1"]

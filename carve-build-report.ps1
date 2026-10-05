@@ -16,8 +16,8 @@ param([switch]$NoArm, [string[]]$Only)
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-$dll = Join-Path $root 'src\CodeCarver.Cli\bin\Debug\net8.0\CodeCarver.Cli.dll'
-if (-not (Test-Path $dll)) { $dll = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\CodeCarver.Cli.dll' }
+$dll = Join-Path $root 'src\CodeCarver.Cli\bin\Debug\net8.0\codecarver.dll'
+if (-not (Test-Path $dll)) { $dll = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\codecarver.dll' }
 if (-not (Test-Path $dll)) { Write-Host 'CLI not built. Run: dotnet build -c Debug'; exit 1 }
 
 $gcc    = Join-Path $root '.toolchains\w64devkit\bin\gcc.exe'

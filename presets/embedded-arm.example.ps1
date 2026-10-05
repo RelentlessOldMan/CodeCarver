@@ -20,7 +20,7 @@ $RunBuild = $false                               # set $true once BuildCmd/SizeC
 # =====================================================================================
 
 $ErrorActionPreference = 'Stop'
-$cli = Join-Path $PSScriptRoot '..\src\CodeCarver.Cli\bin\Release\net8.0\CodeCarver.Cli.dll'
+$cli = Join-Path $PSScriptRoot '..\src\CodeCarver.Cli\bin\Release\net8.0\codecarver.dll'
 if (-not (Test-Path $cli)) { throw "build the CLI first: dotnet build -c Release  (missing $cli)" }
 # Everything is config now: build a carve.toml from the CONFIG block above, then `carve <repo> --config`.
 # (A missing named entry point fails the run; the compiler-free soundness check runs automatically — watch the

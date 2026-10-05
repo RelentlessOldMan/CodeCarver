@@ -74,9 +74,10 @@ public static class CarveResolver
             errors.Add("no entryPoints — list the entry symbols to keep in [common] entryPoints (or entryPointsFile).");
 
         r.Languages = cfg.Common.Languages.Count > 0
-            ? cfg.Common.Languages.Select(l => l.ToLowerInvariant()).Distinct().ToList()
+            ? cfg.Common.Languages.Select(l => l.ToLowerInvariant() switch { "cs" or "c#" => "csharp", "c++" or "cxx" => "cpp", var x => x })
+                                  .Distinct().ToList()
             : new List<string> { "c" };
-        var knownLangs = new[] { "c", "cpp", "csharp", "cs" };
+        var knownLangs = new[] { "c", "cpp", "csharp" };
         foreach (var l in r.Languages)
             if (!knownLangs.Contains(l))
                 errors.Add($"languages: '{l}' is not supported (use c, cpp, csharp). .cmm is handled via run traces, not here.");
@@ -139,6 +140,12 @@ public static class CarveResolver
             r.ClosedWorld = false;
             r.WorldReason = "open-world (both #ifdef branches kept) — no build log or compiler given";
         }
+
+        // --stage needs stages to pick from, and analysisOnly emits no stage at all (review U7).
+        if (stageName is not null && r.AnalysisOnly)
+            errors.Add("--stage has no effect with analysisOnly = true (nothing is emitted). Remove one of them.");
+        else if (stageName is not null && cfg.Stages.Count == 0)
+            errors.Add($"--stage '{stageName}' given, but the config defines no [stages.X] sections.");
 
         // Stages: explicit [stages.*], else one implicit carve from the [common] toggles.
         if (cfg.Stages.Count == 0)

@@ -77,7 +77,7 @@ public sealed class StagedOutput : IDisposable
         ArgumentException.ThrowIfNullOrEmpty(outDir);
         var finalOut = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outDir));
         var parent = Path.GetDirectoryName(finalOut)
-                     ?? throw new ArgumentException($"--out '{outDir}' has no parent directory", nameof(outDir));
+                     ?? throw new ArgumentException($"output directory '{outDir}' has no parent directory", nameof(outDir));
         // Never replace a directory CodeCarver did not create (review O1). The CLI checks this up front with a
         // friendly message; this is the last line of defence for direct library callers.
         if (!IsSafeToReplace(finalOut))
@@ -201,7 +201,7 @@ public sealed class StagedOutput : IDisposable
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 throw new PromoteFailedException(
-                    $"output is now PARTIALLY updated (writing '{rel}' failed) — re-run or use a fresh --out", torn: true, ex);
+                    $"output is now PARTIALLY updated (writing '{rel}' failed) — re-run or use a fresh outputDirectory", torn: true, ex);
             }
         }
 

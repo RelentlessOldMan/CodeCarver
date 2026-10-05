@@ -62,6 +62,9 @@ public sealed class DiagnosticReport
         _warnings[c] = _warnings.GetValueOrDefault(c) + 1;
     }
 
+    /// <summary>Warning counts by category (name-free).</summary>
+    public IReadOnlyDictionary<string, int> WarningCounts => _warnings;
+
     /// <summary>Register run-specific strings (relative paths, file names, entry-point names, config values)
     /// that must never appear in the package; they are replaced at write time.</summary>
     public void AddSensitive(IEnumerable<string> values)
@@ -248,7 +251,7 @@ public sealed class DiagnosticReport
         sb.AppendLine("Excluded (by design):");
         sb.AppendLine("- Source file contents (proprietary — never collected)");
         sb.AppendLine("- Environment variables, secrets, credentials");
-        sb.AppendLine("- The source-tree path, --out/--build-log/etc. paths, and root symbol names");
+        sb.AppendLine("- The source-tree path, output/build-log/trace/config paths, and entry-point names");
         sb.AppendLine("  (elided at the source; the command line is recorded as flags-with-values-elided)");
         sb.AppendLine("- Absolute paths anywhere (home, other drives, UNC shares, WSL) redacted to a placeholder");
         sb.AppendLine("- Warning texts (they name files and symbols): only per-category counts are kept");
@@ -260,8 +263,8 @@ public sealed class DiagnosticReport
         {
             sb.AppendLine("NOTE — THIS PACKAGE INCLUDES NAMES:");
             sb.AppendLine($"  {string.Join(", ", named)} carr{(named.Count == 1 ? "ies" : "y")} file/symbol NAMES");
-            sb.AppendLine("  (never file CONTENTS), included at your request (--diag-verbose) to aid debugging.");
-            sb.AppendLine("  Review before sharing if identifiers are sensitive; omit --diag-verbose to exclude them.");
+            sb.AppendLine("  (never file CONTENTS), included at your request to aid debugging.");
+            sb.AppendLine("  Review before sharing if identifiers are sensitive.");
             sb.AppendLine();
         }
         return sb.ToString();

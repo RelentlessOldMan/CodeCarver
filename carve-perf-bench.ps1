@@ -41,7 +41,7 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 
 # --- Locate the CLI dll (build Release if missing) --------------------------------------------------
-$dll = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\CodeCarver.Cli.dll'
+$dll = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\codecarver.dll'
 if (-not (Test-Path $dll)) {
     Write-Host 'Building CodeCarver (Release)...'
     dotnet build (Join-Path $root 'CodeCarver.sln') -c Release -v q | Out-Null

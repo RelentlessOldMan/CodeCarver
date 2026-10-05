@@ -7,7 +7,7 @@
 # Prereqs: dotnet build -c Release; WSL Ubuntu with g++ (sudo apt install -y g++); .corpus fetched.
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$cli  = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\CodeCarver.Cli.dll'
+$cli  = Join-Path $root 'src\CodeCarver.Cli\bin\Release\net8.0\codecarver.dll'
 $c    = Join-Path $root '.corpus'
 $o    = Join-Path $root '.oracle-cpp'
 if (-not (Test-Path $cli)) { throw "build the CLI first: dotnet build -c Release  (missing $cli)" }

@@ -68,7 +68,7 @@ public static class CarveReport
         sb.AppendLine($"roots  : {(x.Roots.Count == 0 ? "(none)" : string.Join(", ", x.Roots))}");
         if (x.ExcludedDirs.Count > 0) sb.AppendLine($"exclude: {string.Join(", ", x.ExcludedDirs)}");
         if (!x.InfraEnumerated)
-            sb.AppendLine("mode   : analysis-only (no --out) - infrastructure + include-closure are enumerated only when emitting");
+            sb.AppendLine("mode   : analysis-only (analysisOnly = true) - infrastructure + include-closure are enumerated only when emitting");
         sb.AppendLine();
 
         sb.AppendLine("== Summary ==");
@@ -76,12 +76,12 @@ public static class CarveReport
             sb.AppendLine($"  KEPT - required to build : {x.BuildRequired.Count,7} file(s)  "
                           + $"({reachableCode.Count} code + {includeClosure.Count} include-closure)");
         else
-            sb.AppendLine($"  KEPT - reachable code    : {reachableCode.Count,7} file(s)  (include-closure resolved only with --out)");
+            sb.AppendLine($"  KEPT - reachable code    : {reachableCode.Count,7} file(s)  (include-closure resolved only when emitting)");
         sb.AppendLine($"  REMOVED - dead code      : {x.RemovedDeadCode.Count,7} file(s)");
         if (x.InfraEnumerated)
             sb.AppendLine($"  KEPT - infrastructure    : {x.Infrastructure.Count,7} file(s)  (non-code, passed through verbatim)");
         else
-            sb.AppendLine($"  KEPT - infrastructure    :   (n/a) file(s)  (pass --out to enumerate; every non-code file is passed through)");
+            sb.AppendLine($"  KEPT - infrastructure    :   (n/a) file(s)  (enumerated only when emitting; every non-code file is passed through)");
         if (x.InfraEnumerated && x.RemovedGarbage.Count > 0)
             sb.AppendLine($"  REMOVED - garbage        : {x.RemovedGarbage.Count,7} file(s)  (VCS/scratch/editor/coverage - not a build/run input)");
         if (keptAbsent.Count > 0)
@@ -121,7 +121,7 @@ public static class CarveReport
         if (!x.InfraEnumerated)
         {
             sb.AppendLine("== KEPT - infrastructure / other, not code ==");
-            sb.AppendLine("  (not enumerated - pass --out to list; keep-by-default passes through EVERY non-code file verbatim)");
+            sb.AppendLine("  (not enumerated in analysisOnly mode; keep-by-default passes through EVERY non-code file verbatim)");
             return sb.ToString();
         }
 
@@ -169,7 +169,7 @@ public static class CarveReport
         {
             sb.AppendLine();
             sb.AppendLine($"== REVIEW - look like build outputs / prebuilt binaries ({outputs.Count}) ==");
-            sb.AppendLine("  (kept - may be vendored prebuilts the build links; if they are generated, --exclude their dir)");
+            sb.AppendLine("  (kept - may be vendored prebuilts the build links; if they are generated, add their dir to excludeDirectories)");
             foreach (var f in outputs) sb.AppendLine($"    {f}");
         }
 
@@ -178,7 +178,7 @@ public static class CarveReport
             sb.AppendLine();
             sb.AppendLine($"== REMOVED - garbage, not a build/run input ({x.RemovedGarbage.Count}) ==");
             sb.AppendLine("  (VCS metadata, compiler/IDE scratch, dep/coverage artifacts, editor/OS junk, logs/temp; "
-                          + "restore all with --keep-garbage or one with --aux)");
+                          + "restore one with forceKeepFiles)");
             foreach (var f in x.RemovedGarbage.OrderBy(f => f, StringComparer.Ordinal)) sb.AppendLine($"    {f}");
         }
         return sb.ToString();

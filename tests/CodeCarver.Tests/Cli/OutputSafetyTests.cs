@@ -113,6 +113,95 @@ public sealed class OutputSafetyTests
     }
 
     [Fact]
+    public void Summary_HoldsNoPathFileOrSymbolName()
+    {
+        // The one-way workflow: only this file goes back. It must never carry an input name.
+        var work = NewWork();
+        try
+        {
+            var src = Path.Combine(work, "src", "secret_dir");
+            Directory.CreateDirectory(src);
+            File.WriteAllText(Path.Combine(src, "secret_main.c"), "void secret_helper(void);\nint secret_entry(void){ secret_helper(); return 0; }\n");
+            File.WriteAllText(Path.Combine(src, "secret_helper.c"), "void secret_helper(void){}\n");
+            File.WriteAllText(Path.Combine(src, "secret_dead.c"), "void secret_dead(void){}\n");
+            var cfg = Path.Combine(work, "carve.toml");
+            File.WriteAllText(cfg, "outputDirectory = \"secret_out\"\n[common]\nentryPoints = [\"secret_entry\"]\n"
+                + "[stages.secret_stage]\ncarveSourceFileContents = true\n");
+            var code = CarveCommand.Run(new[] { "carve", Path.Combine(work, "src"), "--config", cfg }, new StringWriter(), new StringWriter());
+            Assert.Equal(0, code);
+            var ccDir = Path.Combine(work, "secret_out", "secret_stage", "codecarver");
+            foreach (var f in new[] { "summary.txt", "summary.json" })
+            {
+                var text = File.ReadAllText(Path.Combine(ccDir, f));
+                Assert.DoesNotContain("secret", text, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain(work, text, StringComparison.OrdinalIgnoreCase);
+                Assert.Contains("stage0.keptFiles", text);
+            }
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
+    [Fact]
+    public void ConfigRelativePaths_ResolveAgainstTheConfigFile_U1()
+    {
+        var work = NewWork();
+        try
+        {
+            var src = Path.Combine(work, "proj", "src");
+            Directory.CreateDirectory(src);
+            File.WriteAllText(Path.Combine(src, "main.c"), "int main(void){return 0;}\n");
+            File.WriteAllText(Path.Combine(work, "proj", "run.trace"), Path.Combine(src, "main.c").Replace('\\', '/') + "\n");
+            var cfg = Path.Combine(work, "proj", "carve.toml");
+            File.WriteAllText(cfg, "outputDirectory = \"out\"\n[common]\nentryPoints = [\"main\"]\n[runs.r]\nrunTraceFiles = [\"run.trace\"]\n");
+            // The process's current directory is not proj/, so cwd-relative resolution would miss run.trace.
+            var se = new StringWriter();
+            var code = CarveCommand.Run(new[] { "carve", src, "--config", cfg }, new StringWriter(), se);
+            Assert.True(code == 0, se.ToString());
+            Assert.True(File.Exists(Path.Combine(work, "proj", "out", "carved", "main.c")));
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
+    [Fact]
+    public void StageFlagWithoutStages_IsAnError_U7()
+    {
+        var work = NewWork();
+        try
+        {
+            var src = Path.Combine(work, "src");
+            Directory.CreateDirectory(src);
+            File.WriteAllText(Path.Combine(src, "main.c"), "int main(void){return 0;}\n");
+            var cfg = Path.Combine(work, "carve.toml");
+            File.WriteAllText(cfg, "outputDirectory = \"out\"\n[common]\nentryPoints = [\"main\"]\n");
+            var se = new StringWriter();
+            Assert.Equal(2, CarveCommand.Run(new[] { "carve", src, "--config", cfg, "--stage", "max" }, new StringWriter(), se));
+            Assert.Contains("no [stages.X]", se.ToString());
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
+    [Fact]
+    public void UnresolvedEntryPoint_SuggestsNearMiss_AndWhyStillAnswers_U8()
+    {
+        var work = NewWork();
+        try
+        {
+            var src = Path.Combine(work, "src");
+            Directory.CreateDirectory(src);
+            File.WriteAllText(Path.Combine(src, "main.c"), "void uart_init(void){}\nint main(void){ uart_init(); return 0; }\n");
+            var cfg = Path.Combine(work, "carve.toml");
+            File.WriteAllText(cfg, "outputDirectory = \"out\"\n[common]\nentryPoints = [\"main\", \"uart_inti\"]\n");
+            var se = new StringWriter();
+            Assert.Equal(1, CarveCommand.Run(new[] { "carve", src, "--config", cfg }, new StringWriter(), se));
+            Assert.Contains("did you mean: uart_init", se.ToString());
+            var so = new StringWriter();
+            Assert.Equal(0, CarveCommand.Run(new[] { "carve", src, "--config", cfg, "--why", "uart_init" }, so, new StringWriter()));
+            Assert.Contains("uart_init", so.ToString());
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
+    [Fact]
     public void Begin_DoesNotReapStagingOfSiblingOutputWithPrefixName()
     {
         var work = NewWork();

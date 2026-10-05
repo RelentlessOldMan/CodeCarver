@@ -58,7 +58,7 @@ public static class CarveCommand
     {
         var info = System.Reflection.Assembly.GetExecutingAssembly()
             .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?.InformationalVersion;
-        return string.IsNullOrEmpty(info) ? "0.1.0" : info;
+        return string.IsNullOrEmpty(info) ? "1.0.0" : info;
     }
 
     /// <summary>
@@ -69,7 +69,12 @@ public static class CarveCommand
     /// </summary>
     public static int Init(string[] args, TextWriter @out, TextWriter err)
     {
-        var path = args.Length > 1 && !args[1].StartsWith('-') ? args[1] : "carve.toml";
+        if (args.Length > 2 || (args.Length == 2 && args[1].StartsWith('-')))
+        {
+            err.WriteLine("usage: init [path]   (writes an annotated carve.toml; default path: carve.toml)");
+            return 2;
+        }
+        var path = args.Length > 1 ? args[1] : "carve.toml";
         if (File.Exists(path))
         {
             err.WriteLine($"'{path}' already exists — refusing to overwrite. Delete it or choose another path.");
@@ -161,14 +166,9 @@ public static class CarveCommand
 
         // Fixed, auto-handled settings (no longer user-facing flags).
         var pruneGarbage = true;        // auto-exclude provable non-inputs; forceKeepFiles un-drops
-        var strictRoots = true;         // a missing NAMED entry point always fails (soundness check always runs below)
-        string? traceFormat = null;     // standard trace-log format only (no regex knob)
-        string? fileTraceFormat = null; // file-access traces auto-detect
         long maxParseBytes = cv.MaxParseBytes ?? 20_000_000;            // [advanced] escape hatches
         int? parseTimeoutMs = cv.ParseTimeout is { } pt ? pt * 1000 : null;
         int? maxSymbolsPerFile = cv.MaxSymbolsPerFile;
-        var dumpSpans = false;
-        string? diagPath = null;        // no --diag flag; crash auto-diag still works via DiagState
         // Per-stage; declared here for the diag snapshot, set inside the emit loop.
         var prune = false;
         var pruneHeaders = false;
@@ -218,7 +218,7 @@ public static class CarveCommand
         // accumulate; only WRITTEN when --diag is set. Paths are redacted at write time (no username leaks).
         var diag = DiagnosticReport.Start();
         DiagState.Report = diag;
-        DiagState.Path = diagPath;
+        DiagState.Path = null;          // no --diag flag; an unexpected failure still auto-writes to DefaultPath
         // Default landing spot for an auto-written package (unhandled crash, or --diag-repro/--diag-verbose used
         // without an explicit --diag path). Session-stamped so concurrent runs don't collide.
         DiagState.DefaultPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"CodeCarver_diag_{diag.SessionId}.zip");
@@ -257,6 +257,15 @@ public static class CarveCommand
         diag.Set("sourceRootKind", ClassifyRoot(dir));
         diag.Set("lang", lang);
         diag.Set("rootCount", roots.Length);
+        // The name-free summary (codecarver/summary.txt + .json): numbers, booleans and fixed category names ONLY —
+        // never a path, file name or symbol — so it is what the owner can send back from the one-way workflow.
+        var summary = new SortedDictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["codecarverVersion"] = Version(),
+            ["lang"] = lang,
+            ["entryPoints"] = roots.Length,
+            ["stagesConfigured"] = cv.Stages.Count,
+        };
         diag.Set("closedWorld", closedWorld);
         diag.Set("stageCount", cv.Stages.Count);
         diag.Event("args parsed");
@@ -504,12 +513,6 @@ public static class CarveCommand
             ? cv.Languages.SelectMany(ExtsFor).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
             : ExtsFor(lang);
 
-        if (roots.Length == 0)
-        {
-            err.WriteLine("carve needs --roots sym1,sym2 (the entry symbols to keep)");
-            return 2;
-        }
-
         // All source-tree scans go through SourceWalk (Core): skips unreadable dirs (network shares; eval-#7)
         // and does not recurse into directory junctions/symlinks (loop / double-scan) while still returning
         // symlinked source FILES (dropping one would be unsound).
@@ -568,6 +571,8 @@ public static class CarveCommand
             var tuExt = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
             var unlogged = parseRels.Count(r => tuExt.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !perFileSpecs.ContainsKey(r));
             diag.Set("unloggedSourceFiles", unlogged);
+            summary["world.unloggedSourceFiles"] = unlogged;
+            summary["world.incompleteDefineSetFiles"] = openWorldFiles.Count;
             if (unlogged > 0)
                 err.WriteLine($"  build   : {unlogged} source file(s) appear in no compile command -> open-world for them (both #ifdef branches kept)");
             if (openWorldFiles.Count > 0)
@@ -687,7 +692,7 @@ public static class CarveCommand
                         // attributable -- supply -I via --build-log to resolve it exactly.
                         if (hits.Count > 1 && unresolved.Add(("ambig:" + Path.GetFileName(inc), inc)))
                             err.WriteLine($"  warn    : #include \"{inc}\" matched {hits.Count} files by basename "
-                                                    + "(kept all — sound but may over-keep; supply -I via --build-log to disambiguate)");
+                                                    + "(kept all — sound but may over-keep; a build log with -I flags (buildLogs) disambiguates)");
                     }
 
                     if (cands.Count == 0)
@@ -695,7 +700,7 @@ public static class CarveCommand
                         var fromRel = Path.GetRelativePath(dir, fromFull).Replace('\\', '/');
                         if (unresolved.Add((fromRel, inc)))
                             err.WriteLine($"  warn    : {fromRel}: #include \"{inc}\" resolved to no file in the tree — "
-                                                    + "the carved tree may not compile (supply -I via --build-log)");
+                                                    + "the carved tree may not compile (a build log with -I flags (buildLogs) resolves it)");
                         continue;
                     }
                     foreach (var target in cands)
@@ -835,6 +840,7 @@ public static class CarveCommand
                 }
             }
             err.WriteLine($"  config  : {ambientMacros.Count:N0} macro name(s) #defined in the tree stay unknown unless the build defines them");
+            summary["world.ambientMacros"] = ambientMacros.Count;
         }
         var graph = fe.BuildGraph(parseRels, ReadRel, defines, closedWorld);
         Mark("build-graph");
@@ -854,24 +860,23 @@ public static class CarveCommand
         // Per-root resolution. A firmware root set is a long hand-maintained list of ISRs/exported API
         // ("the whole game", WORKREPO.md §0); a SINGLE typo among valid names would otherwise carve that
         // symbol away silently and look like a clean success plus a bigger size win. So report every
-        // requested name that resolved to nothing, and — with --strict-roots — fail the run.
+        // requested name that resolved to nothing, and fail the run (with near-miss names to fix the typo).
         var resolvedNames = new HashSet<string>(
             explicitRoots.Where(r => r.Kind == RootKind.ExplicitSymbol && r.Note is not null).Select(r => r.Note!),
             StringComparer.Ordinal);
         var unresolvedRoots = roots.Where(r => !resolvedNames.Contains(r)).ToList();
-        if (roots.Length > 0 && explicitRoots.Count == 0)
-        {
-            err.WriteLine($"none of the requested roots were found as symbols: {string.Join(", ", roots)}");
-            return 1;
-        }
         if (unresolvedRoots.Count > 0)
         {
+            var near = NearMisses(graph, unresolvedRoots);
             foreach (var u in unresolvedRoots)
                 err.WriteLine($"  warn    : requested root '{u}' was NOT found as a symbol — nothing rooted for it " +
-                                        "(typo? macro-defined signature? excluded/other-variant file?)");
-            if (strictRoots)
+                              "(typo? macro-defined signature? excluded/other-variant file?)"
+                              + (near.TryGetValue(u, out var cands) && cands.Count > 0 ? $" — did you mean: {string.Join(", ", cands)}?" : ""));
+            // --why still answers (review U8): explaining a symbol is how you debug a missing root.
+            if (whySymbol is null)
             {
-                err.WriteLine($"strict-roots: {unresolvedRoots.Count} of {roots.Length} requested roots unresolved — failing (drop --strict-roots to proceed anyway).");
+                err.WriteLine($"{unresolvedRoots.Count} of {roots.Length} entry point(s) unresolved — failing so a typo can't silently carve "
+                    + "the symbol away. Fix or remove the name in entryPoints.");
                 return 1;
             }
         }
@@ -943,36 +948,25 @@ public static class CarveCommand
 
         // Runtime trace (functions a real run executed): root them so the carve is guaranteed to keep what ran,
         // including dynamic-dispatch / function-pointer edges static reachability can't see. Trace names are
-        // machine-generated (many external/libc), so they do NOT go through the --strict-roots per-root warnings;
+        // machine-generated (many external/libc), so they do NOT go through the per-entry-point checks;
         // instead the summary reports how many resolved in-scope.
         var traceRoots = new List<Root>();
         var traceTotal = 0;
         if (traceList.Count > 0)
         {
-            System.Text.RegularExpressions.Regex? pat = null;
-            if (traceFormat is not null)
-                // A user-supplied pattern is applied to every line of a possibly huge trace; cap each match so a
-                // pathological (catastrophic-backtracking) pattern surfaces as a clean error rather than hanging.
-                try { pat = new System.Text.RegularExpressions.Regex(traceFormat, System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(2)); }
-                catch (Exception ex) { err.WriteLine($"--trace-format is not a valid regex: {ex.Message}"); return 2; }
             // Union the function names across every trace (the files were validated/pruned up front).
             var traceNames = new HashSet<string>(StringComparer.Ordinal);
             foreach (var tp in traceList)
             {
                 if (!File.Exists(tp)) continue; // defensive; missing ones were already handled
-                try
-                {
-                    var recs = TraceFile.Parse(File.ReadAllText(tp), pat, out var bad);
-                    foreach (var n in TraceFile.FunctionNames(recs)) traceNames.Add(n);
-                    if (bad > 0) err.WriteLine($"  warn    : {bad} line(s) of function trace '{Path.GetFileName(tp)}' had no readable function name");
-                }
-                catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
-                { err.WriteLine("--trace-format took too long to match a trace line (catastrophic backtracking?) — simplify the pattern"); return 2; }
+                var recs = TraceFile.Parse(File.ReadAllText(tp), null, out var bad);
+                foreach (var n in TraceFile.FunctionNames(recs)) traceNames.Add(n);
+                if (bad > 0) err.WriteLine($"  warn    : {bad} line(s) of function trace '{Path.GetFileName(tp)}' had no readable function name");
             }
             traceTotal = traceNames.Count;
             traceRoots = new ExplicitRootProvider(symbols: traceNames).Discover(graph).ToList();
             if (traceTotal == 0)
-                err.WriteLine("  warn    : --trace produced 0 function names (does --trace-format have a named 'fn' group?)");
+                err.WriteLine("  warn    : runTraceLogs produced 0 function names (expected one function name per line, optionally `file:line`)");
         }
 
         // File-access traces: the files the OS actually opened under the repo during a real build/run. The OS
@@ -1072,10 +1066,13 @@ public static class CarveCommand
                 if (n.Kind == NodeKind.File && wantFiles.Contains(n.Name))
                     fileTraceRoots.Add(new Root(n.Id, RootKind.ExplicitFile, "observed"));
             err.WriteLine($"  files   : {observedRel.Count} observed in-tree from {buildFileTraces.Count} build + {runFileTraces.Count} run file-trace(s)"
-                + $" ({fileTraceRoots.Count} code file(s) rooted)"
+                + $" ({(summary["traces.codeFilesRooted"] = fileTraceRoots.Count)} code file(s) rooted)"
                 + (externalTu + externalHeaders > 0
                     ? $"; {externalTu} translation unit(s) + {externalHeaders} header(s) read OUTSIDE the carve root (missing dependency?)" : ""));
             diag.Set("observedOutsideTu", externalTu); diag.Set("observedOutsideHeaders", externalHeaders);
+            summary["traces.observedInTree"] = observedRel.Count;
+            summary["traces.outsideRootTranslationUnits"] = externalTu;
+            summary["traces.outsideRootHeaders"] = externalHeaders;
         }
 
         // forceKeepFiles (review K1): resolve each glob once. A forced code file is an ExplicitFile root, so its
@@ -1099,7 +1096,7 @@ public static class CarveCommand
                                    .Concat(ctorRoots).Concat(forceKeepRoots).Concat(forcedRoots).Concat(traceRoots).Concat(fileTraceRoots).ToList();
         if (rootSet.Count == 0)
         {
-            err.WriteLine("no roots to carve from: name entry symbols with --roots");
+            err.WriteLine("no roots to carve from: list the entry symbols in [common] entryPoints");
             return 1;
         }
 
@@ -1107,6 +1104,27 @@ public static class CarveCommand
         var plan = ReachabilityEngine.Compute(graph, rootSet);
         Mark("reachability");
         var s = plan.Stats;
+        summary["world.closed"] = closedWorld;
+        summary["world.compileCommands"] = buildCmds.Count;
+        summary["world.compilerProbed"] = probeBase is not null;
+        summary["graph.nodes"] = s.TotalNodes;
+        summary["graph.files"] = s.TotalFiles;
+        foreach (var g in graph.Nodes.GroupBy(n => n.Kind)) summary[$"graph.nodes.{g.Key}"] = g.Count();
+        summary["reach.keptNodes"] = s.ReachedNodes;
+        summary["reach.keptFiles"] = s.KeptFiles;
+        summary["roots.entryPointsResolved"] = resolvedNames.Count;
+        summary["roots.entryPointsUnresolved"] = unresolvedRoots.Count;
+        summary["roots.implicit"] = implicitRoots.Count;
+        summary["roots.assembly"] = asmRoots.Count;
+        summary["roots.linkerSection"] = sectionRoots.Count;
+        summary["roots.constructor"] = ctorRoots.Count;
+        summary["roots.parseFailedKeptWhole"] = forceKeepRoots.Count;
+        summary["roots.forceKeepFiles"] = forcedRoots.Count;
+        summary["roots.functionTrace"] = traceRoots.Count;
+        summary["roots.fileTrace"] = fileTraceRoots.Count;
+        summary["traces.functionNames"] = traceTotal;
+        summary["files.bigKeptWhole"] = bigFiles.Count;
+        summary["files.denseHeadersKeptWhole"] = denseFiles.Count;
 
         // Close each stage's plan over what that stage's emitter WRITES (review F1, owner decision D-A): an
         // unreached definition the emitter keeps anyway (whole kept file; a span the pruner can't remove) is
@@ -1134,16 +1152,6 @@ public static class CarveCommand
             return stagePlans[pruned] = sp;
         }
         var whyPlan = PlanFor(!cv.AnalysisOnly && cv.Stages.Count > 0 && cv.Stages[0].CarveSourceFileContents);
-
-        if (dumpSpans)
-        {
-            foreach (var n in graph.Nodes
-                         .Where(n => n.Kind is NodeKind.Function or NodeKind.Global or NodeKind.Macro)
-                         .OrderBy(n => n.FilePath, StringComparer.Ordinal)
-                         .ThenBy(n => n.Span.StartLine))
-                @out.WriteLine($"  {(plan.IsKept(n.Id) ? "KEEP" : "drop")} {n.Kind} {n.FilePath}:{n.Span}\t{n.Name}");
-            return 0;
-        }
 
         // --why <symbol>: explain the keep-chain (or that it was carved) for a named symbol — for debugging
         // a carve against a real tree ("why is this huge thing still here?" / "why did this get dropped?").
@@ -1241,6 +1249,8 @@ public static class CarveCommand
                         + (cc.OversizedKeptWhole > 0 ? $"; {cc.OversizedKeptWhole} oversized kept-whole" : ""));
                 foreach (var w in cc.Warnings) { err.WriteLine($"  warn    : cmm {w}"); diag.Warn("cmm " + w); }
                 diag.Set("cmmTotal", cc.Total); diag.Set("cmmKept", cc.Kept.Count); diag.Set("cmmDropped", cc.Dropped.Count);
+                summary["cmm.total"] = cc.Total; summary["cmm.observed"] = cc.ObservedSeeds;
+                summary["cmm.viaClosure"] = cc.ClosureAdded; summary["cmm.dropped"] = cc.Dropped.Count;
             }
         }
         // Dropped .cmm are infrastructure, not modelled code — fold them into the emitter's drop set so they
@@ -1272,6 +1282,7 @@ public static class CarveCommand
         Func<string, string, bool[]?>? deadLinesFor = defines is null && perFileDefines is null ? null
             : (rel, text) => (perFileDefines?.Invoke(rel) ?? defines) is { } t ? PreprocessorScanner.DeadLineMap(text, t, closedWorld) : null;
         // Runs the emitted-tree check, prints the verdict, writes codecarver/verify.txt; true when it failed.
+        string summaryStage = "run";   // key prefix for the stage being verified ("run" in analysis-only mode)
         bool VerifyEmitted(CarvePlan p, IEnumerable<(string Rel, string Path)> emittedFiles, string ccDir)
         {
             if (!linkCheck) return false;
@@ -1299,9 +1310,25 @@ public static class CarveCommand
                     + "(correct if the #ifdef world is; see verify.txt)");
             if (r.FilesSkipped > 0)
                 @out.WriteLine($"  verify  : note — {r.FilesSkipped} file(s) over {maxParseBytes:N0} B or unreadable were not checked");
+            summary[$"{summaryStage}.verify.failed"] = hard.Count;
+            summary[$"{summaryStage}.verify.deadLineOnly"] = soft.Count;
+            summary[$"{summaryStage}.verify.filesChecked"] = r.FilesChecked;
+            summary[$"{summaryStage}.verify.filesNotChecked"] = r.FilesSkipped;
             return hard.Count > 0;
         }
         @out.WriteLine($"  world   : {worldReason}");
+
+        void WriteSummary(string ccDir)
+        {
+            foreach (var (cat, n) in diag.WarningCounts) summary[$"warnings.{cat}"] = n;
+            summary["exitCode"] = verifyFailed ? 3 : 0;
+            WriteArtifact(Path.Combine(ccDir, "summary.txt"),
+                "# CodeCarver summary — numbers only: no path, file name or symbol. Safe to send back.\n"
+                + string.Concat(summary.Select(kv => $"{kv.Key} = {Fmt(kv.Value)}\n")), "summary");
+            WriteArtifact(Path.Combine(ccDir, "summary.json"),
+                System.Text.Json.JsonSerializer.Serialize(summary, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), "summary");
+            static string Fmt(object? v) => v switch { bool b => b ? "true" : "false", null => "", _ => Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture) ?? "" };
+        }
 
         void WriteArtifact(string path, string content, string what)
         {
@@ -1386,6 +1413,10 @@ public static class CarveCommand
             WriteDecisions(ccDir, "", aplan);
             WriteRepro(ccDir, aplan);
             if (VerifyEmitted(aplan, aplan.KeptFiles.Select(r => (r, Path.Combine(dir, r))), ccDir)) verifyFailed = true;
+            summary["run.keptFiles"] = aplan.KeptFiles.Count;
+            summary["run.droppedFiles"] = aplan.DroppedFiles.Count;
+            summary["run.closureAddedFiles"] = aplan.KeptFiles.Count - plan.KeptFiles.Count;
+            WriteSummary(ccDir);
             Mark("analyze");
             diag.Set("analysisOnly", true);
             diag.Set("totalNodes", aplan.Stats.TotalNodes); diag.Set("keptFiles", aplan.Stats.KeptFiles); diag.Set("droppedFiles", aplan.Stats.DroppedFiles);
@@ -1398,7 +1429,42 @@ public static class CarveCommand
         // complete buildable project under <outputDirectory>/[<stage>/]carved plus report/manifest/resolved-config
         // under the sibling codecarver/. ---
         var originalCodeBytes = originalBytes;  // code-only base; do NOT mutate across stages
-        var configText = File.Exists(configPath) ? File.ReadAllText(configPath) : "";
+        // The configuration this stage actually ran with, after merging the selected builds/runs and resolving
+        // relative paths (review U5) — not the input file with a header on it.
+        string ResolvedConfigToml(ResolvedStage st)
+        {
+            static string Q(string v) => "'" + v.Replace("'", "") + "'";
+            static string L(IEnumerable<string> xs) => "[" + string.Join(", ", xs.Select(Q)) + "]";
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"# CodeCarver {Version()} — resolved configuration for stage '{st.Name}'.");
+            sb.AppendLine($"# world: {worldReason}");
+            sb.AppendLine($"outputDirectory = {Q(Path.GetFullPath(outputDirectory))}");
+            sb.AppendLine("[common]");
+            sb.AppendLine($"entryPoints = {L(roots)}");
+            sb.AppendLine($"languages = {L(cv.Languages)}");
+            sb.AppendLine($"excludeDirectories = {L(excludeDirs)}");
+            sb.AppendLine($"forceKeepFiles = {L(auxGlobs)}");
+            sb.AppendLine($"carveSourceFileContents = {(st.CarveSourceFileContents && lang is "c" or "cpp" ? "true" : "false")}");
+            sb.AppendLine($"carveHeaderFileContents = {(st.CarveHeaderFileContents ? "true" : "false")}");
+            sb.AppendLine("[builds.resolved]");
+            sb.AppendLine($"buildLogs = {L(buildLogs)}");
+            sb.AppendLine($"compiler = {Q(probeCompiler ?? "")}");
+            sb.AppendLine($"compilerNames = {L(cv.CompilerNames)}");
+            sb.AppendLine($"defines = {L(manualDefines)}");
+            sb.AppendLine($"buildTraceFiles = {L(buildFileTraces)}");
+            sb.AppendLine("[runs.resolved]");
+            sb.AppendLine($"runTraceFiles = {L(runFileTraces)}");
+            sb.AppendLine($"runTraceLogs = {L(traceList)}");
+            sb.AppendLine($"dropUnobservedCmm = {(cv.DropUnobservedCmm ? "true" : "false")}");
+            sb.AppendLine("[advanced]");
+            sb.AppendLine($"maxParseBytes = {maxParseBytes}");
+            if (cv.ParseTimeout is { } ptv) sb.AppendLine($"parseTimeout = {ptv}");
+            if (maxSymbolsPerFile is { } msf) sb.AppendLine($"maxSymbolsPerFile = {msf}");
+            sb.AppendLine($"allowUnmatchedTraces = {(cv.AllowUnmatchedTraces ? "true" : "false")}");
+            if (cv.PathMap.Count > 0)
+                sb.AppendLine("pathMap = [" + string.Join(", ", cv.PathMap.Select(m => $"{{ from = {Q(m.From)}, to = {Q(m.To)} }}")) + "]");
+            return sb.ToString();
+        }
         foreach (var stage in cv.Stages)
         {
             prune = stage.CarveSourceFileContents;
@@ -1411,6 +1477,13 @@ public static class CarveCommand
                 prune = false;
             }
             var splan = PlanFor(prune);
+            var stageIndex = cv.Stages.IndexOf(stage);
+            summaryStage = $"stage{stageIndex}";
+            summary[$"{summaryStage}.carveSourceFileContents"] = prune;
+            summary[$"{summaryStage}.carveHeaderFileContents"] = pruneHeaders;
+            summary[$"{summaryStage}.keptFiles"] = splan.KeptFiles.Count;
+            summary[$"{summaryStage}.droppedFiles"] = splan.DroppedFiles.Count;
+            summary[$"{summaryStage}.closureAddedFiles"] = splan.KeptFiles.Count - plan.KeptFiles.Count;
             var baseDir = stage.Name.Length == 0 ? outputDirectory : Path.Combine(outputDirectory, stage.Name);
             var outDir = Path.Combine(baseDir, "carved");
             var ccDir = Path.Combine(baseDir, "codecarver");
@@ -1472,6 +1545,11 @@ public static class CarveCommand
             var saved = origTotal - carvedBytes;
             var pct = origTotal > 0 ? (double)saved / origTotal : 0;
             @out.WriteLine($"  size    : {origTotal:N0} B -> {carvedBytes:N0} B  ({pct:P0} smaller, saved {saved:N0} B)");
+            summary[$"{summaryStage}.bytesBefore"] = origTotal;
+            summary[$"{summaryStage}.bytesAfter"] = carvedBytes;
+            summary[$"{summaryStage}.emittedCodeFiles"] = res.FilesWritten;
+            summary[$"{summaryStage}.infrastructureFiles"] = infra.Count;
+            summary[$"{summaryStage}.garbageFilesExcluded"] = infra.Garbage.Count;
             @out.WriteLine($"  buckets : {buildRequiredFiles.Count:N0} required-to-build + {infra.Count:N0} infrastructure kept, "
                 + $"{splan.DroppedFiles.Count:N0} dead-code" + (infra.Garbage.Count > 0 ? $" + {infra.Garbage.Count:N0} auto-excluded" : "") + " file(s) removed");
 
@@ -1498,12 +1576,10 @@ public static class CarveCommand
             };
             WriteArtifact(Path.Combine(ccDir, "manifest.json"),
                 System.Text.Json.JsonSerializer.Serialize(manifest, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), "manifest");
-            WriteArtifact(Path.Combine(ccDir, "resolved-config.toml"),
-                $"# CodeCarver resolved config — stage '{stage.Name}'\n# {worldReason}\n"
-                + $"# entryPoints={roots.Length}  languages={string.Join(",", cv.Languages)}  buildLogs={buildLogs.Count}  "
-                + $"runTraceFiles={runFileTraces.Count}  runTraceLogs={traceList.Count}\n\n{configText}", "config");
+            WriteArtifact(Path.Combine(ccDir, "resolved-config.toml"), ResolvedConfigToml(stage), "config");
             WriteDecisions(ccDir, stage.Name, splan);
             WriteRepro(ccDir, splan);
+            WriteSummary(ccDir);
         }
         Mark("emit");
 
@@ -1524,6 +1600,42 @@ public static class CarveCommand
         diag.Event("run complete");
 
         return verifyFailed ? 3 : 0; // non-zero so the soundness check is usable as a CI gate
+    }
+
+    /// <summary>Up to three defined names close to each unresolved entry point: same name ignoring case, or edit
+    /// distance ≤ 2 among names of similar length.</summary>
+    static Dictionary<string, List<string>> NearMisses(CodeGraph graph, IReadOnlyList<string> wanted)
+    {
+        var r = wanted.ToDictionary(w => w, _ => new List<string>(), StringComparer.Ordinal);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var n in graph.Nodes)
+        {
+            if (n.Kind is not (NodeKind.Function or NodeKind.Global) || !seen.Add(n.Name)) continue;
+            foreach (var w in wanted)
+            {
+                var list = r[w];
+                if (list.Count >= 3 || Math.Abs(n.Name.Length - w.Length) > 2) continue;
+                if (string.Equals(n.Name, w, StringComparison.OrdinalIgnoreCase) || Distance(n.Name, w) <= 2) list.Add(n.Name);
+            }
+        }
+        return r;
+    }
+
+    static int Distance(string a, string b)
+    {
+        var d = new int[b.Length + 1];
+        for (var j = 0; j <= b.Length; j++) d[j] = j;
+        for (var i = 1; i <= a.Length; i++)
+        {
+            var prev = d[0]; d[0] = i;
+            for (var j = 1; j <= b.Length; j++)
+            {
+                var cur = d[j];
+                d[j] = Math.Min(Math.Min(d[j] + 1, d[j - 1] + 1), prev + (char.ToLowerInvariant(a[i - 1]) == char.ToLowerInvariant(b[j - 1]) ? 0 : 1));
+                prev = cur;
+            }
+        }
+        return d[b.Length];
     }
 
     /// <summary>For absolute trace paths that miss the carve root, find the prefix most of them share once their
@@ -1575,7 +1687,7 @@ public static class CarveCommand
         {
             // Only the value-carrying flags the CLI still accepts (inputs/tuning moved to --config, whose path is
             // elided too). The config FILE's contents are never read into the diag package, so no values leak.
-            "--roots", "--out", "--config", "--manifest", "--diag", "--report", "--lang", "--why",
+            "--config", "--stage", "--why",
         };
         var sb = new System.Text.StringBuilder("carve <source>");
         for (var i = 2; i < a.Length; i++)   // a[0]="carve", a[1]=source dir (already shown as <source>)

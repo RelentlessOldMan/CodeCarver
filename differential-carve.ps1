@@ -28,7 +28,7 @@ param(
     [int]$ParseTimeout = 0
 )
 $ErrorActionPreference = 'Stop'
-$cli = Join-Path $PSScriptRoot 'src\CodeCarver.Cli\bin\Release\net8.0\CodeCarver.Cli.dll'
+$cli = Join-Path $PSScriptRoot 'src\CodeCarver.Cli\bin\Release\net8.0\codecarver.dll'
 if (-not (Test-Path $cli)) { throw "build the CLI first: dotnet build -c Release  (missing $cli)" }
 if (-not $RepoB) { $RepoB = $RepoA; Write-Host "(determinism mode: carving $RepoA twice)" -ForegroundColor DarkGray }
 

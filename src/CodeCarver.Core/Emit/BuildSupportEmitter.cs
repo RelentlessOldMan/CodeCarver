@@ -41,7 +41,7 @@ public static class BuildSupportEmitter
             // Refuse a glob that escapes the source root — it could clobber files outside --out (eval-#7).
             if (GlobEscapesRoot(glob))
             {
-                warnings.Add($"--aux glob '{glob}' refused: contains '..' or an absolute path (would write outside --out)");
+                warnings.Add($"forceKeepFiles '{glob}' refused: contains '..' or an absolute path (would write outside the output)");
                 continue;
             }
             // Count actual matches, not the picked-set delta: a glob may match files the built-in support-ext
@@ -50,7 +50,7 @@ public static class BuildSupportEmitter
             foreach (var p in MatchGlob(sourceRoot, glob))
                 if (Keep(p)) { picked.Add(p); matched++; }
             if (matched == 0)
-                warnings.Add($"--aux glob '{glob}' matched no files under {sourceRoot} "
+                warnings.Add($"forceKeepFiles '{glob}' matched no files under {sourceRoot} "
                              + "(a bare pattern like '*.inc' already searches all subdirectories)");
         }
 
@@ -68,7 +68,7 @@ public static class BuildSupportEmitter
             if (!dstFull.StartsWith(outFull + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
                 && !string.Equals(dstFull, outFull, StringComparison.OrdinalIgnoreCase))
             {
-                warnings.Add($"skipped '{rel}': destination would fall outside --out");
+                warnings.Add($"skipped '{rel}': destination would fall outside the output directory");
                 continue;
             }
             // out overlapping source would make dst==src; File.Copy onto itself throws. The CLI refuses

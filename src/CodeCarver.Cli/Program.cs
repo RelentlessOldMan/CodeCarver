@@ -7,9 +7,29 @@ using CodeCarver.Core.Roots;
 // CodeCarver CLI dispatcher. The real work of `carve` lives in CarveCommand.Run (extracted so it can be
 // driven — and coverage-measured — in-process); `demo` and `scan-log` are small enough to stay here.
 
-var cmd = args.Length > 0 ? args[0] : "demo";
+var cmd = args.Length > 0 ? args[0] : "help";
 switch (cmd)
 {
+    case "help":
+    case "--help":
+    case "-h":
+    case "/?":
+        Console.WriteLine($"""
+            CodeCarver {CarveCommand.Version()} — carve a source tree down to what an image needs.
+
+            usage:
+              codecarver carve <source-dir> --config carve.toml [--stage <name>] [--why <symbol>]
+              codecarver init [path]          write an annotated carve.toml (default: carve.toml)
+              codecarver scan-log <log>       show what CodeCarver reads from a build log / compile_commands.json
+              codecarver version              print the version
+              codecarver demo                 run the built-in engine demo
+              codecarver help                 this text
+
+            exit codes: 0 ok, 1 runtime failure, 2 usage or configuration error,
+                        3 the emitted tree failed verify (it would not link)
+            Everything else lives in the config file — run 'init' for the annotated template.
+            """);
+        return 0;
     case "demo":
         RunDemo();
         return 0;
@@ -26,7 +46,7 @@ switch (cmd)
         Console.WriteLine($"CodeCarver {CarveCommand.Version()}");
         return 0;
     default:
-        Console.Error.WriteLine($"unknown command '{cmd}'. try: carve <dir> --roots a,b | emit-config <file> | demo | version");
+        Console.Error.WriteLine($"unknown command '{cmd}'. Commands: carve, init, scan-log, version, demo, help.");
         return 2;
 }
 

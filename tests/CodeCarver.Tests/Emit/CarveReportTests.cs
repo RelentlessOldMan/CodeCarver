@@ -132,7 +132,7 @@ public sealed class CarveReportTests
         Assert.Contains("REMOVED - garbage", text);
         Assert.Contains(".git/config", text);
         Assert.Contains("src/main.c.bak", text);
-        Assert.Contains("--keep-garbage", text);
+        Assert.Contains("forceKeepFiles", text);
         Assert.Contains("2,048 B", text);   // garbage byte total surfaced
 
         // Infra grouped by build ROLE.

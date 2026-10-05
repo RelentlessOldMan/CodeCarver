@@ -63,7 +63,7 @@ public static class InfrastructureEmitter
             // Belt-and-braces: NEVER write outside --out, whatever the rel path resolved to.
             if (!dstFull.StartsWith(outFull + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
                 && !string.Equals(dstFull, outFull, StringComparison.OrdinalIgnoreCase))
-            { warnings.Add($"skipped '{rel}': destination would fall outside --out"); continue; }
+            { warnings.Add($"skipped '{rel}': destination would fall outside the output directory"); continue; }
             // out overlapping source would make dst==src; File.Copy onto itself throws. The CLI refuses
             // overlapping --out, but skip defensively for direct library callers.
             if (string.Equals(full, dstFull, StringComparison.OrdinalIgnoreCase)) continue;
@@ -124,12 +124,12 @@ public static class InfrastructureEmitter
         foreach (var glob in auxGlobs)
         {
             if (BuildSupportEmitter.GlobEscapesRoot(glob))
-            { warnings.Add($"--aux glob '{glob}' refused: contains '..' or an absolute path (would write outside --out)"); continue; }
+            { warnings.Add($"forceKeepFiles '{glob}' refused: contains '..' or an absolute path (would write outside the output)"); continue; }
             var matched = 0;
             foreach (var p in BuildSupportEmitter.MatchGlob(sourceRoot, glob))
             { forced.Add(Path.GetRelativePath(sourceRoot, p).Replace('\\', '/')); matched++; }
             if (matched == 0)
-                warnings.Add($"--aux glob '{glob}' matched no files under {sourceRoot} "
+                warnings.Add($"forceKeepFiles '{glob}' matched no files under {sourceRoot} "
                              + "(a bare pattern like '*.inc' already searches all subdirectories)");
         }
 

@@ -16,6 +16,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <Product>CodeCarver</Product>
+    <!-- The command every doc uses: codecarver(.exe) / codecarver.dll. -->
+    <AssemblyName>codecarver</AssemblyName>
     <!-- Fallback only (no git): the real version is 1.0.<commit-count> set by StampGitSha below, so the
          patch number bumps by one on every commit/push (like CodeCompass 1.0.NNN). -->
     <Version>1.0.0</Version>
@@ -44,9 +46,13 @@
       <Output TaskParameter="ConsoleOutput" PropertyName="_GitDirty" />
     </Exec>
     <PropertyGroup>
-      <Version Condition="'$(_GitCount)' != ''">1.0.$(_GitCount)</Version>
-      <SourceRevisionId Condition="'$(_GitSha)' != '' and '$(_GitDirty)' == ''">$(_GitSha)</SourceRevisionId>
-      <SourceRevisionId Condition="'$(_GitSha)' != '' and '$(_GitDirty)' != ''">$(_GitSha)-dirty</SourceRevisionId>
+      <!-- Only well-formed values: when git fails, ConsoleOutput holds its ERROR text, which must not become the
+           version ("1.0.fatal: ambiguous argument ..."; review SC-E1). -->
+      <_GitCountOk>$([System.Text.RegularExpressions.Regex]::IsMatch('$(_GitCount)', '^[0-9]+$'))</_GitCountOk>
+      <_GitShaOk>$([System.Text.RegularExpressions.Regex]::IsMatch('$(_GitSha)', '^[0-9a-f]{7,40}$'))</_GitShaOk>
+      <Version Condition="'$(_GitCountOk)' == 'True'">1.0.$(_GitCount)</Version>
+      <SourceRevisionId Condition="'$(_GitShaOk)' == 'True' and '$(_GitDirty)' == ''">$(_GitSha)</SourceRevisionId>
+      <SourceRevisionId Condition="'$(_GitShaOk)' == 'True' and '$(_GitDirty)' != ''">$(_GitSha)-dirty</SourceRevisionId>
     </PropertyGroup>
   </Target>
 
