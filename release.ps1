@@ -126,8 +126,17 @@ if (Test-Path $zip) { Remove-Item -Force $zip }
 # extractors turn into flat files (the native tree-sitter libraries are then not found).
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-[System.IO.Compression.ZipFile]::CreateFromDirectory($pub, $zip)
-# .NET Framework before 4.6.1 (or the UseBackslash compat switch) still writes '\' here: verify, never assume.
+# Not ZipFile.CreateFromDirectory either: under Windows PowerShell 5.1 it still writes '\' entry names. Add each
+# file with an explicit '/'-separated name instead.
+$pubRoot = (Resolve-Path $pub).ProviderPath.TrimEnd('\') + '\'
+$zw = [System.IO.Compression.ZipFile]::Open($zip, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+    foreach ($f in Get-ChildItem $pub -Recurse -File) {
+        $entry = $f.FullName.Substring($pubRoot.Length).Replace('\', '/')
+        [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zw, $f.FullName, $entry, [System.IO.Compression.CompressionLevel]::Optimal)
+    }
+} finally { $zw.Dispose() }
+# Verify, never assume: no entry may carry a '\'.
 $za = [System.IO.Compression.ZipFile]::OpenRead($zip)
 try { $bad = @($za.Entries | Where-Object { $_.FullName.Contains('\') } | Select-Object -First 3 | ForEach-Object { $_.FullName }) }
 finally { $za.Dispose() }
