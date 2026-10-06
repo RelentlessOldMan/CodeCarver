@@ -1,0 +1,86 @@
+# CodeCarver self-check: carves tiny synthetic trees, one per definition shape a past eval found missed, and
+# checks the carve kept the file that defines what main needs. Uses no source of yours; nothing leaves the box.
+#
+#   powershell -ExecutionPolicy Bypass -File tools\selfcheck\selfcheck.ps1
+#
+# Prints PASS/FAIL per case and exits 0 only if every case passes. Runs in a few seconds per case.
+# Windows PowerShell 5.1 or later; keep this file ASCII (5.1 misreads non-ASCII without a BOM).
+param(
+    [string]$CodeCarver = (Join-Path $PSScriptRoot '..\..\codecarver.dll'),
+    [switch]$KeepTemp
+)
+$ErrorActionPreference = 'Stop'
+if (-not (Test-Path $CodeCarver)) { Write-Host "codecarver.dll not found at $CodeCarver (pass -CodeCarver <path>)"; exit 2 }
+$CodeCarver = (Resolve-Path $CodeCarver).Path
+# 5.1 turns a native command's stderr into an error record; under Stop that would abort the run on the first
+# expected failure instead of reporting it.
+$ErrorActionPreference = 'Continue'
+
+$cases = @(
+    @{ Name = 'nested-scope C++ method (ns::Class::f)'; Lang = 'cpp'; Expect = @('uart.cpp', 'helper.cpp'); Why = 'hw::Uart::send'
+       Files = @{
+         'w.h'        = "namespace hw { struct Uart { void send(); }; }`nint helper(void);`n"
+         'main.cpp'   = "#include `"w.h`"`nint main() { hw::Uart u; u.send(); return 0; }`n"
+         'uart.cpp'   = "#include `"w.h`"`nvoid hw::Uart::send() { helper(); }`n"
+         'helper.cpp' = "int helper(void) { return 7; }`n"
+         'unused.cpp' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'K&R definition'; Lang = 'c'; Expect = @('add.c')
+       Files = @{
+         'main.c' = "int add();`nint main(void) { return add(1, 2); }`n"
+         'add.c'  = "int add(a, b)`n    int a;`n    int b;`n{`n    return a + b;`n}`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'implicit-int definition'; Lang = 'c'; Expect = @('twice.c')
+       Files = @{
+         'main.c'  = "int twice(int);`nint main(void) { return twice(2); }`n"
+         'twice.c' = "twice(int x) { return 2 * x; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'function head split across #ifdef'; Lang = 'c'; Expect = @('split.c')
+       Files = @{
+         'main.c'  = "int helper(int);`nint main(void) { return helper(1); }`n"
+         'split.c' = "#ifdef VARIANT_B`nint helper_b(int x)`n#else`nint helper(int x)`n#endif`n{`n    return x;`n}`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'macro-defined function'; Lang = 'c'; Expect = @('task.c')
+       Files = @{
+         'main.c' = "void blink_task(void);`nint main(void) { blink_task(); return 0; }`n"
+         'task.c' = "#define DEFINE_TASK(n) void n##_task(void)`nDEFINE_TASK(blink) { }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+)
+
+$tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("cc-selfcheck-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force $tempRoot | Out-Null
+$version = (& dotnet $CodeCarver version) -join ' '
+Write-Host "CodeCarver self-check: $version"
+$failed = 0
+$i = 0
+foreach ($c in $cases) {
+    $i++
+    $case = Join-Path $tempRoot "case$i"
+    $src = Join-Path $case 'src'
+    $out = Join-Path $case 'out'
+    New-Item -ItemType Directory -Force $src | Out-Null
+    foreach ($f in $c.Files.Keys) { [IO.File]::WriteAllText((Join-Path $src $f), $c.Files[$f]) }
+    $toml = "outputDirectory = '$out'`n[common]`nentryPoints = [`"main`"]`nlanguages = [`"$($c.Lang)`"]`n"
+    $cfg = Join-Path $case 'carve.toml'
+    [IO.File]::WriteAllText($cfg, $toml)
+
+    $problems = @()
+    $null = & dotnet $CodeCarver carve $src --config $cfg 2>&1
+    $code = $LASTEXITCODE
+    if ($code -ne 0) { $problems += "carve exit $code" }
+    $carved = Join-Path $out 'carved'
+    foreach ($e in $c.Expect) {
+        if (-not (Test-Path (Join-Path $carved $e))) { $problems += "$e dropped" }
+    }
+    $unusedName = @($c.Files.Keys | Where-Object { $_ -like 'unused.*' })[0]
+    if ($unusedName -and (Test-Path (Join-Path $carved $unusedName))) { $problems += "$unusedName kept (carve not cutting)" }
+    if ($c.Why) {
+        $null = & dotnet $CodeCarver carve $src --config $cfg --why $c.Why 2>&1
+        if ($LASTEXITCODE -ne 0) { $problems += "--why $($c.Why) exit $LASTEXITCODE" }
+    }
+    if ($problems.Count -eq 0) { Write-Host ("PASS  " + $c.Name) }
+    else { $failed++; Write-Host ("FAIL  " + $c.Name + ": " + ($problems -join '; ')) }
+}
+if (-not $KeepTemp) { Remove-Item -Recurse -Force $tempRoot -ErrorAction SilentlyContinue }
+else { Write-Host "cases kept in $tempRoot" }
+Write-Host ("{0} of {1} passed" -f ($cases.Count - $failed), $cases.Count)
+if ($failed -gt 0) { exit 1 } else { exit 0 }

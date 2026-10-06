@@ -80,8 +80,12 @@ jobs:
           if ($tags -contains "v$version") { Write-Host "v$version already released"; exit 0 }
           ./release.ps1 -Version $version -SkipTests
           if (-not $?) { throw "release.ps1 failed" }
+          # Run the shipped self-check from the unpacked zip, so a release is only cut if the zip itself passes it.
+          Expand-Archive "dist/codecarver-$version.zip" "dist/check"
+          powershell -NoProfile -ExecutionPolicy Bypass -File dist/check/tools/selfcheck/selfcheck.ps1
+          if ($LASTEXITCODE -ne 0) { throw "self-check failed" }
           $short = (git rev-parse --short=7 HEAD).Trim()
-          gh release create "v$version" "dist/codecarver-$version.zip" --target $env:GITHUB_SHA --title "CodeCarver $version" --notes "Build $version+$short. Windows and Linux (x64), needs the .NET 8 runtime. Run ``dotnet codecarver.dll version`` to check. Docs are in the zip (USAGE.md, SUPPORT.md); trace-capture scripts are in tools/capture."
+          gh release create "v$version" "dist/codecarver-$version.zip" --target $env:GITHUB_SHA --title "CodeCarver $version" --notes "Build $version+$short. Windows and Linux (x64), needs the .NET 8 runtime. Run ``dotnet codecarver.dll version`` to check. Docs are in the zip (USAGE.md, SUPPORT.md); trace-capture scripts are in tools/capture; tools/selfcheck/selfcheck.ps1 checks the fixed definition shapes in seconds."
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
 
   lint:

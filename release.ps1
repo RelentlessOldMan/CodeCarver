@@ -115,7 +115,11 @@ $capture = Join-Path $root 'tools\capture'
 if (-not (Test-Path $capture)) { throw "tools\capture missing - USAGE.md tells users to run it" }
 New-Item -ItemType Directory -Force (Join-Path $pub 'tools') | Out-Null
 Copy-Item -Recurse -Force $capture (Join-Path $pub 'tools\capture')
-Write-Host "  bundled README.md, LICENSE, THIRD-PARTY-NOTICES.txt, tools/capture/ into the release" -ForegroundColor DarkGray
+# The self-check lets a user confirm a fix on their own machine from synthetic trees alone.
+$selfcheck = Join-Path $root 'tools\selfcheck'
+if (-not (Test-Path $selfcheck)) { throw "tools\selfcheck missing" }
+Copy-Item -Recurse -Force $selfcheck (Join-Path $pub 'tools\selfcheck')
+Write-Host "  bundled README.md, LICENSE, THIRD-PARTY-NOTICES.txt, tools/capture/, tools/selfcheck/ into the release" -ForegroundColor DarkGray
 
 # --- 5. zip (only reached AFTER push is confirmed) ---
 if (-not $Output) { $Output = Join-Path $root 'dist' }

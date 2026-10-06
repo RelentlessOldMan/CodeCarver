@@ -12,6 +12,17 @@ trace counts, `.cmm` counts, per-stage sizes and `verify` counts, warnings by ca
 file name or symbol appears in them (a test enforces this), so they can be sent back as-is when the source must
 stay on its machine. Send it together with the exit code and the CodeCarver version.
 
+## Checking a fix: `tools\selfcheck\selfcheck.ps1`
+
+The release ships a self-check that carves tiny made-up trees, one for each definition shape a past evaluation
+found missed (out-of-line C++ methods in nested scopes, K&R and implicit-int definitions, a function head split
+across `#ifdef`, a macro-defined function), and checks each carve kept what `main` needs. It uses none of your
+source and takes seconds:
+
+    powershell -ExecutionPolicy Bypass -File tools\selfcheck\selfcheck.ps1
+
+It prints `PASS`/`FAIL` per case and exits 0 only when all pass. The PASS/FAIL lines are safe to send back.
+
 ## If it crashes
 
 You don't have to do anything special. On an unhandled exception CodeCarver writes a **source-free**
