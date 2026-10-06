@@ -1064,12 +1064,17 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // namespace with `FMT_BEGIN_NAMESPACE` is structured correctly and its functions are captured.
         // Everything else (spans, dead-line map, initializer scans) uses the ORIGINAL text below.
         var parseText = ExpandScopeMacros(text);
+        List<(string Name, int Line, int EndLine)>? bareKAndR = null;
         if (_cGrammar || path.EndsWith(".c", StringComparison.OrdinalIgnoreCase))
         {
-            parseText = ImplicitInt.Rewrite(parseText, _funcLikeMacroNames.Contains, out _);
+            parseText = ImplicitInt.Rewrite(parseText, _funcLikeMacroNames.Contains, out _, out bareKAndR);
             // A mixed C/C++ tree reads .c files with the C++ grammar, which rejects K&R parameter lists.
             if (!_cGrammar) parseText = ImplicitInt.KAndRToPrototype(parseText, out _);
         }
+        // Alternative parameter sets (#if/#else inside a parameter list) parsed as the first one; the other
+        // branches' names still count as uses of this file.
+        parseText = ParamListConditionals.Blank(parseText, out var blankedBranches);
+        if (blankedBranches.Length > 0) IdentifierRefs(blankedBranches, fileNodeByPath[path], pendingRefs, callShapedOnly: false);
         using var tree = ParseWithBudget(parseText, path, out var timedOut);
         if (timedOut)
         {
@@ -1190,6 +1195,22 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 // construct with its file instead (its body's calls are already attributed to the file).
                 foreach (var id in ids) graph.AddEdge(fileNode, id, EdgeKind.References);
         }
+
+        // Pass 1b': K&R definitions with bare, undeclared parameters straight into the body — `add(a, b) { ... }`
+        // (work eval, 1.0.162). The same text could be a macro-headed body from a header outside the tree, so the
+        // name is defined but the body is not made removable: the node is kept with its file (its calls are already
+        // the file's). A real one keeps its file when called; a misread macro head only adds an unused name.
+        // (Found by the implicit-int scan above; ExpandScopeMacros keeps lines, so they are the original text's.)
+        if (bareKAndR is not null)
+            foreach (var (name, line, endLine) in bareKAndR)
+            {
+                if (Keywords.Contains(name) || (dead is not null && line < dead.Length && dead[line])) continue;
+                if (functionsByName.TryGetValue(name, out var have) && have.Any(h => graph.GetNode(h).FilePath == path)) continue;
+                var fid = graph.GetOrAddNode(NodeKind.Function, name, path, new SourceSpan(line, endLine));
+                graph.AddEdge(fid, fileNode, EdgeKind.DefinedIn);
+                graph.AddEdge(fileNode, fid, EdgeKind.References);
+                Add(functionsByName, name, fid);
+            }
 
         // Pass 1c: symbols a macro use defines — `FW_DECLARE(uart, uart_init, uart_fini);` defining `uart_desc`,
         // or `DEFINE_TASK(blink) { ... }` defining `blink` (see DefinerMacros). Each defined name gets a node

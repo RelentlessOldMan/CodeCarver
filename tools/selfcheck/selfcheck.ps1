@@ -29,6 +29,23 @@ $cases = @(
          'main.c' = "int add();`nint main(void) { return add(1, 2); }`n"
          'add.c'  = "int add(a, b)`n    int a;`n    int b;`n{`n    return a + b;`n}`n"
          'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'K&R definition with undeclared parameters'; Lang = 'c'; Expect = @('add.c', 'leaf.c')
+       Files = @{
+         'main.c' = "int add();`nint main(void) { return add(1, 2); }`n"
+         'add.c'  = "add(a, b)`n{`n    return a + b + leaf();`n}`n"
+         'leaf.c' = "int leaf(void) { return 0; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = '#if/#else inside a parameter list'; Lang = 'c'; Expect = @('setup.c', 'helper.c')
+       Files = @{
+         'main.c'   = "int setup();`nint main(void) { return setup(1, 2); }`n"
+         'setup.c'  = "int setup(int a,`n#if defined(BIG_BUILD)`n          long x, long y, long z, long w,`n#else`n          short x,`n#endif`n          int b)`n{`n    return a + b + helper();`n}`n"
+         'helper.c' = "int helper(void) { return 0; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'registration macro is not a function (verify)'; Lang = 'c'; Expect = @('main.c')
+       Files = @{
+         'reg.h'    = "struct drv { const char *n; int (*i)(void); };`n#define REGISTER_DRIVER(name, init) const struct drv name##_drv = { #name, init };`n"
+         'main.c'   = "#include `"reg.h`"`nint b_init(void) { return 0; }`nREGISTER_DRIVER(b, b_init)`nint b_work(void);`nint main(void) { return b_work() + b_init(); }`nint b_work(void) { return 1; }`n"
+         'unused.c' = "#include `"reg.h`"`nREGISTER_DRIVER(a, a_init)`nint a_init(void) { return 0; }`n" } }
     @{ Name = 'implicit-int definition'; Lang = 'c'; Expect = @('twice.c')
        Files = @{
          'main.c'  = "int twice(int);`nint main(void) { return twice(2); }`n"

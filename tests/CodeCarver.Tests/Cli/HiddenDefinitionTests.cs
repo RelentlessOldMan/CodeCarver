@@ -106,6 +106,38 @@ public sealed class HiddenDefinitionTests
         Assert.Equal(text.Count(c => c == '{'), text.Count(c => c == '}'));
     }
 
+    [Fact]
+    public void KAndRWithUndeclaredParameters_DefinesTheName_AndKeepsItsFile()
+    {
+        // Work eval, 1.0.162: `add(a, b) { ... }`, every parameter an implicit int, no declarations.
+        using var w = new Work();
+        w.W("main.c", "int add();\nint main(void){ return add(1, 2); }\n");
+        w.W("add.c", "/* legacy */\nadd(a, b)\n{\n  return a + leaf();\n}\n");
+        w.W("leaf.c", "int leaf(void) { return 0; }\n");
+        w.W("dead.c", "void dead(void) { }\n");
+        var (code, o) = w.Carve();
+        Assert.True(code == 0, o);
+        Assert.True(File.Exists(w.Out("carved/add.c")), o);
+        Assert.True(File.Exists(w.Out("carved/leaf.c")), o);   // the body's calls count (as its file's)
+        Assert.False(File.Exists(w.Out("carved/dead.c")), o);
+    }
+
+    [Fact]
+    public void BareHeadThatIsReallyAMacro_IsNeverCut_ByIntraFileCarving()
+    {
+        // The same text can be a macro-headed body from a header outside the tree. Its "definition" is never called,
+        // so it must stay with its file rather than be carved as an unreached function.
+        using var w = new Work();
+        w.W("main.c", "void task_body(void);\nint main(void){ task_body(); return 0; }\n");
+        w.W("task.c", "void task_body(void) { }\nportTASK_FUNCTION(prvIdle, pvParameters)\n{\n  idle_hook();\n}\n");
+        w.W("hook.c", "void idle_hook(void) { }\n");
+        var (code, o) = w.Carve("[stages.aggressive]\ncarveSourceFileContents = true\n");
+        Assert.True(code == 0, o);
+        var text = File.ReadAllText(w.Out("aggressive/carved/task.c"));
+        Assert.Contains("idle_hook();", text);
+        Assert.True(File.Exists(w.Out("aggressive/carved/hook.c")), o);
+    }
+
     [Theory]
     [InlineData("int\nhelper(int x) { return x; }\n")]                 // return type on the line above
     [InlineData("FRAMEWORK_FN(os_shell, \"doc\") { run(); }\n")]        // macro-headed body
@@ -316,6 +348,52 @@ public sealed class VerifyCauseTests
             Assert.Contains("verify.failed.definitionNotRecognized = 1", summary);
             Assert.DoesNotContain("HELPER", summary);   // still numbers only
             Assert.Contains("cause definitionNotRecognized", File.ReadAllText(Path.Combine(root, "out", "codecarver", "verify.txt")));
+        }
+        finally { TempDir.Delete(root); }
+    }
+
+    [Fact]
+    public void RegistrationMacroUse_IsNotReadAsADefinition()
+    {
+        // Work eval, 1.0.162: `REGISTER_DRIVER(a, a_init, a_fini)` with no ';', then the next function's '{', read as
+        // a definition of REGISTER_DRIVER in the dropped module, "used" by the same macro's call in the kept one.
+        var root = Path.Combine(Path.GetTempPath(), "cc-regm-" + Guid.NewGuid().ToString("N"));
+        var src = Path.Combine(root, "src");
+        Directory.CreateDirectory(src);
+        try
+        {
+            File.WriteAllText(Path.Combine(src, "reg.h"), "struct drv { const char *n; int (*i)(void); void (*u)(void); };\n"
+                + "#define REGISTER_DRIVER(name, init, uninit) const struct drv name##_drv = { #name, init, uninit };\n");
+            File.WriteAllText(Path.Combine(src, "main.c"), "#include \"reg.h\"\nint b_init(void) { return 0; }\nvoid b_fini(void) { }\n"
+                + "REGISTER_DRIVER(b, b_init, b_fini)\nint b_work(void);\nint main(void) { return b_work(); }\nint b_work(void) { return 1; }\n");
+            File.WriteAllText(Path.Combine(src, "mod_a.c"), "#include \"reg.h\"\nREGISTER_DRIVER(a, a_init, a_fini)\n"
+                + "int a_init(void) { return 0; }\nvoid a_fini(void) { }\n");
+            var cfg = Path.Combine(root, "carve.toml");
+            File.WriteAllText(cfg, $"outputDirectory = \"{Path.Combine(root, "out").Replace("\\", "/")}\"\n"
+                                   + "[common]\nentryPoints = [\"main\"]\nlanguages = [\"c\"]\n");
+            var so = new StringWriter(); var se = new StringWriter();
+            var code = CarveCommand.Run(new[] { "carve", src, "--config", cfg }, so, se);
+            Assert.True(code == 0, so + "\n" + se);
+            Assert.False(File.Exists(Path.Combine(root, "out", "carved", "mod_a.c")));
+        }
+        finally { TempDir.Delete(root); }
+    }
+
+    [Fact]
+    public void LinkCheck_StillReportsATypedFunctionNamedLikeAMacro()
+    {
+        // The macro exemption covers bare `NAME(...)` heads only: a real definition with a return type that shares a
+        // function-like macro's name (another target's macro in a multi-target tree) is still checked.
+        var root = Path.Combine(Path.GetTempPath(), "cc-regt-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var kept = Path.Combine(root, "kept.c");
+            var gone = Path.Combine(root, "gone.c");
+            File.WriteAllText(kept, "#define helper(x) other_helper(x)\nint main(void) { return helper(1); }\n");
+            File.WriteAllText(gone, "int helper(int x) { return x; }\n");
+            var r = CodeCarver.Core.Reachability.EmittedLinkCheck.Run(new[] { ("kept.c", kept) }, new[] { ("gone.c", gone) });
+            Assert.Contains(r.Violations, v => v.Name == "helper");
         }
         finally { TempDir.Delete(root); }
     }

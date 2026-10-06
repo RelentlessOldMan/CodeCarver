@@ -56,14 +56,26 @@ public static class EmittedLinkCheck
 
         // 1. Candidate definitions from dropped files (name -> first defining file).
         var droppedDefs = new Dictionary<string, string>(StringComparer.Ordinal);
+        // A file-scope `MACRO(a, b, c)` with no ';' reads as a definition when the next function's '{' follows.
+        // A name with only such bare "definitions" that the tree #defines as a function-like macro is a macro use,
+        // not a link symbol (work eval, 1.0.162: a registration macro invoked in two modules was reported as
+        // "used" in one and "defined only" in the other).
+        var typedDef = new HashSet<string>(StringComparer.Ordinal);
+        var functionMacros = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (rel, path) in dropped.OrderBy(d => d.Rel, StringComparer.Ordinal))
         {
             var text = TryRead(path, maxBytes);
             if (text is null) { skipped++; continue; }
             checkedFiles++;
             var header = IsHeader(rel);
-            foreach (var d in Scan(text, header).Definitions)
-                if (header || !d.Static) droppedDefs.TryAdd(d.Name, rel);
+            var dscan = Scan(text, header);
+            functionMacros.UnionWith(dscan.FunctionMacros);
+            foreach (var d in dscan.Definitions)
+                if (header || !d.Static)
+                {
+                    droppedDefs.TryAdd(d.Name, rel);
+                    if (!d.Bare) typedDef.Add(d.Name);
+                }
         }
         if (droppedDefs.Count == 0)
             return new LinkCheckResult(Array.Empty<LinkViolation>(), checkedFiles, skipped);
@@ -80,6 +92,7 @@ public static class EmittedLinkCheck
             var map = deadLines?.Invoke(rel, text);
             bool IsDead(int line) => map is not null && line < map.Length && map[line];
             var scan = Scan(text, IsHeader(rel));
+            functionMacros.UnionWith(scan.FunctionMacros);
             foreach (var d in scan.Definitions)
                 if (!IsDead(d.Line)) emittedDefs.Add(d.Name);
             foreach (var (name, line) in scan.Uses)
@@ -94,6 +107,7 @@ public static class EmittedLinkCheck
         foreach (var name in live.Keys.Concat(dead.Keys).Distinct().OrderBy(n => n, StringComparer.Ordinal))
         {
             if (emittedDefs.Contains(name)) continue;
+            if (functionMacros.Contains(name) && !typedDef.Contains(name)) continue;
             var isLive = live.TryGetValue(name, out var at);
             if (!isLive) at = dead[name];
             violations.Add(new LinkViolation(name, droppedDefs[name], at.Rel, at.Line, DeadOnly: !isLive));
@@ -119,13 +133,20 @@ public static class EmittedLinkCheck
 
     // ---- tokenizer + scope tracking ------------------------------------------------------------------
 
-    public readonly record struct Definition(string Name, int Line, bool Static, bool Inline);
+    /// <param name="Bare">Nothing but #define lines precedes the name in its statement (no return type).</param>
+    public readonly record struct Definition(string Name, int Line, bool Static, bool Inline, bool Bare = false);
 
     public sealed class ScanResult
     {
         public List<Definition> Definitions { get; } = new();
         public List<(string Name, int Line)> Uses { get; } = new();
+        /// <summary>Names this file #defines as function-like macros.</summary>
+        public HashSet<string> FunctionMacros { get; } = new(StringComparer.Ordinal);
     }
+
+    static readonly System.Text.RegularExpressions.Regex FuncLikeDefine = new(
+        @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(",
+        System.Text.RegularExpressions.RegexOptions.Multiline | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
     internal readonly record struct Tok(string Text, int Line, bool Ident, bool InDefine);
 
@@ -154,6 +175,9 @@ public static class EmittedLinkCheck
     {
         var toks = Tokenize(text);
         var result = new ScanResult();
+        if (text.Contains("define", StringComparison.Ordinal))
+            foreach (System.Text.RegularExpressions.Match m in FuncLikeDefine.Matches(text))
+                result.FunctionMacros.Add(m.Groups[1].Value);
 
         // Brace stack: 'T' transparent (namespace / extern "C"), 'F' function body, 'Q' function body whose uses
         // don't count (header inline), 'C' class body in a header, 'O' other.
@@ -218,15 +242,16 @@ public static class EmittedLinkCheck
                 var close = MatchParen(toks, i + 1);
                 if (close > 0 && OpensBody(toks, close + 1))
                 {
-                    bool isStatic = false, isInline = false;
+                    bool isStatic = false, isInline = false, bare = true;
                     for (var k = stmtStart; k < i; k++)
                     {
+                        if (!toks[k].InDefine) bare = false;
                         var w = toks[k].Text;
                         if (w == "static") isStatic = true;
                         else if (toks[k].Ident && (w.Contains("inline", StringComparison.OrdinalIgnoreCase)
                                  || w is "template" or "constexpr" or "consteval")) isInline = true;
                     }
-                    result.Definitions.Add(new Definition(name, t.Line, isStatic, isInline));
+                    result.Definitions.Add(new Definition(name, t.Line, isStatic, isInline, bare));
                     stmtDeclared.Add(name);
                     pendingBody = true;
                     pendingQuiet = header && (isStatic || isInline);

@@ -48,31 +48,43 @@ public static class ImplicitInt
     /// unchanged), or the same string instance when there is none. <paramref name="isFunctionLikeMacro"/>
     /// excludes names the tree defines as function-like macros.</summary>
     public static string Rewrite(string text, Func<string, bool> isFunctionLikeMacro, out int recovered)
+        => Rewrite(text, isFunctionLikeMacro, out recovered, out _);
+
+    /// <summary>
+    /// <see cref="Rewrite(string, Func{string, bool}, out int)"/>, also reporting K&amp;R definitions whose
+    /// parameters are bare names with no declarations, straight into the body: <c>add(a, b) { return a + b; }</c>
+    /// (every parameter an implicit <c>int</c>). Those are not rewritten, because a macro-headed body from a header
+    /// outside the tree looks the same (<c>portTASK_FUNCTION(prvIdleTask, pvParameters) {</c>). The caller defines
+    /// the name WITHOUT making the body removable: kept with its file, so a misread macro head costs one extra name,
+    /// never a cut body. Each is (name, 1-based line of the name, 1-based line of the closing brace). One scan
+    /// serves both: this runs on every .c file of a large tree.
+    /// </summary>
+    public static string Rewrite(string text, Func<string, bool> isFunctionLikeMacro, out int recovered,
+                                 out List<(string Name, int Line, int EndLine)> bareHeads)
     {
         recovered = 0;
+        bareHeads = new List<(string, int, int)>();
         // Cheap pre-filter: a recovered head is a line starting with an identifier and '(' — almost every file
         // has one, so the real filter is the scan below; this only skips files with no '(' at all.
         if (text.IndexOf('(') < 0) return text;
+        var (code, inserts, heads) = Scan(text, isFunctionLikeMacro);
 
-        var code = CodeOnly(text);
-        var inserts = new List<int>();
-        var depth = 0;
-        var prevSig = '\0';  // last non-space code character before the current position
-        var lineStart = true;
-        for (var i = 0; i < code.Length; i++)
+        if (heads.Count > 0)
         {
-            if (lineStart && depth == 0 && prevSig is '\0' or ';' or '}')
+            var lineStarts = new List<int> { 0 };
+            for (var i = 0; i < text.Length; i++) if (text[i] == '\n') lineStarts.Add(i + 1);
+            int LineOf(int pos) { var k = lineStarts.BinarySearch(pos); return (k >= 0 ? k : ~k - 1) + 1; }
+            foreach (var (nameAt, name, brace) in heads)
             {
-                var m = Head.Match(code, i);
-                if (m.Success && Accept(text, code, m, isFunctionLikeMacro))
-                    inserts.Add(m.Groups["name"].Index);
+                var depth = 0;
+                var end = -1;
+                for (var i = brace; i < code.Length; i++)
+                {
+                    if (code[i] == '{') depth++;
+                    else if (code[i] == '}' && --depth == 0) { end = i; break; }
+                }
+                if (end > 0) bareHeads.Add((name, LineOf(nameAt), LineOf(end)));
             }
-            lineStart = false;
-            var c = code[i];
-            if (c == '\n') { lineStart = true; continue; }
-            if (c == '{') depth++;
-            else if (c == '}') depth = Math.Max(0, depth - 1);
-            if (!char.IsWhiteSpace(c)) prevSig = c;
         }
         if (inserts.Count == 0) return text;
 
@@ -88,47 +100,81 @@ public static class ImplicitInt
         return sb.ToString();
     }
 
-    private static bool Accept(string text, string code, Match m, Func<string, bool> isFunctionLikeMacro)
+    private static (string Code, List<int> Inserts, List<(int NameAt, string Name, int Brace)> Bare) Scan(
+        string text, Func<string, bool> isFunctionLikeMacro)
     {
+        var code = CodeOnly(text);
+        var inserts = new List<int>();
+        var bareHeads = new List<(int, string, int)>();
+        var depth = 0;
+        var prevSig = '\0';  // last non-space code character before the current position
+        var lineStart = true;
+        for (var i = 0; i < code.Length; i++)
+        {
+            if (lineStart && depth == 0 && prevSig is '\0' or ';' or '}')
+            {
+                var m = Head.Match(code, i);
+                if (m.Success)
+                {
+                    var kind = Accept(text, code, m, isFunctionLikeMacro, out var brace);
+                    if (kind == Shape.Recoverable) inserts.Add(m.Groups["name"].Index);
+                    else if (kind == Shape.BareIntoBody) bareHeads.Add((m.Groups["name"].Index, m.Groups["name"].Value, brace));
+                }
+            }
+            lineStart = false;
+            var c = code[i];
+            if (c == '\n') { lineStart = true; continue; }
+            if (c == '{') depth++;
+            else if (c == '}') depth = Math.Max(0, depth - 1);
+            if (!char.IsWhiteSpace(c)) prevSig = c;
+        }
+        return (code, inserts, bareHeads);
+    }
+
+    private enum Shape { None, Recoverable, BareIntoBody }
+
+    private static Shape Accept(string text, string code, Match m, Func<string, bool> isFunctionLikeMacro, out int brace)
+    {
+        brace = -1;
         var name = m.Groups["name"].Value;
-        if (NotNames.Contains(name) || isFunctionLikeMacro(name)) return false;
-        if (name.ToUpperInvariant() == name) return false;   // FOO(...) { — a macro-headed body, not K&R
+        if (NotNames.Contains(name) || isFunctionLikeMacro(name)) return Shape.None;
+        if (name.ToUpperInvariant() == name) return Shape.None;   // FOO(...) { — a macro-headed body, not K&R
 
         // Parameter list: up to the matching ')'. A nested '(' (function-pointer parameter, call, cast) is
         // outside the narrow shape we accept.
         var open = m.Index + m.Length - 1;
         var close = code.IndexOf(')', open + 1);
-        if (close < 0) return false;
+        if (close < 0) return Shape.None;
         var plist = code.AsSpan(open + 1, close - open - 1);
-        if (plist.IndexOf('(') >= 0) return false;
+        if (plist.IndexOf('(') >= 0) return Shape.None;
         // CodeOnly blanked literals; a quote in the original parameter text means an argument, not a parameter.
-        if (text.AsSpan(open + 1, close - open - 1).IndexOfAny("\"'") >= 0) return false;
+        if (text.AsSpan(open + 1, close - open - 1).IndexOfAny("\"'") >= 0) return Shape.None;
         var items = plist.ToString().Split(',');
         var bare = true;
         foreach (var raw in items)
         {
             var item = raw.Trim();
-            if (!ParamItem.IsMatch(item)) return false;
+            if (!ParamItem.IsMatch(item)) return Shape.None;
             if (!BareIdent.IsMatch(item) || item == "void") bare = false;
         }
         if (items.Length == 1 && items[0].Trim().Length == 0) bare = false;   // helper() — no K&R declarations
 
         // What follows the ')' up to the body's '{'.
-        var brace = code.IndexOf('{', close + 1);
-        if (brace < 0) return false;
+        brace = code.IndexOf('{', close + 1);
+        if (brace < 0) return Shape.None;
         var between = code.AsSpan(close + 1, brace - close - 1);
-        if (between.IndexOfAny("()=}") >= 0) return false;
-        // Bare identifiers straight into a body (`portTASK_FUNCTION(prvIdleTask, pvParameters) {`) are almost always a
-        // macro defined outside the tree, not K&R: real K&R code declares its parameters. Only typed (or empty)
-        // parameter lists may go straight to the body.
-        if (between.Trim().Length == 0) return !bare;
-        if (!bare) return false;
+        if (between.IndexOfAny("()=}") >= 0) return Shape.None;
+        // Bare identifiers straight into a body (`portTASK_FUNCTION(prvIdleTask, pvParameters) {`) are often a macro
+        // defined outside the tree, but also real K&R with every parameter an implicit int (work eval, 1.0.162). Never
+        // rewritten into a removable definition: reported as a bare head instead, and kept with the file.
+        if (between.Trim().Length == 0) return bare ? Shape.BareIntoBody : Shape.Recoverable;
+        if (!bare) return Shape.None;
         // K&R parameter declarations: one or more `type name, *name;` parts, nothing after the last ';'.
         var parts = between.ToString().Split(';');
-        if (parts.Length < 2 || parts[^1].Trim().Length != 0) return false;
+        if (parts.Length < 2 || parts[^1].Trim().Length != 0) return Shape.None;
         for (var k = 0; k < parts.Length - 1; k++)
-            if (!KrDecl.IsMatch(parts[k])) return false;
-        return true;
+            if (!KrDecl.IsMatch(parts[k])) return Shape.None;
+        return Shape.Recoverable;
     }
 
     private static readonly Regex KrHead = new(
