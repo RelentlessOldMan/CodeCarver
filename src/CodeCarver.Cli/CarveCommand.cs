@@ -215,6 +215,9 @@ public static class CarveCommand
 
         // Materialize a prior analysis-only run's plan without parsing (see EmitFrom).
         if (emitFrom is not null) return EmitFrom.Run(dir, cv, emitFrom, Version(), @out, err);
+        // The analysis run fingerprints the source tree BEFORE reading it: a file edited during a long run must
+        // make --emit-from refuse, which a fingerprint taken at the end would miss.
+        var sourceAtStart = cv.AnalysisOnly ? EmitFrom.SourceHash(dir) : default;
 
         // Diagnostic collector for this run: a source-free snapshot (version/env/params/stats/warnings/timings)
         // written to ONE shareable .zip on request via --diag, or automatically on an unhandled failure (the
@@ -1547,13 +1550,17 @@ public static class CarveCommand
                 System.Text.Json.JsonSerializer.Serialize(m, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), "manifest");
             WriteDecisions(ccDir, "", aplan);
             WriteRepro(ccDir, aplan);
-            if (VerifyEmitted(aplan, aplan.KeptFiles.Select(r => (r, Path.Combine(dir, r))), ccDir)) verifyFailed = true;
+            // Verify exactly what a file-level emit would write: the kept files plus the in-tree files they
+            // #include that are not graph files (an .inc table) — --emit-from carries this result over.
+            var wouldWrite = aplan.KeptFiles.Where(r => File.Exists(Path.Combine(dir, r))).ToList();
+            wouldWrite.AddRange(FileTreeEmitter.IncludeClosure(wouldWrite, aplan.KeptFiles, aplan.DroppedFiles, dir));
+            if (VerifyEmitted(aplan, wouldWrite.Select(r => (r, Path.Combine(dir, r))), ccDir)) verifyFailed = true;
             summary["run.keptFiles"] = aplan.KeptFiles.Count;
             summary["run.droppedFiles"] = aplan.DroppedFiles.Count;
             summary["run.closureAddedFiles"] = aplan.KeptFiles.Count - plan.KeptFiles.Count;
             WriteSummary(ccDir);
             // The plan --emit-from replays: writing the tree later costs a copy, not a second parse.
-            try { EmitFrom.WritePlan(ccDir, dir, cv, Version(), aplan.KeptFiles, aplan.DroppedFiles, cmmDropped, observedRel, verifyFailed, summary); }
+            try { EmitFrom.WritePlan(ccDir, sourceAtStart, cv, Version(), aplan.KeptFiles, aplan.DroppedFiles, cmmDropped, observedRel, verifyFailed, summary); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { err.WriteLine($"  warn    : could not write {EmitFrom.PlanFile} ({ex.Message}); --emit-from will not be available"); }
             Mark("analyze");
             diag.Set("analysisOnly", true);
@@ -1819,10 +1826,14 @@ public static class CarveCommand
     /// <item><c>other</c>: none of these.</item>
     /// </list>
     /// </summary>
-    static Dictionary<LinkViolation, string> ClassifyViolations(CodeGraph graph, CarvePlan plan, IReadOnlyList<LinkViolation> hard,
+    public static Dictionary<LinkViolation, string> ClassifyViolations(CodeGraph graph, CarvePlan plan, IReadOnlyList<LinkViolation> hard,
                                                            IReadOnlySet<string> unparsed)
     {
         var cmp = CodeCarver.Core.Util.PathComparer.Default;
+        // Keys normalised once to the platform path comparison, so every lookup below is a hash probe (review: a
+        // scan per violation was O(violations x edges) on a large carve).
+        var foldCase = cmp.Equals("A", "a");
+        string P(string path) => foldCase ? path.ToUpperInvariant() : path;
         var names = hard.Select(v => v.Name).ToHashSet(StringComparer.Ordinal);
         var refFiles = hard.Select(v => v.ReferencedIn).ToHashSet(cmp);
         var defs = new Dictionary<(string, string), bool>();   // (name, file) -> every definition is file-local
@@ -1832,7 +1843,7 @@ public static class CarveCommand
         {
             if (n.Kind is NodeKind.Function or NodeKind.Global && names.Contains(n.Name) && n.FilePath is { } df)
             {
-                var key = (n.Name, df);
+                var key = (n.Name, P(df));
                 var local = (n.Flags & NodeFlags.FileLocal) != 0;
                 defs[key] = defs.TryGetValue(key, out var was) ? was && local : local;
             }
@@ -1841,18 +1852,18 @@ public static class CarveCommand
             {
                 var t = graph.GetNode(e.To);
                 if (t.Kind is not (NodeKind.Function or NodeKind.Global) || !names.Contains(t.Name)) continue;
-                edgeFrom.Add((f, t.Name));
-                if (plan.IsKept(n.Id)) edgeFromReached.Add((f, t.Name));
+                edgeFrom.Add((P(f), t.Name));
+                if (plan.IsKept(n.Id)) edgeFromReached.Add((P(f), t.Name));
             }
         }
 
-        bool Has(HashSet<(string, string)> set, string file, string name) => set.Any(x => x.Item2 == name && cmp.Equals(x.Item1, file));
+        bool Has(HashSet<(string, string)> set, string file, string name) => set.Contains((P(file), name));
         var result = new Dictionary<LinkViolation, string>();
         foreach (var v in hard)
         {
-            var def = defs.FirstOrDefault(kv => kv.Key.Item1 == v.Name && cmp.Equals(kv.Key.Item2, v.DefinedIn));
-            result[v] = def.Key == default ? "definitionNotRecognized"
-                : def.Value ? "definitionFileLocal"
+            var known = defs.TryGetValue((v.Name, P(v.DefinedIn)), out var allLocal);
+            result[v] = !known ? "definitionNotRecognized"
+                : allLocal ? "definitionFileLocal"
                 : unparsed.Contains(v.ReferencedIn) ? "useInUnparsedFile"
                 : !Has(edgeFrom, v.ReferencedIn, v.Name) ? (EmittedLinkCheck.IsHeader(v.ReferencedIn) ? "useInHeaderNotModelled" : "useNotModelled")
                 : !Has(edgeFromReached, v.ReferencedIn, v.Name) ? "useInUnreachedCode"

@@ -121,3 +121,43 @@ public sealed class EmitFromTests
         Assert.Contains("FAILED in the analysis run", o);
     }
 }
+
+public sealed class EmitFromRefusalTests
+{
+    [Fact]
+    public void RefusesAPlanFromAnotherVersion_AndAChangedBuildLog()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cc-emitfrom2-" + Guid.NewGuid().ToString("N"));
+        var src = Path.Combine(root, "src");
+        Directory.CreateDirectory(src);
+        try
+        {
+            File.WriteAllText(Path.Combine(src, "main.c"), "int main(void){ return 0; }\n");
+            var log = Path.Combine(root, "build.log");
+            File.WriteAllText(log, $"gcc -c -DX=1 {Path.Combine(src, "main.c").Replace('\\', '/')} -o main.o\n");
+            var cfg = Path.Combine(root, "carve.toml");
+            File.WriteAllText(cfg, $"outputDirectory = \"{Path.Combine(root, "out").Replace('\\', '/')}\"\nanalysisOnly = true\n"
+                + "[common]\nentryPoints = [\"main\"]\nlanguages = [\"c\"]\n"
+                + $"[builds.b]\nbuildLogs = [\"{log.Replace('\\', '/')}\"]\n");
+            int Run(params string[] more)
+            {
+                var so = new StringWriter(); var se = new StringWriter();
+                return CarveCommand.Run(new[] { "carve", src, "--config", cfg }.Concat(more).ToArray(), so, se);
+            }
+            Assert.Equal(0, Run());
+            var plan = Path.Combine(root, "out", "codecarver", EmitFrom.PlanFile);
+            var original = File.ReadAllText(plan);
+
+            File.WriteAllText(plan, original.Replace("\"codecarverVersion\": \"", "\"codecarverVersion\": \"0.0.0-other+"));
+            Assert.Equal(2, Run("--emit-from", Path.Combine(root, "out")));
+
+            File.WriteAllText(plan, original);
+            File.AppendAllText(log, "# a later build\n");                // the build log changed since the analysis
+            Assert.Equal(2, Run("--emit-from", Path.Combine(root, "out")));
+
+            File.WriteAllText(plan, "{ \"format\": 99 }");
+            Assert.Equal(2, Run("--emit-from", Path.Combine(root, "out")));
+        }
+        finally { TempDir.Delete(root); }
+    }
+}

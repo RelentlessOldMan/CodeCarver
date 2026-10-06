@@ -111,6 +111,7 @@ public sealed class HiddenDefinitionTests
     [InlineData("FRAMEWORK_FN(os_shell, \"doc\") { run(); }\n")]        // macro-headed body
     [InlineData("Framework_fn(os_shell, \"doc\") { run(); }\n")]        // ... even in mixed case: a literal
     [InlineData("REGISTER(a, b) { run(); }\n")]                         // all-caps name
+    [InlineData("static portTASK_FUNCTION( prvIdleTask, pvParameters ) { run(); }\n")]   // out-of-tree head macro (review)
     [InlineData("int f(void) {\n  helper(a, b) ;\n}\n")]                // inside a body
     [InlineData("helper(a, b);\nint x;\nstruct s { int y; };\n")]       // a prototype, not a definition
     [InlineData("x = helper(a);\n")]

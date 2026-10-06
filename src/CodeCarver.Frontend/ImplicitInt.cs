@@ -118,7 +118,10 @@ public static class ImplicitInt
         if (brace < 0) return false;
         var between = code.AsSpan(close + 1, brace - close - 1);
         if (between.IndexOfAny("()=}") >= 0) return false;
-        if (between.Trim().Length == 0) return true;
+        // Bare identifiers straight into a body (`portTASK_FUNCTION(prvIdleTask, pvParameters) {`) are almost always a
+        // macro defined outside the tree, not K&R: real K&R code declares its parameters. Only typed (or empty)
+        // parameter lists may go straight to the body.
+        if (between.Trim().Length == 0) return !bare;
         if (!bare) return false;
         // K&R parameter declarations: one or more `type name, *name;` parts, nothing after the last ';'.
         var parts = between.ToString().Split(';');

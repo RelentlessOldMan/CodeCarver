@@ -15,7 +15,8 @@ namespace CodeCarver.Cli;
 /// the source root (size and last-write time). <c>--emit-from</c> refuses when either fingerprint differs —
 /// a stale plan would emit a tree that does not match the source. Only file-level stages can be replayed:
 /// carving inside files needs the parsed graph. The link check is not re-run (it needs the parsed build
-/// configuration); its result is carried over from the analysis run, which checked the same kept files.
+/// configuration); its result is carried over from the analysis run, which checked exactly the files this emit writes
+/// (the kept files plus their in-tree include closure).
 /// </summary>
 public static class EmitFrom
 {
@@ -70,11 +71,11 @@ public static class EmitFrom
     private static string Hex(string s) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(s)));
 
     /// <summary>Written by an analysis-only run, beside its manifest.</summary>
-    public static void WritePlan(string ccDir, string dir, ResolvedCarve cv, string version,
+    public static void WritePlan(string ccDir, (string Hash, int Files) sourceAtStart, ResolvedCarve cv, string version,
                                  IReadOnlyList<string> kept, IReadOnlyList<string> dropped, IReadOnlyList<string> droppedCmm,
                                  IEnumerable<string> observed, bool verifyFailed, IReadOnlyDictionary<string, object?> summary)
     {
-        var (sourceHash, files) = SourceHash(dir);
+        var (sourceHash, files) = sourceAtStart;
         var plan = new
         {
             format = Format, codecarverVersion = version, configHash = ConfigHash(cv), sourceHash, sourceFiles = files,
@@ -185,7 +186,7 @@ public static class EmitFrom
         }
         @out.WriteLine(plan.VerifyFailed
             ? "  verify  : FAILED in the analysis run (carried over; see its verify.txt) — the carved tree will not link"
-            : "  verify  : OK in the analysis run (carried over — same kept files)");
+            : "  verify  : OK in the analysis run (carried over — it checked the same files this emit wrote)");
         return plan.VerifyFailed ? 3 : 0;
 
         static string Fmt(object? v) => v switch

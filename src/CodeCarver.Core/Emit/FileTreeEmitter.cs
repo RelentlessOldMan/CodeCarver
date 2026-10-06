@@ -236,12 +236,37 @@ public static class FileTreeEmitter
     private static void CopyUnscannedIncludes(IReadOnlyList<string> keptFiles, IReadOnlyList<string> droppedFiles, string sourceRoot, string outDir,
                                               List<string> written, ref long bytes)
     {
-        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourceRoot)) + Path.DirectorySeparatorChar;
         var outRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outDir)) + Path.DirectorySeparatorChar;
+        foreach (var trel in IncludeClosure(written, keptFiles, droppedFiles, sourceRoot))
+        {
+            var target = Path.Combine(sourceRoot, trel);
+            var dst = Path.GetFullPath(Path.Combine(outDir, trel));
+            if (!dst.StartsWith(outRoot, StringComparison.OrdinalIgnoreCase)) continue; // never write outside the output
+            if (SameFile(target, dst)) continue; // out overlaps source - don't copy onto the original
+            var dstDir = Path.GetDirectoryName(dst);
+            if (!string.IsNullOrEmpty(dstDir)) Directory.CreateDirectory(dstDir);
+            try { File.Copy(target, dst, overwrite: true); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
+            bytes += new FileInfo(dst).Length;
+            written.Add(trel);
+        }
+    }
+
+    /// <summary>
+    /// The files a file-level emit writes beyond the kept files: in-tree files the emitted files <c>#include</c>
+    /// (transitively) that are not graph files - an <c>.inc</c> table, a header in an excluded directory. Graph-known
+    /// files keep their own keep/drop decision. Computed from the source alone, so an analysis-only run can verify
+    /// exactly what an emit would write (review: --emit-from carried over a verify that never saw these files).
+    /// </summary>
+    public static List<string> IncludeClosure(IEnumerable<string> emitted, IReadOnlyList<string> keptFiles,
+                                              IReadOnlyList<string> droppedFiles, string sourceRoot)
+    {
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourceRoot)) + Path.DirectorySeparatorChar;
         var known = new HashSet<string>(keptFiles, CodeCarver.Core.Util.PathComparer.Default);
         foreach (var f in droppedFiles) known.Add(f);               // graph-known drops: leave dropped
-        var copied = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
-        var queue = new Queue<string>(written);                      // scan every emitted file for includes
+        var added = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
+        var result = new List<string>();
+        var queue = new Queue<string>(emitted);                      // scan every emitted file for includes
 
         while (queue.Count > 0)
         {
@@ -266,21 +291,13 @@ public static class FileTreeEmitter
                 // Under the root WITH a separator: "/repo2" must not pass for root "/repo" (review RB9).
                 if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue; // outside the tree
                 if (!File.Exists(target)) continue;                  // unresolved here (system/other -I dir)
-                var trel = Path.GetRelativePath(sourceRoot, target).Replace('\\', '/');
-                if (known.Contains(trel) || !copied.Add(trel)) continue; // graph-known or already copied
-
-                var dst = Path.GetFullPath(Path.Combine(outDir, trel));
-                if (!dst.StartsWith(outRoot, StringComparison.OrdinalIgnoreCase)) continue; // never write outside the output
-                if (SameFile(target, dst)) continue; // out overlaps source — don't copy onto the original
-                var dstDir = Path.GetDirectoryName(dst);
-                if (!string.IsNullOrEmpty(dstDir)) Directory.CreateDirectory(dstDir);
-                try { File.Copy(target, dst, overwrite: true); }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
-                bytes += new FileInfo(dst).Length;
-                written.Add(trel);
-                queue.Enqueue(trel);                                 // its own includes may need copying too
+                var trel = Path.GetRelativePath(sourceRoot, target).Replace(Path.DirectorySeparatorChar, '/');
+                if (known.Contains(trel) || !added.Add(trel)) continue; // graph-known or already added
+                result.Add(trel);
+                queue.Enqueue(trel);                                 // its own includes may be needed too
             }
         }
+        return result;
     }
 
     /// <summary>A C/C++ header — its definitions are API/inline/template code any translation unit may

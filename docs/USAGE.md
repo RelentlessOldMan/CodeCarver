@@ -109,9 +109,11 @@ parsing again — on a large tree the parse is most of the run, so a dry run fol
 costs two full runs. The analysis run saves `codecarver/emit-plan.json`; `--emit-from` refuses (exit 2) when
 the CodeCarver version, a setting, a build log or trace it names, or any file under the source root (size or
 time) changed since, and for a stage that carves inside files (that needs the parsed graph — use a file-level
-stage). The link check is not re-run: its result is carried over from the analysis run, which checked the same
-kept files, so a failed analysis still exits 3. The usual flow keeps one config: run it with `analysisOnly = true`,
-review, then run the same command again with `--emit-from <its outputDirectory>`.
+stage). The source fingerprint is taken when the analysis run starts, so a file edited while it ran also makes
+`--emit-from` refuse. The link check is not re-run: its result is carried over from the analysis run, which
+checked exactly the files the emit writes (the kept files plus their in-tree include closure), so a failed
+analysis still exits 3. The usual flow keeps one config: run it with `analysisOnly = true`, review, then run the
+same command again with `--emit-from <its outputDirectory>`.
 
 ## The config file (`carve.toml`)
 

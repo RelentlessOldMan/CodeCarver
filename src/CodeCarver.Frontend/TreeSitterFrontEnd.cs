@@ -119,12 +119,26 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// Before, such a file contributed no uses at all, and a function only it called was dropped while it was
     /// written — a carve that does not link.
     /// </summary>
-    private void KeptWholeRefs(string path, string text, NodeId fileNode, UseList pendingRefs)
+    private void KeptWholeRefs(string path, string text, NodeId fileNode, UseList pendingRefs, bool callShapedOnly = false)
     {
         _unparsed.Add(path);
+        IdentifierRefs(text, fileNode, pendingRefs, callShapedOnly);
+    }
+
+    private static readonly Regex CallShaped = new(@"\b([A-Za-z_]\w*)\s*\(", RegexOptions.Compiled);
+
+    /// <summary>The "every name in this file is a use" rule shared by reference-only includes and files kept whole
+    /// without extraction. <paramref name="callShapedOnly"/> limits it to names followed by '(' — calls and
+    /// function-like macro uses — for a file over the symbol budget, whose hundreds of thousands of field and
+    /// register names would otherwise flood the graph and keep every same-named function in the tree.</summary>
+    private static void IdentifierRefs(string text, NodeId fileNode, UseList pendingRefs, bool callShapedOnly)
+    {
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (Match m in Identifier.Matches(text))
-            if (seen.Add(m.Value) && !Keywords.Contains(m.Value)) pendingRefs.Add((fileNode, m.Value));
+        foreach (Match m in callShapedOnly ? CallShaped.Matches(text) : Identifier.Matches(text))
+        {
+            var name = callShapedOnly ? m.Groups[1].Value : m.Value;
+            if (seen.Add(name) && !Keywords.Contains(name)) pendingRefs.Add((fileNode, name));
+        }
     }
     /// <inheritdoc/>
     public IReadOnlyList<string> Warnings => _warnings;
@@ -303,6 +317,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _warnings.Clear();
         _forceKeepFiles.Clear();
         _fileLocal.Clear();
+        _unparsed.Clear();
         _symbolBudgetKeptWhole.Clear();
         var graph = new CodeGraph();
         var (bytesTotal, filesTotal) = BuildScopeMacros(paths, read); // pre-pass: scope macros + parse work totals
@@ -371,9 +386,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         foreach (var (path, text) in ReferenceOnlyIncludes)
         {
             if (text.Length == 0 || !fileNodeByPath.TryGetValue(path, out var incNode)) continue;
-            var seen = new HashSet<string>(StringComparer.Ordinal);
-            foreach (Match m in Identifier.Matches(text))
-                if (seen.Add(m.Value)) pendingRefs.Add((incNode, m.Value));
+            IdentifierRefs(text, incNode, pendingRefs, callShapedOnly: false);
         }
 
         // P2: a file that is #included by another (unity build, "#include the .c") shares its statics with the
@@ -1009,7 +1022,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 var how = IsTranslationUnit(path) ? "force-rooted, kept whole" : "kept whole via #include-closure";
                 _warnings.Add($"{path}: would mint {symbols:N0} symbols (> {PerFileSymbolBudget:N0} budget) — {how}, not carved (guards graph-memory blow-up)");
                 if (IsTranslationUnit(path)) _forceKeepFiles.Add(path);
-                KeptWholeRefs(path, text, fileNodeByPath[path], pendingRefs);
+                // A translation unit is emitted whole and compiled: every name counts (a handler table has no '(').
+                // A generated header over budget is mostly field/register names: its calls are what can need code.
+                KeptWholeRefs(path, text, fileNodeByPath[path], pendingRefs, callShapedOnly: !IsTranslationUnit(path));
                 return;
             }
         }
@@ -1115,7 +1130,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     Add(isFn ? functionsByName : globalsByName, name, id);
                     pendingRefs.Add((id, use.Macro));
                     foreach (var arg in use.ArgIdentifiers) pendingRefs.Add((id, arg));
-                    if (_keepMacros.Contains(use.Macro)) graph.AddEdge(fileNode, id, EdgeKind.References);
+                    // A defined OBJECT can have effects nobody references: a C++ `static Registrar n##_reg(...)` registers
+                    // at start-up. Before this pass the use was never removable; keep that — an object a use defines
+                    // stays whenever its file does (a function it defines is still removable when unused).
+                    if (_keepMacros.Contains(use.Macro) || !isFn) graph.AddEdge(fileNode, id, EdgeKind.References);
                     ids.Add(id);
                 }
                 foreach (var a in ids)

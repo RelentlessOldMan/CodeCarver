@@ -16,8 +16,9 @@ namespace CodeCarver.Frontend;
 public static class DefinerMacros
 {
     /// <summary>The use's argument <paramref name="Param"/>, wrapped as Prefix + arg + Suffix, is defined;
-    /// <paramref name="Function"/> when it is declared as a function (followed by '(').</summary>
-    public readonly record struct Template(int Param, string Prefix, string Suffix, bool Function);
+    /// <paramref name="Function"/> when it is a function with a body — in the macro (<paramref name="OwnBody"/>) or, for
+    /// a head macro, supplied by the use; anything else (an object built with arguments, a prototype) is an object.</summary>
+    public readonly record struct Template(int Param, string Prefix, string Suffix, bool Function, bool OwnBody = false);
 
     /// <summary>One file-scope use: the defined names, the identifiers in its arguments, its 1-based line span
     /// (through the body when the macro opens a function head) and whether it has such a body.</summary>
@@ -50,7 +51,8 @@ public static class DefinerMacros
                 var close = flat.IndexOf(')');
                 if (close < 0) continue;
                 var ps = flat[..close].Split(',').Select(p => p.Trim()).ToList();
-                var toks = Token.Matches(flat[(close + 1)..]).Select(m => m.Value).ToList();
+                // Comments and string literals blanked: `/* protects n state */` must not read as a declarator.
+                var toks = Token.Matches(ImplicitInt.CodeOnly(flat[(close + 1)..])).Select(m => m.Value).ToList();
                 if (toks.Count > 0) parsed.Add((name, ps, toks));
             }
         }
@@ -64,16 +66,36 @@ public static class DefinerMacros
 
         // Direct: a parameter (possibly pasted) in a declarator position.
         foreach (var (name, ps, toks) in parsed)
+        {
+            var typedefStmt = false;   // inside `typedef ... ;`: the names declared are types, not symbols
             for (var i = 0; i < toks.Count; i++)
             {
+                if (toks[i] is ";" or "{" or "}") { typedefStmt = false; continue; }
+                if (toks[i] == "typedef") { typedefStmt = true; continue; }
+                if (typedefStmt) continue;
                 if (!Chain(toks, i, ps, out var param, out var pre, out var suf, out var end)) continue;
                 var prev = i > 0 ? toks[i - 1] : null;
                 var next = end + 1 < toks.Count ? toks[end + 1] : null;
                 var declPrev = prev == "*" || (prev is not null && Ident.IsMatch(prev) && !NotDeclaratorPrefix.Contains(prev));
                 var declNext = next is null || DeclaratorFollow.Contains(next) || Ident.IsMatch(next);
-                if (declPrev && declNext) AddT(name, new Template(param, pre, suf, next == "(" && prev != "*"));
+                if (declPrev && declNext)
+                {
+                    // `name(...)` is a function only when a body follows: in the macro (`{` after the ')'), or at the
+                    // use when the macro ends there (a head macro, `TASK(x) { ... }`). Otherwise it is an object built
+                    // with arguments (`static Registrar n##_reg(1)`) or a prototype: never a removable function.
+                    var fn = false; var own = false;
+                    if (next == "(" && prev != "*")
+                    {
+                        SplitArgs(toks, end + 1, out var close);
+                        var after = close + 1 < toks.Count ? toks[close + 1] : null;
+                        own = after == "{";
+                        fn = own || after is null;
+                    }
+                    AddT(name, new Template(param, pre, suf, fn, own));
+                }
                 i = end;
             }
+        }
 
         // Through wrappers: a body that calls a definer, passing (a paste of) its own parameter in a defined slot.
         for (var round = 0; round < 8; round++)
@@ -89,7 +111,7 @@ public static class DefinerMacros
                         if (t.Param >= args.Count) continue;
                         var a = args[t.Param];
                         if (a.Count == 0 || !Chain(a, 0, ps, out var param, out var pre, out var suf, out var end) || end != a.Count - 1) continue;
-                        var nt = new Template(param, t.Prefix + pre, suf + t.Suffix, t.Function);
+                        var nt = new Template(param, t.Prefix + pre, suf + t.Suffix, t.Function, t.OwnBody);
                         if (!result.TryGetValue(name, out var l) || !l.Contains(nt)) { AddT(name, nt); added = true; }
                     }
                 }
@@ -142,6 +164,7 @@ public static class DefinerMacros
     /// a function, class or initializer is not a definition we could remove whole, so it is skipped.</summary>
     public static IEnumerable<Use> Uses(string text, Regex use, IReadOnlyDictionary<string, List<Template>> definers)
     {
+        if (!use.IsMatch(text)) yield break;   // cheap: most files use no definer at all
         var code = ImplicitInt.CodeOnly(text);
         var matches = use.Matches(code);
         if (matches.Count == 0) yield break;
@@ -160,12 +183,6 @@ public static class DefinerMacros
             if (close < 0) continue;
             var args = TopLevelArgs(code, open, close);
 
-            var defines = new List<(string, bool)>();
-            foreach (var t in definers[macro])
-                if (t.Param < args.Count && Ident.IsMatch(args[t.Param]))
-                    defines.Add((t.Prefix + args[t.Param] + t.Suffix, t.Function));
-            if (defines.Count == 0) continue;
-
             var end = close;
             var k = close + 1;
             while (k < code.Length && char.IsWhiteSpace(code[k])) k++;
@@ -176,6 +193,13 @@ public static class DefinerMacros
                 if (bodyEnd < 0) continue;
                 end = bodyEnd; hasBody = true;
             }
+
+            // A head macro's name is a function only when this use supplies the body.
+            var defines = new List<(string, bool)>();
+            foreach (var t in definers[macro])
+                if (t.Param < args.Count && Ident.IsMatch(args[t.Param]))
+                    defines.Add((t.Prefix + args[t.Param] + t.Suffix, t.Function && (t.OwnBody || hasBody)));
+            if (defines.Count == 0) continue;
             var ids = Identifiers.Matches(code.Substring(open + 1, close - open - 1)).Select(x => x.Value).Distinct().ToList();
             yield return new Use(macro, defines.Distinct().ToList(), ids, LineOf(m.Index), LineOf(end), hasBody);
         }
