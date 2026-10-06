@@ -66,6 +66,11 @@ $cases = @(
          'main.c'   = "int run();`nint one(void) { return 1; }`nint main(void) { return run(2, one); }`n"
          'cb.c'     = "run(a, cb)`n    int a;`n    int (*cb)();`n{`n    return a + cb();`n}`n"
          'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = '#ifdef inside a table initializer (C++ grammar)'; Lang = 'cpp'; Expect = @('table.cpp')
+       Files = @{
+         'main.cpp'   = "void f();`nint main() { f(); return 0; }`n"
+         'table.cpp'  = "static int tbl[] = {`n#ifdef A`n 1,`n#else`n 2,`n#endif`n};`nvoid f ()`n{`n}`n"
+         'unused.cpp' = "int unused() { return 9; }`n" } }
     @{ Name = 'implicit-int definition'; Lang = 'c'; Expect = @('twice.c')
        Files = @{
          'main.c'  = "int twice(int);`nint main(void) { return twice(2); }`n"

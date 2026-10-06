@@ -23,10 +23,16 @@ namespace CodeCarver.Frontend;
 /// </summary>
 public static class ParamListConditionals
 {
-    public static string Blank(string text, out string removed)
+    public static string Blank(string text, out string removed) => Blank(text, initializers: false, out removed);
+
+    /// <param name="initializers">Also treat conditionals directly inside a file-scope initializer list
+    /// (<c>tbl[] = { 1,\n#ifdef A\n 2,\n#endif\n };</c>). The C++ grammar cannot parse those, and its error recovery
+    /// swallows the function that follows, however ordinary its head (work eval, 1.0.165: three plain
+    /// <c>void name ()</c> definitions in a mixed tree). The C grammar parses them, so only C++-grammar callers ask.</param>
+    public static string Blank(string text, bool initializers, out string removed)
     {
         removed = "";
-        if (!MayHaveOne(text)) return text;
+        if (!MayHaveOne(text, initializers)) return text;
 
         var code = ImplicitInt.CodeOnly(text);
         var lines = new List<(int Start, int End)>();   // [Start, End) excluding the '\n'
@@ -34,7 +40,12 @@ public static class ParamListConditionals
             if (i == code.Length || code[i] == '\n') { lines.Add((s, i)); s = i + 1; }
 
         var frames = new Stack<(bool InParams, bool Blanking)>();
-        int parens = 0, braces = 0;
+        var parens = 0;
+        // Open braces: 'T' transparent (namespace, extern "C"), 'I' an initializer list, 'O' anything else.
+        var braces = new Stack<char>();
+        bool AtFileScope() => braces.All(b => b == 'T');
+        var prevSig = '\0';
+        var stmtStart = 0;
         StringBuilder? sb = null;
         var cut = new StringBuilder();
         bool Blanking() => frames.Any(f => f.Blanking);
@@ -61,7 +72,8 @@ public static class ParamListConditionals
                 var blankThis = false;
                 if (word is "if" or "ifdef" or "ifndef")
                 {
-                    var inParams = parens > 0 && braces == 0;
+                    var inParams = parens > 0 && AtFileScope()
+                                   || initializers && parens == 0 && braces.Count > 0 && braces.Peek() == 'I';
                     blankThis = inParams || Blanking();   // the C++ grammar takes no directive inside a parameter list
                     frames.Push((inParams, false));
                 }
@@ -88,8 +100,16 @@ public static class ParamListConditionals
                 var c = code[k];
                 if (c == '(') parens++;
                 else if (c == ')') parens = Math.Max(0, parens - 1);
-                else if (c == '{') braces++;
-                else if (c == '}') braces = Math.Max(0, braces - 1);
+                else if (c == '{')
+                {
+                    var head = code.AsSpan(stmtStart, k - stmtStart).TrimStart();
+                    braces.Push(prevSig == '=' && AtFileScope() || braces.Count > 0 && braces.Peek() == 'I' ? 'I'
+                        : AtFileScope() && (head.StartsWith("namespace") || head.StartsWith("extern")) ? 'T' : 'O');
+                    stmtStart = k + 1;
+                }
+                else if (c == '}') { if (braces.Count > 0) braces.Pop(); stmtStart = k + 1; }
+                else if (c == ';') stmtStart = k + 1;
+                if (!char.IsWhiteSpace(c)) prevSig = c;
             }
         }
         if (sb is null) return text;
@@ -100,7 +120,10 @@ public static class ParamListConditionals
     /// <summary>Cheap pre-check, run on every file: some <c>#if</c> line follows a line whose code ends in <c>,</c> or
     /// <c>(</c> (a trailing comment, or comment-only lines between, are looked past). Without one there is no
     /// conditional inside a parameter list, and the full pass (a code-only copy of the file) is skipped.</summary>
-    public static bool MayHaveOne(string text)
+    public static bool MayHaveOne(string text) => MayHaveOne(text, initializers: false);
+
+    /// <param name="initializers">Also a line ending in <c>{</c> or <c>=</c> (an initializer list opening).</param>
+    public static bool MayHaveOne(string text, bool initializers)
     {
         var at = 0;
         while ((at = text.IndexOf("#if", at, StringComparison.Ordinal)) >= 0)
@@ -123,7 +146,7 @@ public static class ParamListConditionals
                 }
                 if (line.Length > 0)
                 {
-                    if (line[^1] is ',' or '(') return true;
+                    if (line[^1] is ',' or '(' || initializers && line[^1] is '{' or '=') return true;
                     break;
                 }
                 end = start - 1;                                           // blank or comment-only: look further up

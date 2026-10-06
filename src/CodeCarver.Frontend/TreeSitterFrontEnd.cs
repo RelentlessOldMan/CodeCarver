@@ -992,7 +992,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             parseText = HeadNormalizer.Normalize(parseText, out cut);
         }
         // Alternative parameter sets (#if/#else inside a parameter list) parsed as the first one.
-        parseText = ParamListConditionals.Blank(parseText, out var branches);
+        parseText = ParamListConditionals.Blank(parseText, initializers: !_cGrammar, out var branches);
         blanked = cut.Length == 0 ? branches : branches.Length == 0 ? cut : cut + "\n" + branches;
         return parseText;
     }
@@ -1031,17 +1031,20 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         if (hit is null) { shapes.Add("parserSawNoName"); return shapes; }
         if (hit.Type == "type_identifier") shapes.Add("nameReadAsType");
         var inError = false; var inDef = false; var inDecl = false; var inBody = false;
+        var errorStart = int.MaxValue;
         for (var a = hit.Parent; a is not null; a = a.Parent)
         {
             switch (a.Type)
             {
-                case "ERROR": inError = true; break;
+                case "ERROR": inError = true; errorStart = Math.Min(errorStart, a.StartPosition.Row); break;
                 case "function_definition": inDef = true; break;
                 case "declaration": if (!inDef) inDecl = true; break;
                 case "compound_statement": if (!inDef) inBody = true; break;
             }
         }
         if (inError) shapes.Add("insideParseError");
+        // The error began well above this head: code before it (not the head) broke the parse and swallowed it.
+        if (inError && errorStart < row - 2) shapes.Add("parseErrorStartsAbove");
         if (inBody) shapes.Add("insideABody");
         if (inDecl) shapes.Add("parsedAsDeclaration");
         if (inDef && !inError && !inBody && hit.Type != "type_identifier") shapes.Add("parsedAsDefinitionButRejected");

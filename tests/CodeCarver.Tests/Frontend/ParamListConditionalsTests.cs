@@ -37,6 +37,35 @@ public class ParamListConditionalsTests
         if (!expected) Assert.Same(src, ParamListConditionals.Blank(src, out _));
     }
 
+    [Theory]
+    // Empty bodies: with a call in the body, tree-sitter's recovery happens to find the function (content-dependent).
+    [InlineData("tbl.cpp", "static int tbl[] = {\n#ifdef A\n 1,\n#endif\n 2,\n};\nvoid f ()\n{\n}\n")]
+    [InlineData("tbl.cpp", "static int tbl[] = {\n#if A\n 1,\n#elif B\n 3,\n#else\n 2,\n#endif\n};\nvoid f ()\n{\n}\n")]
+    [InlineData("tbl.c", "static int tbl[] = {\n#ifdef A\n 1,\n#else\n 2,\n#endif\n};\nvoid f ()\n{\n}\n")]   // .c in a mixed tree
+    public void ConditionalInAnInitializer_DoesNotSwallowTheNextFunction_CppGrammar(string file, string src)
+    {
+        // Work eval, 1.0.165: three plain `void name ()` definitions after a table with #ifdef rows, in a mixed tree.
+        using var fe = new CppFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("main.cpp", "void f();\nint main() { f(); return 0; }\n"), (file, src) });
+        var main = graph.Nodes.First(n => n.Name == "main").Id;
+        var plan = ReachabilityEngine.Compute(graph, new[] { new Root(main, RootKind.ExplicitSymbol) });
+        var f = graph.Nodes.SingleOrDefault(n => n.Kind == NodeKind.Function && n.Name == "f");
+        Assert.NotNull(f);
+        Assert.True(plan.IsKept(f!.Id));
+    }
+
+    [Fact]
+    public void Initializers_AreOnlyTouchedWhenAsked()
+    {
+        const string src = "static int tbl[] = {\n#ifdef A\n 1,\n#else\n 2,\n#endif\n};\n";
+        Assert.Same(src, ParamListConditionals.Blank(src, out _));
+        var parse = ParamListConditionals.Blank(src, initializers: true, out var removed);
+        Assert.DoesNotContain("#", parse);
+        Assert.Contains("1,", parse);
+        Assert.DoesNotContain("2,", parse);
+        Assert.Contains("2,", removed);
+    }
+
     [Fact]
     public void Blank_LeavesConditionalsOutsideParameterListsAlone()
     {
