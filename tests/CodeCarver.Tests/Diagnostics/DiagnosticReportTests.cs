@@ -130,17 +130,23 @@ public sealed class DiagnosticReportTests
     [Fact]
     public void BadDestination_ReturnsFalse_DoesNotThrow()
     {
-        // A non-existent drive/root the process can't create is a write failure, not a crash (spec §24).
-        var bad = OperatingSystem.IsWindows()
-            ? @"Z:\no-such-drive\deep\pkg.zip"
-            : "/proc/nonexistent/deep/pkg.zip";
-        var ex = Record.Exception(() =>
+        // A destination the process can't create is a write failure, not a crash (spec §24). Its parent is an
+        // existing FILE, so the directory can never be made — on any OS, and without touching a real drive (the
+        // old `Z:\` could be a mapped network share; review TS8).
+        var blocker = Path.Combine(Path.GetTempPath(), "cc-diag-blocker-" + Guid.NewGuid().ToString("N"));
+        File.WriteAllText(blocker, "");
+        try
         {
-            var ok = DiagnosticReport.Start().TryWritePackage(bad, out _, out var err);
-            Assert.False(ok);
-            Assert.NotNull(err);
-        });
-        Assert.Null(ex); // never throws
+            var bad = Path.Combine(blocker, "deep", "pkg.zip");
+            var ex = Record.Exception(() =>
+            {
+                var ok = DiagnosticReport.Start().TryWritePackage(bad, out _, out var err);
+                Assert.False(ok);
+                Assert.NotNull(err);
+            });
+            Assert.Null(ex); // never throws
+        }
+        finally { File.Delete(blocker); }
     }
 
     [Fact]

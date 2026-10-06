@@ -37,7 +37,7 @@ public class FileTreeEmitterTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -75,7 +75,7 @@ public class FileTreeEmitterTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -96,8 +96,9 @@ public class FileTreeEmitterTests
             File.WriteAllText(Path.Combine(srcDir, "board", "vectors.S"), ".word reset\n");
             File.WriteAllText(Path.Combine(srcDir, "Makefile"), "all:\n\tgcc main.c\n");
 
-            var res = BuildSupportEmitter.Copy(srcDir, outDir,
+            var res = InfrastructureEmitter.Copy(srcDir, outDir,
                 alreadyEmittedRel: new[] { "main.c" },              // main.c already emitted by the tree carve
+                droppedCodeFilesRel: System.Array.Empty<string>(),
                 excludeDirs: System.Array.Empty<string>(),
                 auxGlobs: new[] { "Makefile" });
 
@@ -110,7 +111,7 @@ public class FileTreeEmitterTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -126,8 +127,9 @@ public class FileTreeEmitterTests
             File.WriteAllText(Path.Combine(srcDir, "flash.ld"), "x\n");
             File.WriteAllText(Path.Combine(srcDir, "stm32f7", "startup_f7.s"), "y\n"); // other-board variant
 
-            var res = BuildSupportEmitter.Copy(srcDir, outDir,
+            var res = InfrastructureEmitter.Copy(srcDir, outDir,
                 alreadyEmittedRel: System.Array.Empty<string>(),
+                droppedCodeFilesRel: System.Array.Empty<string>(),
                 excludeDirs: new[] { "stm32f7" },
                 auxGlobs: System.Array.Empty<string>());
 
@@ -137,7 +139,7 @@ public class FileTreeEmitterTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -159,23 +161,23 @@ public class FileTreeEmitterTests
 
             // separator glob -> resolves the subdir file, no crash, no warning
             var o1 = Path.Combine(work, "o1");
-            var r1 = BuildSupportEmitter.Copy(srcDir, o1, none, none, new[] { "gen/*.inc" });
+            var r1 = InfrastructureEmitter.Copy(srcDir, o1, none, none, none, new[] { "gen/*.inc" });
             Assert.True(File.Exists(Path.Combine(o1, "gen", "tables.inc")));
             Assert.Empty(r1.Warnings);
 
             // leading-separator glob normalizes to a root pattern (recursive), no crash
             var o2 = Path.Combine(work, "o2");
-            var r2 = BuildSupportEmitter.Copy(srcDir, o2, none, none, new[] { "/*.inc" });
+            var r2 = InfrastructureEmitter.Copy(srcDir, o2, none, none, none, new[] { "/*.inc" });
             Assert.True(File.Exists(Path.Combine(o2, "top.inc")));
 
             // no-match glob -> warns instead of copying nothing silently
             var o3 = Path.Combine(work, "o3");
-            var r3 = BuildSupportEmitter.Copy(srcDir, o3, none, none, new[] { "*.nomatch" });
+            var r3 = InfrastructureEmitter.Copy(srcDir, o3, none, none, none, new[] { "*.nomatch" });
             Assert.Contains(r3.Warnings, w => w.Contains("*.nomatch"));
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -202,7 +204,7 @@ public class FileTreeEmitterTests
             Assert.Equal(new[] { "x.inc" }, Names("a/b/*.inc"));                        // anchored: one segment
             Assert.Empty(Names("nope/*.zzz"));                                          // no match, no throw
         }
-        finally { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); }
+        finally { TempDir.Delete(work); }
     }
 
     [Fact]
@@ -223,13 +225,13 @@ public class FileTreeEmitterTests
             File.WriteAllText(sibling, "ORIGINAL");
             string[] none = System.Array.Empty<string>();
 
-            var res = BuildSupportEmitter.Copy(srcDir, outDir, none, none, new[] { "../cfg/*.inc" });
+            var res = InfrastructureEmitter.Copy(srcDir, outDir, none, none, none, new[] { "../cfg/*.inc" });
 
             Assert.Contains(res.Warnings, w => w.Contains("refused"));
             Assert.Equal(0, res.Count);
             Assert.Equal("ORIGINAL", File.ReadAllText(sibling)); // sibling of --out NOT overwritten
         }
-        finally { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); }
+        finally { TempDir.Delete(work); }
     }
 
     [Fact]
@@ -246,7 +248,7 @@ public class FileTreeEmitterTests
             var rel = Path.GetRelativePath(work, hit).Replace('\\', '/');
             Assert.Equal("sub/deep/a.inc", rel); // real on-disk casing, not the glob's 'SUB'
         }
-        finally { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); }
+        finally { TempDir.Delete(work); }
     }
 
     [Fact]
@@ -290,7 +292,7 @@ public class FileTreeEmitterTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -348,7 +350,7 @@ public class FileTreeEmitterTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -392,7 +394,7 @@ public class FileTreeEmitterTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -417,7 +419,7 @@ public class FileTreeEmitterTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -448,7 +450,7 @@ public class FileTreeEmitterTests
         }
         finally
         {
-            if (Directory.Exists(srcDir)) Directory.Delete(srcDir, recursive: true);
+            TempDir.Delete(srcDir);
         }
     }
 }

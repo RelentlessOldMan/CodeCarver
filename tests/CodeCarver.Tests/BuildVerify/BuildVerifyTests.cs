@@ -129,7 +129,7 @@ public class BuildVerifyTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -255,7 +255,7 @@ public class BuildVerifyTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -322,7 +322,7 @@ public class BuildVerifyTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -410,7 +410,7 @@ public class BuildVerifyTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -457,7 +457,7 @@ public class BuildVerifyTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -486,7 +486,7 @@ public class BuildVerifyTests
             var plan = ReachabilityEngine.Compute(graph,
                 new ExplicitRootProvider(symbols: new[] { "Reset_Handler" }).Discover(graph).ToList());
             FileTreeEmitter.EmitPruned(plan, graph, fixture, outDir);
-            BuildSupportEmitter.Copy(fixture, outDir, plan.KeptFiles, System.Array.Empty<string>(), System.Array.Empty<string>()); // emit .ld like the CLI
+            InfrastructureEmitter.Copy(fixture, outDir, plan.KeptFiles, plan.DroppedFiles, System.Array.Empty<string>(), System.Array.Empty<string>()); // emit .ld like the CLI
 
             var args = new[] { "-mcpu=cortex-m3", "-mthumb", "-ffreestanding", "-nostdlib",
                                "-Wl,-T,firmware.ld", "-o", "carved.elf" }
@@ -503,7 +503,7 @@ public class BuildVerifyTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -562,7 +562,7 @@ public class BuildVerifyTests
             FileTreeEmitter.EmitPruned(plan, graph, sample, outDir);
 
             // The feature under test: startup .s + linker .ld copied alongside the carved .c.
-            var sup = BuildSupportEmitter.Copy(sample, outDir, plan.KeptFiles,
+            var sup = InfrastructureEmitter.Copy(sample, outDir, plan.KeptFiles, plan.DroppedFiles,
                 System.Array.Empty<string>(), System.Array.Empty<string>());
             Assert.True(sup.Count >= 2);
             Assert.True(File.Exists(Path.Combine(outDir, "flash.s")));   // startup assembly emitted
@@ -576,7 +576,7 @@ public class BuildVerifyTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 

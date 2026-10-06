@@ -329,7 +329,7 @@ public static class CarveCases
         var work = new TempDir("cc-keep-");
         var outDir = work.Sub("out");
         FileTreeEmitter.EmitPruned(plan, graph, fixture, outDir);
-        BuildSupportEmitter.Copy(fixture, outDir, plan.KeptFiles, Array.Empty<string>(), Array.Empty<string>()); // emit .ld like the CLI
+        InfrastructureEmitter.Copy(fixture, outDir, plan.KeptFiles, plan.DroppedFiles, Array.Empty<string>(), Array.Empty<string>()); // emit .ld like the CLI
         return new CarvedCase { Work = work, Src = fixture, Out = outDir, Graph = graph, Plan = plan };
     }
 

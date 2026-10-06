@@ -465,12 +465,12 @@ public class CFrontEndTests
     }
 
     [Fact]
-    public void CallbackInMacroDefinedFunction_IsKept_ViaFile()
+    public void CallbackInMacroDefinedFunction_BelongsToThatFunction()
     {
-        // A function whose signature is hidden behind a macro (janet's `JANET_CORE_FN(name, ...)`) is not
-        // captured, so a callback taken inside its body has no enclosing function to attribute to. It must
-        // fall back to the file, or the callback target is dropped and the carved file dangles. real_root
-        // keeps the file; my_callback is referenced ONLY inside the macro-defined body.
+        // A function whose signature is hidden behind a macro (janet's `JANET_CORE_FN(name, ...)`) used to be
+        // invisible, so a callback taken inside its body fell back to the file. The definer-macro pass now sees
+        // that `CORE_FN(do_register)` defines do_register and owns the body: the callback belongs to do_register
+        // (kept when do_register is, as the emit closure does for any function a kept file writes).
         const string src = """
             static int my_callback(int x){ return x + 1; }
             int register_cb(int (*f)(int));
@@ -485,10 +485,14 @@ public class CFrontEndTests
             """;
         using var fe = new CFrontEnd();
         var graph = fe.BuildGraph(new[] { ("m.c", src) });
-        var plan = ReachabilityEngine.Compute(graph,
-            new[] { new Root(Find(graph, "real_root"), RootKind.ExplicitSymbol) });
+        var viaFunction = ReachabilityEngine.Compute(graph,
+            new[] { new Root(Find(graph, "do_register"), RootKind.ExplicitSymbol) });
+        Assert.True(viaFunction.IsKept(Find(graph, "my_callback")));
 
-        Assert.True(plan.IsKept(Find(graph, "my_callback")));
+        // Reaching only the file's other function no longer drags the callback in (it is do_register's).
+        var other = ReachabilityEngine.Compute(graph,
+            new[] { new Root(Find(graph, "real_root"), RootKind.ExplicitSymbol) });
+        Assert.False(other.IsKept(Find(graph, "my_callback")));
     }
 
     [Fact]

@@ -24,6 +24,8 @@ public sealed class FuzzTests
             "int ", "void ", "static ", "return ", "if(", "for(;;)", "{", "}", "(", ")", ";",
             "#define ", "#ifdef X", "#endif", "#include \"", "struct ", "typedef ", "*", ",",
             "0x", "foo", "\\\n", "/*", "*/", "//", "\"", "'", "__attribute__((", "))",
+            // Shapes the recovery passes look for: implicit-int heads, #if-split heads, definer macros.
+            "\nhelper(", "#else\n", "#if A\n", "\n{", "##", "#define D(n) int n##_x\n", "D(", "#define T(n) void n(void)\n", "T(",
         };
         var n = rng.Next(1, 120);
         for (var i = 0; i < n; i++)
@@ -49,6 +51,7 @@ public sealed class FuzzTests
             // extracted is force-kept (surfaced via Warnings/ForceKeepFiles), never a throw.
             var ex = Record.Exception(() => fe.BuildGraph(new[] { ("fuzz.c", text) }));
             Assert.True(ex is null, $"seed {seed} threw {ex?.GetType().Name}: {ex?.Message}");
+            AssertNoSwallowedCrash(fe, seed);
         }
     }
 
@@ -61,6 +64,15 @@ public sealed class FuzzTests
             using var fe = new CppFrontEnd();
             var ex = Record.Exception(() => fe.BuildGraph(new[] { ("fuzz.cpp", text) }));
             Assert.True(ex is null, $"seed {seed} threw {ex?.GetType().Name}: {ex?.Message}");
+            AssertNoSwallowedCrash(fe, seed);
         }
+    }
+
+    /// <summary>"Extraction failed" is the per-file catch-all: the carve survives (the file is kept whole), but it
+    /// means our own code threw, which is a bug — not a property of the input (review TS5).</summary>
+    private static void AssertNoSwallowedCrash(TreeSitterFrontEnd fe, int seed)
+    {
+        var crash = fe.Warnings.FirstOrDefault(w => w.Contains("extraction failed", StringComparison.Ordinal));
+        Assert.True(crash is null, $"seed {seed}: {crash}");
     }
 }

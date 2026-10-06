@@ -3,86 +3,14 @@ using System.Text.RegularExpressions;
 
 namespace CodeCarver.Core.Emit;
 
-/// <summary>Outcome of copying build-support files alongside a carved tree.</summary>
-public readonly record struct SupportEmitResult(int Count, long Bytes, IReadOnlyList<string> Warnings);
-
 /// <summary>
-/// Copies the non-source files an embedded image needs to actually build — the ones the carve never
-/// modelled because they aren't C translation units: <b>linker scripts</b> (<c>.ld</c>/<c>.lds</c>/
-/// <c>.ldscript</c>) and <b>standalone startup assembly</b> (<c>.s</c>/<c>.S</c>/<c>.asm</c>), plus
-/// anything the caller names with extra globs (Makefiles, TI <c>.cmd</c> linker command files, …).
-///
-/// Without these a carved firmware tree has its C carved perfectly but won't link — no vector table, no
-/// memory map. Copying is generic (no toolchain hardcoded) and an over-approximation: every matching
-/// file is taken (a repo with several board variants keeps them all), which is sound for building —
-/// callers prune variants they don't want with the same exclude list the carve uses.
+/// The forceKeepFiles glob helpers shared by the CLI and <see cref="InfrastructureEmitter"/>: root-escape
+/// refusal and on-disk glob matching. (This class once also copied linker scripts and startup assembly next to a
+/// carved tree; <see cref="InfrastructureEmitter"/> replaced that by passing every non-dropped file through, and
+/// the dead copier was removed — review TS9.)
 /// </summary>
 public static class BuildSupportEmitter
 {
-    private static readonly string[] SupportExts = { ".ld", ".lds", ".ldscript", ".s", ".asm" };
-
-    public static SupportEmitResult Copy(string sourceRoot, string outDir,
-                                         IReadOnlyCollection<string> alreadyEmittedRel,
-                                         IReadOnlyList<string> excludeDirs,
-                                         IReadOnlyList<string> auxGlobs)
-    {
-        bool Keep(string p) => excludeDirs.Count == 0 ||
-            !excludeDirs.Any(x => p.Replace('\\', '/').Contains("/" + x + "/", StringComparison.OrdinalIgnoreCase));
-
-        var warnings = new List<string>();
-        var picked = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
-        // SourceWalk: skip unreadable dirs (network shares) and don't recurse into directory junctions/
-        // symlinks (loop / double-copy), while still returning symlinked files.
-        foreach (var p in CodeCarver.Core.Util.SourceWalk.Files(sourceRoot))
-            if (SupportExts.Any(e => p.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && Keep(p))
-                picked.Add(p);
-        foreach (var glob in auxGlobs)
-        {
-            // Refuse a glob that escapes the source root — it could clobber files outside --out (eval-#7).
-            if (GlobEscapesRoot(glob))
-            {
-                warnings.Add($"forceKeepFiles '{glob}' refused: contains '..' or an absolute path (would write outside the output)");
-                continue;
-            }
-            // Count actual matches, not the picked-set delta: a glob may match files the built-in support-ext
-            // scan already took (e.g. --aux '*.ld' when a .ld was already picked) -- that's a match, not a miss.
-            var matched = 0;
-            foreach (var p in MatchGlob(sourceRoot, glob))
-                if (Keep(p)) { picked.Add(p); matched++; }
-            if (matched == 0)
-                warnings.Add($"forceKeepFiles '{glob}' matched no files under {sourceRoot} "
-                             + "(a bare pattern like '*.inc' already searches all subdirectories)");
-        }
-
-        var outFull = Path.GetFullPath(outDir);
-        var already = new HashSet<string>(alreadyEmittedRel, CodeCarver.Core.Util.PathComparer.Default);
-        var count = 0;
-        long bytes = 0;
-        foreach (var p in picked)
-        {
-            var rel = Path.GetRelativePath(sourceRoot, p).Replace('\\', '/');
-            if (already.Contains(rel)) continue; // already emitted as a graph file — don't double-copy/overwrite
-            var dst = Path.Combine(outDir, rel);
-            // Belt-and-braces: NEVER write outside --out, whatever the rel path resolved to.
-            var dstFull = Path.GetFullPath(dst);
-            if (!dstFull.StartsWith(outFull + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-                && !string.Equals(dstFull, outFull, StringComparison.OrdinalIgnoreCase))
-            {
-                warnings.Add($"skipped '{rel}': destination would fall outside the output directory");
-                continue;
-            }
-            // out overlapping source would make dst==src; File.Copy onto itself throws. The CLI refuses
-            // overlapping --out, but skip defensively for direct library callers.
-            if (string.Equals(Path.GetFullPath(p), dstFull, StringComparison.OrdinalIgnoreCase)) continue;
-            var dd = Path.GetDirectoryName(dst);
-            if (!string.IsNullOrEmpty(dd)) Directory.CreateDirectory(dd);
-            File.Copy(p, dst, overwrite: true);
-            bytes += new FileInfo(dst).Length;
-            count++;
-        }
-        return new SupportEmitResult(count, bytes, warnings);
-    }
-
     /// <summary>An --aux glob that escapes the source root (a <c>..</c> segment) or is rooted/absolute must
     /// never be honored: the destination is <c>Path.Combine(outDir, relPathFromRoot)</c>, so a <c>../</c>
     /// carries into the output path and could read/copy — and OVERWRITE — files OUTSIDE <c>--out</c>, breaking

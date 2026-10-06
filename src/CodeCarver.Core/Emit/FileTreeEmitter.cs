@@ -23,10 +23,17 @@ public static class FileTreeEmitter
     public static EmitResult Emit(CarvePlan plan, string sourceRoot, string outDir)
     {
         ArgumentNullException.ThrowIfNull(plan);
+        return Emit(plan.KeptFiles, plan.DroppedFiles, sourceRoot, outDir);
+    }
+
+    /// <summary>File-level emit from the kept and dropped file lists alone — what <c>--emit-from</c> replays from
+    /// a prior analysis-only run without re-parsing.</summary>
+    public static EmitResult Emit(IReadOnlyList<string> keptFiles, IReadOnlyList<string> droppedFiles, string sourceRoot, string outDir)
+    {
         var written = new List<string>();
         long bytes = 0;
 
-        foreach (var rel in plan.KeptFiles)
+        foreach (var rel in keptFiles)
         {
             var src = Path.Combine(sourceRoot, rel);
             if (!File.Exists(src)) continue; // a header/path not present on disk (e.g. synthesized) — skip
@@ -46,7 +53,7 @@ public static class FileTreeEmitter
             written.Add(rel);
         }
 
-        CopyUnscannedIncludes(plan, sourceRoot, outDir, written, ref bytes);
+        CopyUnscannedIncludes(keptFiles, droppedFiles, sourceRoot, outDir, written, ref bytes);
         return new EmitResult(written.Count, bytes, written);
     }
 
@@ -114,7 +121,7 @@ public static class FileTreeEmitter
             written.Add(rel);
         }
 
-        CopyUnscannedIncludes(plan, sourceRoot, outDir, written, ref bytes);
+        CopyUnscannedIncludes(plan.KeptFiles, plan.DroppedFiles, sourceRoot, outDir, written, ref bytes);
         return new EmitResult(written.Count, bytes, written);
     }
 
@@ -128,6 +135,15 @@ public static class FileTreeEmitter
         var list = defs.Where(n => n.Span.IsKnown)
                        .Select(n => (Start: n.Span.StartLine, End: n.Span.EndLine, Drop: !isKept(n.Id))).ToList();
         list.Sort((a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : a.End.CompareTo(b.End));
+        // Identical spans are ONE definition under several names — a head split across #if branches defines each
+        // branch's name with the shared body. Merge them (dropped only when every name is) so they don't read
+        // as the overlapping mis-parse handled below.
+        for (var i = list.Count - 1; i > 0; i--)
+            if (list[i].Start == list[i - 1].Start && list[i].End == list[i - 1].End)
+            {
+                list[i - 1] = (list[i - 1].Start, list[i - 1].End, list[i - 1].Drop && list[i].Drop);
+                list.RemoveAt(i);
+            }
 
         // If a DROPPED function's span overlaps a KEPT one, the parse nested/mis-grouped this file —
         // e.g. a local class or lambda defined INSIDE a big function, whose method is reached (by name /
@@ -217,13 +233,13 @@ public static class FileTreeEmitter
     /// Sound: it only ADDS files, never touches an emitted/pruned one, and never resurrects a header the
     /// carve deliberately dropped (those are graph-known, so excluded here).
     /// </summary>
-    private static void CopyUnscannedIncludes(CarvePlan plan, string sourceRoot, string outDir,
+    private static void CopyUnscannedIncludes(IReadOnlyList<string> keptFiles, IReadOnlyList<string> droppedFiles, string sourceRoot, string outDir,
                                               List<string> written, ref long bytes)
     {
         var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourceRoot)) + Path.DirectorySeparatorChar;
         var outRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outDir)) + Path.DirectorySeparatorChar;
-        var known = new HashSet<string>(plan.KeptFiles, CodeCarver.Core.Util.PathComparer.Default);
-        foreach (var f in plan.DroppedFiles) known.Add(f);          // graph-known drops: leave dropped
+        var known = new HashSet<string>(keptFiles, CodeCarver.Core.Util.PathComparer.Default);
+        foreach (var f in droppedFiles) known.Add(f);               // graph-known drops: leave dropped
         var copied = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
         var queue = new Queue<string>(written);                      // scan every emitted file for includes
 

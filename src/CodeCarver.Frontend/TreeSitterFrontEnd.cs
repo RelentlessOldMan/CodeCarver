@@ -107,6 +107,25 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private Parser? _inlineParser;
 
     private readonly List<string> _warnings = new();
+    // Files kept whole without extraction (fragment, parse timeout, symbol budget, extraction failure).
+    private readonly HashSet<string> _unparsed = new(StringComparer.Ordinal);
+
+    /// <summary>Files the front-end read but kept whole without extracting definitions or uses.</summary>
+    public IReadOnlyCollection<string> UnparsedFiles => _unparsed;
+
+    /// <summary>
+    /// A file kept whole without extraction is still emitted whole, so whatever it uses must stay: every distinct
+    /// identifier in it becomes a reference from its file node (resolved by name like any use; most match nothing).
+    /// Before, such a file contributed no uses at all, and a function only it called was dropped while it was
+    /// written — a carve that does not link.
+    /// </summary>
+    private void KeptWholeRefs(string path, string text, NodeId fileNode, UseList pendingRefs)
+    {
+        _unparsed.Add(path);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (Match m in Identifier.Matches(text))
+            if (seen.Add(m.Value) && !Keywords.Contains(m.Value)) pendingRefs.Add((fileNode, m.Value));
+    }
     /// <inheritdoc/>
     public IReadOnlyList<string> Warnings => _warnings;
 
@@ -178,6 +197,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // mis-parses and the function (plus several after it, via error recovery) is never captured and so
     // can't be rooted — the pugixml load_file/load_string gap. Emitted output is untouched.
     private Regex? _blankRegex;
+    // The C grammar parses every file as C; the C++ grammar also reads .c files in a mixed tree. Implicit-int
+    // recovery (ImplicitInt) applies to C only — C++ has no implicit int.
+    private readonly bool _cGrammar;
     // FUNCTION-LIKE macro names (`#define NAME(...)`). A real function can't share a name with one (the
     // preprocessor would mangle its definition), so a "function" whose name is here is a misparse — a
     // macro invocation like fmt's `FMT_CATCH(...) {}` parsed as a definition. OBJECT-like rename macros
@@ -188,6 +210,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // another such macro): `#define INITCALL(fn) static void (*__init_##fn)(void) __attribute__((section(".initcalls"),
     // used)) = fn`. A use of one registers something the linker keeps although nothing calls it (review R1).
     private HashSet<string> _keepMacros = new(StringComparer.Ordinal);
+    // Function-like macros that define a symbol named after an argument (see DefinerMacros), and a regex of
+    // their names for finding uses.
+    private Dictionary<string, List<DefinerMacros.Template>> _definers = new(StringComparer.Ordinal);
+    private Regex? _definerUse;
     private HashSet<string> _keepMacrosFnLike = new(StringComparer.Ordinal);
     private Regex? _keepMacroUse;
     private static readonly Regex AnyDefine = new(
@@ -230,6 +256,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     protected TreeSitterFrontEnd(string grammarLib, string grammarFn, string defsQuery, string callsQuery)
     {
         _lang = new Language(grammarLib, grammarFn);
+        _cGrammar = grammarLib == "tree-sitter-c";
         _defs = new Query(_lang, defsQuery);
         _calls = new Query(_lang, callsQuery);
         _idents = new Query(_lang, IdentQuery);
@@ -330,6 +357,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             {
                 _warnings.Add($"{path}: extraction failed ({ex.GetType().Name}: {ex.Message}) — kept whole, not carved");
                 _forceKeepFiles.Add(path);
+                if (fileNodeByPath.TryGetValue(path, out var failedFile)) KeptWholeRefs(path, text, failedFile, pendingRefs);
             }
             if (timeFiles && fsw.ElapsedMilliseconds >= 300)
                 Log.WriteLine($"  slowfile: {fsw.ElapsedMilliseconds,6} ms  {path} ({text.Length:N0} B)");
@@ -379,6 +407,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         foreach (var (macro, kind, frag) in pendingPastes)
         {
             if (frag.Length == 0) continue;
+            // A paste in a definer's declarator slot (`n##_desc = ...`) DEFINES the name at each use (pass 1c),
+            // it does not refer to every `*_desc` in the tree.
+            if (_definers.TryGetValue(graph.GetNode(macro).Name, out var templates)
+                && templates.Any(t => kind == PasteKind.Suffix ? t.Prefix.Length == 0 && t.Suffix == frag
+                                    : kind == PasteKind.Prefix && t.Suffix.Length == 0 && t.Prefix == frag))
+                continue;
             LinkPaste(graph, macro, kind, frag, functionsByName, EdgeKind.Calls);
             LinkPaste(graph, macro, kind, frag, globalsByName, EdgeKind.References);
         }
@@ -553,6 +587,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _keepMacrosFnLike = new HashSet<string>(keep.Where(k => bodies[k].FnLike), StringComparer.Ordinal);
         _keepMacroUse = keep.Count == 0 ? null
             : new Regex(@"\b(?:" + string.Join("|", keep.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
+
+        _definers = DefinerMacros.Build(bodies);
+        _definerUse = _definers.Count == 0 ? null
+            : new Regex(@"\b(" + string.Join("|", _definers.Keys.Select(Regex.Escape)) + @")\s*\(", RegexOptions.Compiled);
 
         _scopeMacros = map;
         _scopeRegex = map.Count == 0 ? null
@@ -763,6 +801,84 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         return false;
     }
 
+    /// <summary>
+    /// Bodies whose function head is split across preprocessor branches (see pass 1a): a bare file- or
+    /// namespace-scope compound_statement preceded by a function head that tree-sitter read as a declaration
+    /// with a MISSING ';' — directly, or as the last thing in each branch of an #if/#ifdef chain. Yields the
+    /// head's name node(s), the node the construct starts at, the body, and whether the construct is exactly
+    /// heads + body (so the whole span can be removed safely).
+    /// </summary>
+    private static IEnumerable<(List<TsNode> Names, TsNode Start, TsNode Body, bool Clean)> SplitHeadDefinitions(TsNode root)
+    {
+        if (!root.HasError) yield break;   // every split head carries a MISSING ';'
+        var scopes = new Stack<TsNode>();
+        scopes.Push(root);
+        while (scopes.Count > 0)
+        {
+            var scope = scopes.Pop();
+            TsNode? prev = null;
+            foreach (var child in scope.NamedChildren)
+            {
+                if (child.Type == "comment") continue;
+                if (child.Type is "namespace_definition" or "linkage_specification"
+                    && child.GetChildForField("body") is { } nested)
+                    scopes.Push(nested);
+                if (child.Type == "compound_statement" && prev is not null)
+                {
+                    var names = new List<TsNode>();
+                    var clean = CollectSplitHeads(prev, names);
+                    if (names.Count > 0) yield return (names, prev, child, clean);
+                }
+                prev = child;
+            }
+        }
+    }
+
+    /// <summary>Adds the function names of the MISSING-';' heads in <paramref name="n"/> (a declaration or an
+    /// #if chain) and returns true when it holds nothing else.</summary>
+    private static bool CollectSplitHeads(TsNode n, List<TsNode> names)
+    {
+        if (n.Type == "declaration")
+        {
+            if (!n.Children.Any(c => c.IsMissing) || HeadName(n) is not { } name) return false;
+            names.Add(name);
+            return true;
+        }
+        if (n.Type is not ("preproc_if" or "preproc_ifdef" or "preproc_elif" or "preproc_elifdef" or "preproc_else"))
+            return false;
+        var cond = n.GetChildForField("condition") ?? n.GetChildForField("name");
+        var alt = n.GetChildForField("alternative");
+        var clean = true;
+        var content = 0;
+        foreach (var c in n.NamedChildren)
+        {
+            if (c.Type == "comment" || (cond is not null && c.Id == cond.Id) || (alt is not null && c.Id == alt.Id)) continue;
+            content++;
+            if (!CollectSplitHeads(c, names)) clean = false;
+        }
+        if (content != 1) clean = false;
+        if (alt is not null && !CollectSplitHeads(alt, names)) clean = false;
+        return clean;
+    }
+
+    /// <summary>The name node of a declaration whose declarator is a function declarator, or null.</summary>
+    private static TsNode? HeadName(TsNode declaration)
+    {
+        var d = declaration.GetChildForField("declarator");
+        for (var i = 0; i < 8 && d is not null; i++)
+        {
+            if (d.Type == "function_declarator")
+            {
+                var name = d.GetChildForField("declarator");
+                if (name?.Type == "parenthesized_declarator") name = name.NamedChildren.FirstOrDefault();
+                if (name?.Type == "qualified_identifier") name = name.GetChildForField("name");
+                return name?.Type is "identifier" or "field_identifier" ? name : null;
+            }
+            d = d.Type is "pointer_declarator" or "reference_declarator" ? d.GetChildForField("declarator") ?? d.NamedChildren.LastOrDefault() : null;
+        }
+        return null;
+    }
+
     /// <summary>A .c/.cc/.cpp/.cxx/.c++ source file — a translation unit we must always parse.</summary>
     private static bool IsTranslationUnit(string path)
     {
@@ -850,16 +966,28 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         if (!IsTranslationUnit(path) && LooksLikeIncludeFragment(text))
         {
             _warnings.Add($"{path}: looks like an #include data fragment (not valid stand-alone C) — kept whole, not carved");
+            KeptWholeRefs(path, text, fileNodeByPath[path], pendingRefs);
             return;
         }
 
         // Expand scope-opening macros for PARSING only (line-preserving), so a file that opens its
         // namespace with `FMT_BEGIN_NAMESPACE` is structured correctly and its functions are captured.
         // Everything else (spans, dead-line map, initializer scans) uses the ORIGINAL text below.
-        using var tree = ParseWithBudget(ExpandScopeMacros(text), path, out var timedOut);
+        var parseText = ExpandScopeMacros(text);
+        if (_cGrammar || path.EndsWith(".c", StringComparison.OrdinalIgnoreCase))
+        {
+            parseText = ImplicitInt.Rewrite(parseText, _funcLikeMacroNames.Contains, out _);
+            // A mixed C/C++ tree reads .c files with the C++ grammar, which rejects K&R parameter lists.
+            if (!_cGrammar) parseText = ImplicitInt.KAndRToPrototype(parseText, out _);
+        }
+        using var tree = ParseWithBudget(parseText, path, out var timedOut);
         if (timedOut)
         {
             _warnings.Add($"{path}: parse exceeded the {ParseBudgetMs} ms budget — kept whole, not carved");
+            // Its definitions are unknown, so nothing could reach it: a translation unit must be force-kept like
+            // one over the symbol budget, or a call into it finds no definition and the file is dropped.
+            if (IsTranslationUnit(path)) _forceKeepFiles.Add(path);
+            KeptWholeRefs(path, text, fileNodeByPath[path], pendingRefs);
             return;
         }
         if (tree is null) return;
@@ -881,6 +1009,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 var how = IsTranslationUnit(path) ? "force-rooted, kept whole" : "kept whole via #include-closure";
                 _warnings.Add($"{path}: would mint {symbols:N0} symbols (> {PerFileSymbolBudget:N0} budget) — {how}, not carved (guards graph-memory blow-up)");
                 if (IsTranslationUnit(path)) _forceKeepFiles.Add(path);
+                KeptWholeRefs(path, text, fileNodeByPath[path], pendingRefs);
                 return;
             }
         }
@@ -917,7 +1046,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(fid, fileNode, EdgeKind.DefinedIn);
                 Add(functionsByName, name, fid);
                 funcSpans.Add((span.Value.Start, span.Value.End, fid));
-                if (IsTranslationUnit(path) && IsFileScopeStatic(node)) _fileLocal.Add(fid);
+                if (IsTranslationUnit(path) && IsFileScopeStatic(node)) { _fileLocal.Add(fid); graph.AddFlag(fid, NodeFlags.FileLocal); }
             }
             else if (cap.Name == "macro")
             {
@@ -936,6 +1065,64 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(tid, fileNode, EdgeKind.DefinedIn);
             }
         }
+
+        // Pass 1a: a function head split across #if/#else/#endif with the body's '{' after the #endif —
+        //   #ifdef VARIANT_SDI / void helper_sdi(int x) / #else / void helper(int x) / #endif / { ... }
+        // Neither branch is a definition to tree-sitter (each head is a declaration with a MISSING ';', and the
+        // body is a bare top-level compound_statement), so no function was minted and the file was dropped
+        // while a call still needed it (work eval, 1.0.159). Every live branch's name is defined by the shared
+        // body; they become one unit — same span, linked both ways — so reaching any of them keeps the body.
+        foreach (var (names, spanStart, body, clean) in SplitHeadDefinitions(root))
+        {
+            var live = names.Where(n => !IsDead(n) && !Keywords.Contains(n.Text)).ToList();
+            if (live.Count == 0) continue;
+            var span = new SourceSpan(spanStart.StartPosition.Row + 1, body.EndPosition.Row + 1);
+            var ids = new List<NodeId>();
+            foreach (var n in live)
+            {
+                defNamePositions.Add((n.StartPosition.Row, n.StartPosition.Column));
+                var fid = graph.GetOrAddNode(NodeKind.Function, n.Text, path, span);
+                graph.AddEdge(fid, fileNode, EdgeKind.DefinedIn);
+                Add(functionsByName, n.Text, fid);
+                ids.Add(fid);
+            }
+            foreach (var a in ids)
+                foreach (var b in ids)
+                    if (a != b) graph.AddEdge(a, b, EdgeKind.Calls);
+            if (clean)
+                funcSpans.Add((span.StartLine, span.EndLine, ids[0]));
+            else
+                // The #if block holds more than the heads: removing the span would take that with it. Keep the
+                // construct with its file instead (its body's calls are already attributed to the file).
+                foreach (var id in ids) graph.AddEdge(fileNode, id, EdgeKind.References);
+        }
+
+        // Pass 1c: symbols a macro use defines — `FW_DECLARE(uart, uart_init, uart_fini);` defining `uart_desc`,
+        // or `DEFINE_TASK(blink) { ... }` defining `blink` (see DefinerMacros). Each defined name gets a node
+        // spanning the use (and its body), referencing the macro and every identifier in the arguments, so a
+        // file elsewhere naming `uart_desc` keeps this file, and this use keeps uart_init. A use that also
+        // registers something (a keep macro: section/used/constructor) stays whenever its file does.
+        if (_definerUse is not null)
+            foreach (var use in DefinerMacros.Uses(text, _definerUse, _definers))
+            {
+                if (dead is not null && use.StartLine < dead.Length && dead[use.StartLine]) continue;
+                var span = new SourceSpan(use.StartLine, use.EndLine);
+                var ids = new List<NodeId>();
+                foreach (var (name, isFn) in use.Defines)
+                {
+                    var id = graph.GetOrAddNode(isFn ? NodeKind.Function : NodeKind.Global, name, path, span);
+                    graph.AddEdge(id, fileNode, EdgeKind.DefinedIn);
+                    Add(isFn ? functionsByName : globalsByName, name, id);
+                    pendingRefs.Add((id, use.Macro));
+                    foreach (var arg in use.ArgIdentifiers) pendingRefs.Add((id, arg));
+                    if (_keepMacros.Contains(use.Macro)) graph.AddEdge(fileNode, id, EdgeKind.References);
+                    ids.Add(id);
+                }
+                foreach (var a in ids)
+                    foreach (var b in ids)
+                        if (a != b) graph.AddEdge(a, b, EdgeKind.Calls);
+                funcSpans.Add((use.StartLine, use.EndLine, ids[0]));   // the body's calls belong to the defined name
+            }
 
         // Pass 1b: file-scope INITIALIZED globals (data tables). Span = the whole declaration, so a big
         // lookup table can be removed wholesale when nothing reachable references it.

@@ -96,25 +96,26 @@ public static class CarveCommand
 
     static int RunCore(string[] args, TextWriter @out, TextWriter err)
     {
-        // carve <source-dir> --config carve.toml [--stage <name>] [--why <symbol>]
+        // carve <source-dir> --config carve.toml [--stage <name>] [--why <symbol>] [--emit-from <analysis output>]
         if (args.Length < 2 || !Directory.Exists(args[1]))
         {
-            err.WriteLine("usage: carve <source-dir> --config carve.toml [--stage <name>] [--why <symbol>]");
+            err.WriteLine("usage: carve <source-dir> --config carve.toml [--stage <name>] [--why <symbol>] [--emit-from <analysis output>]");
             err.WriteLine("       run 'init' to write an annotated carve.toml.");
             return 2;
         }
         var dir = args[1];
 
-        string? configPath = null, stageName = null, whySymbol = null;
+        string? configPath = null, stageName = null, whySymbol = null, emitFrom = null;
         for (var i = 2; i < args.Length; i++)
         {
             if (args[i] == "--config" && i + 1 < args.Length) configPath = args[++i];
             else if (args[i] == "--stage" && i + 1 < args.Length) stageName = args[++i];
             else if (args[i] == "--why" && i + 1 < args.Length) whySymbol = args[++i];
+            else if (args[i] == "--emit-from" && i + 1 < args.Length) emitFrom = args[++i];
             else
             {
                 err.WriteLine($"unknown or incomplete option '{args[i]}'. usage: carve <source-dir> --config carve.toml "
-                    + "[--stage <name>] [--why <symbol>].  Everything else lives in the config — run 'init' for a template.");
+                    + "[--stage <name>] [--why <symbol>] [--emit-from <analysis output>].  Everything else lives in the config — run 'init' for a template.");
                 return 2;
             }
         }
@@ -199,7 +200,7 @@ public static class CarveCommand
         // Never replace a directory CodeCarver did not create (review O1): each stage writes <base>/carved and
         // <base>/codecarver; an existing non-empty one is only ours if <base> carries the output marker. Checked
         // before any work so a long analysis can't end by destroying someone's files.
-        foreach (var st in cv.AnalysisOnly ? new[] { "" } : cv.Stages.Select(x => x.Name).ToArray())
+        foreach (var st in cv.AnalysisOnly && emitFrom is null ? new[] { "" } : cv.Stages.Select(x => x.Name).ToArray())
         {
             var b = st.Length == 0 ? outputFull : Path.Combine(outputFull, st);
             foreach (var sub in new[] { "carved", "codecarver" })
@@ -211,6 +212,9 @@ public static class CarveCommand
                 return 2;
             }
         }
+
+        // Materialize a prior analysis-only run's plan without parsing (see EmitFrom).
+        if (emitFrom is not null) return EmitFrom.Run(dir, cv, emitFrom, Version(), @out, err);
 
         // Diagnostic collector for this run: a source-free snapshot (version/env/params/stats/warnings/timings)
         // written to ONE shareable .zip on request via --diag, or automatically on an unhandled failure (the
@@ -865,24 +869,25 @@ public static class CarveCommand
                                     + (bigFiles.Count > 0 ? $" + {bigFiles.Count} big-file(s) kept whole" : "")
                                     + (denseFiles.Count > 0 ? $" + {denseFiles.Count} dense-header(s) kept whole" : "") + " -- analyzing...");
 
-        // Live, self-calibrating parse ETA for a large tree. Parsing dominates the run and scales ~linearly with
-        // bytes, so measured throughput (bytesDone/elapsed) x known remaining bytes = a real, refining estimate —
-        // not a guess. Printed to stderr ~every 3 s so it never pollutes --dump-spans / manifest stdout.
+        // Live parse progress for a large tree, with an ETA measured on this run (see ParseEta: rolling window,
+        // bytes and files blended, no number until it has warmed up). Printed to stderr ~every 3 s so it never
+        // pollutes --dump-spans / manifest stdout.
         if (fe is TreeSitterFrontEnd tsp && (scanFiles > 500 || scanBytes > 50_000_000))
         {
             var psw = System.Diagnostics.Stopwatch.StartNew();
-            var lastPrint = 0.0;                                // 0 => first ETA only after a ~3 s warmup (calibrated rate)
+            var eta = new ParseEta();
+            var lastPrint = 0.0;
             tsp.OnParseProgress = (filesDone, filesTotal, bytesDone, bytesTotal) =>
             {
                 var el = psw.Elapsed.TotalSeconds;
                 var last = filesDone >= filesTotal;
                 if (bytesDone <= 0 || el <= 0.001) return;
-                if (!last && el - lastPrint < 3.0) return;     // warmup + throttle; always emit the final 100% line
+                if (!last && el - lastPrint < 3.0) return;     // throttle; always emit the final 100% line
                 lastPrint = el;
-                var rate = bytesDone / el;                     // bytes/sec, measured on THIS run
-                var etaSec = rate > 0 ? (bytesTotal - bytesDone) / rate : -1;
+                var (rate, etaSec) = eta.Update(el, filesDone, filesTotal, bytesDone, bytesTotal);
                 err.WriteLine($"  parsing : {100.0 * bytesDone / bytesTotal,3:N0}% "
-                    + $"({filesDone:N0}/{filesTotal:N0} files, {rate / 1_000_000.0:N1} MB/s) -- ETA {FormatEta(etaSec)}");
+                    + $"({filesDone:N0}/{filesTotal:N0} files, {rate / 1_000_000.0:N1} MB/s) -- ETA "
+                    + (etaSec < 0 ? "estimating..." : FormatEta(etaSec)));
             };
         }
         if (defines is not null && closedWorld && closureLang)
@@ -924,6 +929,10 @@ public static class CarveCommand
             summary["world.ambientMacros"] = ambientMacros.Count;
         }
         var graph = fe.BuildGraph(parseRels, ReadRel, defines, closedWorld);
+        // Files kept whole without extraction: the parser never saw them (big / macro-dense) or gave up on them.
+        // verify uses this to say when a failure comes from such a file (cause useInUnparsedFile).
+        var unparsedFiles = new HashSet<string>(skipParse, CodeCarver.Core.Util.PathComparer.Default);
+        if (fe is TreeSitterFrontEnd tsUnparsed) unparsedFiles.UnionWith(tsUnparsed.UnparsedFiles);
         Mark("build-graph");
         if (readErrors > 12) err.WriteLine($"  warn    : (+{readErrors - 12} more unreadable files kept whole)");
 
@@ -1407,7 +1416,12 @@ public static class CarveCommand
             var sb = new System.Text.StringBuilder();
             sb.AppendLine($"# CodeCarver emitted-tree verify — {r.FilesChecked} file(s) checked, {r.FilesSkipped} too large/unreadable");
             sb.AppendLine("# A violation: emitted code uses a function that only a DROPPED file defines.");
-            foreach (var v in hard) sb.AppendLine($"FAIL {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined only in dropped {v.DefinedIn}");
+            // Why each failure happened, as counts (summary.txt stays source-free), so a remote eval can say which
+            // part of the tool missed without sending a name or a path. Per-violation causes go to verify.txt.
+            var why = hard.Count == 0 ? new Dictionary<LinkViolation, string>() : ClassifyViolations(graph, p, hard, unparsedFiles);
+            var causes = why.Values.GroupBy(c => c).OrderBy(g => g.Key, StringComparer.Ordinal)
+                            .ToDictionary(g => g.Key, g => g.Count());
+            foreach (var v in hard) sb.AppendLine($"FAIL {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined only in dropped {v.DefinedIn}\tcause {why[v]}");
             foreach (var v in soft) sb.AppendLine($"DEAD {v.Name}\tused {v.ReferencedIn}:{v.Line} (#ifdef-dead line)\tdefined only in dropped {v.DefinedIn}");
             Directory.CreateDirectory(ccDir);
             WriteArtifact(Path.Combine(ccDir, "verify.txt"), sb.ToString(), "verifylog");
@@ -1418,6 +1432,7 @@ public static class CarveCommand
                 @out.WriteLine($"  verify  : FAILED — emitted code uses {hard.Count} function(s) defined only in dropped files (the carved tree will not link):");
                 foreach (var v in hard.Take(20)) @out.WriteLine($"            {v.Name}  used {v.ReferencedIn}:{v.Line}, defined only in dropped {v.DefinedIn}");
                 if (hard.Count > 20) @out.WriteLine($"            (+{hard.Count - 20} more in verify.txt)");
+                @out.WriteLine("            causes: " + string.Join(", ", causes.Select(c => $"{c.Key} {c.Value}")));
             }
             if (soft.Count > 0)
                 @out.WriteLine($"  verify  : note — {soft.Count} function(s) used only on #ifdef-dead lines are defined only in dropped files "
@@ -1425,6 +1440,7 @@ public static class CarveCommand
             if (r.FilesSkipped > 0)
                 @out.WriteLine($"  verify  : note — {r.FilesSkipped} file(s) over {maxParseBytes:N0} B or unreadable were not checked");
             summary[$"{summaryStage}.verify.failed"] = hard.Count;
+            foreach (var (cause, n) in causes) summary[$"{summaryStage}.verify.failed.{cause}"] = n;
             summary[$"{summaryStage}.verify.deadLineOnly"] = soft.Count;
             summary[$"{summaryStage}.verify.filesChecked"] = r.FilesChecked;
             summary[$"{summaryStage}.verify.filesNotChecked"] = r.FilesSkipped;
@@ -1536,6 +1552,9 @@ public static class CarveCommand
             summary["run.droppedFiles"] = aplan.DroppedFiles.Count;
             summary["run.closureAddedFiles"] = aplan.KeptFiles.Count - plan.KeptFiles.Count;
             WriteSummary(ccDir);
+            // The plan --emit-from replays: writing the tree later costs a copy, not a second parse.
+            try { EmitFrom.WritePlan(ccDir, dir, cv, Version(), aplan.KeptFiles, aplan.DroppedFiles, cmmDropped, observedRel, verifyFailed, summary); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { err.WriteLine($"  warn    : could not write {EmitFrom.PlanFile} ({ex.Message}); --emit-from will not be available"); }
             Mark("analyze");
             diag.Set("analysisOnly", true);
             diag.Set("totalNodes", aplan.Stats.TotalNodes); diag.Set("keptFiles", aplan.Stats.KeptFiles); diag.Set("droppedFiles", aplan.Stats.DroppedFiles);
@@ -1783,6 +1802,63 @@ public static class CarveCommand
             }
         }
         return votes.Count == 0 ? null : votes.OrderByDescending(v => v.Value).First().Key;
+    }
+
+    /// <summary>
+    /// Why the graph let each verify failure through — the part of the tool that missed it:
+    /// <list type="bullet">
+    /// <item><c>definitionNotRecognized</c>: the dropped file's definition never became a graph node (a parser
+    ///   gap: an unusual definition shape, a macro-made definition, an inactive-looking #if region).</item>
+    /// <item><c>definitionFileLocal</c>: it did, but only as a file-scope <c>static</c>, which a use from another
+    ///   translation unit does not resolve to.</item>
+    /// <item><c>useNotModelled</c> / <c>useInHeaderNotModelled</c>: the definition is in the graph, but nothing in
+    ///   the referencing file has an edge to it (the use was not captured).</item>
+    /// <item><c>useInUnparsedFile</c>: the use is in a file kept whole without parsing (over maxParseBytes, a
+    ///   macro-dense header, a fragment, a parse timeout), whose uses are not extracted.</item>
+    /// <item><c>useInUnreachedCode</c>: there is an edge, but only from code the carve did not reach.</item>
+    /// <item><c>other</c>: none of these.</item>
+    /// </list>
+    /// </summary>
+    static Dictionary<LinkViolation, string> ClassifyViolations(CodeGraph graph, CarvePlan plan, IReadOnlyList<LinkViolation> hard,
+                                                           IReadOnlySet<string> unparsed)
+    {
+        var cmp = CodeCarver.Core.Util.PathComparer.Default;
+        var names = hard.Select(v => v.Name).ToHashSet(StringComparer.Ordinal);
+        var refFiles = hard.Select(v => v.ReferencedIn).ToHashSet(cmp);
+        var defs = new Dictionary<(string, string), bool>();   // (name, file) -> every definition is file-local
+        var edgeFrom = new HashSet<(string, string)>();        // (referencing file, name): some node there has an edge to it
+        var edgeFromReached = new HashSet<(string, string)>();
+        foreach (var n in graph.Nodes)
+        {
+            if (n.Kind is NodeKind.Function or NodeKind.Global && names.Contains(n.Name) && n.FilePath is { } df)
+            {
+                var key = (n.Name, df);
+                var local = (n.Flags & NodeFlags.FileLocal) != 0;
+                defs[key] = defs.TryGetValue(key, out var was) ? was && local : local;
+            }
+            if (n.FilePath is not { } f || !refFiles.Contains(f)) continue;
+            foreach (var e in graph.OutEdges(n.Id))
+            {
+                var t = graph.GetNode(e.To);
+                if (t.Kind is not (NodeKind.Function or NodeKind.Global) || !names.Contains(t.Name)) continue;
+                edgeFrom.Add((f, t.Name));
+                if (plan.IsKept(n.Id)) edgeFromReached.Add((f, t.Name));
+            }
+        }
+
+        bool Has(HashSet<(string, string)> set, string file, string name) => set.Any(x => x.Item2 == name && cmp.Equals(x.Item1, file));
+        var result = new Dictionary<LinkViolation, string>();
+        foreach (var v in hard)
+        {
+            var def = defs.FirstOrDefault(kv => kv.Key.Item1 == v.Name && cmp.Equals(kv.Key.Item2, v.DefinedIn));
+            result[v] = def.Key == default ? "definitionNotRecognized"
+                : def.Value ? "definitionFileLocal"
+                : unparsed.Contains(v.ReferencedIn) ? "useInUnparsedFile"
+                : !Has(edgeFrom, v.ReferencedIn, v.Name) ? (EmittedLinkCheck.IsHeader(v.ReferencedIn) ? "useInHeaderNotModelled" : "useNotModelled")
+                : !Has(edgeFromReached, v.ReferencedIn, v.Name) ? "useInUnreachedCode"
+                : "other";
+        }
+        return result;
     }
 
     // Human ETA from a seconds estimate. "?" when not yet computable (no throughput sample yet).

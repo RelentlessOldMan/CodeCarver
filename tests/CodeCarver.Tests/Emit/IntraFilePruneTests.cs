@@ -40,7 +40,7 @@ public class IntraFilePruneTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 
@@ -84,7 +84,7 @@ public class IntraFilePruneTests
         }
         finally
         {
-            if (Directory.Exists(work)) Directory.Delete(work, recursive: true);
+            TempDir.Delete(work);
         }
     }
 }

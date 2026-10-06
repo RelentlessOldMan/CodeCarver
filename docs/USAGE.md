@@ -104,6 +104,15 @@ directory) · `3` the emitted tree failed `verify` (it would not link).
 
 `--stage` with a config that has no `[stages]`, or with `analysisOnly = true`, is an error.
 
+**`--emit-from <analysis output>`** writes the tree an earlier `analysisOnly = true` run decided on, without
+parsing again — on a large tree the parse is most of the run, so a dry run followed by the real emit no longer
+costs two full runs. The analysis run saves `codecarver/emit-plan.json`; `--emit-from` refuses (exit 2) when
+the CodeCarver version, a setting, a build log or trace it names, or any file under the source root (size or
+time) changed since, and for a stage that carves inside files (that needs the parsed graph — use a file-level
+stage). The link check is not re-run: its result is carried over from the analysis run, which checked the same
+kept files, so a failed analysis still exits 3. The usual flow keeps one config: run it with `analysisOnly = true`,
+review, then run the same command again with `--emit-from <its outputDirectory>`.
+
 ## The config file (`carve.toml`)
 
 `init` writes this annotated; every option is a TOML key, and an unknown key is an error. Booleans accept
@@ -288,7 +297,11 @@ Two optional inputs let an observed build or run tighten and audit the carve. Bo
   file-level **and** `carveSourceFileContents` intra-file carving. `#include "x.h"` resolves beside the
   including file first, then through the translation unit's own `-I` order (a basename match is only a
   fallback). A file-scope `static` function is not reached from other translation units. A parameter or local
-  variable named like a function does not keep that function.
+  variable named like a function does not keep that function. Definitions the parser can't see directly are
+  still recognised: pre-C99 implicit-`int` and K&R definitions (`helper(a, b) int a; { ... }`, in C files), a
+  function head split across `#if`/`#else`/`#endif` with one shared body (every branch's name is defined), and
+  a symbol a macro use defines (`FW_DECLARE(uart, ...)` defining `uart_desc` via `n##_desc`, including through
+  wrapper macros and head macros like `DEFINE_TASK(blink) { ... }`).
 - **C#** (`languages = ["csharp"]`): always **file-level** — a `.cs` file is kept or dropped whole;
   `carveSourceFileContents` is ignored with a note. The file set is closed over identifier and type
   references: a kept file that mentions a name keeps every type and method of that name. Files with top-level
@@ -358,6 +371,12 @@ not use the carve's graph: it fails the run (**exit 3**) when emitted code uses 
 `#ifdef` world is reported as a note, not a failure (it is correct if the world is). Files over
 `maxParseBytes` are not checked and are counted. Details go to `codecarver/verify.txt`.
 
+Each failure also gets a **cause**, counted in `summary.txt` as `verify.failed.<cause>` (numbers only, safe to
+send back) and named per failure in `verify.txt`: `definitionNotRecognized` (the dropped file's definition never
+became part of the graph: an unusual definition shape), `definitionFileLocal` (only a file-scope `static`),
+`useNotModelled` / `useInHeaderNotModelled` (the definition is known but the use was not captured),
+`useInUnreachedCode` (only code the carve did not reach uses it), or `other`.
+
 `verify` is a link check, not a build: it cannot see a missing type, macro or header. Build what you carved:
 
 ```
@@ -372,14 +391,16 @@ Recommended workflow the first time you point it at a big, unfamiliar tree:
 ```
 # in carve.toml: analysisOnly = true for the dry run; drop it (and add [stages]) for the real emit.
 codecarver carve <dir> --config carve.toml   # 1. analysisOnly: stats, dropped files, warnings, verify (no emit)
-codecarver carve <dir> --config carve.toml   # 2. real carve -> outputDirectory/[<stage>/]carved + codecarver/
+codecarver carve <dir> --config carve.toml --emit-from <outputDirectory>   # 2. emit that plan, no re-parse (file-level)
+#   or drop analysisOnly (and add [stages]) for a full carve -> outputDirectory/[<stage>/]carved + codecarver/
 cc -c out/carved/*.c -Iout/carved/           # 3. build the output (the only real guarantee)
 ```
 
-On a large tree it prints a **live, self-calibrating ETA** while parsing (the dominant phase) — e.g.
-`parsing : 22% (4,376/20,075 files, 1.2 MB/s) -- ETA ~6m 41s`. It's calculated, not guessed: measured
-throughput on this run × the known remaining source bytes, refined every few seconds (first estimate after
-a ~3 s warmup). Printed to stderr, so it never pollutes stdout. Reachability and emit are a short tail after
+On a large tree it prints a **live ETA** while parsing (the dominant phase) — e.g.
+`parsing : 22% (4,376/20,075 files, 1.2 MB/s) -- ETA ~6m 41s`. It is measured on this run: the rate over the
+last minute and over the last 15 s, from both bytes and files, showing the smaller estimate, so a slow opening
+stretch of big files stops counting once it is past. Until 15 s and 2% of the work have passed it shows
+`ETA estimating...`. Printed to stderr, so it never pollutes stdout. Reachability and emit are a short tail after
 parsing; emit scales with how much is *kept*.
 
 It's built to survive a messy real tree: a file it can't read or can't parse is **skipped with a

@@ -75,7 +75,7 @@ permanent regression test.
 Given a profile, a session will typically:
 
 1. **Translate it to a `carve.toml`.** Everything lives in the config — the CLI is just
-   `codecarver carve <src> --config carve.toml [--stage <name>] [--why <sym>]` (`codecarver init` writes an
+   `codecarver carve <src> --config carve.toml [--stage <name>] [--why <sym>] [--emit-from <dir>]` (`codecarver init` writes an
    annotated template). The profile maps directly:
 
    | Profile says | Becomes (config key) |

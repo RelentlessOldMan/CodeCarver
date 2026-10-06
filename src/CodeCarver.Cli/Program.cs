@@ -23,7 +23,7 @@ switch (cmd)
             CodeCarver {CarveCommand.Version()} — carve a source tree down to what an image needs.
 
             usage:
-              codecarver carve <source-dir> --config carve.toml [--stage <name>] [--why <symbol>]
+              codecarver carve <source-dir> --config carve.toml [--stage <name>] [--why <symbol>] [--emit-from <analysis output>]
               codecarver init [path]          write an annotated carve.toml (default: carve.toml)
               codecarver scan-log <log>       show what CodeCarver reads from a build log / compile_commands.json
               codecarver version              print the version

@@ -24,6 +24,9 @@ public enum NodeFlags
     Virtual = 1 << 4,
     /// <summary>Machine-generated (bindings, tables) — informational for reporting.</summary>
     Generated = 1 << 5,
+    /// <summary>A file-scope <c>static</c> function of a translation unit: uses from other translation units do
+    /// not resolve to it. Informational (verify's cause classification); resolution itself is in the front-end.</summary>
+    FileLocal = 1 << 6,
 }
 
 /// <summary>

@@ -240,6 +240,22 @@ public sealed class ExamplesTests
         private CarvedExample(TempDir work, string dir, string config, int code, string output, IReadOnlyList<string> stages)
         { _work = work; Dir = dir; ConfigPath = config; Code = code; Output = output; StageDirs = stages; }
 
+        /// <summary>The READMEs quote byte counts of the LF files the repository stores. A checkout made before
+        /// .gitattributes pinned examples/ to LF (or with core.autocrlf and an older git) still has CRLF files in
+        /// the working tree, which grew every count (work eval, 1.0.159) — so carve an LF copy, always.</summary>
+        private static void ToLf(string dir)
+        {
+            foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+            {
+                var bytes = File.ReadAllBytes(f);
+                if (Array.IndexOf(bytes, (byte)0) >= 0 || Array.IndexOf(bytes, (byte)'\r') < 0) continue;   // binary, or already LF
+                var lf = new List<byte>(bytes.Length);
+                for (var i = 0; i < bytes.Length; i++)
+                    if (!(bytes[i] == '\r' && i + 1 < bytes.Length && bytes[i + 1] == '\n')) lf.Add(bytes[i]);
+                File.WriteAllBytes(f, lf.ToArray());
+            }
+        }
+
         public static CarvedExample Run(string example, string configName, string? configText = null)
         {
             var work = new TempDir("cc-example-");
@@ -247,6 +263,7 @@ public sealed class ExamplesTests
             {
                 var dir = work.Sub(example);
                 TempDir.CopyTree(Path.Combine(TestRepo.Root, "examples", example), dir);
+                ToLf(dir);
                 var cfg = Path.Combine(dir, configName);
                 if (configText is not null) File.WriteAllText(cfg, configText);
 
