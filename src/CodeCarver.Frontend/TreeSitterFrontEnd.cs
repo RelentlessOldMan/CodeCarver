@@ -116,6 +116,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private int _recoveredByScan;
     /// <summary>Function definitions a parse with errors missed and the token-scanner backstop defined (pass 1d).</summary>
     public int DefinitionsRecoveredByScan => _recoveredByScan;
+    // CODECARVER_TIMING: where the per-file parse time goes (Stopwatch ticks), and how many files parsed with errors.
+    private long _tPrep, _tParse, _tScan, _tRead; private int _errorFiles;
 
     /// <summary>Files the front-end read but kept whole without extracting definitions or uses.</summary>
     public IReadOnlyCollection<string> UnparsedFiles => _unparsed;
@@ -363,7 +365,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         foreach (var path in paths)
         {
+            var tr = System.Diagnostics.Stopwatch.GetTimestamp();
             var text = read(path);
+            _tRead += System.Diagnostics.Stopwatch.GetTimestamp() - tr;
             if (text.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
             if (timeFiles) fsw.Restart();
             try
@@ -402,6 +406,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
 
         Phase("parse files");
+        if (phaseClock is not null)
+        {
+            static long Ms(long ticks) => ticks * 1000 / System.Diagnostics.Stopwatch.Frequency;
+            Log.WriteLine($"  timing  :     rewrites    {Ms(_tPrep),7} ms");
+            Log.WriteLine($"  timing  :     tree-sitter {Ms(_tParse),7} ms");
+            Log.WriteLine($"  timing  :     scan 1d     {Ms(_tScan),7} ms  ({_errorFiles:N0} files with parse errors, {_recoveredByScan:N0} recovered)");
+            Log.WriteLine($"  timing  :     read        {Ms(_tRead),7} ms");
+        }
         // P2: a file that is #included by another (unity build, "#include the .c") shares its statics with the
         // includer, so its statics are not restricted.
         var includedFiles = new HashSet<string>(StringComparer.Ordinal);
@@ -1148,9 +1160,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             return;
         }
 
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var parseText = PrepareParseText(path, text, out var bareKAndR, out var blankedForParse);
         if (blankedForParse.Length > 0) IdentifierRefs(blankedForParse, fileNodeByPath[path], pendingRefs, callShapedOnly: false);
+        var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         using var tree = ParseWithBudget(parseText, path, out var timedOut);
+        _tPrep += t1 - t0; _tParse += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
         if (timedOut)
         {
             _warnings.Add($"{path}: parse exceeded the {ParseBudgetMs} ms budget — kept whole, not carved");
@@ -1293,6 +1308,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // needs no parse; run the same scanner here and define every function it sees that the parse missed. Like a
         // bare K&R head, the node is kept with its file and never carved on its own (the body's calls are already the
         // file's), so a misread costs one extra name, never a cut body.
+        var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (root.HasError) _errorFiles++;
         if (root.HasError)
             foreach (var d in CodeCarver.Core.Reachability.EmittedLinkCheck.Scan(text, header: !IsTranslationUnit(path)).Definitions)
             {
@@ -1306,6 +1323,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 if (d.Static && IsTranslationUnit(path)) { _fileLocal.Add(fid); graph.AddFlag(fid, NodeFlags.FileLocal); }
                 _recoveredByScan++;
             }
+        _tScan += System.Diagnostics.Stopwatch.GetTimestamp() - t2;
 
         // Pass 1c: symbols a macro use defines — `FW_DECLARE(uart, uart_init, uart_fini);` defining `uart_desc`,
         // or `DEFINE_TASK(blink) { ... }` defining `blink` (see DefinerMacros). Each defined name gets a node

@@ -14,6 +14,9 @@ namespace CodeCarver.Frontend;
 ///   others, without one all but the first.</item>
 /// <item>ALL-CAPS macro calls in the head or its parameters — AUTOSAR <c>FUNC(void, COM_CODE) f(P2VAR(uint8,
 ///   AUTOMATIC, X) p)</c>: the argument lists are blanked, leaving <c>FUNC f(P2VAR p)</c>.</item>
+/// <item>a prototype wrapper around the parameter list — <c>int add PROTO((int a, int b)) {</c> (PROTO, __P,
+///   _ANSI_ARGS_): <c>PROTO(</c> and the outer <c>)</c> are blanked. Read as written, the wrapper is the name and
+///   the real name a type, and no verify scan sees the definition either: a silent miss.</item>
 /// <item>directive lines inside the head: a <c>#pragma</c> between the <c>)</c> and the <c>{</c>, or an
 ///   <c>#if/#else</c> choosing the return type (the first branch is kept).</item>
 /// </list>
@@ -24,6 +27,7 @@ public static class HeadNormalizer
 {
     private static readonly Regex Tok = new(@"[A-Za-z_]\w*|\d\w*|\S", RegexOptions.CultureInvariant);
     private static readonly Regex AllCaps = new(@"^[A-Z][A-Z0-9_]*$", RegexOptions.CultureInvariant);
+    private static readonly Regex Wrapper = new(@"^_*[A-Z][A-Z0-9_]*$", RegexOptions.CultureInvariant);
 
     // Words tree-sitter's C grammar knows inside a declaration's specifiers.
     private static readonly HashSet<string> Known = new(StringComparer.Ordinal)
@@ -81,6 +85,18 @@ public static class HeadNormalizer
             if (close < 0) continue;
             var brace = BodyAfter(toks, close + 1);
             if (brace < 0) continue;
+            // `int add PROTO((int a, int b)) {` — a prototype wrapper (PROTO, __P, _ANSI_ARGS_, PARAMS) around the
+            // parameter list: the name is the word before it. Blank `PROTO(` and the outer `)`.
+            if (Wrapper.IsMatch(s) && !Known.Contains(s) && i > stmtStart && IsIdent(toks[i - 1].S)
+                && toks[i + 2].S == "(" && MatchParen(toks, i + 2) == close - 1)
+            {
+                if (!HeadPrefix(toks, stmtStart, i - 1)) continue;
+                blank.Add((toks[i].Pos, toks[i + 1].Pos + 1));
+                blank.Add((toks[close].Pos, toks[close].Pos + 1));
+                Plan(text, toks, stmtStart, i - 1, close, brace, blank, wrapper: i);
+                i = close;
+                continue;
+            }
             if (!HeadPrefix(toks, stmtStart, i)) continue;
             Plan(text, toks, stmtStart, i, close, brace, blank);
             // Skip the parameter list: no candidate names inside it.
@@ -154,7 +170,7 @@ public static class HeadNormalizer
     }
 
     private static void Plan(string text, List<(int Pos, string S)> toks, int start, int name, int close, int brace,
-                             List<(int, int)> blank)
+                             List<(int, int)> blank, int wrapper = -1)
     {
         // 1. #if/#else choosing part of the type: keep the first branch. The #if can come before the statement's first
         // token, so look from the end of the previous statement; only conditionals around a token of this head count.
@@ -173,7 +189,7 @@ public static class HeadNormalizer
         var calls = new List<(int Open, int Close)>();
         for (var k = start; k < close; k++)
         {
-            if (k == name) continue;
+            if (k == name || k == wrapper) continue;
             if (IsIdent(toks[k].S) && AllCaps.IsMatch(toks[k].S) && toks[k + 1].S == "(" && !Known.Contains(toks[k].S))
             {
                 var c = MatchParen(toks, k + 1);

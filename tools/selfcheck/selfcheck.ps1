@@ -77,6 +77,13 @@ $cases = @(
          'caps.c'   = "CHECK(int x) { return x + leaf(); }`n"
          'leaf.c'   = "int leaf(void) { return 0; }`n"
          'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'PROTO((...)) prototype wrapper on a definition'; Lang = 'c'; Expect = @('add.c', 'leaf.c')
+       Files = @{
+         'p.h'      = "#define PROTO(x) x`nint add PROTO((int a, int b));`n"
+         'main.c'   = "#include `"p.h`"`nint main(void) { return add(1, 2); }`n"
+         'add.c'    = "#include `"p.h`"`nint add PROTO((int a, int b))`n{`n    return a + b + leaf();`n}`n"
+         'leaf.c'   = "int leaf(void) { return 0; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
     @{ Name = 'implicit-int definition'; Lang = 'c'; Expect = @('twice.c')
        Files = @{
          'main.c'  = "int twice(int);`nint main(void) { return twice(2); }`n"

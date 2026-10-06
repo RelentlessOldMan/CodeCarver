@@ -23,6 +23,9 @@ public sealed class DefinitionShapeTests
         { "return type chosen by #ifdef", "#ifdef WIDE\nlong\n#else\nint\n#endif\nf(void)\n{\n  return helper();\n}\n" },
         { "K&R function-pointer declaration", "f(a, cb)\n  int a;\n  int (*cb)();\n{\n  return cb(a) + helper();\n}\n" },
         { "implicit int, function-pointer parameter", "f(int (*cb)(void)) { return cb() + helper(); }\n" },
+        { "PROTO wrapper", "#define PROTO(x) x\nint f PROTO((int a, int b))\n{\n  return a + b + helper();\n}\n" },
+        { "__P wrapper, wrapper defined elsewhere", "int f __P((void)) { return helper(); }\n" },
+        { "_ANSI_ARGS_ wrapper, macro type", "STATUS f _ANSI_ARGS_((P2VAR(uint8, AUTOMATIC, X) p)) { return helper(); }\n" },
     };
 
     [Theory]
@@ -60,6 +63,7 @@ public sealed class DefinitionShapeTests
     [InlineData("int f(void) { return 0; }\n")]                                   // nothing to do
     [InlineData("static const uint8_t f(void) { return 0; }\n")]                 // one type name: kept
     [InlineData("int f(void);\nint x = g(1);\n")]                                // no body
+    [InlineData("int f PROTO((int a, int b));\n")]                               // a wrapped prototype: no body
     [InlineData("typedef int WINAPI_T fn(void);\n")]                             // a typedef
     [InlineData("int g(void) {\n  int WINAPI f(void) { }\n}\n")]                  // not at file scope
     [InlineData("#ifdef A\nvoid helper_a(int x)\n#else\nvoid helper(int x)\n#endif\n{\n}\n")]   // split head: pass 1a's
