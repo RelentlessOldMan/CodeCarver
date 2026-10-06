@@ -113,6 +113,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // Files kept whole without extraction (fragment, parse timeout, symbol budget, extraction failure).
     private readonly HashSet<string> _unparsed = new(StringComparer.Ordinal);
 
+    private int _recoveredByScan;
+    /// <summary>Function definitions a parse with errors missed and the token-scanner backstop defined (pass 1d).</summary>
+    public int DefinitionsRecoveredByScan => _recoveredByScan;
+
     /// <summary>Files the front-end read but kept whole without extracting definitions or uses.</summary>
     public IReadOnlyCollection<string> UnparsedFiles => _unparsed;
 
@@ -1006,7 +1010,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public IReadOnlyList<string> DiagnoseDefinition(string path, string text, int line, string name)
     {
         var shapes = new List<string>();
-        if (_unparsed.Contains(path)) shapes.Add("fileNotParsed");
+        if (_unparsed.Contains(path)) { shapes.Add("fileNotParsed"); return shapes; }   // nothing the parser did applies
         if (_funcLikeMacroNames.Contains(name)) shapes.Add("nameIsAFunctionLikeMacro");
         shapes.AddRange(DefinitionHead.TextShapes(text, line, name));
 
@@ -1281,6 +1285,26 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(fid, fileNode, EdgeKind.DefinedIn);
                 graph.AddEdge(fileNode, fid, EdgeKind.References);
                 Add(functionsByName, name, fid);
+            }
+
+        // Pass 1d (backstop): a file whose parse has errors can lose ordinary definitions to error recovery — a
+        // construct the grammar can't read swallows the function around or after it (work eval, 1.0.167: three plain
+        // `void name ()` definitions inside parse errors). The link check finds definitions with a token scanner that
+        // needs no parse; run the same scanner here and define every function it sees that the parse missed. Like a
+        // bare K&R head, the node is kept with its file and never carved on its own (the body's calls are already the
+        // file's), so a misread costs one extra name, never a cut body.
+        if (root.HasError)
+            foreach (var d in CodeCarver.Core.Reachability.EmittedLinkCheck.Scan(text, header: !IsTranslationUnit(path)).Definitions)
+            {
+                if (Keywords.Contains(d.Name) || _funcLikeMacroNames.Contains(d.Name)) continue;
+                if (dead is not null && d.Line < dead.Length && dead[d.Line]) continue;
+                if (functionsByName.TryGetValue(d.Name, out var have) && have.Any(h => graph.GetNode(h).FilePath == path)) continue;
+                var fid = graph.GetOrAddNode(NodeKind.Function, d.Name, path, new SourceSpan(d.Line, d.Line));
+                graph.AddEdge(fid, fileNode, EdgeKind.DefinedIn);
+                graph.AddEdge(fileNode, fid, EdgeKind.References);
+                Add(functionsByName, d.Name, fid);
+                if (d.Static && IsTranslationUnit(path)) { _fileLocal.Add(fid); graph.AddFlag(fid, NodeFlags.FileLocal); }
+                _recoveredByScan++;
             }
 
         // Pass 1c: symbols a macro use defines — `FW_DECLARE(uart, uart_init, uart_fini);` defining `uart_desc`,

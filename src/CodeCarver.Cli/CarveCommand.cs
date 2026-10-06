@@ -1260,6 +1260,7 @@ public static class CarveCommand
         summary["traces.functionNames"] = traceTotal;
         summary["files.bigKeptWhole"] = bigFiles.Count;
         summary["files.denseHeadersKeptWhole"] = denseFiles.Count;
+        if (fe is TreeSitterFrontEnd scanFe) summary["parse.definitionsRecoveredByScan"] = scanFe.DefinitionsRecoveredByScan;
 
         // Close each stage's plan over what that stage's emitter WRITES (review F1, owner decision D-A): an
         // unreached definition the emitter keeps anyway (whole kept file; a span the pruner can't remove) is

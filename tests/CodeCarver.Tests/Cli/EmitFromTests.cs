@@ -113,10 +113,12 @@ public sealed class EmitFromTests
     public void EmitFrom_CarriesAFailedVerifyOver_AsExit3()
     {
         using var w = new Work();
-        w.W("main.c", "int HELPER(int);\nint main(void){ return HELPER(1); }\n");
-        w.W("caps.c", "HELPER(int x) { return x; }\n");                 // not recognised: verify fails
-        Assert.Equal(3, w.Carve(w.Config("plan", analysis: true)).Code);
-        var (code, o) = w.Carve(w.Config("plan", analysis: true), "--emit-from", Path.Combine(w.Root, "plan"));
+        w.W("main.c", "int helper(void);\nint main(void){ return helper(); }\n");
+        // Over the symbol budget, not included, so dropped while main calls into it: verify fails.
+        w.W("lib.h", "int helper(void) { return 1; }\nint other(void) { return 2; }\nint third(void) { return 3; }\n");
+        const string budget = "[advanced]\nmaxSymbolsPerFile = 2\n";
+        Assert.Equal(3, w.Carve(w.Config("plan", analysis: true, budget)).Code);
+        var (code, o) = w.Carve(w.Config("plan", analysis: true, budget), "--emit-from", Path.Combine(w.Root, "plan"));
         Assert.Equal(3, code);
         Assert.Contains("FAILED in the analysis run", o);
     }

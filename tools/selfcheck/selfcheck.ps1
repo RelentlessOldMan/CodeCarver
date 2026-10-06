@@ -71,6 +71,12 @@ $cases = @(
          'main.cpp'   = "void f();`nint main() { f(); return 0; }`n"
          'table.cpp'  = "static int tbl[] = {`n#ifdef A`n 1,`n#else`n 2,`n#endif`n};`nvoid f ()`n{`n}`n"
          'unused.cpp' = "int unused() { return 9; }`n" } }
+    @{ Name = 'definition inside a parse error (scan backstop)'; Lang = 'c'; Expect = @('caps.c', 'leaf.c')
+       Files = @{
+         'main.c'   = "int CHECK(int);`nint main(void) { return CHECK(1); }`n"
+         'caps.c'   = "CHECK(int x) { return x + leaf(); }`n"
+         'leaf.c'   = "int leaf(void) { return 0; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
     @{ Name = 'implicit-int definition'; Lang = 'c'; Expect = @('twice.c')
        Files = @{
          'main.c'  = "int twice(int);`nint main(void) { return twice(2); }`n"

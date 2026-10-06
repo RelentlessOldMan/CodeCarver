@@ -399,6 +399,11 @@ A `definitionNotRecognized` failure is also described by **shape**, counted as
 
 These are fixed words, so the counts are as safe to send back as the rest of `summary.txt`.
 
+When a file's parse has errors, the carve also runs `verify`'s own token scanner over it and defines every function
+the scanner sees that the parse missed (error recovery can swallow an ordinary function near a construct the grammar
+cannot read). Such a function is kept with its file rather than carved on its own; `parse.definitionsRecoveredByScan`
+in `summary.txt` counts them. A name the tree also `#define`s as a function-like macro is not recovered this way.
+
 `verify` is a link check, not a build: it cannot see a missing type, macro or header. Build what you carved:
 
 ```

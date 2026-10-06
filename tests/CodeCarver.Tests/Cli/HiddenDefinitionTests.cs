@@ -335,25 +335,57 @@ public sealed class VerifyCauseTests
         Directory.CreateDirectory(src);
         try
         {
-            // An all-caps implicit-int definition is deliberately NOT recovered (it looks like a macro-headed body).
-            File.WriteAllText(Path.Combine(src, "main.c"), "int HELPER(int);\nint main(void){ return HELPER(1); }\n");
-            File.WriteAllText(Path.Combine(src, "caps.c"), "HELPER(int x) { return x; }\n");
+            // A header over the symbol budget is kept whole unparsed (no definitions in the graph). Nothing includes it,
+            // so it is dropped, while main calls a function it defines.
+            File.WriteAllText(Path.Combine(src, "main.c"), "int helper(void);\nint main(void){ return helper(); }\n");
+            File.WriteAllText(Path.Combine(src, "lib.h"), "int helper(void) { return 1; }\nint other(void) { return 2; }\nint third(void) { return 3; }\n");
             var cfg = Path.Combine(root, "carve.toml");
             File.WriteAllText(cfg, $"outputDirectory = \"{Path.Combine(root, "out").Replace("\\", "/")}\"\n"
-                                   + "[common]\nentryPoints = [\"main\"]\nlanguages = [\"c\"]\n");
+                                   + "[common]\nentryPoints = [\"main\"]\nlanguages = [\"c\"]\n[advanced]\nmaxSymbolsPerFile = 2\n");
             var so = new StringWriter(); var se = new StringWriter();
             var code = CarveCommand.Run(new[] { "carve", src, "--config", cfg }, so, se);
             Assert.True(code == 3, so + "\n" + se);
             var summary = File.ReadAllText(Path.Combine(root, "out", "codecarver", "summary.txt"));
             Assert.Contains("verify.failed.definitionNotRecognized = 1", summary);
             // ... and what the definition looks like, as fixed shape names.
-            Assert.Contains("verify.failed.definitionNotRecognized.noReturnType = 1", summary);
-            Assert.Contains("verify.failed.definitionNotRecognized.parsedAs_", summary);
-            Assert.DoesNotContain("HELPER", summary);   // still numbers only
+            Assert.Contains("verify.failed.definitionNotRecognized.fileNotParsed = 1", summary);
+            Assert.DoesNotContain("helper", summary);   // still numbers only
             var verify = File.ReadAllText(Path.Combine(root, "out", "codecarver", "verify.txt"));
             Assert.Contains("cause definitionNotRecognized", verify);
-            Assert.Contains("caps.c:1", verify);
-            Assert.Contains("shape noReturnType+parsedAs_", verify);
+            Assert.Contains("lib.h:1", verify);
+            Assert.Contains("shape fileNotParsed", verify);
+        }
+        finally { TempDir.Delete(root); }
+    }
+
+    [Theory]
+    [InlineData("int f(int a) reentrant { return a + helper(); }\n", true)]   // Keil, C++ grammar: a parse error
+    [InlineData("F(int x) { return x + helper(); }\n", false)]                  // all-caps implicit int, C grammar
+    public void ParseErrorDefinitions_AreRecoveredByTheScanBackstop(string source, bool mixed)
+    {
+        // Work eval, 1.0.167: three ordinary definitions inside parse errors. The link check's token scanner finds
+        // them without a parse; the carve now runs it on files whose parse has errors and defines what was missed.
+        var root = Path.Combine(Path.GetTempPath(), "cc-scan-" + Guid.NewGuid().ToString("N"));
+        var src = Path.Combine(root, "src");
+        Directory.CreateDirectory(src);
+        try
+        {
+            var name = source.StartsWith("F(") ? "F" : "f";
+            File.WriteAllText(Path.Combine(src, "main.c"), $"int {name}(int);\nint main(void) {{ return {name}(1); }}\n");
+            File.WriteAllText(Path.Combine(src, "f.c"), source);
+            File.WriteAllText(Path.Combine(src, "helper.c"), "int helper(void) { return 0; }\n");
+            File.WriteAllText(Path.Combine(src, "dead.c"), "int dead(void) { return 0; }\n");
+            if (mixed) File.WriteAllText(Path.Combine(src, "x.cpp"), "int unused_cpp() { return 0; }\n");
+            var cfg = Path.Combine(root, "carve.toml");
+            File.WriteAllText(cfg, $"outputDirectory = \"{Path.Combine(root, "out").Replace("\\", "/")}\"\n"
+                                   + "[common]\nentryPoints = [\"main\"]\nlanguages = " + (mixed ? "[\"c\", \"cpp\"]" : "[\"c\"]") + "\n");
+            var so = new StringWriter(); var se = new StringWriter();
+            var code = CarveCommand.Run(new[] { "carve", src, "--config", cfg }, so, se);
+            Assert.True(code == 0, so + "\n" + se);
+            Assert.True(File.Exists(Path.Combine(root, "out", "carved", "f.c")));
+            Assert.True(File.Exists(Path.Combine(root, "out", "carved", "helper.c")));   // the body's calls count
+            Assert.False(File.Exists(Path.Combine(root, "out", "carved", "dead.c")));
+            Assert.Contains("parse.definitionsRecoveredByScan = 1", File.ReadAllText(Path.Combine(root, "out", "codecarver", "summary.txt")));
         }
         finally { TempDir.Delete(root); }
     }
