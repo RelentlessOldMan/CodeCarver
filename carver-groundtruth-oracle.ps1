@@ -24,7 +24,14 @@ param(
   [long]$MaxParseBytes = 50000,      # skip big/giant headers (no call edges) so a 100 GB tree fits in memory
   [double]$ExpectedReachableFrac = -1, # graded-dial target; <0 = auto-derive from a carve_r<NN> corpus name
   [double]$GradedTolerance = 0.10,   # |observed - expected| allowed (dead subgraphs quantize the dial ~+/-0.06)
-  [string]$CliDll
+  [string]$CliDll,
+  # -TraceBuild: a REAL clean gcc build (WSL) of every reachable file plus -CompileUnreachableFrac of the others,
+  # captured with tools/capture; its build log + trace (pathMap'd from the WSL path) go into the carve. The rest of
+  # the tree is never compiled, like another target's files. Asserts the usual soundness/precision plus: no file
+  # the build never compiled is kept.
+  [switch]$TraceBuild,
+  [double]$CompileUnreachableFrac = 0.5,
+  [string[]]$Advanced = @()            # extra [advanced] lines, e.g. 'placeholderFiles = false' (proves a check has teeth)
 )
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -145,6 +152,57 @@ while ($qd.Count -gt 0) { $c = $qd.Dequeue(); if ($calls.ContainsKey($c)) { fore
 $expectedFiles = @{}; foreach ($s in $reach.Keys) { $expectedFiles[$defBase[$s]] = $true }
 Write-Host ("roots {0} => {1} functions transitively reachable (direct+indirect); expect {2} def-files kept" -f ($rootList -join ','), $reach.Count, $expectedFiles.Count)
 
+$traceExtra = @()
+$compiled = @{}
+if ($TraceBuild) {
+  function ToWsl([string]$p) { $f = [IO.Path]::GetFullPath($p); '/mnt/' + $f.Substring(0, 1).ToLowerInvariant() + ($f.Substring(2) -replace '\\', '/') }
+  # Every .c: the reachable ones are compiled; of the rest, a fixed (seeded) fraction is compiled (built but never
+  # called, which static reachability must still drop) and the others never are.
+  $allC = @(Get-ChildItem $corpusFull -Recurse -File -Filter *.c | ForEach-Object { $_.FullName.Substring($corpusFull.Length + 1) -replace '\\', '/' } | Sort-Object)
+  # A real build links what it compiles, so the compiled set is closed over calls: seed it with the reachable files
+  # plus a seeded fraction of the others, then add the file of every function a compiled file's functions call.
+  $rng = New-Object System.Random 1337
+  foreach ($rel in $allC) {
+    $k = $rel.ToLowerInvariant()
+    if ($expectedFiles.ContainsKey($k) -or $rng.NextDouble() -lt $CompileUnreachableFrac) { $compiled[$k] = $true }
+  }
+  $symsByFile = @{}
+  foreach ($s in $defBase.Keys) { $f = $defBase[$s]; if (-not $symsByFile.ContainsKey($f)) { $symsByFile[$f] = New-Object System.Collections.Generic.List[string] }; $symsByFile[$f].Add($s) }
+  $work = New-Object System.Collections.Queue
+  foreach ($k in @($compiled.Keys)) { [void]$work.Enqueue($k) }
+  while ($work.Count -gt 0) {
+    $f = $work.Dequeue()
+    if (-not $symsByFile.ContainsKey($f)) { continue }
+    foreach ($s in $symsByFile[$f]) {
+      $callees = @(); if ($calls.ContainsKey($s)) { $callees += $calls[$s] }
+      if ($indirect.ContainsKey($s)) { $callees += @($indirect[$s] | Where-Object { $_.resolved -ne $false } | ForEach-Object { [string]$_.target }) }
+      foreach ($t in $callees) {
+        $tf = $defBase[$t]
+        if ($tf -and -not $compiled.ContainsKey($tf)) { $compiled[$tf] = $true; [void]$work.Enqueue($tf) }
+      }
+    }
+  }
+  $list = @($allC | Where-Object { $compiled.ContainsKey($_.ToLowerInvariant()) })
+  $traceDir = Join-Path $env:TEMP ("cc-tb-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+  New-Item -ItemType Directory -Force $traceDir | Out-Null
+  [IO.File]::WriteAllText((Join-Path $traceDir 'list.txt'), (($list -join "`n") + "`n"))
+  Write-Host ("== clean build (WSL gcc, traced): {0} of {1} .c files ==" -f @($list).Count, $allC.Count) -ForegroundColor Cyan
+  $corpusWsl = ToWsl $corpusFull
+  & wsl -d Ubuntu -- bash (ToWsl (Join-Path $repoRoot 'tools\trace-oracle\wsl-trace-build.sh')) trace $corpusWsl (ToWsl (Join-Path $traceDir 'list.txt')) (ToWsl $traceDir) (ToWsl (Join-Path $repoRoot 'tools\capture\capture-file-trace.sh'))
+  if ($LASTEXITCODE -ne 0) { throw "traced build failed (exit $LASTEXITCODE) - see $traceDir\build.log" }
+  foreach ($bad in @(Get-Content (Join-Path $traceDir 'failed.txt') | Where-Object { $_ })) {
+    $k = $bad.Trim().ToLowerInvariant()
+    if ($expectedFiles.ContainsKey($k)) { throw "reachable file does not compile, so no build could contain it: $bad" }
+    $compiled.Remove($k)
+    Write-Host "  not compilable (left out of the build): $bad" -ForegroundColor DarkGray
+  }
+  $traceExtra = @(
+    '[builds.main]'
+    "buildLogs = [$(ConvertTo-TomlPath (Join-Path $traceDir 'build.log'))]"
+    "buildTraceFiles = [$(ConvertTo-TomlPath (Join-Path $traceDir 'build.trace'))]")
+  $pathMapLine = "pathMap = [{ from = `"$corpusWsl`", to = `".`" }]"
+}
+
 # Run the carve (analysis + CodeCarver manifest listing kept files). No --out: correctness only, no copy.
 # analysisOnly => plan + manifest only (no multi-GB emit). Manifest lands under codecarver/.
 $ccOut = Join-Path $env:TEMP ("cc-gt-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
@@ -154,12 +212,15 @@ $gtCfg = "$ccOut.toml"
 # so a multi-root corpus expected more than the carve was asked for).
 @(
   "outputDirectory = $(ConvertTo-TomlPath $ccOut)"
-  'analysisOnly = true'
+  $(if ($TraceBuild) { 'analysisOnly = false' } else { 'analysisOnly = true' })   # -TraceBuild links the carved tree
   '[common]'
   "entryPoints = $(ConvertTo-TomlArray $rootList)"
   'languages = ["c"]'
   '[advanced]'
   "maxParseBytes = $MaxParseBytes"
+  $(if ($TraceBuild) { $pathMapLine })
+  $Advanced
+  $traceExtra
 ) -join "`n" | Set-Content -Encoding utf8 $gtCfg
 Write-Host "== carving (this may take minutes on a 100 GB tree) ==" -ForegroundColor Cyan
 # CodeCarver writes progress ('scanning:', 'warn:') to stderr; under -ErrorActionPreference Stop a native
@@ -167,9 +228,10 @@ Write-Host "== carving (this may take minutes on a 100 GB tree) ==" -ForegroundC
 # the invocation and gate on the exit code instead (a known PS 5.1 hazard).
 $ErrorActionPreference = 'Continue'
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-& dotnet $CliDll carve $corpusFull --config $gtCfg 2>&1 |
-  Select-String 'nodes|files|size|scanning|warn|mode' | ForEach-Object { "  " + $_.Line }
+$carveOut = @(& dotnet $CliDll carve $corpusFull --config $gtCfg 2>&1 | ForEach-Object { "$_" })
 $carveExit = $LASTEXITCODE
+$carveOut | Select-String 'nodes|files|size|scanning|warn|mode|world|trace|observed|build   :|placeholders' | ForEach-Object { "  " + $_.Line }
+if ($carveExit -ne 0 -and $carveExit -ne 3) { $carveOut | Select-Object -Last 15 | ForEach-Object { "  | $_" } }
 $sw.Stop()
 Remove-Item $gtCfg -Force -ErrorAction SilentlyContinue
 if ($carveExit -ne 0) { throw "carve failed (exit $carveExit) - no result to judge" }
@@ -199,6 +261,38 @@ if ($missing.Count -eq 0) {
 $precisionPct = if (($expectedFiles.Count + $overkeep.Count) -gt 0) { [math]::Round(100.0 * $expectedFiles.Count / ($expectedFiles.Count + $overkeep.Count), 1) } else { 100 }
 $precColor = if ($overkeep.Count -eq 0) { 'Green' } else { 'Yellow' }
 Write-Host ("PRECISION  : {0} src over-kept beyond the reachable set  (precision {1}%)" -f $overkeep.Count, $precisionPct) -ForegroundColor $precColor
+
+$traceFail = $false
+if ($TraceBuild) {
+  # A file the clean build never compiled cannot be part of it: keeping one is a precision bug.
+  $keptNotCompiled = @($cc.keptFiles | ForEach-Object { RelKey ([string]$_) } | Where-Object { $_ -like '*.c' -and -not $compiled.ContainsKey($_) })
+  if ($keptNotCompiled.Count -eq 0) {
+    Write-Host ("TRACE      : PASS - {0} .c compiled, none of the never-compiled ones kept" -f $compiled.Count) -ForegroundColor Green
+  } else {
+    Write-Host ("TRACE      : FAIL - {0} never-compiled .c file(s) kept, e.g. {1}" -f $keptNotCompiled.Count, (($keptNotCompiled | Select-Object -First 3) -join ', ')) -ForegroundColor Red
+    $traceFail = $true
+  }
+  # The carved tree must build with the ORIGINAL build's file list (a dropped file it lists is a placeholder) and
+  # need no symbol the original build didn't: compile that list from the carved tree, combine, compare undefined.
+  $linkDir = Join-Path $traceDir 'link'
+  New-Item -ItemType Directory -Force $linkDir | Out-Null
+  & wsl -d Ubuntu -- bash (ToWsl (Join-Path $repoRoot 'tools\trace-oracle\wsl-trace-build.sh')) link (ToWsl (Join-Path $ccOut 'carved')) (ToWsl (Join-Path $traceDir 'list.ok')) (ToWsl $linkDir)
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "LINK       : FAIL - the original build's file list does not compile from the carved tree (see $linkDir\build.log)" -ForegroundColor Red
+    $traceFail = $true
+  } else {
+    $origUndef = @(Get-Content (Join-Path $traceDir 'undefined.txt') | Where-Object { $_ })
+    $newUndef = @(Get-Content (Join-Path $linkDir 'undefined.txt') | Where-Object { $_ } | Where-Object { $origUndef -notcontains $_ })
+    $placeholders = @($cc.placeholderFiles).Count
+    if ($newUndef.Count -eq 0) {
+      Write-Host ("LINK       : PASS - the build's {0} files compile from the carved tree ({1} placeholder(s)); no new undefined symbol" -f @(Get-Content (Join-Path $traceDir 'list.ok')).Count, $placeholders) -ForegroundColor Green
+    } else {
+      Write-Host ("LINK       : FAIL - {0} symbol(s) undefined in the carved build only, e.g. {1}" -f $newUndef.Count, (($newUndef | Select-Object -First 5) -join ', ')) -ForegroundColor Red
+      $traceFail = $true
+    }
+  }
+  Remove-Item -Recurse -Force $traceDir -ErrorAction SilentlyContinue
+}
 
 # ===== v1 CORPUS additions -- INERT until the manifest gains the fields (agreed 3-way 2026-09-30) ==========
 # These activate automatically once Spawner ships indirectEdges / _meta.roots / indirectTruthSha; on today's
@@ -287,4 +381,4 @@ if ($expFrac -ge 0) {
 # =========================================================================================================
 
 Remove-Item -Recurse -Force $ccOut -ErrorAction SilentlyContinue   # script-made temp dir (GUID name)
-if ($missing.Count -ne 0 -or $gradedFail -or $digestFail) { exit 1 }
+if ($missing.Count -ne 0 -or $gradedFail -or $digestFail -or $traceFail) { exit 1 }

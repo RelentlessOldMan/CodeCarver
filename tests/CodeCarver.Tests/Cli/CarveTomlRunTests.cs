@@ -345,7 +345,8 @@ public sealed class CarveTomlRunTests
             var live = defined ? "feature.c" : "fallback.c";
             var dead = defined ? "fallback.c" : "feature.c";
             Assert.True(File.Exists(Path.Combine(outDir, "carved", live)), $"{live} (live branch's callee) must be kept");
-            Assert.False(File.Exists(Path.Combine(outDir, "carved", dead)), $"{dead} (dead branch's callee) must be dropped");
+            // The build log compiles it, so the dropped file comes back as a placeholder (build files that list it work).
+            Assert.Contains("Placeholder written by CodeCarver", File.ReadAllText(Path.Combine(outDir, "carved", dead)));
             Assert.Contains($"dropped : {dead}", o);
             Assert.Contains("verify  : OK", o);
         }
@@ -371,7 +372,8 @@ public sealed class CarveTomlRunTests
             var (code, o, _) = Run("carve", src, "--config", cfg);
             Assert.Equal(0, code);
             Assert.Contains("closed-world", o);
-            Assert.False(File.Exists(Path.Combine(outDir, "carved", "feature.c")));   // kept today
+            // Dropped (its code gone); logged, so written as a placeholder.
+            Assert.Contains("Placeholder written by CodeCarver", File.ReadAllText(Path.Combine(outDir, "carved", "feature.c")));
         }
         finally { Cleanup(work); }
     }

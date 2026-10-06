@@ -595,6 +595,43 @@ public static class CarveCommand
         // Both populations skip the parser and are kept whole via include-closure.
         var skipParse = new HashSet<string>(bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)),
                                             StringComparer.Ordinal);
+        // A build trace for EVERY selected build is the list of files a clean, full build opened. A code file none of
+        // them opened is not part of the build, so it is never read or parsed: it stays a file in the graph, with no
+        // definitions, and is dropped as dead code (on a 100 GB tree that is most of the read and parse time, and on a
+        // network drive most of the round trips). verify still token-scans it, so a trace that missed a file the kept
+        // code needs fails loudly (cause definedInFileNotBuilt) instead of cutting silently. Files a run opened and
+        // forceKeepFiles are always read. Off with [advanced] skipFilesNotBuilt = false.
+        var notBuilt = new HashSet<string>(StringComparer.Ordinal);
+        if (closureLang && cv.EveryBuildTraced && cv.SkipFilesNotBuilt)
+        {
+            var rootF = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)) + Path.DirectorySeparatorChar;
+            var opened = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var complete = true;
+            foreach (var tp in buildFileTraces.Concat(runFileTraces))
+            {
+                try
+                {
+                    foreach (var cand in FileAccessTrace.Paths(File.ReadLines(tp)))
+                    {
+                        string full;
+                        try { var mp = MapPath(cand); full = Path.IsPathFullyQualified(mp) ? Path.GetFullPath(mp) : Path.GetFullPath(Path.Combine(rootF, mp)); }
+                        catch { continue; }   // not a usable path token (noise)
+                        if (full.StartsWith(rootF, StringComparison.OrdinalIgnoreCase))
+                            opened.Add(Path.GetRelativePath(rootF, full).Replace('\\', '/'));
+                    }
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { complete = false; }   // reported (exit 2) where traces are ingested
+            }
+            if (complete && opened.Count > 0)
+            {
+                foreach (var glob in auxGlobs.Where(g => !BuildSupportEmitter.GlobEscapesRoot(g)))
+                    foreach (var p in BuildSupportEmitter.MatchGlob(dir, glob)) opened.Add(Path.GetRelativePath(dir, p).Replace('\\', '/'));
+                foreach (var rel in parseRels)
+                    if (!opened.Contains(rel) && !skipParse.Contains(rel)) notBuilt.Add(rel);
+                err.WriteLine($"  build   : {notBuilt.Count:N0} of {parseRels.Count:N0} code file(s) were not opened by the traced build(s) -> not read or parsed (dropped unless kept code needs them; verify checks)");
+            }
+            summary["parse.filesNotBuiltSkipped"] = notBuilt.Count;
+        }
         if (perFileSpecs.Count > 0)
         {
             // D-B: translation units no compile command covers are resolved open-world; say how many.
@@ -637,7 +674,7 @@ public static class CarveCommand
         var readWarned = new HashSet<string>(StringComparer.Ordinal);
         string ReadRel(string rel)
         {
-            if (skipParse.Contains(rel)) return "";
+            if (skipParse.Contains(rel) || notBuilt.Contains(rel)) return "";
             if (!fullByRel.TryGetValue(rel, out var full)) return "";
             try { return File.ReadAllText(full); }
             catch (Exception ex)   // an unreadable/locked/odd file must not sink the whole run
@@ -711,7 +748,7 @@ public static class CarveCommand
             // parsed source files (skip/keep-whole files aren't scanned for includes, matching the prior behavior).
             var queue = new Queue<string>();
             foreach (var rel in parseRels)
-                if (!skipParse.Contains(rel)) queue.Enqueue(fullByRel[rel]);
+                if (!skipParse.Contains(rel) && !notBuilt.Contains(rel)) queue.Enqueue(fullByRel[rel]);
             while (queue.Count > 0)
             {
                 var fromFull = queue.Dequeue();
@@ -865,8 +902,8 @@ public static class CarveCommand
         // Sign of life for a large tree so a multi-minute analyze isn't a silent black box (and you can see
         // how far it got if it's interrupted). CODECARVER_TIMING=1 adds a per-phase + slow-file breakdown.
         // Byte total from file SIZES (not held text) — the parsed files are those not skipped/oversized.
-        var scanBytes = parseRels.Where(r => !skipParse.Contains(r)).Sum(r => sizeByRel.TryGetValue(r, out var s) ? s : 0L);
-        var scanFiles = parseRels.Count(r => !skipParse.Contains(r));
+        var scanBytes = parseRels.Where(r => !skipParse.Contains(r) && !notBuilt.Contains(r)).Sum(r => sizeByRel.TryGetValue(r, out var s) ? s : 0L);
+        var scanFiles = parseRels.Count(r => !skipParse.Contains(r) && !notBuilt.Contains(r));
         if (scanFiles > 500 || scanBytes > 50_000_000)
             err.WriteLine($"  scanning: {scanFiles:N0} files (~{scanBytes / 1_000_000.0:N0} MB)"
                                     + (bigFiles.Count > 0 ? $" + {bigFiles.Count} big-file(s) kept whole" : "")
@@ -1077,6 +1114,8 @@ public static class CarveCommand
         // observed set is threaded into the emitter (never garbage-prune an observed file) and the report
         // (attribution + flag the kept-but-unobserved infra as drop-candidates).
         var observedRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var runObservedRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);     // opened by a RUN (only these root their file)
+        var buildObservedRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // opened by a BUILD (what it compiled)
         var fileTraceRoots = new List<Root>();
         int externalTu = 0, externalHeaders = 0;   // source files that EXIST outside the carve root (missing dependency?)
         if (buildFileTraces.Count + runFileTraces.Count > 0)
@@ -1123,7 +1162,9 @@ public static class CarveCommand
                         catch { continue; } // not a usable path token (noise)
                         if (full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) && File.Exists(full))
                         {
-                            observedRel.Add(Path.GetRelativePath(rootFull, full).Replace('\\', '/'));
+                            var obs = Path.GetRelativePath(rootFull, full).Replace('\\', '/');
+                            observedRel.Add(obs);
+                            (kind == "build" ? buildObservedRel : runObservedRel).Add(obs);
                             inTree++;
                             continue;
                         }
@@ -1155,10 +1196,12 @@ public static class CarveCommand
             // case the opener used), so rooting — which compares exactly — finds them.
             var walkByLower = fullByRel.Keys.GroupBy(k => k, StringComparer.OrdinalIgnoreCase)
                                        .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
-            var observedCode = observedRel.Select(r => walkByLower.TryGetValue(r, out var w) ? w : null)
-                                          .Where(r => r is not null).Select(r => r!).Distinct(StringComparer.Ordinal).ToList();
-            // D-D: an observed code file roots its FILE node only. The file is kept (and, file-level, closed over
-            // whole by EmitClosure); the pruned stage can still remove functions no entry point reaches.
+            var observedCode = runObservedRel.Select(r => walkByLower.TryGetValue(r, out var w) ? w : null)
+                                             .Where(r => r is not null).Select(r => r!).Distinct(StringComparer.Ordinal).ToList();
+            // D-D: a code file a RUN opened roots its FILE node only. The file is kept (and, file-level, closed over
+            // whole by EmitClosure); the pruned stage can still remove functions no entry point reaches. A BUILD's
+            // opens are not roots: a build compiles files nothing reachable calls, and keeping those defeats the carve.
+            // They are what the build compiled — a dropped one is emitted as a placeholder (see PlaceholderTus).
             var wantFiles = new HashSet<string>(observedCode, StringComparer.Ordinal);
             foreach (var n in graph.Nodes)
                 if (n.Kind == NodeKind.File && wantFiles.Contains(n.Name))
@@ -1428,6 +1471,9 @@ public static class CarveCommand
             // Why each failure happened, as counts (summary.txt stays source-free), so a remote eval can say which
             // part of the tool missed without sending a name or a path. Per-violation causes go to verify.txt.
             var why = hard.Count == 0 ? new Dictionary<LinkViolation, string>() : ClassifyViolations(graph, p, hard, unparsedFiles);
+            // Defined only in a file the traced build never opened: the trace is incomplete (partial or incremental
+            // build, a build step outside it), or the use is in code the real build doesn't compile.
+            foreach (var v in hard) if (notBuilt.Contains(v.DefinedIn)) why[v] = "definedInFileNotBuilt";
             var causes = why.Values.GroupBy(c => c).OrderBy(g => g.Key, StringComparer.Ordinal)
                             .ToDictionary(g => g.Key, g => g.Count());
             // A definition that never became a node: what its head looks like and what the parser made of it, as fixed
@@ -1548,9 +1594,34 @@ public static class CarveCommand
 
         // Analysis-only (no carved tree): compute the decision and write report + manifest, skipping the (possibly
         // huge) emit. The WORKREPO "dry run" and the ground-truth oracle use this to inspect kept/dropped fast.
+        // Placeholders: a dropped translation unit the build compiled (named by a compile command in a build log, or
+        // opened by a build trace). Build files that list sources (a Makefile, a .vcxproj) still name it, so the carved
+        // tree gets a stand-in that defines nothing: the unchanged build still finds every file it lists, and the
+        // binary loses the code. Off with [advanced] placeholderFiles = false (then edit the build's file list).
+        var tuExtsP = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++" };
+        var compiledTus = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (cv.PlaceholderFiles && closureLang)
+        {
+            foreach (var cc in buildCmds) if (CmdRel(cc) is { } crel) compiledTus.Add(crel);
+            compiledTus.UnionWith(buildObservedRel);
+            compiledTus.RemoveWhere(r => !tuExtsP.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)));
+        }
+        List<string> PlaceholderTus(CarvePlan p) => p.DroppedFiles.Where(compiledTus.Contains).OrderBy(r => r, StringComparer.Ordinal).ToList();
+        static string PlaceholderText(string rel)
+        {
+            var id = new string(Path.GetFileNameWithoutExtension(rel).Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
+            return "/* Placeholder written by CodeCarver: nothing the carved program reaches is defined in this file, so its\n"
+                 + "   code was removed. It stays so build files that list it still work. (An empty file is not valid ISO C.) */\n"
+                 + $"typedef int codecarver_placeholder_{id};\n";
+        }
+
         if (cv.AnalysisOnly)
         {
             var aplan = PlanFor(false);   // what a file-level emit would write, closed over (D-A)
+            var aPlaceholders = PlaceholderTus(aplan);
+            if (aPlaceholders.Count > 0)
+                @out.WriteLine($"  placeholders: {aPlaceholders.Count:N0} dropped file(s) the build compiled would be written as stand-ins (build files that list them keep working)");
+            summary["run.placeholderFiles"] = aPlaceholders.Count;
             if (aplan.KeptFiles.Count > plan.KeptFiles.Count)
                 @out.WriteLine($"  closure : +{aplan.KeptFiles.Count - plan.KeptFiles.Count} file(s) kept because kept files' unreached code uses them (file-level output must link)");
             var ccDir = Path.Combine(outputDirectory, "codecarver");
@@ -1573,7 +1644,7 @@ public static class CarveCommand
                 codecarverVersion = Version(), root = dir, roots, lang, analysisOnly = true,
                 defines = defineSpecs.Distinct().ToArray(), closedWorld,
                 stats = new { aplan.Stats.TotalNodes, aplan.Stats.ReachedNodes, aplan.Stats.DroppedNodes, aplan.Stats.TotalFiles, aplan.Stats.KeptFiles, aplan.Stats.DroppedFiles },
-                keptFiles = aplan.KeptFiles, droppedFiles = aplan.DroppedFiles, droppedCmm = cmmDropped,
+                keptFiles = aplan.KeptFiles, droppedFiles = aplan.DroppedFiles, droppedCmm = cmmDropped, placeholderFiles = aPlaceholders,
                 observedFiles = observedRel.OrderBy(f => f, StringComparer.Ordinal).ToArray(),
             };
             WriteArtifact(Path.Combine(ccDir, "manifest.json"),
@@ -1692,6 +1763,19 @@ public static class CarveCommand
                 @out.WriteLine($"  excluded: {infra.Garbage.Count:N0} non-input file(s) NOT copied ({infra.GarbageBytes:N0} B) — VCS/scratch/editor (forceKeepFiles to keep)");
             foreach (var w in infra.Warnings) err.WriteLine($"  warn    : {w}");
 
+            var placeholders = PlaceholderTus(splan);
+            foreach (var ph in placeholders)
+            {
+                var target = Path.Combine(stageDir, ph);
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                var text = PlaceholderText(ph);
+                File.WriteAllText(target, text);
+                carvedBytes += text.Length;
+            }
+            if (placeholders.Count > 0)
+                @out.WriteLine($"  placeholders: {placeholders.Count:N0} dropped file(s) the build compiled written as stand-ins (build files that list them keep working)");
+            summary[$"{summaryStage}.placeholderFiles"] = placeholders.Count;
+
             // After the infrastructure copy: assembly, linker scripts and other text files seed what the header
             // carve must keep (review H1).
             if (pruneHeaders && lang is "c" or "cpp")
@@ -1746,7 +1830,7 @@ public static class CarveCommand
                 stage = stage.Name, carveSourceFileContents = prune, carveHeaderFileContents = pruneHeaders,
                 stats = new { splan.Stats.TotalNodes, splan.Stats.ReachedNodes, splan.Stats.DroppedNodes, splan.Stats.TotalFiles,
                     splan.Stats.KeptFiles, splan.Stats.DroppedFiles, originalBytes = origTotal, carvedBytes, savedBytes = saved },
-                keptFiles = splan.KeptFiles, droppedFiles = splan.DroppedFiles, droppedCmm = cmmDropped,
+                keptFiles = splan.KeptFiles, droppedFiles = splan.DroppedFiles, droppedCmm = cmmDropped, placeholderFiles = placeholders,
                 // Written because kept code #includes them, though they hold no reached node (an .inc table, a
                 // header in an excluded directory) — so every emitted file is in exactly one list.
                 includeClosureFiles = buildRequiredFiles.Except(splan.KeptFiles, CodeCarver.Core.Util.PathComparer.Default)

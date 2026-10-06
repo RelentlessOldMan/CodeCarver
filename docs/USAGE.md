@@ -252,7 +252,9 @@ reported separately (not folded into the headline %). The `report.txt` shows wha
 
 ## Traces: keep what a real run actually touched
 
-Two optional inputs let an observed build or run tighten and audit the carve. Both **add** to the static carve.
+Two optional inputs let an observed build or run tighten, speed up and audit the carve. A function trace and a
+run's file trace **add** to the static carve; a build's file trace limits what is read and says what the build
+compiled.
 
 - **Function trace** (`[runs.smoke] runTraceLogs = ["run.log", ...]`): the functions a run executed become
   roots, covering dynamic dispatch (function pointers, vtables) static analysis can't resolve. One format — a
@@ -270,7 +272,24 @@ Two optional inputs let an observed build or run tighten and audit the carve. Bo
     scripts, the binaries and data they load) that a function trace can't see and that static analysis can't
     resolve (computed `&var` paths).
 
-  An observed **code** file roots its **file** only: the file is kept (and, file-level, emitted whole with its
+  A **build** trace says what the build *compiled*, not what the program needs:
+  - **Files the build never opened are not read.** When *every* selected build has a build trace, a code file
+    none of them opened can't be part of the build. It's dropped without being read or parsed, which on a big
+    tree is most of the carve time (and most of the round trips on a network drive). The `build :` line says how
+    many; `parse.filesNotBuiltSkipped` counts them. verify still scans those files, so a trace that missed a
+    file the kept code needs fails loudly with cause `definedInFileNotBuilt` (a partial or incremental build,
+    or a build step outside the capture) instead of cutting it. `[advanced] skipFilesNotBuilt = false` turns
+    this off.
+  - **Compiled files nothing reachable calls are dropped, as placeholders.** A build compiles files the image
+    never calls into. Static reachability drops them. Build files that list sources (a Makefile, a `.vcxproj`)
+    still name them, so each is written as a **placeholder**: a few lines that define nothing (an empty file is
+    not valid ISO C). The unchanged build finds every file it lists, and the binary loses the code (unless the
+    linker already discarded it, via `--gc-sections` or a static library). "Compiled" means named by a compile
+    command in `buildLogs` or opened by a build trace, so a build log alone gets placeholders too. The count is
+    `<stage>.placeholderFiles`, and `manifest.json` lists them under `placeholderFiles`. With
+    `[advanced] placeholderFiles = false` they are removed outright (edit the build's file list to match).
+
+  A code file a **run** opened roots its **file** only: the file is kept (and, file-level, emitted whole with its
   closure), but at a `carveSourceFileContents` stage its functions that no root reaches are still removed.
   Every observed file is kept (never auto-excluded); the report tags observed infrastructure `[observed]` and
   flags **kept-but-unobserved** files as drop candidates. Only paths under the carve root that exist count;
@@ -290,8 +309,9 @@ Two optional inputs let an observed build or run tighten and audit the carve. Bo
   ```
 
 > Over-capturing (un-exercised paths, extra tools) only ever keeps more, and the report shows you exactly what
-> each trace touched. A clean, full build is required for a build trace: an incremental build opens almost
-> nothing.
+> each trace touched. A **clean, full** build is required for a build trace: an incremental build opens almost
+> nothing, and every file it didn't open would be skipped (verify then fails with `definedInFileNotBuilt`).
+> Give every build's trace: a selected build without one turns the skip off, since its files aren't covered.
 
 ## Languages
 

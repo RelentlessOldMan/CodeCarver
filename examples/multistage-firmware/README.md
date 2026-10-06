@@ -31,7 +31,7 @@ Output lands in `out/<stage>/{carved,codecarver}` (git-ignored; regenerate with 
 | `src/boards/old/variant.c` | a board variant NOT in this image — dropped via `excludeDirectories` |
 | `src/notes.txt.bak`, `src/build.log`, `src/__pycache__/` | **auto-excluded** (editor/scratch junk — never a build/run input) |
 | `inputs/compile_commands.json` | the **build log** (pins `-D`/`-I` → `#ifdef` world) |
-| `inputs/build.procmon.csv` | a **build file-trace** — files opened while *building*; catches inputs the compile log doesn't list: the assembled `startup.s`, the linker script `flash.ld`, the `config.h` the compiler pulled in (all flip to `[observed]`). An observed code file is **kept**, but only its file is rooted — functions in it that no entry point reaches are still removed at `aggressive` |
+| `inputs/build.procmon.csv` | a **build file-trace** — files opened while *building*; catches inputs the compile log doesn't list: the assembled `startup.s`, the linker script `flash.ld`, the `config.h` the compiler pulled in (all flip to `[observed]`). It says what the build **compiled**, not what the image needs: a compiled file nothing reachable calls is still dropped (and written as a placeholder so build files that list it keep working), and a code file the traced build never opened (`debug.c`) is not even read |
 | `inputs/run.procmon.csv` | a **run file-trace** — the loader opened `scripts/flash.cmm` + `data/calib.bin` (kept + `[observed]`) |
 | `inputs/run.log` | a **run function-trace** — the functions that actually executed (become roots) |
 
@@ -41,7 +41,7 @@ The build/run traces here are tiny hand-written samples; on a real project you c
 ## What a run prints (abridged)
 
 ```
-  files   : 11 observed in-tree from 1 build + 1 run file-trace(s) (6 code file(s) rooted)
+  files   : 11 observed in-tree from 1 build + 1 run file-trace(s) (0 code file(s) rooted)
   roots   : main, Timer_ISR
   trace   : 7 function(s) from 1 trace(s) rooted; 7 resolved in-scope
   files   : 6/7 kept, 1 dropped
@@ -56,8 +56,8 @@ The build/run traces here are tiny hand-written samples; on a real project you c
   size    : 2,761 B -> 2,300 B  (17% smaller, saved 461 B)
 ```
 
-`aggressive` beats `safe` because `diagnostic_selftest()` is stripped from the kept `app.c`. (The build trace
-observed `app.c` being compiled; that keeps the file, it does not root every function in it.) `max` matches
+`aggressive` beats `safe` because `diagnostic_selftest()` is stripped from the kept `app.c`. (`app.c` is kept
+because `main` calls into it; the build trace only says it was compiled, so it roots nothing.) `max` matches
 `aggressive` here only because `config.h` is too small to trigger header-carving — on a real multi-MB register
 header, `max` strips the unused `#define`s too.
 

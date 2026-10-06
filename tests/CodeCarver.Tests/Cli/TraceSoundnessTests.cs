@@ -19,14 +19,15 @@ public sealed class TraceSoundnessTests
             File.WriteAllText(Path.Combine(Src, "Tool.c"), "void tool_used(void){}\nvoid tool_unused(void){}\n");
         }
         public string F(string p) => p.Replace('\\', '/');
+        // A RUN trace: only a run's opens root their files (a build's are what it compiled; see BuildTraceTests).
         public (int Code, string Out, string Err) Carve(string trace, string extra = "", bool prune = false)
         {
-            var tp = Path.Combine(Root, "build.trace");
+            var tp = Path.Combine(Root, "run.trace");
             File.WriteAllText(tp, trace);
             var cfg = Path.Combine(Root, "carve.toml");
             File.WriteAllText(cfg, $"outputDirectory = \"{F(Path.Combine(Root, "out"))}\"\n[common]\nentryPoints = [\"main\"]\n"
                 + (prune ? "carveSourceFileContents = true\n" : "")
-                + $"[builds.b]\nbuildTraceFiles = [\"{F(tp)}\"]\n" + extra);
+                + $"[runs.r]\nrunTraceFiles = [\"{F(tp)}\"]\n" + extra);
             var so = new StringWriter(); var se = new StringWriter();
             var code = CarveCommand.Run(new[] { "carve", Src, "--config", cfg }, so, se);
             return (code, so.ToString(), se.ToString());

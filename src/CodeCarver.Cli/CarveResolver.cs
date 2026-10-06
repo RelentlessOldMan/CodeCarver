@@ -21,6 +21,9 @@ public sealed class ResolvedCarve
     public List<string> Compilers = new();        // from each selected build that named one
     public List<string> Defines = new();
     public List<string> BuildTraceFiles = new();
+    public bool EveryBuildTraced;                  // every selected build has a build trace: its opens cover the whole build
+    public bool SkipFilesNotBuilt = true;          // [advanced] then: code files no build opened are never read or parsed
+    public bool PlaceholderFiles = true;           // [advanced] a dropped file the build compiled is emitted as a stand-in
     public List<string> RunTraceFiles = new();
     public List<string> RunTraceLogs = new();
     public List<string> ExcludeDirectories = new();
@@ -114,6 +117,10 @@ public static class CarveResolver
             if (!string.IsNullOrWhiteSpace(bs.Compiler)) r.Compilers.Add(bs.Compiler!);
             r.CompilerNames.AddRange(bs.CompilerNames);
         }
+        var selectedBuilds = buildNames.Where(b => cfg.Builds.ContainsKey(b)).ToList();
+        r.EveryBuildTraced = selectedBuilds.Count > 0 && selectedBuilds.All(b => cfg.Builds[b].BuildTraceFiles.Count > 0);
+        r.SkipFilesNotBuilt = cfg.SkipFilesNotBuilt;
+        r.PlaceholderFiles = cfg.PlaceholderFiles;
         var traced = runNames.Where(rn => cfg.Runs.TryGetValue(rn, out var x) && x.RunTraceFiles.Count > 0).ToList();
         r.DropUnobservedCmm = traced.Count > 0 && traced.All(rn => cfg.Runs[rn].DropUnobservedCmm);
         foreach (var rn in runNames)

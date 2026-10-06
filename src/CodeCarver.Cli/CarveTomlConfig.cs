@@ -22,6 +22,8 @@ public sealed class CarveTomlConfig
     public int? MaxSymbolsPerFile;
     public List<(string From, string To)> PathMap = new();   // trace / compile-command path prefixes -> carve root
     public bool AllowUnmatchedTraces;
+    public bool PlaceholderFiles = true;                      // a dropped file the build compiled is emitted as a stand-in
+    public bool SkipFilesNotBuilt = true;                     // with a build trace for every build: never read code it didn't open
     public bool PruneGarbage = true;                          // drop VCS/IDE scratch, logs, dep files (false = keep everything)                         // a trace with no in-tree path is a warning, not an error
 }
 
@@ -66,7 +68,7 @@ public static class ConfigLoader
     public sealed record Result(CarveTomlConfig? Config, IReadOnlyList<string> Errors, IReadOnlyList<string> Warnings);
 
     private static readonly string[] TopKeys = { "outputDirectory", "analysisOnly", "common", "builds", "runs", "stages", "use", "advanced" };
-    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "maxSymbolsPerFile", "pathMap", "allowUnmatchedTraces", "pruneGarbage" };
+    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "maxSymbolsPerFile", "pathMap", "allowUnmatchedTraces", "pruneGarbage", "skipFilesNotBuilt", "placeholderFiles" };
     private static readonly string[] CommonKeys =
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
@@ -199,6 +201,8 @@ public static class ConfigLoader
             cfg.MaxParseBytes = GetLong(adv, "maxParseBytes", "[advanced]", ctx, min: 1);
             cfg.AllowUnmatchedTraces = GetBool(adv, "allowUnmatchedTraces", "[advanced]", ctx) ?? false;
             cfg.PruneGarbage = GetBool(adv, "pruneGarbage", "[advanced]", ctx) ?? true;
+            cfg.SkipFilesNotBuilt = GetBool(adv, "skipFilesNotBuilt", "[advanced]", ctx) ?? true;
+            cfg.PlaceholderFiles = GetBool(adv, "placeholderFiles", "[advanced]", ctx) ?? true;
             if (adv.TryGetValue("pathMap", out var pm))
             {
                 // pathMap = [{ from = "/build/agent/repo", to = "." }, ...]   ("to" is relative to the carve root)
@@ -235,7 +239,7 @@ public static class ConfigLoader
         # Inputs and options live here, so the command line stays short. Relative paths are relative to THIS
         # file's directory; globs (excludeDirectories, forceKeepFiles) are relative to the source dir.
         # Rarely needed: analysisOnly = true (top level: plan + reports, no carved tree) and an [advanced]
-        # section (maxParseBytes, parseTimeout, maxSymbolsPerFile, pathMap, allowUnmatchedTraces, pruneGarbage) — see USAGE.md.
+        # section (maxParseBytes, parseTimeout, maxSymbolsPerFile, pathMap, allowUnmatchedTraces, pruneGarbage, skipFilesNotBuilt, placeholderFiles) — see USAGE.md.
 
         # Where the carved project + reports go — must be OUTSIDE the source tree. CodeCarver manages a
         # carved/ + codecarver/ layout under it, and never replaces an existing directory it did not create.
