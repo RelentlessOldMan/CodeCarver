@@ -140,30 +140,30 @@ public static class ImplicitInt
         if (NotNames.Contains(name) || isFunctionLikeMacro(name)) return Shape.None;
         if (name.ToUpperInvariant() == name) return Shape.None;   // FOO(...) { — a macro-headed body, not K&R
 
-        // Parameter list: up to the matching ')'. A nested '(' (function-pointer parameter, call, cast) is
-        // outside the narrow shape we accept.
+        // Parameter list: up to the matching ')'. The only nested '(' accepted is a function-pointer parameter,
+        // `int (*cb)(void)`; a call or cast is outside the narrow shape we accept.
         var open = m.Index + m.Length - 1;
-        var close = code.IndexOf(')', open + 1);
+        var close = MatchingParen(code, open);
         if (close < 0) return Shape.None;
         var plist = code.AsSpan(open + 1, close - open - 1);
-        if (plist.IndexOf('(') >= 0) return Shape.None;
         // CodeOnly blanked literals; a quote in the original parameter text means an argument, not a parameter.
         if (text.AsSpan(open + 1, close - open - 1).IndexOfAny("\"'") >= 0) return Shape.None;
-        var items = plist.ToString().Split(',');
+        var items = SplitTopLevel(plist.ToString());
         var bare = true;
         foreach (var raw in items)
         {
             var item = raw.Trim();
-            if (!ParamItem.IsMatch(item)) return Shape.None;
+            if (FnPtrDecl.IsMatch(item)) { bare = false; continue; }
+            if (item.IndexOf('(') >= 0 || !ParamItem.IsMatch(item)) return Shape.None;
             if (!BareIdent.IsMatch(item) || item == "void") bare = false;
         }
-        if (items.Length == 1 && items[0].Trim().Length == 0) bare = false;   // helper() — no K&R declarations
+        if (items.Count == 1 && items[0].Trim().Length == 0) bare = false;   // helper() — no K&R declarations
 
         // What follows the ')' up to the body's '{'.
         brace = code.IndexOf('{', close + 1);
         if (brace < 0) return Shape.None;
         var between = code.AsSpan(close + 1, brace - close - 1);
-        if (between.IndexOfAny("()=}") >= 0) return Shape.None;
+        if (between.IndexOfAny("=}") >= 0) return Shape.None;
         // Bare identifiers straight into a body (`portTASK_FUNCTION(prvIdleTask, pvParameters) {`) are often a macro
         // defined outside the tree, but also real K&R with every parameter an implicit int (work eval, 1.0.162). Never
         // rewritten into a removable definition: reported as a bare head instead, and kept with the file.
@@ -173,8 +173,40 @@ public static class ImplicitInt
         var parts = between.ToString().Split(';');
         if (parts.Length < 2 || parts[^1].Trim().Length != 0) return Shape.None;
         for (var k = 0; k < parts.Length - 1; k++)
-            if (!KrDecl.IsMatch(parts[k])) return Shape.None;
+            if (!KrDecl.IsMatch(parts[k]) && !FnPtrDecl.IsMatch(parts[k].Trim())) return Shape.None;
         return Shape.Recoverable;
+    }
+
+    // `int (*cb)(void)` / `void (**tbl[4])(int, char *)`: a function-pointer parameter or K&R declaration.
+    private static readonly Regex FnPtrDecl = new(
+        @"^[A-Za-z_][\w\s\*]*\(\s*\*+\s*(?<id>[A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*\)\s*\([^()]*\)$", RegexOptions.CultureInvariant);
+
+    private static int MatchingParen(string code, int open)
+    {
+        var depth = 0;
+        for (var k = open; k < code.Length; k++)
+        {
+            var c = code[k];
+            if (c == '(') depth++;
+            else if (c == ')' && --depth == 0) return k;
+            else if (c is '{' or '}' or ';') return -1;
+        }
+        return -1;
+    }
+
+    // Splits on commas outside parentheses.
+    private static List<string> SplitTopLevel(string s)
+    {
+        var parts = new List<string>();
+        int depth = 0, from = 0;
+        for (var k = 0; k < s.Length; k++)
+        {
+            if (s[k] == '(') depth++;
+            else if (s[k] == ')') depth--;
+            else if (s[k] == ',' && depth == 0) { parts.Add(s[from..k]); from = k + 1; }
+        }
+        parts.Add(s[from..]);
+        return parts;
     }
 
     private static readonly Regex KrHead = new(
@@ -213,7 +245,7 @@ public static class ImplicitInt
             var brace = code.IndexOf('{', close + 1);
             if (brace < 0) continue;
             var between = code[(close + 1)..brace];
-            if (between.AsSpan().IndexOfAny("()=}") >= 0) continue;
+            if (between.AsSpan().IndexOfAny("=}") >= 0) continue;
             var parts = between.Split(';');
             if (parts.Length < 2 || parts[^1].Trim().Length != 0) continue;
 
@@ -222,6 +254,9 @@ public static class ImplicitInt
             var ok = true;
             foreach (var part in parts[..^1])
             {
+                var fp = FnPtrDecl.Match(part.Trim());
+                if (fp.Success) { decls[fp.Groups["id"].Value] = part.Trim(); continue; }
+                if (part.IndexOf('(') >= 0) { ok = false; break; }
                 var items = part.Split(',');
                 var first = KrFirst.Match(items[0]);
                 if (!first.Success || first.Groups["base"].Value.Trim().Length == 0) { ok = false; break; }

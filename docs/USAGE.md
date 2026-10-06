@@ -379,6 +379,26 @@ became part of the graph: an unusual definition shape), `definitionFileLocal` (o
 `useNotModelled` / `useInHeaderNotModelled` (the definition is known but the use was not captured),
 `useInUnreachedCode` (only code the carve did not reach uses it), or `other`.
 
+A `definitionNotRecognized` failure is also described by **shape**, counted as
+`verify.failed.definitionNotRecognized.<shape>` (one failure can have several) and listed per failure in `verify.txt`:
+
+| Shape | Meaning |
+|---|---|
+| `noReturnType` | nothing before the name (old-style implicit `int`, or a macro-headed body) |
+| `extraWordBeforeName` | an unknown word between the type and the name (`int CALLCONV f(...)`) |
+| `macroCallBeforeName` / `macroCallInParameters` | a macro call in the head (`FUNC(void, X) f(...)`) |
+| `functionPointerParameter` | a parameter like `int (*cb)(void)` |
+| `kAndRDeclarations` / `bareKAndRHead` | K&R parameter declarations / bare undeclared parameters |
+| `wordsAfterParameters` | words between `)` and `{` (`reentrant`, attribute macros) |
+| `directiveInHead` | a `#if`, `#pragma` or other directive line inside the head |
+| `noBodyAfterHead` / `unbalancedParameters` / `nameNotOnLine` | the head as written does not reach a `{` |
+| `nameIsAFunctionLikeMacro` | the tree also `#define`s the name as a function-like macro |
+| `fileNotParsed` / `inDeadIfdefBranch` | the file was kept whole unparsed / the line is dead under the `#ifdef` world |
+| `nameReadAsType`, `insideParseError`, `insideABody`, `parsedAsDeclaration`, `parsedAsDefinitionButRejected` | what the parser made of the name |
+| `parsedAs_<node>` | otherwise, the grammar node the name ended up in (a tree-sitter node name) |
+
+These are fixed words, so the counts are as safe to send back as the rest of `summary.txt`.
+
 `verify` is a link check, not a build: it cannot see a missing type, macro or header. Build what you carved:
 
 ```

@@ -8,7 +8,8 @@ namespace CodeCarver.Core.Reachability;
 /// <param name="Line">1-based line of that reference.</param>
 /// <param name="DeadOnly">True when every reference sits on a line the #ifdef model calls dead — the carve
 /// relied on that model to drop the definition. Reported, but not a hard failure.</param>
-public sealed record LinkViolation(string Name, string DefinedIn, string ReferencedIn, int Line, bool DeadOnly);
+/// <param name="DefinedLine">1-based line of that definition in <paramref name="DefinedIn"/>.</param>
+public sealed record LinkViolation(string Name, string DefinedIn, string ReferencedIn, int Line, bool DeadOnly, int DefinedLine = 0);
 
 /// <summary>Outcome of <see cref="EmittedLinkCheck.Run"/>.</summary>
 public sealed record LinkCheckResult(IReadOnlyList<LinkViolation> Violations, int FilesChecked, int FilesSkipped)
@@ -55,7 +56,7 @@ public static class EmittedLinkCheck
         var checkedFiles = 0;
 
         // 1. Candidate definitions from dropped files (name -> first defining file).
-        var droppedDefs = new Dictionary<string, string>(StringComparer.Ordinal);
+        var droppedDefs = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
         // A file-scope `MACRO(a, b, c)` with no ';' reads as a definition when the next function's '{' follows.
         // A name with only such bare "definitions" that the tree #defines as a function-like macro is a macro use,
         // not a link symbol (work eval, 1.0.162: a registration macro invoked in two modules was reported as
@@ -73,7 +74,7 @@ public static class EmittedLinkCheck
             foreach (var d in dscan.Definitions)
                 if (header || !d.Static)
                 {
-                    droppedDefs.TryAdd(d.Name, rel);
+                    droppedDefs.TryAdd(d.Name, (rel, d.Line));
                     if (!d.Bare) typedDef.Add(d.Name);
                 }
         }
@@ -110,7 +111,8 @@ public static class EmittedLinkCheck
             if (functionMacros.Contains(name) && !typedDef.Contains(name)) continue;
             var isLive = live.TryGetValue(name, out var at);
             if (!isLive) at = dead[name];
-            violations.Add(new LinkViolation(name, droppedDefs[name], at.Rel, at.Line, DeadOnly: !isLive));
+            var def = droppedDefs[name];
+            violations.Add(new LinkViolation(name, def.Rel, at.Rel, at.Line, DeadOnly: !isLive, DefinedLine: def.Line));
         }
         return new LinkCheckResult(violations, checkedFiles, skipped);
     }

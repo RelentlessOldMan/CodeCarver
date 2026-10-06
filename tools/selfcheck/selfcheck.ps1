@@ -46,6 +46,26 @@ $cases = @(
          'reg.h'    = "struct drv { const char *n; int (*i)(void); };`n#define REGISTER_DRIVER(name, init) const struct drv name##_drv = { #name, init };`n"
          'main.c'   = "#include `"reg.h`"`nint b_init(void) { return 0; }`nREGISTER_DRIVER(b, b_init)`nint b_work(void);`nint main(void) { return b_work() + b_init(); }`nint b_work(void) { return 1; }`n"
          'unused.c' = "#include `"reg.h`"`nREGISTER_DRIVER(a, a_init)`nint a_init(void) { return 0; }`n" } }
+    @{ Name = 'unknown macro between type and name'; Lang = 'c'; Expect = @('win.c')
+       Files = @{
+         'main.c'   = "int f(void);`nint main(void) { return f(); }`n"
+         'win.c'    = "int WINAPI f(void) { return 0; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'AUTOSAR FUNC/P2VAR head'; Lang = 'c'; Expect = @('com.c')
+       Files = @{
+         'main.c'   = "int Com_Init();`nint main(void) { return Com_Init(0); }`n"
+         'com.c'    = "FUNC(Std_ReturnType, COM_CODE) Com_Init(P2VAR(uint8, AUTOMATIC, COM_APPL_DATA) cfg) { return 0; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = '#pragma between head and body'; Lang = 'c'; Expect = @('pragma.c')
+       Files = @{
+         'main.c'   = "int f(void);`nint main(void) { return f(); }`n"
+         'pragma.c' = "int f(void)`n#pragma optimize`n{`n    return 0;`n}`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'K&R function-pointer parameter'; Lang = 'c'; Expect = @('cb.c')
+       Files = @{
+         'main.c'   = "int run();`nint one(void) { return 1; }`nint main(void) { return run(2, one); }`n"
+         'cb.c'     = "run(a, cb)`n    int a;`n    int (*cb)();`n{`n    return a + cb();`n}`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
     @{ Name = 'implicit-int definition'; Lang = 'c'; Expect = @('twice.c')
        Files = @{
          'main.c'  = "int twice(int);`nint main(void) { return twice(2); }`n"

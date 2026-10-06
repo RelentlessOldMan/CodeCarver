@@ -969,6 +969,87 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         return null;
     }
 
+    /// <summary>
+    /// The text tree-sitter is given for a file: every parse-only, line-preserving rewrite. Spans, the dead-line map and
+    /// the emitter all read the ORIGINAL text. <paramref name="blanked"/> is text removed for parsing whose names must
+    /// still count as the file's uses; <paramref name="bareKAndR"/> are K&amp;R heads defined without a removable body.
+    /// </summary>
+    private string PrepareParseText(string path, string text, out List<(string Name, int Line, int EndLine)>? bareKAndR,
+                                    out string blanked)
+    {
+        // Expand scope-opening macros, so a file that opens its namespace with `FMT_BEGIN_NAMESPACE` is structured
+        // correctly and its functions are captured.
+        var parseText = ExpandScopeMacros(text);
+        bareKAndR = null;
+        var cut = "";
+        if (_cGrammar || path.EndsWith(".c", StringComparison.OrdinalIgnoreCase))
+        {
+            parseText = ImplicitInt.Rewrite(parseText, _funcLikeMacroNames.Contains, out _, out bareKAndR);
+            // A mixed C/C++ tree reads .c files with the C++ grammar, which rejects K&R parameter lists.
+            if (!_cGrammar) parseText = ImplicitInt.KAndRToPrototype(parseText, out _);
+            // Heads the C grammar can't read (`int WINAPI f(void)`, AUTOSAR `FUNC(void, X) f(...)`, a #pragma before
+            // the body).
+            parseText = HeadNormalizer.Normalize(parseText, out cut);
+        }
+        // Alternative parameter sets (#if/#else inside a parameter list) parsed as the first one.
+        parseText = ParamListConditionals.Blank(parseText, out var branches);
+        blanked = cut.Length == 0 ? branches : branches.Length == 0 ? cut : cut + "\n" + branches;
+        return parseText;
+    }
+
+    /// <summary>
+    /// Why a definition the link check found never became a graph node: fixed shape names, source-free, so a remote
+    /// evaluation can report them as counts. <paramref name="line"/> is the 1-based line of the name in
+    /// <paramref name="text"/>. Text features describe the head; parser features say what tree-sitter made of the
+    /// name after the same parse-only rewrites the carve applied.
+    /// </summary>
+    public IReadOnlyList<string> DiagnoseDefinition(string path, string text, int line, string name)
+    {
+        var shapes = new List<string>();
+        if (_unparsed.Contains(path)) shapes.Add("fileNotParsed");
+        if (_funcLikeMacroNames.Contains(name)) shapes.Add("nameIsAFunctionLikeMacro");
+        shapes.AddRange(DefinitionHead.TextShapes(text, line, name));
+
+        var parseText = PrepareParseText(path, text, out var bare, out _);
+        if (bare is not null && bare.Any(b => b.Name == name && b.Line == line)) shapes.Add("bareKAndRHead");
+        using var parser = new Parser(_lang);
+        using var tree = parser.Parse(parseText);
+        if (tree is null) { shapes.Add("parseFailed"); return shapes; }
+        TsNode? hit = null;
+        var row = line - 1;
+        void Find(TsNode n)
+        {
+            if (hit is not null || n.StartPosition.Row > row || n.EndPosition.Row < row) return;
+            if (n.StartPosition.Row == row && n.Text == name && n.Type is "identifier" or "type_identifier" or "field_identifier")
+            {
+                hit = n;
+                return;
+            }
+            foreach (var c in n.Children) Find(c);
+        }
+        Find(tree.RootNode);
+        if (hit is null) { shapes.Add("parserSawNoName"); return shapes; }
+        if (hit.Type == "type_identifier") shapes.Add("nameReadAsType");
+        var inError = false; var inDef = false; var inDecl = false; var inBody = false;
+        for (var a = hit.Parent; a is not null; a = a.Parent)
+        {
+            switch (a.Type)
+            {
+                case "ERROR": inError = true; break;
+                case "function_definition": inDef = true; break;
+                case "declaration": if (!inDef) inDecl = true; break;
+                case "compound_statement": if (!inDef) inBody = true; break;
+            }
+        }
+        if (inError) shapes.Add("insideParseError");
+        if (inBody) shapes.Add("insideABody");
+        if (inDecl) shapes.Add("parsedAsDeclaration");
+        if (inDef && !inError && !inBody && hit.Type != "type_identifier") shapes.Add("parsedAsDefinitionButRejected");
+        // Otherwise: the grammar node the name ended up in (a fixed tree-sitter node name, so still source-free).
+        if (!inError && !inBody && !inDecl && !inDef && hit.Parent is { } parent) shapes.Add("parsedAs_" + parent.Type);
+        return shapes;
+    }
+
     /// <summary>A .c/.cc/.cpp/.cxx/.c++ source file — a translation unit we must always parse.</summary>
     private static bool IsTranslationUnit(string path)
     {
@@ -1060,21 +1141,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             return;
         }
 
-        // Expand scope-opening macros for PARSING only (line-preserving), so a file that opens its
-        // namespace with `FMT_BEGIN_NAMESPACE` is structured correctly and its functions are captured.
-        // Everything else (spans, dead-line map, initializer scans) uses the ORIGINAL text below.
-        var parseText = ExpandScopeMacros(text);
-        List<(string Name, int Line, int EndLine)>? bareKAndR = null;
-        if (_cGrammar || path.EndsWith(".c", StringComparison.OrdinalIgnoreCase))
-        {
-            parseText = ImplicitInt.Rewrite(parseText, _funcLikeMacroNames.Contains, out _, out bareKAndR);
-            // A mixed C/C++ tree reads .c files with the C++ grammar, which rejects K&R parameter lists.
-            if (!_cGrammar) parseText = ImplicitInt.KAndRToPrototype(parseText, out _);
-        }
-        // Alternative parameter sets (#if/#else inside a parameter list) parsed as the first one; the other
-        // branches' names still count as uses of this file.
-        parseText = ParamListConditionals.Blank(parseText, out var blankedBranches);
-        if (blankedBranches.Length > 0) IdentifierRefs(blankedBranches, fileNodeByPath[path], pendingRefs, callShapedOnly: false);
+        var parseText = PrepareParseText(path, text, out var bareKAndR, out var blankedForParse);
+        if (blankedForParse.Length > 0) IdentifierRefs(blankedForParse, fileNodeByPath[path], pendingRefs, callShapedOnly: false);
         using var tree = ParseWithBudget(parseText, path, out var timedOut);
         if (timedOut)
         {

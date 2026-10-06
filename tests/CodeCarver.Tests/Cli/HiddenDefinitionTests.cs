@@ -346,8 +346,14 @@ public sealed class VerifyCauseTests
             Assert.True(code == 3, so + "\n" + se);
             var summary = File.ReadAllText(Path.Combine(root, "out", "codecarver", "summary.txt"));
             Assert.Contains("verify.failed.definitionNotRecognized = 1", summary);
+            // ... and what the definition looks like, as fixed shape names.
+            Assert.Contains("verify.failed.definitionNotRecognized.noReturnType = 1", summary);
+            Assert.Contains("verify.failed.definitionNotRecognized.parsedAs_", summary);
             Assert.DoesNotContain("HELPER", summary);   // still numbers only
-            Assert.Contains("cause definitionNotRecognized", File.ReadAllText(Path.Combine(root, "out", "codecarver", "verify.txt")));
+            var verify = File.ReadAllText(Path.Combine(root, "out", "codecarver", "verify.txt"));
+            Assert.Contains("cause definitionNotRecognized", verify);
+            Assert.Contains("caps.c:1", verify);
+            Assert.Contains("shape noReturnType+parsedAs_", verify);
         }
         finally { TempDir.Delete(root); }
     }

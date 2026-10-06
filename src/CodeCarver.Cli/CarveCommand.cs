@@ -1429,7 +1429,28 @@ public static class CarveCommand
             var why = hard.Count == 0 ? new Dictionary<LinkViolation, string>() : ClassifyViolations(graph, p, hard, unparsedFiles);
             var causes = why.Values.GroupBy(c => c).OrderBy(g => g.Key, StringComparer.Ordinal)
                             .ToDictionary(g => g.Key, g => g.Count());
-            foreach (var v in hard) sb.AppendLine($"FAIL {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined only in dropped {v.DefinedIn}\tcause {why[v]}");
+            // A definition that never became a node: what its head looks like and what the parser made of it, as fixed
+            // shape names (work eval, 1.0.162: three such failures cost a long hunt in the wrong place).
+            var shapes = new Dictionary<LinkViolation, List<string>>();
+            if (fe is TreeSitterFrontEnd ts)
+                foreach (var v in hard)
+                {
+                    if (why[v] != "definitionNotRecognized" || v.DefinedLine <= 0) continue;
+                    var defText = ReadRel(v.DefinedIn);
+                    if (defText.Length == 0) continue;
+                    List<string> list;
+                    try { list = ts.DiagnoseDefinition(v.DefinedIn, defText, v.DefinedLine, v.Name).ToList(); }
+                    catch (Exception ex) when (ex is not OutOfMemoryException) { list = new List<string> { "diagnosisFailed" }; }
+                    if (deadLinesFor?.Invoke(v.DefinedIn, defText) is { } dl && v.DefinedLine < dl.Length && dl[v.DefinedLine])
+                        list.Add("inDeadIfdefBranch");
+                    if (list.Count == 0) list.Add("noKnownShape");
+                    shapes[v] = list;
+                }
+            var shapeCounts = shapes.Values.SelectMany(s => s.Distinct()).GroupBy(s => s)
+                                    .OrderBy(g => g.Key, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.Count());
+            foreach (var v in hard)
+                sb.AppendLine($"FAIL {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined only in dropped {v.DefinedIn}:{v.DefinedLine}\tcause {why[v]}"
+                              + (shapes.TryGetValue(v, out var sh) ? "\tshape " + string.Join('+', sh) : ""));
             foreach (var v in soft) sb.AppendLine($"DEAD {v.Name}\tused {v.ReferencedIn}:{v.Line} (#ifdef-dead line)\tdefined only in dropped {v.DefinedIn}");
             Directory.CreateDirectory(ccDir);
             WriteArtifact(Path.Combine(ccDir, "verify.txt"), sb.ToString(), "verifylog");
@@ -1441,6 +1462,8 @@ public static class CarveCommand
                 foreach (var v in hard.Take(20)) @out.WriteLine($"            {v.Name}  used {v.ReferencedIn}:{v.Line}, defined only in dropped {v.DefinedIn}");
                 if (hard.Count > 20) @out.WriteLine($"            (+{hard.Count - 20} more in verify.txt)");
                 @out.WriteLine("            causes: " + string.Join(", ", causes.Select(c => $"{c.Key} {c.Value}")));
+                if (shapeCounts.Count > 0)
+                    @out.WriteLine("            unrecognised-definition shapes: " + string.Join(", ", shapeCounts.Select(c => $"{c.Key} {c.Value}")));
             }
             if (soft.Count > 0)
                 @out.WriteLine($"  verify  : note — {soft.Count} function(s) used only on #ifdef-dead lines are defined only in dropped files "
@@ -1449,6 +1472,7 @@ public static class CarveCommand
                 @out.WriteLine($"  verify  : note — {r.FilesSkipped} file(s) over {maxParseBytes:N0} B or unreadable were not checked");
             summary[$"{summaryStage}.verify.failed"] = hard.Count;
             foreach (var (cause, n) in causes) summary[$"{summaryStage}.verify.failed.{cause}"] = n;
+            foreach (var (shape, n) in shapeCounts) summary[$"{summaryStage}.verify.failed.definitionNotRecognized.{shape}"] = n;
             summary[$"{summaryStage}.verify.deadLineOnly"] = soft.Count;
             summary[$"{summaryStage}.verify.filesChecked"] = r.FilesChecked;
             summary[$"{summaryStage}.verify.filesNotChecked"] = r.FilesSkipped;
