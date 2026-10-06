@@ -155,6 +155,34 @@ public class CppFrontEndTests
     }
 
     [Fact]
+    public void OutOfLineMethodInNestedScopes_IsADefinition_AndNestedQualifiedCallsResolve()
+    {
+        // Work eval, 1.0.162: `void hw::Uart::send() {}` (a namespace AND a class) never became a node, so its
+        // file was dropped while main still called it, and verify passed. Each scope nests a qualified_identifier.
+        const string src = """
+            namespace hw { struct Uart { void send(); static int make(); }; }
+            namespace a { namespace b { namespace c { int deep(); } } }
+            int helper(void) { return 7; }
+            int deep_helper(void) { return 8; }
+            void hw::Uart::send() { helper(); }
+            int hw::Uart::make() { return a::b::c::deep(); }
+            int a::b::c::deep() { return deep_helper(); }
+            int main() { hw::Uart u; u.send(); return hw::Uart::make(); }
+            """;
+        using var fe = new CppFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("hw.cpp", src) });
+        var main = graph.Nodes.First(n => n.Name == "main").Id;
+        var plan = ReachabilityEngine.Compute(graph, new[] { new Root(main, RootKind.ExplicitSymbol) });
+
+        foreach (var name in new[] { "send", "make", "deep", "helper", "deep_helper" })
+        {
+            var n = graph.Nodes.SingleOrDefault(x => x.Kind == NodeKind.Function && x.Name == name);
+            Assert.True(n is not null, $"{name} should be a function node");
+            Assert.True(plan.IsKept(n!.Id), $"{name} should be kept");
+        }
+    }
+
+    [Fact]
     public void MacroSpecifierBeforeQualifiedMethod_IsCaptured()
     {
         // pugixml load_file/load_string gap: `PUGI_IMPL_FN xml_parse_result xml_document::load_string(...)`

@@ -13,11 +13,18 @@ namespace CodeCarver.Frontend;
 /// </summary>
 public sealed class CppFrontEnd() : TreeSitterFrontEnd("tree-sitter-cpp", "tree_sitter_cpp", DefsQuery, CallsQuery)
 {
+    // `ns::Widget::draw` nests one qualified_identifier per scope, and a query can't recurse, so each depth
+    // (up to 4 scopes) is spelled out. With only the one-scope pattern an out-of-line method of a class in a
+    // namespace never became a node: its file was dropped while a call still needed it, and verify, which
+    // looks names up in the same graph, passed (work eval, 1.0.162: `--why` said "no symbol named").
     private const string DefsQuery = """
         (function_declarator declarator: (identifier) @function)
         (function_declarator declarator: (parenthesized_declarator (identifier) @function))
         (function_declarator declarator: (field_identifier) @function)
         (function_declarator declarator: (qualified_identifier name: (identifier) @function))
+        (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (identifier) @function)))
+        (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @function))))
+        (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @function)))))
         (class_specifier name: (type_identifier) @class)
         (struct_specifier name: (type_identifier) @struct)
         (enum_specifier name: (type_identifier) @enum)
@@ -36,8 +43,13 @@ public sealed class CppFrontEnd() : TreeSitterFrontEnd("tree-sitter-cpp", "tree_
         (call_expression function: (identifier) @callee)
         (call_expression function: (field_expression field: (field_identifier) @callee))
         (call_expression function: (qualified_identifier name: (identifier) @callee))
+        (call_expression function: (qualified_identifier name: (qualified_identifier name: (identifier) @callee)))
+        (call_expression function: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @callee))))
+        (call_expression function: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @callee)))))
         (call_expression function: (template_function name: (identifier) @callee))
         (call_expression function: (field_expression field: (template_method name: (field_identifier) @callee)))
         (call_expression function: (qualified_identifier name: (template_function name: (identifier) @callee)))
+        (call_expression function: (qualified_identifier name: (qualified_identifier name: (template_function name: (identifier) @callee))))
+        (call_expression function: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (template_function name: (identifier) @callee)))))
         """;
 }

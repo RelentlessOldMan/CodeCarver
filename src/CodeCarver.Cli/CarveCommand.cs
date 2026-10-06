@@ -1294,10 +1294,15 @@ public static class CarveCommand
         // a carve against a real tree ("why is this huge thing still here?" / "why did this get dropped?").
         if (whySymbol is not null)
         {
-            var matches = graph.Nodes.Where(n => n.Kind != NodeKind.File && n.Name == whySymbol).ToList();
+            // Nodes carry the unqualified name, so `ns::Widget::draw` is looked up as `draw`.
+            var lookup = whySymbol.Contains("::") ? whySymbol[(whySymbol.LastIndexOf("::") + 2)..] : whySymbol;
+            var matches = graph.Nodes.Where(n => n.Kind != NodeKind.File && n.Name == lookup).ToList();
             if (matches.Count == 0)
             {
-                err.WriteLine($"no symbol named '{whySymbol}' was found");
+                err.WriteLine($"no symbol named '{lookup}' was found: no definition of it became a graph node. Either it is "
+                              + "defined in a file that was not parsed (outside the scanned languages, excluded, or kept whole "
+                              + "unparsed), or only declared, or defined in a shape the parser does not recognise "
+                              + "(a verify failure for it reports definitionNotRecognized)");
                 return 1;
             }
             foreach (var n in matches.OrderBy(n => n.FilePath, StringComparer.Ordinal).ThenBy(n => n.Span.StartLine))
