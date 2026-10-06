@@ -20,6 +20,8 @@ namespace CodeCarver.Frontend;
 public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 {
     private const string IdentQuery = "(identifier) @id";
+    // Scope nodes for ScopeIndex (the C++ grammar adds for_range_loop).
+    private const string ScopeQueryC = "(compound_statement) @block (for_statement) @for (function_definition) @fn (storage_class_specifier) @storage ";
     // Names a function declares for itself — parameters and locals (P3). An identifier inside the body that
     // refers to one of these is not a reference to a same-named function elsewhere.
     private const string LocalQuery = """
@@ -97,6 +99,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private readonly Query _initRefs;
     private readonly Query _globals;
     private readonly Query _locals;
+    private readonly Query _scopes;
     // Functions with internal linkage (`static` at file scope in a .c/.cpp): only their own translation unit
     // can call them (P2). Filled while parsing, consulted when uses are resolved.
     private readonly HashSet<NodeId> _fileLocal = new();
@@ -277,6 +280,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _initRefs = new Query(_lang, InitRefQuery);
         _globals = new Query(_lang, GlobalQuery);
         _locals = new Query(_lang, LocalQuery);
+        _scopes = new Query(_lang, _cGrammar ? ScopeQueryC : ScopeQueryC + "(for_range_loop) @for");
     }
 
     /// <summary>
@@ -320,7 +324,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _unparsed.Clear();
         _symbolBudgetKeptWhole.Clear();
         var graph = new CodeGraph();
+        // CODECARVER_TIMING: sub-phases of the graph build (pre-pass, parse, resolution) to the log.
+        var phaseClock = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null ? System.Diagnostics.Stopwatch.StartNew() : null;
+        void Phase(string what) { if (phaseClock is null) return; Log.WriteLine($"  timing  :   {what,-14}{phaseClock.ElapsedMilliseconds,7} ms"); phaseClock.Restart(); }
         var (bytesTotal, filesTotal) = BuildScopeMacros(paths, read); // pre-pass: scope macros + parse work totals
+        Phase("macro pre-pass");
 
         var fileNodeByPath = new Dictionary<string, NodeId>(StringComparer.Ordinal);
         var pathsByBasename = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
@@ -389,6 +397,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             IdentifierRefs(text, incNode, pendingRefs, callShapedOnly: false);
         }
 
+        Phase("parse files");
         // P2: a file that is #included by another (unity build, "#include the .c") shares its statics with the
         // includer, so its statics are not restricted.
         var includedFiles = new HashSet<string>(StringComparer.Ordinal);
@@ -417,6 +426,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // Token-paste (##): a macro that builds a name like `arg ## Suffix` generates functions we can't
         // see statically. Conservatively link the macro to every function whose name matches the literal
         // fragment, so a name-generating macro (dispatch/handler tables) keeps its generated targets.
+        Phase("resolve uses");
         foreach (var (macro, kind, frag) in pendingPastes)
         {
             if (frag.Length == 0) continue;
@@ -441,6 +451,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (globalsByName.TryGetValue(name, out var gs)) foreach (var id in gs) graph.AddFlag(id, NodeFlags.Keep);
         }
 
+        Phase("pastes+rest");
         return graph;
     }
 
@@ -773,44 +784,110 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
     /// <summary>Parameters and locals by name, each with where its scope starts (the declaration) and ends
     /// (the enclosing block, or the whole function for a parameter).</summary>
-    private Dictionary<string, List<((int, int) From, (int, int) To)>> CollectLocals(TsNode root)
+    /// <summary>
+    /// The scopes of one parsed file, by byte range: function definitions, blocks, <c>for</c> loops, and block-scope
+    /// <c>extern</c> declarations. Answers "inside a function body?" and "innermost scope" by binary search over the
+    /// (properly nested) ranges. Tree-sitter's <c>Node.Parent</c> re-walks from the root on every call, so the
+    /// ancestor walks this replaces cost O(depth^2) per identifier — 48 s of a 150 s carve of the death corpus.
+    /// </summary>
+    private sealed class ScopeIndex
     {
-        var r = new Dictionary<string, List<((int, int), (int, int))>>(StringComparer.Ordinal);
+        private const byte Block = 0, For = 1, Function = 2;
+        private readonly int[] _start, _end, _parent;
+        private readonly byte[] _kind;
+        private readonly List<(int Start, int End)> _externs = new();
+
+        public ScopeIndex(Query query, TsNode root)
+        {
+            var list = new List<(int S, int E, byte K)>();
+            foreach (var cap in query.Execute(root).Captures)
+            {
+                var n = cap.Node;
+                switch (cap.Name)
+                {
+                    case "block": list.Add((n.StartIndex, n.EndIndex, Block)); break;
+                    case "for": list.Add((n.StartIndex, n.EndIndex, For)); break;
+                    case "fn": list.Add((n.StartIndex, n.EndIndex, Function)); break;
+                    case "storage":
+                        if (n.Text == "extern" && n.Parent is { Type: "declaration" } d) _externs.Add((d.StartIndex, d.EndIndex));
+                        break;
+                }
+            }
+            list.Sort((a, b) => a.S != b.S ? a.S.CompareTo(b.S) : b.E.CompareTo(a.E));   // outer before inner
+            _start = new int[list.Count]; _end = new int[list.Count]; _kind = new byte[list.Count]; _parent = new int[list.Count];
+            var open = new Stack<int>();
+            for (var i = 0; i < list.Count; i++)
+            {
+                (_start[i], _end[i], _kind[i]) = list[i];
+                while (open.Count > 0 && _end[open.Peek()] <= _start[i]) open.Pop();
+                _parent[i] = open.Count > 0 ? open.Peek() : -1;
+                open.Push(i);
+            }
+        }
+
+        /// <summary>The innermost scope containing byte <paramref name="pos"/>, or -1. The last scope starting at
+        /// or before it is the container or a descendant of it, so its parent chain reaches the container.</summary>
+        private int Innermost(int pos)
+        {
+            int lo = 0, hi = _start.Length - 1, idx = -1;
+            while (lo <= hi) { var mid = (lo + hi) >> 1; if (_start[mid] <= pos) { idx = mid; lo = mid + 1; } else hi = mid - 1; }
+            while (idx >= 0 && _end[idx] <= pos) idx = _parent[idx];
+            return idx;
+        }
+
+        /// <summary>Inside a function body or block (what <c>InsideFunctionBody</c> answers by walking up).</summary>
+        public bool InBody(int pos)
+        {
+            for (var i = Innermost(pos); i >= 0; i = _parent[i])
+                if (_kind[i] is Block or Function) return true;
+            return false;
+        }
+
+        /// <summary>The end of the innermost block / for / function scope containing <paramref name="pos"/>.</summary>
+        public int? ScopeEnd(int pos) => Innermost(pos) is var i and >= 0 ? _end[i] : null;
+
+        /// <summary>The end of the innermost function definition containing <paramref name="pos"/>.</summary>
+        public int? FunctionEnd(int pos)
+        {
+            for (var i = Innermost(pos); i >= 0; i = _parent[i])
+                if (_kind[i] == Function) return _end[i];
+            return null;
+        }
+
+        public bool InExternDeclaration(int pos) => _externs.Any(e => e.Start <= pos && pos < e.End);
+    }
+
+    private Dictionary<string, List<(int From, int To)>> CollectLocals(TsNode root, ScopeIndex scopes)
+    {
+        var r = new Dictionary<string, List<(int, int)>>(StringComparer.Ordinal);
         foreach (var cap in _locals.Execute(root).Captures)
         {
             var n = cap.Node;
-            TsNode? scope = null;
-            if (InsideFunctionBody(n))
+            var at = n.StartIndex;
+            int? scopeEnd;
+            if (scopes.InBody(at))
             {
                 // A block-scope `extern int g;` names the GLOBAL g — its uses are references, not locals.
-                var decl = n.Parent;
-                for (var i = 0; i < 4 && decl is not null && decl.Type != "declaration"; i++) decl = decl.Parent;
-                if (decl is not null && decl.Children.Any(c => c.Type == "storage_class_specifier" && c.Text == "extern")) continue;
-                for (var p = n.Parent; p is not null; p = p.Parent)
-                    if (p.Type is "compound_statement" or "for_statement" or "for_range_loop" or "function_definition") { scope = p; break; }
+                if (scopes.InExternDeclaration(at)) continue;
+                scopeEnd = scopes.ScopeEnd(at);
             }
             else
-            {
-                // A parameter of a function DEFINITION: in scope for that function's body.
-                var p = n.Parent;
-                for (var i = 0; i < 8 && p is not null; i++, p = p.Parent)
-                {
-                    if (p.Type == "function_definition") { scope = p; break; }
-                    if (p.Type is "declaration" or "field_declaration" or "translation_unit") break;
-                }
-            }
-            if (scope is null) continue;
-            if (!r.TryGetValue(n.Text, out var l)) r[n.Text] = l = new List<((int, int), (int, int))>();
-            l.Add(((n.StartPosition.Row, n.StartPosition.Column), (scope.EndPosition.Row, scope.EndPosition.Column)));
+                // A parameter of a function DEFINITION: in scope for that function's body (a prototype's parameter
+                // is in no function definition).
+                scopeEnd = scopes.FunctionEnd(at);
+            if (scopeEnd is not { } end) continue;
+            var name = n.Text;
+            if (!r.TryGetValue(name, out var l)) r[name] = l = new List<(int, int)>();
+            l.Add((at, end));
         }
         return r;
     }
 
-    private static bool IsLocalUse(Dictionary<string, List<((int, int) From, (int, int) To)>> locals, string name, (int, int) pos)
+    private static bool IsLocalUse(Dictionary<string, List<(int From, int To)>> locals, string name, int pos)
     {
         if (!locals.TryGetValue(name, out var l)) return false;
         foreach (var (from, to) in l)
-            if (pos.CompareTo(from) >= 0 && pos.CompareTo(to) < 0) return true;   // the declaration itself, and every use after it
+            if (pos >= from && pos < to) return true;   // the declaration itself, and every use after it
         return false;
     }
 
@@ -1029,6 +1106,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             }
         }
 
+        // Scope ranges once per file: pass 1b and pass 4 ask "inside a function body?" per capture (see ScopeIndex).
+        var scopes = new ScopeIndex(_scopes, root);
         var fileNode = fileNodeByPath[path];
         var srcLines = text.Split('\n');
 
@@ -1148,7 +1227,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         {
             var node = cap.Node;
             if (IsDead(node)) continue;
-            if (InsideFunctionBody(node)) continue; // a LOCAL variable, not a file-scope global
+            if (scopes.InBody(node.StartIndex)) continue; // a LOCAL variable, not a file-scope global
             var span = GlobalDeclarationSpan(node);
             if (span is null) continue;
             var gid = graph.GetOrAddNode(NodeKind.Global, node.Text, path, new SourceSpan(span.Value.Start, span.Value.End));
@@ -1216,31 +1295,38 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var calleePositions = new HashSet<(int, int)>();
         foreach (var cap in _calls.Execute(root).Captures)
         {
-            if (IsDead(cap.Node)) continue;
-            calleePositions.Add((cap.Node.StartPosition.Row, cap.Node.StartPosition.Column));
+            // Each Node property is a native call: read position and text once (millions of captures on a big tree).
+            var node = cap.Node;
+            var sp = node.StartPosition;
+            if (dead is not null && sp.Row + 1 < dead.Length && dead[sp.Row + 1]) continue;
+            calleePositions.Add((sp.Row, sp.Column));
             // A call not inside any captured function is inside a function we failed to parse (e.g. an
             // unusual macro-prefixed / bare-typedef-return declaration like zlib's `local gzFile gz_open`
             // or `void ZLIB_INTERNAL _tr_flush_block`). That function stays in the emitted file, so keep
             // its callees whenever the file is kept — attribute the call to the file node.
-            var from = Enclosing(cap.Node.StartPosition.Row + 1) ?? fileNode;
-            pendingCalls.Add((from, cap.Node.Text));
+            var from = Enclosing(sp.Row + 1) ?? fileNode;
+            pendingCalls.Add((from, node.Text));
         }
 
         // Pass 4: non-call references INSIDE functions (address-taken: a callback passed/assigned).
         // InsideError only matters when the file actually has a parse error somewhere; checking once
         // avoids a costly ancestor walk per file-scope identifier in the common (clean-parse) case.
         var treeHasError = root.HasError;
-        var locals = CollectLocals(root);
+        var locals = CollectLocals(root, scopes);
         foreach (var cap in _idents.Execute(root).Captures)
         {
-            if (IsDead(cap.Node)) continue;
-            var pos = (cap.Node.StartPosition.Row, cap.Node.StartPosition.Column);
+            var node = cap.Node;
+            var sp = node.StartPosition;
+            if (dead is not null && sp.Row + 1 < dead.Length && dead[sp.Row + 1]) continue;
+            var pos = (sp.Row, sp.Column);
             if (defNamePositions.Contains(pos) || calleePositions.Contains(pos)) continue;
-            if (IsLocalUse(locals, cap.Node.Text, pos)) continue;
-            var from = Enclosing(cap.Node.StartPosition.Row + 1);
+            var name = node.Text;
+            var at = node.StartIndex;
+            if (IsLocalUse(locals, name, at)) continue;
+            var from = Enclosing(sp.Row + 1);
             if (from is { } f)
-                pendingRefs.Add((f, cap.Node.Text));
-            else if (InsideFunctionBody(cap.Node) || (treeHasError && InsideError(cap.Node)))
+                pendingRefs.Add((f, name));
+            else if (scopes.InBody(at) || (treeHasError && InsideError(node)))
                 // Attribute to the file (kept while the file is), same fallback as pass 3's calls, in two
                 // cases the enclosing-function lookup can't see: (a) inside a function body whose signature we couldn't
                 // capture — a macro-defined header like janet's `JANET_CORE_FN(os_shell, ...)`, so a
@@ -1250,7 +1336,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 // `JanetMethod x[] = {..., cfun_..., ...}` table). Both are real misparses, not the
                 // clean-parsing file-scope prototype that must NOT be swept in (it would keep every
                 // declared function). Over-approximation bounded to the misparsed region — sound.
-                pendingRefs.Add((fileNode, cap.Node.Text));
+                pendingRefs.Add((fileNode, name));
         }
 
         // Pass 5: function names used as DATA at FILE SCOPE (tables, hooks, registries). Attributed to
