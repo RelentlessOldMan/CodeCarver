@@ -74,12 +74,40 @@ public sealed class FailureCasesTests
         Assert.Equal(3, t.Carve(log: false).Code);
         var unpacked = Path.Combine(t.Root, "unpacked");
         ZipFile.ExtractToDirectory(Debug(t, "anon.zip"), unpacked);
+        Assert.False(Directory.Exists(Path.Combine(unpacked, "case1", "fs")));   // packed: rebuilt from store/
+        CodeCarver.Cli.FailureCases.Unpack(unpacked);
         var cfg = Path.Combine(unpacked, "case1", "carve.toml");
         Assert.Contains("carve fs/anon/root --config carve.toml", File.ReadLines(cfg).First());
         var srcRel = "fs/anon/root";
         var so = new StringWriter(); var se = new StringWriter();
         var code = CodeCarver.Cli.CarveCommand.Run(new[] { "carve", Path.Combine(unpacked, "case1", srcRel), "--config", cfg }, so, se);
         Assert.True(code == 3, so + "\n" + se);
+    }
+
+    [Fact]
+    public void CasesSharingAHeader_StoreItOnce()
+    {
+        // Two different failures (two names, two files) whose files include the same big header.
+        var big = string.Concat(Enumerable.Range(0, 2000).Select(i => $"#define BIG_REG_{i} ({i}u)\n"));
+        using var t = new TreeCarve()
+            .W("big_regs.h", big)
+            .W("main.c", "int first_fn(void); int second_fn(void);\nint main(void){ return first_fn() + second_fn(); }\n")
+            .W("one.c", "#include \"big_regs.h\"\nint gone_one(void);\nint first_fn(void) { return gone_one(); }\n")
+            .W("two.c", "#include \"big_regs.h\"\nint gone_two(void);\nint second_fn(void) { return gone_two(); }\n")
+            .W("old/gone_one.c", "int gone_one(void) { return 1; }\n")
+            .W("old/gone_two.c", "int gone_two(void) { return 2; }\n");
+        t.TracePaths = new() { t.S("main.c"), t.S("one.c"), t.S("two.c"), t.S("big_regs.h") };
+        Assert.Equal(3, t.Carve(log: false).Code);
+        var anonDir = Debug(t, "anon");
+        Assert.Contains("case 2:", File.ReadAllText(Path.Combine(anonDir, "cases.txt")));
+        var lists = Directory.EnumerateFiles(anonDir, "files.tsv", SearchOption.AllDirectories).ToList();
+        Assert.Equal(2, lists.Count);
+        // The header's stored copy is named in both cases' lists, and is in store/ once.
+        var blobs = lists.Select(l => File.ReadLines(l).Select(x => x.Split('\t')[1]).ToHashSet()).ToList();
+        var shared = blobs[0].Intersect(blobs[1]).ToList();
+        Assert.Contains(shared, id => new FileInfo(Path.Combine(anonDir, "store", id)).Length > 20_000);
+        Assert.Equal(Directory.EnumerateFiles(Path.Combine(anonDir, "store")).Count(), blobs[0].Union(blobs[1]).Count());
+        Assert.Contains("2 reproduce", File.ReadAllText(Path.Combine(t.Root, "out", "codecarver", "summary.txt")).Replace(".debug.reproduced = 2", "2 reproduce"));
     }
 
     [Fact]

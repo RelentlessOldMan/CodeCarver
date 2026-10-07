@@ -118,7 +118,8 @@ public static class FailureCases
         raw.AppendLine("# CodeCarver verify failures, in full. Real names and paths: keep this on this machine.");
         raw.AppendLine("# The anonymized copy is debug/anon.zip; debug/raw/key.txt says which anonymized name is which.");
         anon.AppendLine("# CodeCarver verify failures, anonymized: every name, path, string, number and comment rewritten.");
-        anon.AppendLine("# Each caseN/ folder is a replayable carve of the files involved:  codecarver carve <caseN/src root> --config caseN/carve.toml");
+        anon.AppendLine("# Each caseN/ folder is a replayable carve of the files involved. Each distinct file is stored once in store/;");
+        anon.AppendLine("# rebuild the case trees with  powershell -File unpack.ps1  then  codecarver carve caseN/fs/anon/root --config caseN/carve.toml");
         anon.AppendLine($"# {hard.Count} failure(s), {cases.Count} written.");
         // Anonymized file text for the excerpts, checked like every bundle file: a word that survived is cut out.
         var anonText = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -153,6 +154,7 @@ public static class FailureCases
         File.WriteAllText(Path.Combine(rawDir, "key.txt"),
             "# anonymized -> original. Keep this on this machine.\n" + string.Concat(a.Map().Select(p => $"{p.Anonymized}\t{p.Original}\n")));
         File.WriteAllText(Path.Combine(anonDir, "cases.txt"), anon.ToString());
+        Pack(anonDir);
         var zip = Path.Combine(debugDir, "anon.zip");
         try
         {
@@ -162,6 +164,71 @@ public static class FailureCases
         catch (IOException) { zip = null!; }
         return new Outcome(cases.Count, reproduced, zip);
     }
+
+    const string FilesList = "files.tsv";
+
+    /// <summary>Rebuilds every caseN/ tree under <paramref name="anonDir"/> from store/ (what unpack.ps1 does).</summary>
+    public static void Unpack(string anonDir)
+    {
+        foreach (var caseDir in Directory.EnumerateDirectories(anonDir, "case*"))
+        {
+            var list = Path.Combine(caseDir, FilesList);
+            if (!File.Exists(list)) continue;
+            foreach (var line in File.ReadLines(list))
+            {
+                var parts = line.Split('\t');
+                if (parts.Length != 2) continue;
+                var dest = Path.Combine(caseDir, parts[0]);
+                Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                File.Copy(Path.Combine(anonDir, "store", parts[1]), dest, overwrite: true);
+            }
+        }
+    }
+
+    // Each case's tree (caseN/fs) becomes caseN/files.tsv (path, stored file) plus one copy of each distinct file in
+    // store/: cases that include the same headers share them, so the zip carries each once.
+    static void Pack(string anonDir)
+    {
+        var store = Path.Combine(anonDir, "store");
+        Directory.CreateDirectory(store);
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        foreach (var caseDir in Directory.EnumerateDirectories(anonDir, "case*"))
+        {
+            var fs = Path.Combine(caseDir, "fs");
+            if (!Directory.Exists(fs)) continue;
+            var list = new StringBuilder();
+            foreach (var f in Directory.EnumerateFiles(fs, "*", SearchOption.AllDirectories).OrderBy(f => f, StringComparer.Ordinal))
+            {
+                var bytes = File.ReadAllBytes(f);
+                var id = Convert.ToHexString(sha.ComputeHash(bytes))[..20].ToLowerInvariant();
+                var blob = Path.Combine(store, id);
+                if (!File.Exists(blob)) File.WriteAllBytes(blob, bytes);
+                list.Append(Path.GetRelativePath(caseDir, f).Replace('\\', '/')).Append('\t').Append(id).Append('\n');
+            }
+            File.WriteAllText(Path.Combine(caseDir, FilesList), list.ToString());
+            Directory.Delete(fs, recursive: true);
+        }
+        File.WriteAllText(Path.Combine(anonDir, "unpack.ps1"), UnpackScript);
+    }
+
+    // ASCII only (Windows PowerShell 5.1 reads a BOM-less script as the ANSI code page).
+    const string UnpackScript =
+        "# Rebuilds each caseN/ tree from store/: every line of caseN/files.tsv is <path in the case><TAB><stored file>.\n"
+        + "#   powershell -ExecutionPolicy Bypass -File unpack.ps1\n"
+        + "$ErrorActionPreference = 'Stop'\n"
+        + "Get-ChildItem -Path $PSScriptRoot -Directory -Filter 'case*' | ForEach-Object {\n"
+        + "    $case = $_.FullName\n"
+        + "    $list = Join-Path $case 'files.tsv'\n"
+        + "    if (Test-Path $list) {\n"
+        + "        Get-Content $list | Where-Object { $_ -ne '' } | ForEach-Object {\n"
+        + "            $p = $_ -split \"`t\"\n"
+        + "            $dest = Join-Path $case $p[0]\n"
+        + "            New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null\n"
+        + "            Copy-Item (Join-Path (Join-Path $PSScriptRoot 'store') $p[1]) $dest -Force\n"
+        + "        }\n"
+        + "    }\n"
+        + "}\n"
+        + "Write-Host 'unpacked: carve a case with  codecarver carve caseN/fs/anon/root --config caseN/carve.toml'\n";
 
     static string ShapeOf(IReadOnlyDictionary<LinkViolation, List<string>> shapes, LinkViolation v) =>
         shapes.TryGetValue(v, out var s) ? string.Join('+', s) : "";

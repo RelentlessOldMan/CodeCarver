@@ -28,6 +28,9 @@ debug/
   anon.zip        anon/ zipped: the thing to send
 ```
 
+Cases that include the same headers share them: each distinct file is stored once in `anon/store/`, and
+`caseN/files.tsv` lists where each goes. `anon/unpack.ps1` rebuilds the case trees.
+
 **What the anonymized copy holds.** The files a failure involves (the use, every definition, the headers they
 include, and SDK or configure headers outside the tree the build opened), their compile commands and build trace
 entries, and a `carve.toml`, all rewritten: every word of every name, file and folder becomes an opaque word of the
