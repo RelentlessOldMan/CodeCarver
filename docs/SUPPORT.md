@@ -2,7 +2,8 @@
 
 If a carve misbehaves — wrong output, a crash, a tree that won't build — you can hand a developer
 enough to diagnose it **without sharing a single line of your source**. Everything below is either
-source-free or made of your own names (never file *contents*), and you decide what to send.
+source-free, made of your own names (never file *contents*), or anonymized code structure with every name
+replaced (`debug/anon.zip`, below), and you decide what to send.
 
 ## The first thing to send: `summary.txt`
 
@@ -11,6 +12,37 @@ They hold **numbers, booleans and fixed category names only** — the `#ifdef` w
 trace counts, `.cmm` counts, per-stage sizes and `verify` counts, warnings by category, the exit code. No path,
 file name or symbol appears in them (a test enforces this), so they can be sent back as-is when the source must
 stay on its machine. Send it together with the exit code and the CodeCarver version.
+
+## When `verify` fails: `codecarver/debug/`
+
+A failed `verify` (exit 3) writes every failure up, with no flag, in `<outputDirectory>/[<stage>/]codecarver/debug/`:
+
+```
+debug/
+  raw/cases.txt   per failure, in your names: the use and the function around it, the code around the use and the
+                  definition, the #if lines open at each and how the #if model read them, every file that defines the
+                  name and whether the build log compiled it, the build trace opened it, it was parsed and it was kept,
+                  and every graph node with the name. KEEP THIS LOCAL.
+  raw/key.txt     which anonymized name is which of yours, to read an answer that talks about k12 or p3.c. KEEP LOCAL.
+  anon/           the same cases ANONYMIZED, each caseN/ with a replayable copy of the files involved
+  anon.zip        anon/ zipped: the thing to send
+```
+
+**What the anonymized copy holds.** The files a failure involves (the use, every definition, the headers they
+include, and SDK or configure headers outside the tree the build opened), their compile commands and build trace
+entries, and a `carve.toml`, all rewritten: every word of every name, file and folder becomes an opaque word of the
+same case (`uart_init` becomes `k1_k2`, `uart_send` becomes `k1_k3`, `drivers/uart.c` becomes `p4/p5.c`), string
+contents are rewritten the same way, comments become blank, and numbers above 16 become ordered stand-ins (17, 18,
+...). What stays is the *shape*: keywords, punctuation, `#if` structure, line numbers, file extensions, and
+compiler, attribute and standard-library names (`static`, `__attribute__`, `weak`, `printf`, `uint32_t`). So it is
+not your source, but it is your code's structure. **Look at `anon.zip` before sending it** if structure is sensitive.
+
+Every file is checked before it is written: one that still holds a word from the original is left out (the case
+says how many), never written.
+
+**Replay.** CodeCarver carves each anonymized copy right away and records in `cases.txt` whether the same failure
+happens there (`replay: yes`). A `yes` means the copy alone reproduces the bug: a developer can fix it from the zip
+without ever seeing your code. Counts are in `summary.txt` (`<stage>.debug.cases`, `<stage>.debug.reproduced`).
 
 ## Checking a fix: `tools\selfcheck\selfcheck.ps1`
 

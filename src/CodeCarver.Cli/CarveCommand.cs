@@ -630,6 +630,8 @@ public static class CarveCommand
         // Files OUTSIDE the root the traced builds opened (SDK and generated headers): the closed world reads their
         // #defines. Null when not every selected build has a trace.
         List<string>? buildOpenedOutside = null;
+        // Every path the build traces name, as read (for the anonymized failure bundles: a missing file counts too).
+        var buildTraceFull = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         // The build log and the build trace describe the same build: every in-root source the log compiled must show
         // up as opened in the trace. -1 = not checked (no log or no trace).
         var traceMissedCompiled = -1;
@@ -651,6 +653,7 @@ public static class CarveCommand
                         string full;
                         try { var mp = MapPath(cand); full = Path.IsPathFullyQualified(mp) ? Path.GetFullPath(mp) : Path.GetFullPath(Path.Combine(rootF, mp)); }
                         catch { continue; }   // not a usable path token (noise)
+                        if (isBuild) buildTraceFull.Add(full);
                         if (isBuild && Path.GetExtension(full).ToLowerInvariant() is ".o" or ".obj") objectStems.Add(Path.GetFileNameWithoutExtension(full));
                         if (full.StartsWith(rootF, StringComparison.OrdinalIgnoreCase))
                         {
@@ -1839,6 +1842,46 @@ public static class CarveCommand
                     + "(correct if the #ifdef world is; see verify.txt)");
             if (r.FilesSkipped > 0)
                 @out.WriteLine($"  verify  : note — {r.FilesSkipped} file(s) over {maxParseBytes:N0} B or unreadable were not checked");
+            // Every failure, written up with what it takes to debug it: raw (local) and anonymized with a replayable
+            // bundle (safe to send). A diagnostic aid: it never fails the carve.
+            if (hard.Count > 0 && !FailureCases.Replaying)
+            {
+                try
+                {
+                    var cx = new FailureCases.Context
+                    {
+                        Root = Path.GetFullPath(dir),
+                        FullPath = rel => fullByRel.TryGetValue(rel, out var fp) ? fp : Path.Combine(dir, rel),
+                        Graph = graph, Plan = p, BuildCommands = buildCmds,
+                        BuildOpened = buildFileTraces.Count > 0 ? buildObservedRel : null,
+                        BuildTraceAll = buildFileTraces.Count > 0 ? buildTraceFull : null,
+                        LinkNames = linkUses.Select(u => u.Name).Distinct(StringComparer.Ordinal).ToList(),
+                        Wrapped = wrapped.ToList(),
+                        NotBuilt = notBuilt, Unparsed = unparsedFiles,
+                        LineMaps = (rel, text) =>
+                        {
+                            var t = (perFileDefines?.Invoke(rel) ?? defines) ?? new MacroTable();
+                            return (deadLinesFor?.Invoke(rel, text), PreprocessorScanner.UncertainLineMap(text, t, closedWorld));
+                        },
+                        Languages = cv.Languages, ManualDefines = cv.Defines,
+                        CarveSource = pruned, CarveHeaders = pruned && pruneHeaders,
+                        Advanced = new[] { $"maxParseBytes = {maxParseBytes}", $"skipFilesNotBuilt = {(cv.SkipFilesNotBuilt ? "true" : "false")}",
+                                           $"allowUnmatchedTraces = {(cv.AllowUnmatchedTraces ? "true" : "false")}" }
+                            .Concat(maxSymbolsPerFile is { } msfc ? new[] { $"maxSymbolsPerFile = {msfc}" } : Array.Empty<string>())
+                            .Concat(cv.ParseTimeout is { } ptc ? new[] { $"parseTimeout = {ptc}" } : Array.Empty<string>()).ToList(),
+                    };
+                    var fc = FailureCases.Write(cx, hard, why, shapes, ccDir);
+                    @out.WriteLine($"  debug   : {fc.Cases} failure case(s) written up, {fc.Reproduced} reproduce in their anonymized bundle");
+                    if (fc.AnonZip is { } z) @out.WriteLine($"            send: {z}  (anonymized, safe to share)");
+                    @out.WriteLine($"            keep: {Path.Combine(ccDir, "debug", "raw")}  (real names: stays on this machine)");
+                    summary[$"{summaryStage}.debug.cases"] = fc.Cases;
+                    summary[$"{summaryStage}.debug.reproduced"] = fc.Reproduced;
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    err.WriteLine($"  warn    : could not write the failure cases ({ex.GetType().Name})");
+                }
+            }
             summary[$"{summaryStage}.verify.failed"] = hard.Count;
             foreach (var (cause, n) in causes) summary[$"{summaryStage}.verify.failed.{cause}"] = n;
             foreach (var (shape, n) in shapeCounts) summary[$"{summaryStage}.verify.failed.definitionNotRecognized.{shape}"] = n;
