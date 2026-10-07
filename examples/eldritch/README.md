@@ -7,7 +7,7 @@ same thing, it can carve a lot of real code.
 ## Run it
 
 ```
-tools/eldritch/eldritch-oracle.ps1              # needs WSL with gcc + strace
+tools/eldritch/eldritch-oracle.ps1              # needs gcc + strace (WSL on Windows)
 tools/eldritch/eldritch-oracle.ps1 -SaveInputs  # ...and refresh inputs/ (the captured build log + trace)
 codecarver carve src --config carve.toml        # just the carve, from the captured inputs (no gcc needed)
 ```
@@ -22,7 +22,8 @@ The oracle:
    what the original printed. With log + trace, the decoys must be gone and the compiled-but-unreached files must
    be placeholders.
 
-The test suite carves it too (`EldritchTests`, from `inputs/`), so CI checks it on every push.
+The test suite carves it too (`EldritchTests`, from `inputs/`), and CI runs the whole oracle on Linux before every
+release.
 
 ## What's in it
 

@@ -48,12 +48,40 @@ jobs:
             (cd "$ex" && rm -rf out && dotnet ../../src/CodeCarver.Cli/bin/Release/net8.0/codecarver.dll carve src --config carve.toml)
           done
 
+  # The horror oracles: build the eldritch and hellbuild examples with real gcc under strace, carve each one with four
+  # input sets at four stages, then build and run every carved tree and require the original's output. A carve that
+  # verifies but does not build is a silent miss; only this job sees it.
+  horror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build
+        run: dotnet build src/CodeCarver.Cli -c Release
+
+      - name: Oracles
+        shell: pwsh
+        run: |
+          sudo apt-get install -y strace >/dev/null
+          $dll = "src/CodeCarver.Cli/bin/Release/net8.0/codecarver.dll"
+          $failed = 0
+          foreach ($e in 'eldritch', 'hellbuild') {
+            ./tools/eldritch/eldritch-oracle.ps1 -Example $e -CliDll $dll
+            if ($LASTEXITCODE -ne 0) { $failed++ }
+          }
+          exit $failed
+
   # Every green push to main publishes its zip as GitHub Release v1.0.<commit-count>, the same number the
   # build stamps into `codecarver version`. Packaging is release.ps1, exactly as run locally; the tests already
   # passed in the jobs above, so it skips its own test gate.
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, lint]
+    needs: [test, lint, horror]
     runs-on: windows-latest
     timeout-minutes: 20
     permissions:

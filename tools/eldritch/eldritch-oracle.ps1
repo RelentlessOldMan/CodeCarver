@@ -21,6 +21,9 @@
   sub-makes, generated sources, configure, wrappers, sh -c, quiet rules). Each example's oracle.txt names its binary and
   what a log+trace carve must drop or turn into placeholders.
 
+  On Windows the builds run in WSL; under PowerShell on Linux they run directly, which is how CI runs both examples
+  before every release. Needs gcc, make and strace.
+
   Not ComputeWarden-gated: a few dozen tiny compiles.
 
 .EXAMPLE
@@ -31,28 +34,38 @@
 param(
     # examples\<name>: src\build.sh <src> <out> <sdk> builds it, oracle.txt names its binary and its log+trace checks
     [string]$Example = 'eldritch',
-    [string]$CliDll = (Join-Path $PSScriptRoot '..\..\src\CodeCarver.Cli\bin\Debug\net8.0\codecarver.dll'),
+    [string]$CliDll = (Join-Path $PSScriptRoot '../../src/CodeCarver.Cli/bin/Debug/net8.0/codecarver.dll'),
     [switch]$SaveInputs,   # also refresh examples/eldritch/inputs (the captured log + trace CI carves with)
     [string]$Work = (Join-Path ([IO.Path]::GetTempPath()) ('eldritch-' + [guid]::NewGuid().ToString('N').Substring(0, 8)))
 )
 $ErrorActionPreference = 'Stop'
-$repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$ex = Join-Path $repo "examples\$Example"
+$repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
+$ex = Join-Path $repo "examples/$Example"
 $src = Join-Path $ex 'src'
 $sdk = Join-Path $ex 'sdk'
 # oracle.txt: "binary <name>", "dropped <rel>" and "placeholder <rel>" (checked with log + trace, every stage).
 $checks = @(Get-Content -Encoding utf8 (Join-Path $ex 'oracle.txt') | Where-Object { $_ -match '^\w+ ' } | ForEach-Object { $k, $v = $_ -split ' ', 2; [pscustomobject]@{ Kind = $k; Rel = $v } })
 $bin = ($checks | Where-Object Kind -eq 'binary' | Select-Object -First 1).Rel
-if (-not $bin) { throw "$ex\oracle.txt names no binary" }
+if (-not $bin) { throw "$ex/oracle.txt names no binary" }
 if (-not (Test-Path $CliDll)) { throw "CLI not built: $CliDll (dotnet build src/CodeCarver.Cli)" }
 New-Item -ItemType Directory -Force $Work | Out-Null
 $Work = (Resolve-Path $Work).Path
 
-function ToWsl([string]$p) { $f = [IO.Path]::GetFullPath($p); '/mnt/' + $f.Substring(0, 1).ToLowerInvariant() + ($f.Substring(2) -replace '\\', '/') }
-function Invoke-Wsl([string]$cmd) { $ErrorActionPreference = 'Continue'; $o = & wsl.exe -e bash -lc $cmd 2>&1; return @{ Code = $LASTEXITCODE; Out = ($o | Out-String) } }
+# On Windows the builds run in WSL; on Linux (CI) they run directly. $IsLinux is unset in Windows PowerShell 5.1.
+$native = [bool]$IsLinux
+function ToWsl([string]$p) {
+    $f = [IO.Path]::GetFullPath($p)
+    if ($native) { return $f }
+    '/mnt/' + $f.Substring(0, 1).ToLowerInvariant() + ($f.Substring(2) -replace '\\', '/')
+}
+function Invoke-Wsl([string]$cmd) {
+    $ErrorActionPreference = 'Continue'
+    $o = if ($native) { & bash -lc $cmd 2>&1 } else { & wsl.exe -e bash -lc $cmd 2>&1 }
+    return @{ Code = $LASTEXITCODE; Out = ($o | Out-String) }
+}
 
 $srcW = ToWsl $src; $sdkW = ToWsl $sdk; $workW = ToWsl $Work
-$capture = ToWsl (Join-Path $repo 'tools\capture\capture-file-trace.sh')
+$capture = ToWsl (Join-Path $repo 'tools/capture/capture-file-trace.sh')
 
 # 1. The original, traced.
 $r = Invoke-Wsl "set -e; cd '$workW'; rm -rf /tmp/$Example-orig; bash '$capture' build.trace -- sh '$srcW/build.sh' '$srcW' /tmp/$Example-orig '$sdkW' > build.log 2>&1; /tmp/$Example-orig/$bin > expected.txt"
@@ -103,7 +116,7 @@ carveHeaderFileContents = true
     $carve = @(& dotnet $CliDll carve $src --config $cfg 2>&1 | ForEach-Object { "$_" })
     $code = $LASTEXITCODE
     foreach ($stage in 'safe', 'headers', 'aggressive', 'max') {
-        $carved = Join-Path $out "$stage\carved"
+        $carved = Join-Path $out "$stage/carved"
         $row = [ordered]@{ mode = $mode; stage = $stage; carve = $code; verify = '-'; build = '-'; output = '-'; notes = '' }
         # Exit 3 = verify failed: the tree was still emitted, so build it anyway. A verify FAIL that builds is a
         # false alarm; a verify OK that does not build is a silent miss - the worst kind. Both count.
@@ -112,7 +125,7 @@ carveHeaderFileContents = true
             $rows += [pscustomobject]$row
             continue
         }
-        $vlog = Join-Path $out "$stage\codecarver\verify.txt"
+        $vlog = Join-Path $out "$stage/codecarver/verify.txt"
         $vfails = if (Test-Path $vlog) { @(Get-Content $vlog | Where-Object { $_ -match '^FAIL ' }).Count } else { 0 }
         if ($vfails -gt 0) { $row.verify = "FAIL $vfails"; $fail++ } else { $row.verify = 'ok' }
         $tag = ($mode -replace '\+', '-') + "-$stage"
@@ -147,7 +160,7 @@ carveHeaderFileContents = true
     if ($code -ne 0 -and $code -ne 3) { Write-Host "--- carve ($mode) exit ${code}:"; $carve | Select-Object -Last 25 | ForEach-Object { Write-Host "  $_" } }
 }
 $rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
-if ($fail -gt 0) { Write-Host "ELDRITCH: FAIL ($fail problem(s)); work dir $Work"; exit 1 }
-Write-Host "ELDRITCH: PASS - every carve of the horror builds and prints the original's output"
+if ($fail -gt 0) { Write-Host "$($Example.ToUpperInvariant()): FAIL ($fail problem(s)); work dir $Work"; exit 1 }
+Write-Host "$($Example.ToUpperInvariant()): PASS - every carve builds and prints the original's output"
 Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
 exit 0

@@ -7,7 +7,7 @@ as hard to read as real builds do.
 ## Run it
 
 ```
-tools/eldritch/eldritch-oracle.ps1 -Example hellbuild              # needs WSL with gcc, make + strace
+tools/eldritch/eldritch-oracle.ps1 -Example hellbuild              # needs gcc, make + strace (WSL on Windows)
 tools/eldritch/eldritch-oracle.ps1 -Example hellbuild -SaveInputs  # ...and refresh inputs/
 codecarver carve src --config carve.toml                           # just the carve, from the captured inputs
 ```
@@ -15,7 +15,7 @@ codecarver carve src --config carve.toml                           # just the ca
 The oracle builds the original under strace, carves it with four input sets (log + trace, log, trace, none) at
 four stages, then builds and runs every carved tree and requires the same output: `hell 11 22 37 5 40 5 6 8 9 33 12`.
 `oracle.txt` lists what a log + trace carve must drop and what it must turn into placeholders. `HellbuildTests`
-carves from `inputs/` on every push.
+carves from `inputs/` on every push, and CI runs the whole oracle on Linux before every release.
 
 ## What's in it
 
