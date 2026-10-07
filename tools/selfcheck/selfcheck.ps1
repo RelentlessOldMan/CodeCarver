@@ -99,6 +99,32 @@ $cases = @(
          'main.c' = "void blink_task(void);`nint main(void) { blink_task(); return 0; }`n"
          'task.c' = "#define DEFINE_TASK(n) void n##_task(void)`nDEFINE_TASK(blink) { }`n"
          'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'digraph body <% %>'; Lang = 'c'; Expect = @('odd.c')
+       Files = @{
+         'main.c'   = "int odd(int);`nint main(void) { return odd(1); }`n"
+         'odd.c'    = "int odd(int a) <% int v<:1:> = <% a %>; return v<:0:>; %>`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'name wrapped in a macro: int EXPORT(f)(...)'; Lang = 'c'; Expect = @('odd.c')
+       Files = @{
+         'main.c'   = "int odd(int);`nint main(void) { return odd(1); }`n"
+         'odd.c'    = "#define EXPORT(n) n`nint EXPORT(odd)(int a) { return a; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'unbalanced junk inside #if 0'; Lang = 'c'; Expect = @('odd.c')
+       Files = @{
+         'main.c'   = "int odd(int);`nint main(void) { return odd(1); }`n"
+         'odd.c'    = "#if 0`nint fake(void) { { {`n#endif`nint odd(int a) { return a; }`n#if 0`n}}}`n#endif`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'weak aliases (#pragma, _Pragma, alias macro)'; Lang = 'c'; Expect = @('alias.c')
+       Files = @{
+         'main.c'   = "int h1(void); int h2(void); int h3(void);`nint main(void) { return h1() + h2() + h3(); }`n"
+         'alias.c'  = "#define WEAK_ALIAS(f) __attribute__((weak, alias(#f)))`nint i1(void) { return 1; }`n#pragma weak h1 = i1`nint i2(void) { return 2; }`n_Pragma(`"weak h2 = i2`")`nint i3(void) { return 3; }`nint h3(void) WEAK_ALIAS(i3);`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'macro call does not bind to a same-named function'; Lang = 'c'; Expect = @('real.c')
+       Files = @{
+         'log.h'    = "int real_log(int);`n#define log_it(x) real_log(x)`n"
+         'main.c'   = "#include `"log.h`"`nint main(void) { return log_it(1); }`n"
+         'real.c'   = "int real_log(int x) { return x; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
 )
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("cc-selfcheck-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))

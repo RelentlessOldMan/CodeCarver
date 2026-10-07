@@ -1,0 +1,128 @@
+<#
+.SYNOPSIS
+  The eldritch horror oracle: carve examples/eldritch every way, then BUILD and RUN each carved tree with real gcc
+  (WSL) and require the exact output of the original.
+
+.DESCRIPTION
+  examples/eldritch is small but packs every nasty C construct we know of: macros hiding same-named decoy functions,
+  weak/strong pairs, four kinds of alias, a function written in assembly, #if worlds decided by an out-of-root
+  header / -include / @response file / the C library / a built-in, split heads, K&R, PROTO((...)), tables,
+  token pasting, X-macros, a unity include, a constructor, a symbol named only by inline asm, a body from an
+  #include, digraphs, _Generic, an attribute-only reference, a file compiled twice with different -D, ...
+
+  1. The original is built in WSL under tools/capture (strace): build.log (echoed compiles) + build.trace.
+     Its output is the expected output.
+  2. It is carved with four input sets (log+trace, log, trace, none) at three stages (safe, aggressive, max).
+  3. Each carved tree is built with its own build.sh and run. Carve exit must be 0, the build must succeed and the
+     output must match. With log+trace the decoys must be dropped and compiled-but-unreached files must be placeholders.
+
+  Not ComputeWarden-gated: a few dozen tiny compiles.
+
+.EXAMPLE
+  ./tools/eldritch/eldritch-oracle.ps1
+#>
+[CmdletBinding()]
+param(
+    [string]$CliDll = (Join-Path $PSScriptRoot '..\..\src\CodeCarver.Cli\bin\Debug\net8.0\codecarver.dll'),
+    [switch]$SaveInputs,   # also refresh examples/eldritch/inputs (the captured log + trace CI carves with)
+    [string]$Work = (Join-Path ([IO.Path]::GetTempPath()) ('eldritch-' + [guid]::NewGuid().ToString('N').Substring(0, 8)))
+)
+$ErrorActionPreference = 'Stop'
+$repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$ex = Join-Path $repo 'examples\eldritch'
+$src = Join-Path $ex 'src'
+$sdk = Join-Path $ex 'sdk'
+if (-not (Test-Path $CliDll)) { throw "CLI not built: $CliDll (dotnet build src/CodeCarver.Cli)" }
+New-Item -ItemType Directory -Force $Work | Out-Null
+$Work = (Resolve-Path $Work).Path
+
+function ToWsl([string]$p) { $f = [IO.Path]::GetFullPath($p); '/mnt/' + $f.Substring(0, 1).ToLowerInvariant() + ($f.Substring(2) -replace '\\', '/') }
+function Invoke-Wsl([string]$cmd) { $ErrorActionPreference = 'Continue'; $o = & wsl.exe -e bash -lc $cmd 2>&1; return @{ Code = $LASTEXITCODE; Out = ($o | Out-String) } }
+
+$srcW = ToWsl $src; $sdkW = ToWsl $sdk; $workW = ToWsl $Work
+$capture = ToWsl (Join-Path $repo 'tools\capture\capture-file-trace.sh')
+
+# 1. The original, traced.
+$r = Invoke-Wsl "set -e; cd '$workW'; rm -rf /tmp/eldritch-orig; bash '$capture' build.trace -- sh '$srcW/build.sh' '$srcW' /tmp/eldritch-orig '$sdkW' > build.log 2>&1; /tmp/eldritch-orig/eldritch > expected.txt"
+if ($SaveInputs -and $r.Code -eq 0) {
+    # examples/eldritch/inputs: CI carves with these (no gcc there). They name only /mnt/c/... repo paths, /tmp and /usr.
+    $in = Join-Path $ex 'inputs'
+    New-Item -ItemType Directory -Force $in | Out-Null
+    foreach ($n in 'build.log', 'build.trace', 'expected.txt') { Copy-Item (Join-Path $Work $n) (Join-Path $in $n) -Force }
+    Write-Host "saved build.log, build.trace, expected.txt to $in"
+}
+if ($r.Code -ne 0) { throw "original build failed:`n$($r.Out)`n$(Get-Content (Join-Path $Work 'build.log') -Raw)" }
+$expected = Get-Content (Join-Path $Work 'expected.txt') -Raw
+Write-Host "original: $((Get-Content (Join-Path $Work 'expected.txt')).Count) output line(s); trace $((Get-Content (Join-Path $Work 'build.trace')).Count) path(s)"
+
+$fail = 0
+$rows = @()
+foreach ($mode in 'log+trace', 'log', 'trace', 'none') {
+    $out = Join-Path $Work ("out-" + ($mode -replace '\+', '-'))
+    $builds = ''
+    if ($mode -ne 'none') {
+        $builds = "[builds.b]`n"
+        if ($mode -match 'log') { $builds += "buildLogs = [`"$(($Work -replace '\\','/'))/build.log`"]`n" }
+        if ($mode -match 'trace') { $builds += "buildTraceFiles = [`"$(($Work -replace '\\','/'))/build.trace`"]`n" }
+    }
+    $cfg = Join-Path $Work "carve-$($mode -replace '\+','-').toml"
+    @"
+outputDirectory = "$($out -replace '\\','/')"
+[common]
+entryPoints = ["main"]
+languages = ["c"]
+$builds
+[advanced]
+pathMap = [{ from = "$srcW", to = "." }, { from = "$sdkW", to = "../sdk" }]
+[stages.safe]
+carveSourceFileContents = false
+carveHeaderFileContents = false
+[stages.aggressive]
+carveSourceFileContents = true
+carveHeaderFileContents = false
+[stages.max]
+carveSourceFileContents = true
+carveHeaderFileContents = true
+"@ | Set-Content -Encoding utf8 $cfg
+    $ErrorActionPreference = 'Continue'
+    $carve = @(& dotnet $CliDll carve $src --config $cfg 2>&1 | ForEach-Object { "$_" })
+    $code = $LASTEXITCODE
+    foreach ($stage in 'safe', 'aggressive', 'max') {
+        $carved = Join-Path $out "$stage\carved"
+        $row = [ordered]@{ mode = $mode; stage = $stage; carve = $code; build = '-'; output = '-'; notes = '' }
+        if ($code -ne 0) {
+            $row.notes = 'carve failed'; $fail++
+            $rows += [pscustomobject]$row
+            continue
+        }
+        $cW = ToWsl $carved
+        $skip = if ($mode -eq 'none') { 'SKIP_MISSING=1 ' } else { '' }
+        $b = Invoke-Wsl "cd '$workW'; rm -rf 'b-$stage'; ${skip}sh '$cW/build.sh' '$cW' 'b-$stage' '$sdkW' > 'b-$stage.log' 2>&1 && ./b-$stage/eldritch > 'b-$stage.txt'"
+        if ($b.Code -ne 0) {
+            $row.build = 'FAIL'; $fail++
+            $errs = @(Get-Content (Join-Path $Work "b-$stage.log") | Where-Object { $_ -match 'error|undefined reference' } | Select-Object -First 4)
+            $row.notes = ($errs -join ' | ')
+        }
+        else {
+            $row.build = 'ok'
+            $got = Get-Content (Join-Path $Work "b-$stage.txt") -Raw
+            if ($got -eq $expected) { $row.output = 'same' } else { $row.output = 'DIFFERENT'; $fail++ }
+        }
+        if ($mode -eq 'log+trace' -and $stage -eq 'safe') {
+            $bad = @()
+            foreach ($d in 'legacy\decoy.c', 'legacy\garbage.c') { if (Test-Path (Join-Path $carved $d)) { $bad += "$d kept" } }
+            foreach ($p in 'quiet.c', 'unused_compiled.c') {
+                $f = Join-Path $carved $p
+                if (-not (Test-Path $f) -or -not ((Get-Content $f -Raw) -match 'Placeholder written by CodeCarver')) { $bad += "$p not a placeholder" }
+            }
+            if ($bad.Count -gt 0) { $row.notes = ($row.notes + ' ' + ($bad -join ', ')).Trim(); $fail++ }
+        }
+        $rows += [pscustomobject]$row
+    }
+    if ($code -ne 0) { Write-Host "--- carve ($mode) exit ${code}:"; $carve | Select-Object -Last 25 | ForEach-Object { Write-Host "  $_" } }
+}
+$rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+if ($fail -gt 0) { Write-Host "ELDRITCH: FAIL ($fail problem(s)); work dir $Work"; exit 1 }
+Write-Host "ELDRITCH: PASS - every carve of the horror builds and prints the original's output"
+Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
+exit 0

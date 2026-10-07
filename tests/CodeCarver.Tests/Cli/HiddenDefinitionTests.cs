@@ -420,17 +420,20 @@ public sealed class VerifyCauseTests
     [Fact]
     public void LinkCheck_StillReportsATypedFunctionNamedLikeAMacro()
     {
-        // The macro exemption covers bare `NAME(...)` heads only: a real definition with a return type that shares a
-        // function-like macro's name (another target's macro in a multi-target tree) is still checked.
+        // A real definition with a return type that shares a function-like macro's name is still checked when that
+        // macro belongs to another target: the calling file doesn't include it, so the call is a real call. (Where the
+        // macro IS visible at the call, the preprocessor expands it and no link reference exists: NameBindingTests.)
         var root = Path.Combine(Path.GetTempPath(), "cc-regt-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
         try
         {
             var kept = Path.Combine(root, "kept.c");
+            var other = Path.Combine(root, "other.h");
             var gone = Path.Combine(root, "gone.c");
-            File.WriteAllText(kept, "#define helper(x) other_helper(x)\nint main(void) { return helper(1); }\n");
+            File.WriteAllText(kept, "int helper(int);\nint main(void) { return helper(1); }\n");
+            File.WriteAllText(other, "#define helper(x) other_helper(x)\n");
             File.WriteAllText(gone, "int helper(int x) { return x; }\n");
-            var r = CodeCarver.Core.Reachability.EmittedLinkCheck.Run(new[] { ("kept.c", kept) }, new[] { ("gone.c", gone) });
+            var r = CodeCarver.Core.Reachability.EmittedLinkCheck.Run(new[] { ("kept.c", kept), ("other.h", other) }, new[] { ("gone.c", gone) });
             Assert.Contains(r.Violations, v => v.Name == "helper");
         }
         finally { TempDir.Delete(root); }

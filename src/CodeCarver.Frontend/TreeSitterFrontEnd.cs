@@ -43,6 +43,22 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private static readonly Regex AliasAttr = new(
         @"(?<name>[A-Za-z_]\w*)\s*\([^()]*\)\s*__attribute__\s*\(\(\s*[^()]*?\balias\s*\(\s*""(?<target>[A-Za-z_]\w*)""",
         RegexOptions.Compiled);
+    // The other ways C text makes one name an alias of another (pass 2b):
+    //   __attribute__((alias("impl"))) void hook(void);     #pragma weak hook = impl     __asm__(".set hook, impl")
+    private static readonly Regex AliasAttrBefore = new(
+        @"__attribute__\s*\(\([^;{}]*?\balias\s*\(\s*""(?<target>[A-Za-z_]\w*)""\s*\)[^;{}]*?\)\)[\w\s\*]*?\b(?<name>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*;",
+        RegexOptions.Compiled);
+    private static readonly Regex PragmaWeakAlias = new(
+        @"(?:^[ \t]*#[ \t]*pragma[ \t]+weak|\b_Pragma\s*\(\s*""\s*weak)[ \t]+(?<name>[A-Za-z_]\w*)[ \t]*=[ \t]*(?<target>[A-Za-z_]\w*)",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+    private static readonly Regex AsmSetAlias = new(
+        @"\.(?:set|equ|equiv)\s+(?<name>[A-Za-z_]\w*)\s*,\s*(?<target>[A-Za-z_]\w*)", RegexOptions.Compiled);
+    // Body (after the macro's "(") of an alias macro: `f) __attribute__((weak, alias(#f)))`.
+    private static readonly Regex AliasMacroBody = new(@"^\s*(\w+)\s*\)[^\n]*\balias\s*\(\s*#\s*\1\b", RegexOptions.Compiled);
+    private Regex? _aliasMacroUse;
+    // Identity wrappers `#define EXPORT(n) n` / `(n)`, as used on a definition's name: `int EXPORT(f)(void) {`.
+    private static readonly Regex IdentityBody = new(@"^\s*(\w+)\s*\)\s*\(?\s*\1\s*\)?\s*$", RegexOptions.Compiled);
+    private Regex? _wrapperUse;
 
     // Keep-attributes: symbols the runtime/linker keep regardless of any call — implicit roots a
     // from-main closure would silently drop (a self-registering `constructor`, an initcall-section entry).
@@ -655,7 +671,38 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             : new Regex(@"\b(?:" + string.Join("|", blank.Select(Regex.Escape)) + @")\b(?!\s*\()", RegexOptions.Compiled);
 
         _funcLikeMacroNames = fnLike;
+
+        // Alias macros: `#define WEAK_ALIAS(f) __attribute__((weak, alias(#f)))`. A declarator followed by one is an
+        // alias of the macro's argument (pass 2b).
+        var aliasMacros = bodies.Where(kv => kv.Value.FnLike && kv.Value.Bodies.Any(b => AliasMacroBody.IsMatch(b)))
+                                .Select(kv => kv.Key).ToList();
+        var wrappers = bodies.Where(kv => kv.Value.FnLike && kv.Value.Bodies.Count > 0 && kv.Value.Bodies.All(b => IdentityBody.IsMatch(b)))
+                             .Select(kv => kv.Key).ToList();
+        _wrapperUse = wrappers.Count == 0 ? null
+            : new Regex(@"\b(?:" + string.Join("|", wrappers.Select(Regex.Escape)) + @")\s*\(\s*(?<name>[A-Za-z_]\w*)\s*\)(?=\s*\()",
+                        RegexOptions.Compiled);
+        _aliasMacroUse = aliasMacros.Count == 0 ? null
+            : new Regex(@"\b(?<name>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*(?:" + string.Join("|", aliasMacros.Select(Regex.Escape))
+                        + @")\s*\(\s*(?<target>[A-Za-z_]\w*)\s*\)\s*;", RegexOptions.Compiled);
         return (bytesTotal, filesTotal);
+    }
+
+    /// <summary>`int EXPORT(name)(params)` where <c>#define EXPORT(n) n</c> (or <c>(n)</c>): the parser sees a call-shaped
+    /// head named EXPORT. For parsing only, blank the wrapper and its parentheses so the head reads <c>int name(params)</c>.
+    /// Length-preserving; #define lines are left alone.</summary>
+    private string UnwrapNames(string text)
+    {
+        if (_wrapperUse is null || !_wrapperUse.IsMatch(text)) return text;
+        var sb = new StringBuilder(text);
+        foreach (Match m in _wrapperUse.Matches(text))
+        {
+            var lineStart = text.LastIndexOf('\n', Math.Max(0, m.Index - 1)) + 1;
+            if (text.AsSpan(lineStart, m.Index - lineStart).TrimStart().StartsWith("#")) continue;
+            var name = m.Groups["name"];
+            for (var k = m.Index; k < name.Index; k++) if (sb[k] != '\n') sb[k] = ' ';
+            for (var k = name.Index + name.Length; k < m.Index + m.Length; k++) if (sb[k] != '\n') sb[k] = ' ';
+        }
+        return sb.ToString();
     }
 
     /// <summary>Replace scope-opening macros with their (single-line) expansion, for parsing only. Skips
@@ -995,7 +1042,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     {
         // Expand scope-opening macros, so a file that opens its namespace with `FMT_BEGIN_NAMESPACE` is structured
         // correctly and its functions are captured.
-        var parseText = ExpandScopeMacros(text);
+        var parseText = ExpandScopeMacros(Digraphs.Rewrite(CodeCarver.Core.Preprocess.PreprocessorScanner.BlankAlwaysDead(text)));
+        parseText = UnwrapNames(parseText);
         bareKAndR = null;
         var cut = "";
         if (_cGrammar || path.EndsWith(".c", StringComparison.OrdinalIgnoreCase))
@@ -1395,12 +1443,19 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // bodyless declaration tree-sitter treats as a prototype (uncaptured), yet it IS a real symbol the
         // vector table points at — and it REQUIRES its target. Register the alias name as a function and
         // link it to the target, so a reference to the alias (e.g. from the vector table) keeps the target.
-        foreach (Match m in text.Contains("alias") ? AliasAttr.Matches(text) : (IEnumerable<Match>)Array.Empty<Match>())
+        IEnumerable<Match> aliases = Array.Empty<Match>();
+        if (text.Contains("alias", StringComparison.Ordinal))
+            aliases = aliases.Concat(AliasAttr.Matches(text)).Concat(AliasAttrBefore.Matches(text));
+        if (text.Contains("ragma", StringComparison.Ordinal)) aliases = aliases.Concat(PragmaWeakAlias.Matches(text));   // #pragma and _Pragma
+        if (text.Contains("asm", StringComparison.Ordinal)) aliases = aliases.Concat(AsmSetAlias.Matches(text));
+        if (_aliasMacroUse is not null) aliases = aliases.Concat(_aliasMacroUse.Matches(text));
+        foreach (Match m in aliases)
         {
             var name = m.Groups["name"].Value;
             if (Keywords.Contains(name)) continue;
             var ln = 1;
-            for (var k = 0; k < m.Index && k < text.Length; k++) if (text[k] == '\n') ln++;
+            for (var k = 0; k < m.Groups["name"].Index && k < text.Length; k++) if (text[k] == '\n') ln++;
+            if (dead is not null && ln < dead.Length && dead[ln]) continue;
             var aid = graph.GetOrAddNode(NodeKind.Function, name, path, new SourceSpan(ln, ln));
             graph.AddEdge(aid, fileNode, EdgeKind.DefinedIn);
             Add(functionsByName, name, aid);

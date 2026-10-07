@@ -9,7 +9,13 @@ namespace CodeCarver.Core.Reachability;
 /// <param name="DeadOnly">True when every reference sits on a line the #ifdef model calls dead — the carve
 /// relied on that model to drop the definition. Reported, but not a hard failure.</param>
 /// <param name="DefinedLine">1-based line of that definition in <paramref name="DefinedIn"/>.</param>
-public sealed record LinkViolation(string Name, string DefinedIn, string ReferencedIn, int Line, bool DeadOnly, int DefinedLine = 0);
+public sealed record LinkViolation(string Name, string DefinedIn, string ReferencedIn, int Line, bool DeadOnly, int DefinedLine = 0)
+{
+    /// <summary>Every dropped file that defines the name (<see cref="DefinedIn"/> is the first).</summary>
+    public IReadOnlyList<string> DefinedInAll { get; init; } = Array.Empty<string>();
+    /// <summary>The emitted code declares the name weak: an unresolved reference links (as null).</summary>
+    public bool Weak { get; init; }
+}
 
 /// <summary>Outcome of <see cref="EmittedLinkCheck.Run"/>.</summary>
 public sealed record LinkCheckResult(IReadOnlyList<LinkViolation> Violations, int FilesChecked, int FilesSkipped)
@@ -46,12 +52,16 @@ public static class EmittedLinkCheck
     /// <param name="dropped">Dropped code files: (relative path, path on disk to read).</param>
     /// <param name="deadLines">Optional: (relative path, emitted text) → 1-based dead-line map, or null.</param>
     /// <param name="maxBytes">Files larger than this are not read (counted in FilesSkipped).</param>
+    /// <param name="original">For a stage that carves INSIDE kept files: emitted relative path → the original file on
+    /// disk. A function the original defines and the emitted copy doesn't was pruned, and counts as dropped.</param>
     public static LinkCheckResult Run(
         IEnumerable<(string Rel, string Path)> emitted,
         IEnumerable<(string Rel, string Path)> dropped,
         Func<string, string, bool[]?>? deadLines = null,
-        long maxBytes = 20_000_000)
+        long maxBytes = 20_000_000,
+        Func<string, string?>? original = null)
     {
+        emitted = emitted.ToList();
         var skipped = 0;
         var checkedFiles = 0;
 
@@ -62,6 +72,7 @@ public static class EmittedLinkCheck
         // not a link symbol (work eval, 1.0.162: a registration macro invoked in two modules was reported as
         // "used" in one and "defined only" in the other).
         var typedDef = new HashSet<string>(StringComparer.Ordinal);
+        var definers = new Dictionary<string, List<string>>(StringComparer.Ordinal);
         var functionMacros = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (rel, path) in dropped.OrderBy(d => d.Rel, StringComparer.Ordinal))
         {
@@ -69,22 +80,61 @@ public static class EmittedLinkCheck
             if (text is null) { skipped++; continue; }
             checkedFiles++;
             var header = IsHeader(rel);
-            var dscan = Scan(text, header);
+            var dscan = Scan(text, header, declarators: false);
             functionMacros.UnionWith(dscan.FunctionMacros);
             foreach (var d in dscan.Definitions)
                 if (header || !d.Static)
                 {
                     droppedDefs.TryAdd(d.Name, (rel, d.Line));
+                    if (!definers.TryGetValue(d.Name, out var dl)) definers[d.Name] = dl = new List<string>();
+                    if (!dl.Contains(rel)) dl.Add(rel);
                     if (!d.Bare) typedDef.Add(d.Name);
                 }
         }
-        if (droppedDefs.Count == 0)
+        // Functions pruned out of kept files. A pruned static is only visible in its own file.
+        var prunedStatics = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
+        if (original is not null)
+            foreach (var (rel, path) in emitted)
+            {
+                if (IsAssembly(rel) || original(rel) is not { } op) continue;
+                var otext = TryRead(op, maxBytes);
+                var etext = otext is null ? null : TryRead(path, maxBytes);
+                if (otext is null || etext is null || otext == etext) continue;
+                var header = IsHeader(rel);
+                var kept = Scan(etext, header, declarators: false).Definitions.Select(d => d.Name).ToHashSet(StringComparer.Ordinal);
+                foreach (var d in Scan(otext, header, declarators: false).Definitions)
+                {
+                    if (kept.Contains(d.Name)) continue;
+                    if (d.Static && !header)
+                    {
+                        if (!prunedStatics.TryGetValue(rel, out var ps)) prunedStatics[rel] = ps = new(StringComparer.Ordinal);
+                        ps.TryAdd(d.Name, d.Line);
+                        continue;
+                    }
+                    droppedDefs.TryAdd(d.Name, (rel, d.Line));
+                    if (!definers.TryGetValue(d.Name, out var dl)) definers[d.Name] = dl = new List<string>();
+                    if (!dl.Contains(rel)) dl.Add(rel);
+                    if (!d.Bare) typedDef.Add(d.Name);
+                }
+            }
+        var staticViolations = new List<LinkViolation>();
+        if (droppedDefs.Count == 0 && prunedStatics.Count == 0)
             return new LinkCheckResult(Array.Empty<LinkViolation>(), checkedFiles, skipped);
 
         // 2+3. Definitions and uses in the emitted files.
         var emittedDefs = new HashSet<string>(StringComparer.Ordinal);
         var live = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
         var dead = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
+        // Per file: the function-like macros it #defines on live lines, and what it #includes. A call `name(...)` where
+        // a function-like macro `name` is visible (this file or a header it includes) is expanded by the preprocessor:
+        // it never reaches the linker, whatever a same-named function elsewhere does.
+        var fileMacros = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        var fileIncludes = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var headersByBase = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        var macroCalls = new List<(string Name, string Rel, int Line, bool Dead)>();
+        var aliasMacros = new HashSet<string>(StringComparer.Ordinal);
+        var macroDeclarators = new List<(string Name, string Macro, string Target, string Rel, int Line)>();
+        var weakNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (rel, path) in emitted.OrderBy(e => e.Rel, StringComparer.Ordinal))
         {
             var text = TryRead(path, maxBytes);
@@ -92,28 +142,82 @@ public static class EmittedLinkCheck
             checkedFiles++;
             var map = deadLines?.Invoke(rel, text);
             bool IsDead(int line) => map is not null && line < map.Length && map[line];
-            var scan = Scan(text, IsHeader(rel));
+            var scan = IsAssembly(rel) ? ScanAssembly(text) : Scan(text, IsHeader(rel));
             functionMacros.UnionWith(scan.FunctionMacros);
+            fileMacros[rel] = scan.FunctionMacroLines.Where(m => !IsDead(m.Line)).Select(m => m.Name).ToHashSet(StringComparer.Ordinal);
+            fileIncludes[rel] = scan.Includes;
+            var b = Path.GetFileName(rel);
+            if (!headersByBase.TryGetValue(b, out var hl)) headersByBase[b] = hl = new List<string>();
+            hl.Add(rel);
             foreach (var d in scan.Definitions)
                 if (!IsDead(d.Line)) emittedDefs.Add(d.Name);
+            aliasMacros.UnionWith(scan.AliasMacros);
+            foreach (var md in scan.MacroDeclarators) if (!IsDead(md.Line)) macroDeclarators.Add((md.Name, md.Macro, md.Target, rel, md.Line));
+            weakNames.UnionWith(scan.WeakDeclarations);
+            if (prunedStatics.TryGetValue(rel, out var pruned))
+            {
+                var definedHere = scan.Definitions.Select(d => d.Name).ToHashSet(StringComparer.Ordinal);
+                var reported = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var (name, line) in scan.Uses)
+                    if (pruned.TryGetValue(name, out var defLine) && !definedHere.Contains(name) && reported.Add(name)
+                        && !(scan.CallUses.Contains((name, line)) && scan.FunctionMacros.Contains(name)))
+                        staticViolations.Add(new LinkViolation(name, rel, rel, line, DeadOnly: IsDead(line), DefinedLine: defLine)
+                                             { DefinedInAll = new[] { rel } });
+            }
             foreach (var (name, line) in scan.Uses)
             {
                 if (!droppedDefs.ContainsKey(name)) continue;
+                if (scan.CallUses.Contains((name, line))) { macroCalls.Add((name, rel, line, IsDead(line))); continue; }
                 var into = IsDead(line) ? dead : live;
                 into.TryAdd(name, (rel, line));
             }
+        }
+        // Function-like macros visible in a file: its own, plus those of every emitted header it includes (by basename,
+        // transitively). Memoised; a cycle just stops.
+        var visible = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        HashSet<string> Visible(string rel)
+        {
+            if (visible.TryGetValue(rel, out var v)) return v;
+            v = new HashSet<string>(StringComparer.Ordinal);
+            visible[rel] = v;   // cycle guard
+            var stack = new Stack<string>(); stack.Push(rel);
+            var seen = new HashSet<string>(StringComparer.Ordinal) { rel };
+            while (stack.Count > 0)
+            {
+                var f = stack.Pop();
+                if (fileMacros.TryGetValue(f, out var ms)) v.UnionWith(ms);
+                if (!fileIncludes.TryGetValue(f, out var incs)) continue;
+                foreach (var inc in incs)
+                    if (headersByBase.TryGetValue(Path.GetFileName(inc), out var hs))
+                        foreach (var h in hs) if (seen.Add(h)) stack.Push(h);
+            }
+            return v;
+        }
+        foreach (var (name, macro, target, mrel, mline) in macroDeclarators)
+            if (aliasMacros.Contains(macro))
+            {
+                emittedDefs.Add(name);
+                if (droppedDefs.ContainsKey(target)) live.TryAdd(target, (mrel, mline));   // the alias needs its target
+            }
+        foreach (var (name, rel, line, isDead) in macroCalls)
+        {
+            // Only a name some file #defines as a function-like macro can be one (the include closure is the cost).
+            if (functionMacros.Contains(name) && Visible(rel).Contains(name)) continue;   // a macro invocation, not a reference
+            (isDead ? dead : live).TryAdd(name, (rel, line));
         }
 
         var violations = new List<LinkViolation>();
         foreach (var name in live.Keys.Concat(dead.Keys).Distinct().OrderBy(n => n, StringComparer.Ordinal))
         {
             if (emittedDefs.Contains(name)) continue;
+
             if (functionMacros.Contains(name) && !typedDef.Contains(name)) continue;
             var isLive = live.TryGetValue(name, out var at);
             if (!isLive) at = dead[name];
             var def = droppedDefs[name];
-            violations.Add(new LinkViolation(name, def.Rel, at.Rel, at.Line, DeadOnly: !isLive, DefinedLine: def.Line));
+            violations.Add(new LinkViolation(name, def.Rel, at.Rel, at.Line, DeadOnly: !isLive, DefinedLine: def.Line) { DefinedInAll = definers[name], Weak = weakNames.Contains(name) });
         }
+        violations.AddRange(staticViolations);
         return new LinkCheckResult(violations, checkedFiles, skipped);
     }
 
@@ -144,11 +248,133 @@ public static class EmittedLinkCheck
         public List<(string Name, int Line)> Uses { get; } = new();
         /// <summary>Names this file #defines as function-like macros.</summary>
         public HashSet<string> FunctionMacros { get; } = new(StringComparer.Ordinal);
+        /// <summary>Each function-like #define, with its line.</summary>
+        public List<(string Name, int Line)> FunctionMacroLines { get; } = new();
+        /// <summary>What each #include names ("x.h" or &lt;x.h&gt;, without the delimiters).</summary>
+        public List<string> Includes { get; } = new();
+        /// <summary>Uses written as a call, <c>name(</c>: a function-like macro of that name would expand them.</summary>
+        public HashSet<(string Name, int Line)> CallUses { get; } = new();
+        /// <summary>Function-like macros this file defines whose body is <c>alias(#arg)</c>.</summary>
+        public HashSet<string> AliasMacros { get; } = new(StringComparer.Ordinal);
+        /// <summary><c>decl(...) MACRO(target);</c>: a definition of decl when MACRO is an alias macro (which may be
+        /// #defined in another file).</summary>
+        public List<(string Name, int Line, string Macro, string Target)> MacroDeclarators { get; } = new();
+        /// <summary>Names declared weak without a body: a reference to one may stay unresolved.</summary>
+        public HashSet<string> WeakDeclarations { get; } = new(StringComparer.Ordinal);
     }
 
     static readonly System.Text.RegularExpressions.Regex FuncLikeDefine = new(
         @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(",
         System.Text.RegularExpressions.RegexOptions.Multiline | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    static readonly System.Text.RegularExpressions.Regex IncludeLine = new(
+        @"^[ \t]*#[ \t]*include[ \t]*[""<]([^"">\r\n]+)["">]",
+        System.Text.RegularExpressions.RegexOptions.Multiline | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    // Names a file defines without a body: aliases and assembler symbols. A reference to one links.
+    //   void hook(void) __attribute__((weak, alias("impl")));      __attribute__((alias("impl"))) void hook(void);
+    //   void hook(void) WEAK_ALIAS(impl);   (a macro whose body is alias(#arg))      #pragma weak hook = impl
+    //   __asm__(".set hook, impl")   .equ / .equiv      .globl hook ... hook:
+    const System.Text.RegularExpressions.RegexOptions Rx = System.Text.RegularExpressions.RegexOptions.Multiline
+        | System.Text.RegularExpressions.RegexOptions.CultureInvariant;
+    // Group 1 = the alias (a definition), group 2 = its target (a use: the alias needs it).
+    static readonly System.Text.RegularExpressions.Regex AliasAfter = new(
+        @"\b([A-Za-z_]\w*)\s*\([^(){};]*\)\s*__attribute__\s*\(\([^;{}]*?\balias\s*\(\s*""(\w+)""", Rx);
+    static readonly System.Text.RegularExpressions.Regex AliasBefore = new(
+        @"__attribute__\s*\(\([^;{}]*?\balias\s*\(\s*""(?<t>\w+)""\s*\)[^;{}]*?\)\)[\w\s\*]*?\b(?<n>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*;", Rx);
+    static readonly System.Text.RegularExpressions.Regex AliasMacroDefine = new(
+        @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(\s*(\w+)\s*\)[^\n]*\balias\s*\(\s*#\s*\2\b", Rx);
+    static readonly System.Text.RegularExpressions.Regex MacroDeclarator = new(
+        @"\b([A-Za-z_]\w*)\s*\([^(){};]*\)\s*([A-Za-z_]\w*)\s*\(\s*(\w+)\s*\)\s*;", Rx);
+    // #pragma weak a = b  and  _Pragma("weak a = b"); without "= b" only a is declared weak.
+    static readonly System.Text.RegularExpressions.Regex PragmaWeak = new(
+        @"(?:^[ \t]*#[ \t]*pragma[ \t]+weak|\b_Pragma\s*\(\s*""\s*weak)[ \t]+([A-Za-z_]\w*)(?:[ \t]*=[ \t]*([A-Za-z_]\w*))?", Rx);
+    static readonly System.Text.RegularExpressions.Regex AsmSet = new(
+        @"\.(?:set|equ|equiv)\s+([A-Za-z_.$][\w.$]*)\s*,\s*([A-Za-z_.$][\w.$]*)?", Rx);
+    // A weak declaration (no body): the reference may stay unresolved, so it needs no definition.
+    static readonly System.Text.RegularExpressions.Regex WeakDeclAfter = new(
+        @"\b([A-Za-z_]\w*)\s*\([^(){};]*\)\s*__attribute__\s*\(\([^;{}()]*\bweak\b[^;{}()]*\)\)\s*;", Rx);
+    static readonly System.Text.RegularExpressions.Regex WeakDeclBefore = new(
+        @"__attribute__\s*\(\([^;{}()]*\bweak\b[^;{}()]*\)\)[\w\s\*]*?\b([A-Za-z_]\w*)\s*\([^(){};]*\)\s*;", Rx);
+    static readonly System.Text.RegularExpressions.Regex AsmGlobal = new(
+        @"(?:^|[\s""])\.(?:globl|global|weak|weakref)\s+([A-Za-z_.$][\w.$]*(?:\s*,\s*[A-Za-z_.$][\w.$]*)*)", Rx);
+    static readonly System.Text.RegularExpressions.Regex AsmPublic = new(
+        @"^[ \t]*(?:PUBLIC|EXPORT|GLOBAL|XDEF|\.public)[ \t]+([A-Za-z_]\w*(?:[ \t]*,[ \t]*[A-Za-z_]\w*)*)|^[ \t]*([A-Za-z_]\w*)[ \t]+PROC\b",
+        Rx | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    /// <summary>Assembly source: a GNU/ARM/MASM-style file, not C.</summary>
+    public static bool IsAssembly(string rel) =>
+        Path.GetExtension(rel).ToLowerInvariant() is ".s" or ".asm" or ".sx" or ".a51" or ".s43" or ".s90";
+
+    static int[] LineStarts(string text)
+    {
+        var l = new List<int> { 0 };
+        for (var i = 0; i < text.Length; i++) if (text[i] == '\n') l.Add(i + 1);
+        return l.ToArray();
+    }
+    static int LineOf(int[] starts, int index)
+    {
+        var k = Array.BinarySearch(starts, index);
+        return (k >= 0 ? k : ~k - 1) + 1;
+    }
+
+    /// <summary>Aliases, weak pragmas and assembler symbols defined in C text (see the regexes above). A declarator
+    /// followed by a macro goes to <see cref="ScanResult.MacroDeclarators"/>: whether that macro is an alias macro is
+    /// decided across files.</summary>
+    static void BodilessDefinitions(string text, ScanResult result, bool declarators)
+    {
+        var starts = LineStarts(text);
+        void Add(string name, int index) => result.Definitions.Add(new Definition(name, LineOf(starts, index), false, false));
+        // The alias needs its target: a use (it sits in a string or a directive, which the tokenizer skips).
+        void Use(System.Text.RegularExpressions.Group g) { if (g.Success) result.Uses.Add((g.Value, LineOf(starts, g.Index))); }
+        if (text.Contains("alias", StringComparison.Ordinal))
+        {
+            foreach (System.Text.RegularExpressions.Match m in AliasAfter.Matches(text)) { Add(m.Groups[1].Value, m.Groups[1].Index); Use(m.Groups[2]); }
+            foreach (System.Text.RegularExpressions.Match m in AliasBefore.Matches(text)) { Add(m.Groups["n"].Value, m.Groups["n"].Index); Use(m.Groups["t"]); }
+            foreach (System.Text.RegularExpressions.Match m in AliasMacroDefine.Matches(text)) result.AliasMacros.Add(m.Groups[1].Value);
+        }
+        if (declarators) foreach (System.Text.RegularExpressions.Match m in MacroDeclarator.Matches(text))
+            result.MacroDeclarators.Add((m.Groups[1].Value, LineOf(starts, m.Groups[1].Index), m.Groups[2].Value, m.Groups[3].Value));
+        if (text.Contains("weak", StringComparison.Ordinal))
+        {
+            foreach (System.Text.RegularExpressions.Match m in PragmaWeak.Matches(text))
+            {
+                if (m.Groups[2].Success) { Add(m.Groups[1].Value, m.Groups[1].Index); Use(m.Groups[2]); }
+                else result.WeakDeclarations.Add(m.Groups[1].Value);
+            }
+            foreach (System.Text.RegularExpressions.Match m in WeakDeclAfter.Matches(text)) result.WeakDeclarations.Add(m.Groups[1].Value);
+            foreach (System.Text.RegularExpressions.Match m in WeakDeclBefore.Matches(text)) result.WeakDeclarations.Add(m.Groups[1].Value);
+        }
+        if (text.Contains("asm", StringComparison.Ordinal))
+        {
+            foreach (System.Text.RegularExpressions.Match m in AsmSet.Matches(text)) { Add(m.Groups[1].Value, m.Groups[1].Index); Use(m.Groups[2]); }
+            // .globl name together with a `name:` label in the same text.
+            foreach (System.Text.RegularExpressions.Match m in AsmGlobal.Matches(text))
+                foreach (var n in m.Groups[1].Value.Split(',', StringSplitOptions.TrimEntries))
+                    if (System.Text.RegularExpressions.Regex.IsMatch(text, @"(?:^|[\s""])" + System.Text.RegularExpressions.Regex.Escape(n) + @"\s*:"))
+                        Add(n, m.Groups[1].Index);
+        }
+    }
+
+    /// <summary>An assembly file: its exported and aliased symbols are definitions (<c>.globl</c>/<c>.weak</c>,
+    /// <c>PUBLIC</c>/<c>EXPORT</c>, <c>name PROC</c>, <c>.set</c>/<c>.equ</c>). Uses are scanned as for C, so a vector
+    /// table's <c>.word handler</c> still counts.</summary>
+    public static ScanResult ScanAssembly(string text)
+    {
+        var result = Scan(text);
+        result.Definitions.Clear();
+        var starts = LineStarts(text);
+        void Add(string name, int index) => result.Definitions.Add(new Definition(name, LineOf(starts, index), false, false));
+        foreach (System.Text.RegularExpressions.Match m in AsmGlobal.Matches(text))
+            foreach (var n in m.Groups[1].Value.Split(',', StringSplitOptions.TrimEntries)) Add(n, m.Groups[1].Index);
+        foreach (System.Text.RegularExpressions.Match m in AsmPublic.Matches(text))
+        {
+            if (m.Groups[1].Success)
+                foreach (var n in m.Groups[1].Value.Split(',', StringSplitOptions.TrimEntries)) Add(n, m.Groups[1].Index);
+            else Add(m.Groups[2].Value, m.Groups[2].Index);
+        }
+        foreach (System.Text.RegularExpressions.Match m in AsmSet.Matches(text)) Add(m.Groups[1].Value, m.Groups[1].Index);
+        return result;
+    }
 
     internal readonly record struct Tok(string Text, int Line, bool Ident, bool InDefine);
 
@@ -173,13 +399,26 @@ public static class EmittedLinkCheck
     /// <summary>Tokenize and collect definitions and uses. In a <paramref name="header"/>, uses inside the body
     /// of a static/inline/template definition, or inside a C++ class body, are not collected: a compiler emits
     /// such a definition only where it is used, and then reachability followed it from that use.</summary>
-    public static ScanResult Scan(string text, bool header = false)
+    /// <param name="declarators">Collect <see cref="ScanResult.MacroDeclarators"/> (only emitted files need them).</param>
+    public static ScanResult Scan(string text, bool header = false, bool declarators = true)
     {
+        // `#if 0` blocks are dead in every configuration and often not C (unbalanced braces): never read them.
+        text = CodeCarver.Core.Preprocess.PreprocessorScanner.BlankAlwaysDead(text);
         var toks = Tokenize(text);
         var result = new ScanResult();
-        if (text.Contains("define", StringComparison.Ordinal))
-            foreach (System.Text.RegularExpressions.Match m in FuncLikeDefine.Matches(text))
-                result.FunctionMacros.Add(m.Groups[1].Value);
+        if (text.Contains('#'))
+        {
+            var starts = LineStarts(text);
+            if (text.Contains("define", StringComparison.Ordinal))
+                foreach (System.Text.RegularExpressions.Match m in FuncLikeDefine.Matches(text))
+                {
+                    result.FunctionMacros.Add(m.Groups[1].Value);
+                    result.FunctionMacroLines.Add((m.Groups[1].Value, LineOf(starts, m.Index)));
+                }
+            if (text.Contains("include", StringComparison.Ordinal))
+                foreach (System.Text.RegularExpressions.Match m in IncludeLine.Matches(text)) result.Includes.Add(m.Groups[1].Value);
+        }
+        BodilessDefinitions(text, result, declarators);
 
         // Brace stack: 'T' transparent (namespace / extern "C"), 'F' function body, 'Q' function body whose uses
         // don't count (header inline), 'C' class body in a header, 'O' other.
@@ -238,6 +477,33 @@ public static class EmittedLinkCheck
             // Member access: obj.name / p->name are fields/methods, not free names.
             if (prev.Text is "." or "->") continue;
 
+            // `int (name)(params) {`: a parenthesised name (it dodges a function-like macro of the same name).
+            if (AtFileScope() && prev.Text == "(" && next.Text == ")" && i + 2 < toks.Count && toks[i + 2].Text == "("
+                && !NotNames.Contains(name) && MatchParen(toks, i + 2) is var pclose && pclose > 0 && OpensBody(toks, pclose + 1))
+            {
+                result.Definitions.Add(new Definition(name, t.Line, StaticBefore(toks, stmtStart, i), false));
+                stmtDeclared.Add(name);
+                pendingBody = true;
+                pendingQuiet = header && StaticBefore(toks, stmtStart, i);
+                i = pclose;
+                continue;
+            }
+            // `int WRAP(name)(params) {`: the name wrapped in a macro (`#define WRAP(n) n`). A real parameter list is
+            // never a lone identifier followed by another parameter list, so the definition is of the inner name.
+            if (AtFileScope() && next.Text == "(" && i + 4 < toks.Count && toks[i + 2].Ident && !toks[i + 2].InDefine
+                && toks[i + 3].Text == ")" && toks[i + 4].Text == "(" && !NotNames.Contains(name)
+                && MatchParen(toks, i + 4) is var wclose && wclose > 0 && OpensBody(toks, wclose + 1))
+            {
+                var inner = toks[i + 2].Text;
+                var st = StaticBefore(toks, stmtStart, i);
+                result.Definitions.Add(new Definition(inner, t.Line, st, false));
+                stmtDeclared.Add(inner);
+                pendingBody = true;
+                pendingQuiet = header && st;
+                i = wclose;
+                continue;
+            }
+
             // File-scope function definition: name ( ... ) [attrs/qualifiers/init-list] {
             if (AtFileScope() && next.Text == "(" && !NotNames.Contains(name))
             {
@@ -279,8 +545,15 @@ public static class EmittedLinkCheck
             if (!inFunction && AtFileScope() && stmtDeclared.Contains(name)) continue;
             if (ExprKeywords.Contains(name)) continue;
             result.Uses.Add((name, t.Line));
+            if (next.Text == "(") result.CallUses.Add((name, t.Line));   // `(name)(x)` has ")" next: never a macro call
         }
         return result;
+    }
+
+    static bool StaticBefore(List<Tok> toks, int from, int to)
+    {
+        for (var k = from; k < to; k++) if (toks[k].Text == "static") return true;
+        return false;
     }
 
     static bool IsTransparentOpen(List<Tok> toks, int brace)
@@ -355,12 +628,12 @@ public static class EmittedLinkCheck
                 i += 2;
                 continue;
             }
-            if (c == '#' && atLineStart && directives)
+            if ((c == '#' || (c == '%' && i + 1 < s.Length && s[i + 1] == ':')) && atLineStart && directives)
             {
-                // Collect the logical directive line (with continuations), stripped of comments.
+                // Collect the logical directive line (with continuations), stripped of comments. `%:` is the # digraph.
                 var start = line;
                 var sb = new System.Text.StringBuilder();
-                i++;
+                i += c == '%' ? 2 : 1;
                 while (i < s.Length && s[i] != '\n')
                 {
                     if (s[i] == '\\' && i + 1 < s.Length && (s[i + 1] == '\n' || (s[i + 1] == '\r' && i + 2 < s.Length && s[i + 2] == '\n')))
@@ -406,6 +679,10 @@ public static class EmittedLinkCheck
             if (i + 1 < s.Length)
             {
                 var two = s.Substring(i, 2);
+                // Digraphs: <% %> <: :> are { } [ ] (but C++ `<::` before anything but : or > is < ::).
+                var di = two switch { "<%" => "{", "%>" => "}", "<:" => "[", ":>" => "]", _ => null };
+                if (di is not null && !(two == "<:" && i + 2 < s.Length && s[i + 2] == ':' && (i + 3 >= s.Length || s[i + 3] is not (':' or '>'))))
+                { toks.Add(new Tok(di, line, false, false)); i += 2; continue; }
                 if (two is "->" or "::" or "&&" or "||" or "==" or "!=" or "<=" or ">=" or "##")
                 { toks.Add(new Tok(two, line, false, false)); i += 2; continue; }
             }

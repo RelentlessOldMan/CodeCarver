@@ -37,6 +37,29 @@ public static class PreprocessorScanner
         public bool Active => ParentActive && BranchActive;
     }
 
+    private static readonly System.Text.RegularExpressions.Regex ConstantIf = new(
+        @"^[ \t]*#[ \t]*(?:el)?if[ \t(]*[01]\b", System.Text.RegularExpressions.RegexOptions.Multiline | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>The text with every line that is dead in EVERY configuration (<c>#if 0</c>, the <c>#else</c> of
+    /// <c>#if 1</c>) blanked to spaces, line breaks kept. Such a block is often not C at all (unbalanced braces, notes),
+    /// and a parser or tokenizer that reads it loses the real code after it. Directive lines stay.</summary>
+    public static string BlankAlwaysDead(string text)
+    {
+        if (!text.Contains("if", StringComparison.Ordinal) || !ConstantIf.IsMatch(text)) return text;
+        var dead = DeadLineMap(text, new MacroTable(), closedWorld: false);
+        var lines = text.Split('\n');
+        var any = false;
+        for (var i = 0; i < lines.Length; i++)
+        {
+            if (i + 1 >= dead.Length || !dead[i + 1] || lines[i].TrimStart().StartsWith('#')) continue;
+            var l = lines[i];
+            var cr = l.EndsWith('\r');
+            lines[i] = new string(' ', cr ? l.Length - 1 : l.Length) + (cr ? "\r" : "");
+            any = true;
+        }
+        return any ? string.Join('\n', lines) : text;
+    }
+
     /// <summary>Returns a 1-based map (index 0 unused) where true = the line is in a dead branch.</summary>
     public static bool[] DeadLineMap(string text, MacroTable defines, bool closedWorld = false)
     {

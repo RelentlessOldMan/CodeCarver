@@ -404,9 +404,12 @@ public static class CarveCommand
                         string? text = null;
                         try
                         {
+                            // Searched like #include "...": the command's directory, then each -I dir in order.
                             var bd = Path.IsPathFullyQualified(cc.Directory) ? cc.Directory : Path.Combine(dir, cc.Directory);
-                            var full = Path.IsPathFullyQualified(fi) ? fi : Path.Combine(bd, fi);
-                            if (File.Exists(full)) text = File.ReadAllText(full);
+                            var full = (Path.IsPathFullyQualified(fi) ? new[] { fi }
+                                        : new[] { Path.Combine(bd, fi) }.Concat(cc.Includes.Select(i => Path.Combine(Path.IsPathFullyQualified(i) ? i : Path.Combine(bd, i), fi))))
+                                       .FirstOrDefault(File.Exists);
+                            if (full is not null) text = File.ReadAllText(full);
                         }
                         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
                         if (text is null) { openWorldFiles.Add(kv.Key); continue; }
@@ -602,13 +605,22 @@ public static class CarveCommand
         // code needs fails loudly (cause definedInFileNotBuilt) instead of cutting silently. Files a run opened and
         // forceKeepFiles are always read. Off with [advanced] skipFilesNotBuilt = false.
         var notBuilt = new HashSet<string>(StringComparer.Ordinal);
-        if (closureLang && cv.EveryBuildTraced && cv.SkipFilesNotBuilt)
+        // Files OUTSIDE the root the traced builds opened (SDK and generated headers): the closed world reads their
+        // #defines. Null when not every selected build has a trace.
+        List<string>? buildOpenedOutside = null;
+        // The build log and the build trace describe the same build: every in-root source the log compiled must show
+        // up as opened in the trace. -1 = not checked (no log or no trace).
+        var traceMissedCompiled = -1;
+        if (closureLang && cv.EveryBuildTraced)
         {
             var rootF = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)) + Path.DirectorySeparatorChar;
             var opened = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var openedByBuild = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var outside = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var complete = true;
             foreach (var tp in buildFileTraces.Concat(runFileTraces))
             {
+                var isBuild = buildFileTraces.Contains(tp);
                 try
                 {
                     foreach (var cand in FileAccessTrace.Paths(File.ReadLines(tp)))
@@ -617,12 +629,29 @@ public static class CarveCommand
                         try { var mp = MapPath(cand); full = Path.IsPathFullyQualified(mp) ? Path.GetFullPath(mp) : Path.GetFullPath(Path.Combine(rootF, mp)); }
                         catch { continue; }   // not a usable path token (noise)
                         if (full.StartsWith(rootF, StringComparison.OrdinalIgnoreCase))
-                            opened.Add(Path.GetRelativePath(rootF, full).Replace('\\', '/'));
+                        {
+                            var rel = Path.GetRelativePath(rootF, full).Replace('\\', '/');
+                            opened.Add(rel);
+                            if (isBuild) openedByBuild.Add(rel);
+                        }
+                        else if (isBuild) outside.Add(full);
                     }
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { complete = false; }   // reported (exit 2) where traces are ingested
             }
-            if (complete && opened.Count > 0)
+            if (complete) buildOpenedOutside = outside.ToList();
+            if (complete && buildCmds.Count > 0)
+            {
+                var compiled = buildCmds.Select(CmdRel).Where(r => r is not null).Select(r => r!)
+                                        .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                traceMissedCompiled = compiled.Count(r => !openedByBuild.Contains(r));
+                summary["build.traceMissedCompiledFiles"] = traceMissedCompiled;
+                if (traceMissedCompiled > 0)
+                    err.WriteLine($"  build   : WARNING - the build trace is incomplete: {traceMissedCompiled:N0} of {compiled.Count:N0} source file(s) the build log "
+                        + "compiled were never opened in it. Likely: strace without -f, a build inside a container or a build server/daemon started "
+                        + "before tracing, a compiler cache, an incremental build, or paths that need [advanced] pathMap. Every file is read instead.");
+            }
+            if (cv.SkipFilesNotBuilt && complete && opened.Count > 0 && traceMissedCompiled <= 0)
             {
                 foreach (var glob in auxGlobs.Where(g => !BuildSupportEmitter.GlobEscapesRoot(g)))
                     foreach (var p in BuildSupportEmitter.MatchGlob(dir, glob)) opened.Add(Path.GetRelativePath(dir, p).Replace('\\', '/'));
@@ -630,7 +659,7 @@ public static class CarveCommand
                     if (!opened.Contains(rel) && !skipParse.Contains(rel)) notBuilt.Add(rel);
                 err.WriteLine($"  build   : {notBuilt.Count:N0} of {parseRels.Count:N0} code file(s) were not opened by the traced build(s) -> not read or parsed (dropped unless kept code needs them; verify checks)");
             }
-            summary["parse.filesNotBuiltSkipped"] = notBuilt.Count;
+            if (cv.SkipFilesNotBuilt) summary["parse.filesNotBuiltSkipped"] = notBuilt.Count;
         }
         if (perFileSpecs.Count > 0)
         {
@@ -947,8 +976,117 @@ public static class CarveCommand
                 foreach (System.Text.RegularExpressions.Match m in condRe.Matches(text))
                     foreach (System.Text.RegularExpressions.Match id in identRe.Matches(m.Groups[1].Value)) condIdents.Add(id.Value);
             }
-            foreach (var rel in parseRels) ScanText(ReadRel(rel));
+            // Quoted #includes, kept per file so the ones that leave the tree (or resolve nowhere) can be followed below.
+            var incRe = new System.Text.RegularExpressions.Regex(@"^\s*#\s*include\s*(?:""([^""]+)""|<([^>]+)>|([A-Za-z_]\w*))",
+                System.Text.RegularExpressions.RegexOptions.Multiline);
+            var quoted = new List<(string FromDir, string Raw)>();
+            var computedIncludes = 0;
+            void Includes(string fromDir, string text)
+            {
+                if (!text.Contains("include", StringComparison.Ordinal)) return;
+                foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
+                    if (m.Groups[1].Success) quoted.Add((fromDir, m.Groups[1].Value));
+                    else if (m.Groups[3].Success) computedIncludes++;
+            }
+            foreach (var rel in parseRels)
+            {
+                var text = ReadRel(rel);
+                ScanText(text);
+                Includes(Path.GetDirectoryName(fullByRel[rel]) ?? dir, text);
+            }
             foreach (var (_, text) in refIncludes) ScanText(text);
+
+            // Headers the build reads that the walk didn't: outside the root (an SDK, generated config) or in an
+            // excluded directory. A trace of every build says exactly which; otherwise every header under the build
+            // log's include dirs is read, and quoted #includes that leave the tree are followed. Only names some #if
+            // tests are kept. Anything that can't be seen makes the names nothing visible defines unknown.
+            var scannedFull = new HashSet<string>(fullByRel.Values.Select(Path.GetFullPath), StringComparer.OrdinalIgnoreCase);
+            var headerExt = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { ".h", ".hh", ".hpp", ".hxx", ".h++", ".inc", ".def", ".inl", ".ipp", ".tcc", ".tpp", ".c", ".cc", ".cpp", ".cxx", "" };
+            var outsideScanned = 0;
+            var notHere = 0;                      // headers the trace says the build opened that aren't on this machine
+            var unseen = new List<string>();      // why some header can't be read: shown on the config line
+            void ScanFile(string full)
+            {
+                if (!scannedFull.Add(full) || !headerExt.Contains(Path.GetExtension(full))) return;
+                try
+                {
+                    // tools/capture records successful opens only, so a missing one is a path from another machine
+                    // (a WSL or CI path with no pathMap): its macros can't be seen. Extensionless paths are mostly
+                    // programs, not headers.
+                    if (!File.Exists(full)) { if (Path.GetExtension(full).Length > 0) notHere++; return; }
+                    if (Path.GetExtension(full).Length == 0 && new FileInfo(full).Length > 4_000_000) return;  // not a header
+                    var text = File.ReadAllText(full);
+                    outsideScanned++;
+                    foreach (System.Text.RegularExpressions.Match m in defRe.Matches(text))
+                        if (condIdents.Contains(m.Groups[1].Value)) ambientMacros.Add(m.Groups[1].Value);
+                    Includes(Path.GetDirectoryName(full) ?? dir, text);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { unseen.Add("an unreadable header"); }
+            }
+            var incDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var cc in buildCmds)
+            {
+                var bd = Path.IsPathFullyQualified(cc.Directory) ? cc.Directory : Path.Combine(dir, cc.Directory);
+                foreach (var inc in cc.Includes)
+                    try { incDirs.Add(Path.GetFullPath(Path.IsPathFullyQualified(inc) ? inc : Path.Combine(bd, inc))); }
+                    catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { }
+            }
+            var rootFull = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir));
+            if (buildOpenedOutside is not null)
+            {
+                foreach (var f in buildOpenedOutside) ScanFile(f);
+                if (notHere > 0) unseen.Add($"{notHere} header(s) the build trace opened aren't on this machine (system headers of another OS, or paths that need pathMap)");
+            }
+            else
+            {
+                var missingDirs = 0;
+                foreach (var d in incDirs)
+                {
+                    if (!Directory.Exists(d)) { missingDirs++; continue; }
+                    // A dir that contains the root (-I.. ) would mean the whole disk: its top level only.
+                    var holdsRoot = rootFull.StartsWith(Path.TrimEndingDirectorySeparator(d) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+                    var opt = new EnumerationOptions { RecurseSubdirectories = !holdsRoot, IgnoreInaccessible = true };
+                    foreach (var f in Directory.EnumerateFiles(d, "*", opt))
+                        if (Path.GetExtension(f).Length > 0) ScanFile(Path.GetFullPath(f));
+                }
+                if (missingDirs > 0) unseen.Add($"{missingDirs} include dir(s) from the build log don't exist here");
+            }
+            // Quoted includes: follow the ones that leave the tree; one that resolves nowhere hides its macros.
+            var basenames = new HashSet<string>(fullByRel.Keys.Select(r => Path.GetFileName(r)), StringComparer.OrdinalIgnoreCase);
+            var unresolved = 0;
+            for (var qi = 0; qi < quoted.Count; qi++)
+            {
+                var (fromDir, raw) = quoted[qi];
+                string? hit = null;
+                foreach (var cand in new[] { fromDir }.Concat(incDirs))
+                {
+                    string full;
+                    try { full = Path.GetFullPath(Path.Combine(cand, raw)); } catch { continue; }
+                    if (File.Exists(full)) { hit = full; break; }
+                }
+                if (hit is not null) { ScanFile(hit); continue; }
+                if (!basenames.Contains(Path.GetFileName(raw))) unresolved++;
+            }
+            if (buildOpenedOutside is null)
+            {
+                if (unresolved > 0) unseen.Add($"{unresolved} #include \"...\"(s) resolve to no file here");
+                if (computedIncludes > 0) unseen.Add($"{computedIncludes} computed #include(s)");
+            }
+            if (outsideScanned > 0)
+                err.WriteLine($"  config  : read {outsideScanned:N0} header(s) outside the carve root or excluded for macros #if tests");
+            summary["world.headersOutsideRootScanned"] = outsideScanned;
+            if (unseen.Count > 0)
+            {
+                // What can't be seen may define any name that nothing visible defines: those stay unknown.
+                var dashD = new HashSet<string>(buildCmds.SelectMany(c => c.Defines).Select(SpecName).Concat(manualDefines.Select(SpecName)), StringComparer.Ordinal);
+                var invisible = condIdents.Where(n => !ambientMacros.Contains(n) && !dashD.Contains(n)).ToList();
+                ambientMacros.UnionWith(invisible);
+                if (invisible.Count > 0)
+                    err.WriteLine($"  config  : {invisible.Count:N0} #if name(s) defined nowhere visible stay unknown ({string.Join("; ", unseen.Distinct())}). "
+                    + "A build trace makes this exact; so does mapping the include dir(s) with [advanced] pathMap.");
+                summary["world.invisibleMacroNames"] = invisible.Count;
+            }
             foreach (var rel in skipParse)
             {
                 try
@@ -997,9 +1135,37 @@ public static class CarveCommand
         if (unresolvedRoots.Count > 0)
         {
             var near = NearMisses(graph, unresolvedRoots);
+            // Why a name isn't a node: look for its definition in the text itself (only on this failure path).
+            string WhyUnresolved(string name)
+            {
+                var re = new System.Text.RegularExpressions.Regex(@"\b" + System.Text.RegularExpressions.Regex.Escape(name) + @"\b");
+                (string Rel, int Line)? FindDef(IEnumerable<string> rels, Func<string, string> read, bool checkDead, out bool dead)
+                {
+                    dead = false;
+                    foreach (var rel in rels)
+                    {
+                        string text;
+                        try { text = read(rel); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
+                        if (text.Length == 0 || !re.IsMatch(text)) continue;
+                        var def = EmittedLinkCheck.Scan(text, EmittedLinkCheck.IsHeader(rel)).Definitions.FirstOrDefault(d => d.Name == name);
+                        if (def.Name is null) continue;
+                        if (checkDead && (perFileDefines?.Invoke(rel) ?? defines) is { } t
+                            && PreprocessorScanner.DeadLineMap(text, t, closedWorld) is var dl && def.Line < dl.Length && dl[def.Line])
+                            dead = true;
+                        return (rel, def.Line);
+                    }
+                    return null;
+                }
+                if (FindDef(parseRels.Where(r => !notBuilt.Contains(r)), ReadRel, true, out var isDead) is { } p)
+                    return isDead
+                        ? $"it is defined at {p.Rel}:{p.Line} inside an #if branch this build's configuration turns off — it isn't compiled in this build"
+                        : $"it is defined at {p.Rel}:{p.Line} but the parser didn't recognise the definition (see --why {name})";
+                if (notBuilt.Count > 0 && FindDef(notBuilt, r => File.ReadAllText(fullByRel[r]), false, out _) is { } q)
+                    return $"it is defined only in {q.Rel}, a file the traced build never compiled — it isn't part of this build (another target or component?)";
+                return "it is not defined anywhere in the tree (typo? defined by a macro? in an excluded directory?)";
+            }
             foreach (var u in unresolvedRoots)
-                err.WriteLine($"  warn    : requested root '{u}' was NOT found as a symbol — nothing rooted for it " +
-                              "(typo? macro-defined signature? excluded/other-variant file?)"
+                err.WriteLine($"  warn    : requested root '{u}' was NOT found as a symbol — nothing rooted for it: {WhyUnresolved(u)}"
                               + (near.TryGetValue(u, out var cands) && cands.Count > 0 ? $" — did you mean: {string.Join(", ", cands)}?" : ""));
             // --why still answers (review U8): explaining a symbol is how you debug a missing root.
             if (whySymbol is null)
@@ -1218,9 +1384,11 @@ public static class CarveCommand
 
         // Assembly startup (.s/.S) references C handlers by name (vector table `.word Handler`) — root them.
         var asmRoots = new List<Root>();
+        var asmFilesInTree = new List<string>();   // every in-scope assembly file (verify reads their symbols)
         if (lang is "c" or "cpp")
         {
-            var asmPaths = CodeCarver.Core.Util.SourceWalk.Files(dir)
+            asmFilesInTree = CodeCarver.Core.Util.SourceWalk.Files(dir).Where(p => EmittedLinkCheck.IsAssembly(p)).Where(p => !Excluded(p)).ToList();
+            var asmPaths = asmFilesInTree
                 .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".s" or ".asm" or ".sx")
                 .Where(p => !Excluded(p))
                 .Where(p => SafeLength(p) <= maxParseBytes)
@@ -1458,13 +1626,22 @@ public static class CarveCommand
             : (rel, text) => (perFileDefines?.Invoke(rel) ?? defines) is { } t ? PreprocessorScanner.DeadLineMap(text, t, closedWorld) : null;
         // Runs the emitted-tree check, prints the verdict, writes codecarver/verify.txt; true when it failed.
         string summaryStage = "run";   // key prefix for the stage being verified ("run" in analysis-only mode)
-        bool VerifyEmitted(CarvePlan p, IEnumerable<(string Rel, string Path)> emittedFiles, string ccDir)
+        bool VerifyEmitted(CarvePlan p, IEnumerable<(string Rel, string Path)> emittedFiles, string ccDir, bool pruned = false)
         {
             if (!linkCheck) return false;
             var droppedForCheck = p.DroppedFiles.Select(r => (r, Path.Combine(dir, r)));
-            var r = EmittedLinkCheck.Run(emittedFiles, droppedForCheck, deadLinesFor, maxParseBytes);
-            var hard = r.Hard;
+            var r = EmittedLinkCheck.Run(emittedFiles, droppedForCheck, deadLinesFor, maxParseBytes,
+                                         original: pruned ? rel => Path.Combine(dir, rel) : null);
+            var hard = r.Hard.ToList();
             var soft = r.DeadOnly;
+            // Defined only in files the traced build never compiled, with the build log confirming the trace is
+            // complete: the real build linked without those files, so dropping them can't break it. The name comes
+            // from somewhere else (another build or a prebuilt library, an alias, a macro). A note, not a failure.
+            // A WEAK reference (declared weak, no definition kept) links as null even when the trace can't be checked;
+            // its only definitions being in never-compiled files means the real build left it null too.
+            var notBuiltOnly = hard.Where(v => (traceMissedCompiled == 0 || v.Weak)
+                                               && v.DefinedInAll.Count > 0 && v.DefinedInAll.All(notBuilt.Contains)).ToList();
+            hard.RemoveAll(notBuiltOnly.Contains);
             var sb = new System.Text.StringBuilder();
             sb.AppendLine($"# CodeCarver emitted-tree verify — {r.FilesChecked} file(s) checked, {r.FilesSkipped} too large/unreadable");
             sb.AppendLine("# A violation: emitted code uses a function that only a DROPPED file defines.");
@@ -1474,6 +1651,9 @@ public static class CarveCommand
             // Defined only in a file the traced build never opened: the trace is incomplete (partial or incremental
             // build, a build step outside it), or the use is in code the real build doesn't compile.
             foreach (var v in hard) if (notBuilt.Contains(v.DefinedIn)) why[v] = "definedInFileNotBuilt";
+            // Removed from a file this stage KEPT (content carving): the pruning missed a use.
+            var keptSet = p.KeptFiles.ToHashSet(StringComparer.Ordinal);
+            foreach (var v in hard) if (keptSet.Contains(v.DefinedIn)) why[v] = "prunedFromKeptFile";
             var causes = why.Values.GroupBy(c => c).OrderBy(g => g.Key, StringComparer.Ordinal)
                             .ToDictionary(g => g.Key, g => g.Count());
             // A definition that never became a node: what its head looks like and what the parser made of it, as fixed
@@ -1499,6 +1679,7 @@ public static class CarveCommand
                 sb.AppendLine($"FAIL {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined only in dropped {v.DefinedIn}:{v.DefinedLine}\tcause {why[v]}"
                               + (shapes.TryGetValue(v, out var sh) ? "\tshape " + string.Join('+', sh) : ""));
             foreach (var v in soft) sb.AppendLine($"DEAD {v.Name}\tused {v.ReferencedIn}:{v.Line} (#ifdef-dead line)\tdefined only in dropped {v.DefinedIn}");
+            foreach (var v in notBuiltOnly) sb.AppendLine($"NOTE {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined only in never-compiled {string.Join(", ", v.DefinedInAll)}");
             Directory.CreateDirectory(ccDir);
             WriteArtifact(Path.Combine(ccDir, "verify.txt"), sb.ToString(), "verifylog");
             if (hard.Count == 0)
@@ -1511,7 +1692,15 @@ public static class CarveCommand
                 @out.WriteLine("            causes: " + string.Join(", ", causes.Select(c => $"{c.Key} {c.Value}")));
                 if (shapeCounts.Count > 0)
                     @out.WriteLine("            unrecognised-definition shapes: " + string.Join(", ", shapeCounts.Select(c => $"{c.Key} {c.Value}")));
+                if (causes.ContainsKey("definedInFileNotBuilt"))
+                    @out.WriteLine(traceMissedCompiled < 0
+                        ? "            definedInFileNotBuilt: add the build log(s) too, so the trace can be checked for completeness"
+                        : "            definedInFileNotBuilt: the build trace is incomplete (see the build: WARNING above)");
             }
+            if (notBuiltOnly.Count > 0)
+                @out.WriteLine($"  verify  : note — {notBuiltOnly.Count} function(s) kept code uses are defined only in files this build never compiled "
+                    + "(another build or a prebuilt library provides them, or an alias/macro the build resolves elsewhere); dropping those files "
+                    + "can't break this build (see verify.txt)");
             if (soft.Count > 0)
                 @out.WriteLine($"  verify  : note — {soft.Count} function(s) used only on #ifdef-dead lines are defined only in dropped files "
                     + "(correct if the #ifdef world is; see verify.txt)");
@@ -1521,6 +1710,7 @@ public static class CarveCommand
             foreach (var (cause, n) in causes) summary[$"{summaryStage}.verify.failed.{cause}"] = n;
             foreach (var (shape, n) in shapeCounts) summary[$"{summaryStage}.verify.failed.definitionNotRecognized.{shape}"] = n;
             summary[$"{summaryStage}.verify.deadLineOnly"] = soft.Count;
+            summary[$"{summaryStage}.verify.notBuiltDefinitions"] = notBuiltOnly.Count;
             summary[$"{summaryStage}.verify.filesChecked"] = r.FilesChecked;
             summary[$"{summaryStage}.verify.filesNotChecked"] = r.FilesSkipped;
             return hard.Count > 0;
@@ -1655,6 +1845,13 @@ public static class CarveCommand
             // #include that are not graph files (an .inc table) — --emit-from carries this result over.
             var wouldWrite = aplan.KeptFiles.Where(r => File.Exists(Path.Combine(dir, r))).ToList();
             wouldWrite.AddRange(FileTreeEmitter.IncludeClosure(wouldWrite, aplan.KeptFiles, aplan.DroppedFiles, dir));
+            // ...and the assembly files the infrastructure copy would carry (they define symbols C calls).
+            var droppedInfra = new HashSet<string>(InfraDropped(aplan), StringComparer.Ordinal);
+            foreach (var f in asmFilesInTree)
+            {
+                var rel = Path.GetRelativePath(dir, f).Replace('\\', '/');
+                if (!droppedInfra.Contains(rel)) wouldWrite.Add(rel);
+            }
             if (VerifyEmitted(aplan, wouldWrite.Select(r => (r, Path.Combine(dir, r))), ccDir)) verifyFailed = true;
             summary["run.keptFiles"] = aplan.KeptFiles.Count;
             summary["run.droppedFiles"] = aplan.DroppedFiles.Count;
@@ -1750,11 +1947,12 @@ public static class CarveCommand
             @out.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{(prune ? "intra-file (unused functions removed)" : "file-level (whole kept files)")}]");
             if (prune) @out.WriteLine("  note    : carveSourceFileContents is EXPERIMENTAL — always build-verify.");
 
-            if (VerifyEmitted(splan, res.Written.Select(r => (r, Path.Combine(stageDir, r))).ToList(), ccDir)) verifyFailed = true;
-
             // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
             // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
             var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel);
+            // Verify the code plus the assembly files copied with it: those define symbols C calls (fast_copy in a .S).
+            var verifyFiles = res.Written.Concat(infra.Files.Where(EmittedLinkCheck.IsAssembly)).Distinct(StringComparer.Ordinal);
+            if (VerifyEmitted(splan, verifyFiles.Select(r => (r, Path.Combine(stageDir, r))).ToList(), ccDir, pruned: prune)) verifyFailed = true;
             carvedBytes += infra.Bytes;
             var origTotal = originalCodeBytes + infra.Bytes;   // delta-neutral passthrough (both sides)
             if (infra.Count > 0)

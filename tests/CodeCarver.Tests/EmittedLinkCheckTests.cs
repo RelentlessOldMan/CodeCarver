@@ -14,6 +14,46 @@ public sealed class EmittedLinkCheckTests
     static HashSet<string> Uses(string text) => EmittedLinkCheck.Scan(text).Uses.Select(u => u.Name).ToHashSet();
     static List<string> Defs(string text) => EmittedLinkCheck.Scan(text).Definitions.Select(d => d.Name).ToList();
 
+    [Theory]
+    [InlineData("int helper(void) { return 1; }\nint api(void) { return helper(); }\n", "int api(void) { return helper(); }\n")]
+    [InlineData("static int helper(void) { return 1; }\nint api(void) { return helper(); }\n", "int api(void) { return helper(); }\n")]
+    [InlineData("int helper_impl(void) { return 1; }\nint helper(void) __attribute__((alias(\"helper_impl\")));\n",
+                "int helper(void) __attribute__((alias(\"helper_impl\")));\n")]
+    [InlineData("int helper_impl(void) { return 1; }\n_Pragma(\"weak helper = helper_impl\")\n", "_Pragma(\"weak helper = helper_impl\")\n")]
+    public void Run_FunctionPrunedFromAKeptFile_ThatIsStillUsed_IsAViolation(string original, string pruned)
+    {
+        // A content-carving stage removes functions from KEPT files. One the emitted code still needs must fail verify.
+        var root = Path.Combine(Path.GetTempPath(), "cc-prune-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "orig"));
+        Directory.CreateDirectory(Path.Combine(root, "out"));
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "orig", "k.c"), original);
+            File.WriteAllText(Path.Combine(root, "out", "k.c"), pruned);
+            var r = EmittedLinkCheck.Run(new[] { ("k.c", Path.Combine(root, "out", "k.c")) }, Array.Empty<(string, string)>(),
+                                         original: rel => Path.Combine(root, "orig", rel));
+            Assert.NotEmpty(r.Hard);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public void Run_PrunedFunctionNobodyUses_IsFine()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cc-prune-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "orig"));
+        Directory.CreateDirectory(Path.Combine(root, "out"));
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "orig", "k.c"), "int unused(void) { return 1; }\nint api(void) { return 2; }\n");
+            File.WriteAllText(Path.Combine(root, "out", "k.c"), "int api(void) { return 2; }\n");
+            var r = EmittedLinkCheck.Run(new[] { ("k.c", Path.Combine(root, "out", "k.c")) }, Array.Empty<(string, string)>(),
+                                         original: rel => Path.Combine(root, "orig", rel));
+            Assert.Empty(r.Violations);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
     [Fact]
     public void Scan_PrototypeIsNotAUse_CallIs()
     {

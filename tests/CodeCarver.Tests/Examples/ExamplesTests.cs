@@ -37,7 +37,7 @@ public sealed class ExamplesTests
         // Guards the discovery itself: a rename or a broken glob must not quietly turn the theories below into
         // zero cases.
         var names = CarveTomlExamples().Select(a => (string)a[0]).ToList();
-        foreach (var expected in new[] { "cmm-trace", "csharp-app", "mixed-cpp-firmware", "multistage-firmware" })
+        foreach (var expected in new[] { "cmm-trace", "csharp-app", "eldritch", "mixed-cpp-firmware", "multistage-firmware" })
             Assert.Contains(expected, names);
         var readmes = ReadmeExamples().Select(a => (string)a[0]).ToList();
         foreach (var expected in new[] { "cmm-trace", "csharp-app", "mixed-cpp-firmware", "multistage-firmware", "stringlib" })
@@ -68,7 +68,8 @@ public sealed class ExamplesTests
             Assert.True(Directory.Exists(Path.Combine(stageDir, "carved")), $"{example}: no carved/ under {stageDir}");
             Assert.True(File.Exists(Path.Combine(stageDir, "codecarver", "manifest.json")), $"{example}: no manifest under {stageDir}");
         }
-        var verifyLines = run.Output.Split('\n').Select(l => l.Trim()).Where(l => l.StartsWith("verify  :")).ToList();
+        var verifyLines = run.Output.Split('\n').Select(l => l.Trim())
+            .Where(l => l.StartsWith("verify  :") && !l.StartsWith("verify  : note")).ToList();
         Assert.Equal(c.Stages.Count, verifyLines.Count);
         if (c.Languages.Contains("csharp", StringComparer.OrdinalIgnoreCase))
             // The emitted-tree link check is C/C++ only; for C# the run says so instead of printing OK.
@@ -100,14 +101,21 @@ public sealed class ExamplesTests
             var dropped = List(manifest, "droppedFiles");
             var droppedCmm = List(manifest, "droppedCmm");
             var garbage = List(manifest, "removedGarbageFiles");
+            var placeholders = List(manifest, "placeholderFiles");
 
-            // Every source file is in exactly one bucket: emitted, dropped (code), dropped (.cmm), removed as
-            // garbage, or under an excluded directory.
+            // Every source file is in exactly one bucket: emitted, dropped (code), a placeholder (dropped, with a
+            // stand-in emitted so build files that list it still work), dropped (.cmm), removed as garbage, or under
+            // an excluded directory.
             foreach (var f in sources)
             {
                 var buckets = new List<string>();
-                if (emitted.Contains(f)) buckets.Add("emitted");
-                if (dropped.Contains(f)) buckets.Add("droppedFiles");
+                if (placeholders.Contains(f))
+                {
+                    Assert.True(emitted.Contains(f) && dropped.Contains(f), $"{example}/{stage}: placeholder {f} not emitted and dropped");
+                    buckets.Add("placeholderFiles");
+                }
+                else if (emitted.Contains(f)) buckets.Add("emitted");
+                if (dropped.Contains(f) && !placeholders.Contains(f)) buckets.Add("droppedFiles");
                 if (droppedCmm.Contains(f)) buckets.Add("droppedCmm");
                 if (garbage.Contains(f)) buckets.Add("removedGarbageFiles");
                 if (excluded.Any(x => f.StartsWith(x, StringComparison.Ordinal))) buckets.Add("excludeDirectories");
@@ -122,7 +130,7 @@ public sealed class ExamplesTests
             // The manifest's kept lists account for the whole emitted tree (review 8c "Examples": files written by
             // the include closure are in includeClosureFiles). Do not weaken this check.
             var keptLists = List(manifest, "keptFiles").Concat(List(manifest, "includeClosureFiles"))
-                .Concat(List(manifest, "infrastructureFiles")).ToHashSet(StringComparer.Ordinal);
+                .Concat(List(manifest, "infrastructureFiles")).Concat(placeholders).ToHashSet(StringComparer.Ordinal);
             var unlisted = emitted.Where(e => !keptLists.Contains(e)).OrderBy(e => e, StringComparer.Ordinal).ToList();
             Assert.True(unlisted.Count == 0,
                 $"{example}/{stage}: emitted but in no kept list of the manifest: {string.Join(", ", unlisted)}");

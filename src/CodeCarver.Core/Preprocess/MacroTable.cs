@@ -112,8 +112,46 @@ public sealed class MacroTable
         if (_macros.ContainsKey(name)) return false;
         if (_unknown.Contains(name)) return true;
         if (_undefined.Contains(name)) return false;
-        return OpenWorld || IsReserved(name) || name is "true" or "false" || (Ambient?.Contains(name) ?? false);
+        return OpenWorld || IsReserved(name) || name is "true" or "false" || NotFromTheBuild.Contains(name)
+               || (Ambient?.Contains(name) ?? false);
     }
+
+    /// <summary>Macros a file gets from the compiler or the C library, not from the build's flags or the tree:
+    /// pre-standard compiler built-ins without a leading underscore (gcc/clang in GNU modes define <c>linux</c>,
+    /// <c>unix</c>, <c>i386</c>), and the limits/sizes/constants of the standard headers (<c>INT_MAX</c>, <c>EOF</c>).
+    /// The headers live outside the tree and no probe reports them, so they are never absent.</summary>
+    public static readonly IReadOnlySet<string> NotFromTheBuild = new HashSet<string>(StringComparer.Ordinal)
+    {
+        // non-reserved compiler built-ins
+        "linux", "unix", "i386", "i486", "i586", "i686", "sun", "sparc", "mips", "vax", "hppa", "m68k", "mc68000",
+        "ns32000", "pyr", "sequent", "u3b2", "MIPSEB", "MIPSEL", "arm", "thumb", "ppc", "powerpc",
+        // <limits.h>
+        "CHAR_BIT", "SCHAR_MIN", "SCHAR_MAX", "UCHAR_MAX", "CHAR_MIN", "CHAR_MAX", "MB_LEN_MAX", "SHRT_MIN", "SHRT_MAX",
+        "USHRT_MAX", "INT_MIN", "INT_MAX", "UINT_MAX", "LONG_MIN", "LONG_MAX", "ULONG_MAX", "LLONG_MIN", "LLONG_MAX",
+        "ULLONG_MAX", "LONG_BIT", "WORD_BIT", "PATH_MAX", "NAME_MAX", "PIPE_BUF", "IOV_MAX", "LINE_MAX", "OPEN_MAX",
+        "ARG_MAX", "PAGE_SIZE", "PAGESIZE", "SSIZE_MAX", "HOST_NAME_MAX",
+        // <stdint.h> / <stddef.h> / <wchar.h>
+        "INT8_MIN", "INT8_MAX", "UINT8_MAX", "INT16_MIN", "INT16_MAX", "UINT16_MAX", "INT32_MIN", "INT32_MAX",
+        "UINT32_MAX", "INT64_MIN", "INT64_MAX", "UINT64_MAX", "INTPTR_MIN", "INTPTR_MAX", "UINTPTR_MAX", "INTMAX_MIN",
+        "INTMAX_MAX", "UINTMAX_MAX", "PTRDIFF_MIN", "PTRDIFF_MAX", "SIZE_MAX", "SIG_ATOMIC_MIN", "SIG_ATOMIC_MAX",
+        "WCHAR_MIN", "WCHAR_MAX", "WINT_MIN", "WINT_MAX", "INT8_C", "INT16_C", "INT32_C", "INT64_C", "UINT8_C",
+        "UINT16_C", "UINT32_C", "UINT64_C", "INTMAX_C", "UINTMAX_C", "NULL", "offsetof", "WEOF",
+        "INT_LEAST8_MAX", "INT_LEAST16_MAX", "INT_LEAST32_MAX", "INT_LEAST64_MAX", "UINT_LEAST8_MAX",
+        "UINT_LEAST16_MAX", "UINT_LEAST32_MAX", "UINT_LEAST64_MAX", "INT_FAST8_MAX", "INT_FAST16_MAX",
+        "INT_FAST32_MAX", "INT_FAST64_MAX", "UINT_FAST8_MAX", "UINT_FAST16_MAX", "UINT_FAST32_MAX", "UINT_FAST64_MAX",
+        // <float.h>
+        "FLT_RADIX", "FLT_MANT_DIG", "DBL_MANT_DIG", "LDBL_MANT_DIG", "FLT_DIG", "DBL_DIG", "LDBL_DIG", "FLT_MAX",
+        "DBL_MAX", "LDBL_MAX", "FLT_MIN", "DBL_MIN", "LDBL_MIN", "FLT_EPSILON", "DBL_EPSILON", "LDBL_EPSILON",
+        "FLT_EVAL_METHOD", "DECIMAL_DIG", "FLT_MAX_EXP", "DBL_MAX_EXP", "LDBL_MAX_EXP",
+        // <stdio.h> / <stdlib.h> / <time.h> / <signal.h> / <errno.h> / <setjmp.h> / <assert.h> / <stdbool.h>
+        "EOF", "BUFSIZ", "FILENAME_MAX", "FOPEN_MAX", "L_tmpnam", "TMP_MAX", "SEEK_SET", "SEEK_CUR", "SEEK_END",
+        "stdin", "stdout", "stderr", "EXIT_SUCCESS", "EXIT_FAILURE", "RAND_MAX", "MB_CUR_MAX", "CLOCKS_PER_SEC",
+        "SIGABRT", "SIGFPE", "SIGILL", "SIGINT", "SIGSEGV", "SIGTERM", "SIG_DFL", "SIG_ERR", "SIG_IGN",
+        "EDOM", "ERANGE", "EILSEQ", "EINVAL", "ENOMEM", "ENOENT", "EAGAIN", "EINTR", "errno", "setjmp", "assert",
+        "static_assert", "bool", "alignas", "alignof", "noreturn", "complex", "imaginary", "I",
+        "HUGE_VAL", "HUGE_VALF", "INFINITY", "NAN", "FP_NAN", "FP_INFINITE", "FP_ZERO", "FP_NORMAL", "FP_SUBNORMAL",
+        "MATH_ERRNO", "MATH_ERREXCEPT", "math_errhandling", "M_PI", "M_E",
+    };
 
     /// <summary>Reserved to the implementation: <c>__x</c> or <c>_</c> + uppercase — compiler built-ins.</summary>
     public static bool IsReserved(string name) =>

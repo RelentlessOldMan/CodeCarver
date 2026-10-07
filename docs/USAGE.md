@@ -276,10 +276,16 @@ compiled.
   - **Files the build never opened are not read.** When *every* selected build has a build trace, a code file
     none of them opened can't be part of the build. It's dropped without being read or parsed, which on a big
     tree is most of the carve time (and most of the round trips on a network drive). The `build :` line says how
-    many; `parse.filesNotBuiltSkipped` counts them. verify still scans those files, so a trace that missed a
-    file the kept code needs fails loudly with cause `definedInFileNotBuilt` (a partial or incremental build,
-    or a build step outside the capture) instead of cutting it. `[advanced] skipFilesNotBuilt = false` turns
-    this off.
+    many; `parse.filesNotBuiltSkipped` counts them. `[advanced] skipFilesNotBuilt = false` turns this off.
+  - **Give the build log too: it checks the trace.** The log and the trace describe the same build, so every
+    in-root source the log compiled must appear in the trace as opened. If any don't, the trace is incomplete
+    (strace without `-f`, a build in a container or a build server started before tracing, a compiler cache, an
+    incremental build, or paths that need `pathMap`): the run says so (`build : WARNING`), counts them in
+    `build.traceMissedCompiledFiles`, and reads every file instead of skipping. When the trace checks out, kept code
+    that uses a name defined **only** in files the build never compiled is a **note**, not a failure
+    (`<stage>.verify.notBuiltDefinitions`): the real build linked without those files, so the name comes from
+    somewhere else (another build or a prebuilt library, an alias, a macro). With a trace but no log the check
+    can't run, and such a name fails verify with cause `definedInFileNotBuilt`.
   - **Compiled files nothing reachable calls are dropped, as placeholders.** A build compiles files the image
     never calls into. Static reachability drops them. Build files that list sources (a Makefile, a `.vcxproj`)
     still name them, so each is written as a **placeholder**: a few lines that define nothing (an empty file is
@@ -310,7 +316,8 @@ compiled.
 
 > Over-capturing (un-exercised paths, extra tools) only ever keeps more, and the report shows you exactly what
 > each trace touched. A **clean, full** build is required for a build trace: an incremental build opens almost
-> nothing, and every file it didn't open would be skipped (verify then fails with `definedInFileNotBuilt`).
+> nothing, and every file it didn't open would be skipped. With the build log given too, that is caught up front
+> (the trace misses files the log compiled, so nothing is skipped); without it, verify fails with `definedInFileNotBuilt`.
 > Give every build's trace: a selected build without one turns the skip off, since its files aren't covered.
 
 ## Languages
@@ -323,7 +330,12 @@ compiled.
   still recognised: pre-C99 implicit-`int` and K&R definitions (`helper(a, b) int a; { ... }`, in C files), a
   function head split across `#if`/`#else`/`#endif` with one shared body (every branch's name is defined), and
   a symbol a macro use defines (`FW_DECLARE(uart, ...)` defining `uart_desc` via `n##_desc`, including through
-  wrapper macros and head macros like `DEFINE_TASK(blink) { ... }`).
+  wrapper macros and head macros like `DEFINE_TASK(blink) { ... }`), a name wrapped in a macro
+  (`int EXPORT(f)(void)` with `#define EXPORT(n) n`), digraphs (`<% %>`), and code after junk inside `#if 0`.
+  Aliases are definitions that keep their target: `__attribute__((alias("impl")))` (also through a macro whose
+  body is `alias(#arg)`), `#pragma weak a = b`, `_Pragma("weak a = b")` and asm `.set`/`.equ`. A call written
+  `name(...)` where a function-like macro `name` is visible goes through the macro, not to a same-named function.
+  See [`examples/eldritch`](../examples/eldritch/README.md) for all of these in one program.
 - **C#** (`languages = ["csharp"]`): always **file-level** — a `.cs` file is kept or dropped whole;
   `carveSourceFileContents` is ignored with a note. The file set is closed over identifier and type
   references: a kept file that mentions a name keeps every type and method of that name. Files with top-level
@@ -355,9 +367,19 @@ CodeCarver **derives this automatically**; the `world:` line says which and why.
   - the probed compiler's built-in macros. They are probed with the build's target flags only when every
     compile command shares them; otherwise flag-dependent built-ins (`__ARM_*`, `__OPTIMIZE__`,
     `__STDC_VERSION__`, …) are unknown, and they are always unknown in a C++ carve;
-  - **nothing else.** A macro `#define`d or `#undef`d anywhere in the tree is unknown unless the build defines it
-    (include guards excepted); a reserved name (`__x`, `_X`) the probe didn't report is unknown; a `#define`
-    under an uncertain condition makes the name unknown.
+  - **nothing else.** A macro `#define`d or `#undef`d anywhere the build reads is unknown unless the build defines
+    it (include guards excepted). "Anywhere the build reads" is the tree (excluded directories too), the headers
+    **outside** the carve root the build uses (an SDK, generated config: every file a build trace opened, or
+    without a trace every header under the log's `-I`/`-isystem`/`-iquote`/`-idirafter` dirs and every quoted
+    `#include` that leaves the tree), and forced includes (searched like `#include "..."`, then `-I`). A reserved
+    name (`__x`, `_X`) the probe didn't report is unknown, and so are the C library's macros (`INT_MAX`,
+    `SIZE_MAX`, `EOF`, `bool`, …) and non-underscore built-ins (`linux`, `unix`, `i386`). A `#define` under an
+    uncertain condition makes the name unknown.
+
+  When a header the build reads **can't be seen** (a log's include dir that doesn't exist here, a quoted
+  `#include` that resolves to nothing, a computed `#include MACRO`, or a header a trace from another machine
+  opened), every name an `#if` tests that nothing visible defines and no `-D` names is unknown: the `config :`
+  line says how many and why. A build trace, or `pathMap` for the include dirs, makes it exact.
 
   A translation unit that no compile command covers, or whose command was incomplete (unreadable response
   file or forced include), is resolved open-world; the `build:` lines report how many.
@@ -393,11 +415,24 @@ not use the carve's graph: it fails the run (**exit 3**) when emitted code uses 
 `#ifdef` world is reported as a note, not a failure (it is correct if the world is). Files over
 `maxParseBytes` are not checked and are counted. Details go to `codecarver/verify.txt`.
 
+What counts as a use and a definition follows the compiler and linker: a call `name(...)` where a function-like
+macro `name` is visible (the file or a header it includes) is a macro expansion, not a use; `(name)(...)` is a use.
+Aliases (`alias` attributes, alias macros, `#pragma weak a = b`, `_Pragma`, asm `.set`) define the alias and use the
+target; assembly files define what they export (`.globl`, `.weak`, `PUBLIC`, `name PROC`). A name declared weak
+(`__attribute__((weak))` on a declaration, `#pragma weak name`) links as null when undefined, so a failure on it
+whose only definitions are in files the build never compiled is a note. At a `carveSourceFileContents` stage, a
+function **pruned from a kept file** that emitted code still uses fails too, with cause `prunedFromKeptFile`.
+
 Each failure also gets a **cause**, counted in `summary.txt` as `verify.failed.<cause>` (numbers only, safe to
 send back) and named per failure in `verify.txt`: `definitionNotRecognized` (the dropped file's definition never
 became part of the graph: an unusual definition shape), `definitionFileLocal` (only a file-scope `static`),
 `useNotModelled` / `useInHeaderNotModelled` (the definition is known but the use was not captured),
-`useInUnreachedCode` (only code the carve did not reach uses it), or `other`.
+`useInUnreachedCode` (only code the carve did not reach uses it), `definedInFileNotBuilt` (only in files a build
+trace never opened, with no build log to check the trace), `prunedFromKeptFile`, or `other`.
+
+An **entry point** that isn't found fails the run (exit 1) and says why: it is defined only in a file the traced
+build never compiled (not part of this build), it sits in an `#if` branch this build's configuration turns off,
+the parser didn't recognise its definition (see `--why`), or it isn't defined anywhere in the tree.
 
 A `definitionNotRecognized` failure is also described by **shape**, counted as
 `verify.failed.definitionNotRecognized.<shape>` (one failure can have several) and listed per failure in `verify.txt`:
