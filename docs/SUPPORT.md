@@ -13,6 +13,12 @@ trace counts, `.cmm` counts, per-stage sizes and `verify` counts, warnings by ca
 file name or symbol appears in them (a test enforces this), so they can be sent back as-is when the source must
 stay on its machine. Send it together with the exit code and the CodeCarver version.
 
+On a successful carve it also says where the carve could get tighter and where the time went:
+`keep.files.<reason>` / `keep.bytes.<reason>` count each kept file once under why it is kept (`root`;
+`indirectOnly`: kept only because its address is taken, a vtable or inline asm names it, the price of soundness;
+`header`: included by kept code; `reached`: called or referenced from a root), `keep.bytes.largest10Percent` is the
+share of kept bytes in the ten largest kept files, and `time.<phase>.ms` is each phase's time.
+
 ## When `verify` fails: `codecarver/debug/`
 
 A failed `verify` (exit 3) writes every failure up, with no flag, in `<outputDirectory>/[<stage>/]codecarver/debug/`:

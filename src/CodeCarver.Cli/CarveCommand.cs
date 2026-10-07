@@ -993,6 +993,7 @@ public static class CarveCommand
         {
             if (_timing) err.WriteLine($"  timing  : {phase,-14} {_tsw.ElapsedMilliseconds,7} ms");
             diag.Event($"phase {phase}: {_tsw.ElapsedMilliseconds} ms"); // breadcrumb for the diagnostic package
+            summary[$"time.{phase}.ms"] = _tsw.ElapsedMilliseconds;     // where a long run spends its time
             _tsw.Restart();
         }
         Mark("input+refscan"); // time spent gathering inputs + reference includes above
@@ -1595,6 +1596,14 @@ public static class CarveCommand
         summary["files.bigKeptWhole"] = bigFiles.Count;
         summary["files.denseHeadersKeptWhole"] = denseFiles.Count;
         if (fe is TreeSitterFrontEnd scanFe) summary["parse.definitionsRecoveredByScan"] = scanFe.DefinitionsRecoveredByScan;
+        // Why the kept code is kept (numbers only): where a carve could get tighter. A diagnostic: never fails the carve.
+        try
+        {
+            foreach (var (k, v) in PrecisionStats.Compute(graph, plan, rootSet, rel => sizeByRel.TryGetValue(rel, out var sz) ? sz : 0L))
+                summary[k] = v;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException) { diag.Warn("precision stats: " + ex.GetType().Name); }
+        Mark("precision");
 
         // Close each stage's plan over what that stage's emitter WRITES (review F1, owner decision D-A): an
         // unreached definition the emitter keeps anyway (whole kept file; a span the pruner can't remove) is

@@ -111,6 +111,24 @@ public sealed class FailureCasesTests
     }
 
     [Fact]
+    public void Summary_SaysWhyTheKeptCodeIsKept()
+    {
+        // cb.c is reached only through a function pointer: kept for soundness, the indirect-only bucket.
+        using var t = new TreeCarve()
+            .W("main.c", "#include \"api.h\"\nint (*hook)(void) = cb;\nint main(void){ return direct() + hook(); }\n")
+            .W("api.h", "int direct(void);\nint cb(void);\n")
+            .W("direct.c", "int direct(void) { return 1; }\n")
+            .W("cb.c", "int cb(void) { return 2; }\n");
+        Assert.Equal(0, t.Carve(log: false).Code);
+        var s = t.Summary.Replace("\r", "");
+        Assert.Contains("keep.files.indirectOnly = 1\n", s);
+        Assert.Contains("keep.files.root = 1\n", s);
+        Assert.Contains("keep.files.header = 1\n", s);
+        Assert.Contains("keep.bytes.total = ", s);
+        Assert.Matches(@"time\.reachability\.ms = \d+\n", s);
+    }
+
+    [Fact]
     public void PassingVerify_WritesNoCases()
     {
         using var t = new TreeCarve()
