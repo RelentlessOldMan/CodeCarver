@@ -129,6 +129,44 @@ public sealed class FailureCasesTests
     }
 
     [Fact]
+    public void BuildOutputDropIn_WritesUpTheErrors_RawAndAnonymized()
+    {
+        // The carve keeps main.c only; building it (say, with code the carve can't see) failed on two names.
+        using var t = new TreeCarve()
+            .W("main.c", "int main(void){ return 0; }\n")
+            .W("drivers/secret_extra.c", "int secret_extra_fn(void) { return 1; }\n")
+            .W("cfg/secret_opt.h", "#define SECRET_OPT 1\n");
+        Assert.Equal(0, t.Carve(log: false).Code);
+        var carved = Path.Combine(t.Root, "out", "carved");
+        File.WriteAllText(Path.Combine(t.Root, "out", CodeCarver.Cli.CarveCommand.BuildOutputFile),
+            "gcc -c main.c\n"
+            + $"{Path.Combine(carved, "main.c")}:1:10: fatal error: cfg/secret_opt.h: No such file or directory\n"
+            + "/usr/bin/ld: main.o: in function `main':\nmain.c:(.text+0x9): undefined reference to `secret_extra_fn'\n"
+            + "collect2: error: ld returned 1 exit status\n");
+        var r = t.Carve(log: false);
+        Assert.Equal(0, r.Code);
+        Assert.Contains("build   : build-output.txt: 2 error(s) written up, 2 reproduce", r.Out);
+
+        var dir = Path.Combine(t.Root, "out", "codecarver", "debug-build");
+        var raw = File.ReadAllText(Path.Combine(dir, "raw", "cases.txt"));
+        Assert.Contains("cause build.MissingHeader", raw);
+        Assert.Contains("cfg/secret_opt.h", raw);
+        Assert.Contains("cause build.UndefinedReference", raw);
+        Assert.Contains("drivers/secret_extra.c", raw);
+        Assert.Contains("dropped", raw);
+
+        var anon = File.ReadAllText(Path.Combine(dir, "anon", "cases.txt"));
+        Assert.Contains("replay: yes", anon);
+        Assert.Contains("fatal error: ", anon);                     // the compiler's own words stay
+        Assert.Contains(": No such file or directory", anon);
+        Assert.Contains("undefined reference to `", anon);
+        foreach (var word in new[] { "secret", "extra", "drivers", "SECRET", "OPT", "cc-tc-" })
+            Assert.DoesNotContain(word, anon);
+        Assert.True(File.Exists(Path.Combine(dir, "anon.zip")));
+        Assert.Contains(".buildErrors.cases = 2\n", t.Summary.Replace("\r", ""));
+    }
+
+    [Fact]
     public void PassingVerify_WritesNoCases()
     {
         using var t = new TreeCarve()

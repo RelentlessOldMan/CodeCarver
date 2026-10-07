@@ -59,11 +59,17 @@ public static class FailureCases
 
     public sealed record Outcome(int Cases, int Reproduced, string? AnonZip);
 
+    /// <summary>One failure to write up: a name used in <see cref="UseRel"/> (when known) that only <see cref="DefRels"/>
+    /// define. From a verify violation, or from a compiler or linker error building the carved tree.</summary>
+    public sealed record Subject(string Name, string? UseRel, int UseLine, IReadOnlyList<string> DefRels, int DefLine,
+                                 string Cause, string Shape = "", string? Message = null, string? MessageFile = null)
+    {
+        public bool FromBuild => Message is not null;
+    }
+
     sealed class Case
     {
-        public required LinkViolation V;
-        public required string Cause;
-        public required string Shape;
+        public required Subject S;
         public Node? Enclosing;
         public List<string> Files = new();
         public bool Truncated;
@@ -71,10 +77,73 @@ public static class FailureCases
         public string? ReproCause;
     }
 
+    /// <summary>Writes up verify's failures in <c>debug/</c>.</summary>
     public static Outcome Write(Context cx, IReadOnlyList<LinkViolation> hard, IReadOnlyDictionary<LinkViolation, string> why,
-                                IReadOnlyDictionary<LinkViolation, List<string>> shapes, string ccDir)
+                                IReadOnlyDictionary<LinkViolation, List<string>> shapes, string ccDir) =>
+        Write(cx, hard.Select(v => new Subject(v.Name, v.ReferencedIn, v.Line,
+                                               v.DefinedInAll.Count > 0 ? v.DefinedInAll : new[] { v.DefinedIn }, v.DefinedLine,
+                                               why.GetValueOrDefault(v) ?? "other", ShapeOf(shapes, v))).ToList(),
+              Path.Combine(ccDir, "debug"), "verify failures");
+
+    /// <summary>Writes up the errors building the carved tree printed (<paramref name="buildOutput"/>) in
+    /// <c>debug-build/</c>: for each name the compiler or linker missed, where the original tree defines it.</summary>
+    public static Outcome WriteBuildErrors(Context cx, string buildOutput, string carvedDir, string ccDir)
     {
-        var debugDir = Path.Combine(ccDir, "debug");
+        var errors = BuildErrors.Parse(buildOutput);
+        var rels = cx.Graph.Nodes.Where(n => n.Kind == NodeKind.File).Select(n => n.Name).ToList();
+        var subjects = new List<Subject>();
+        foreach (var e in errors)
+        {
+            var useRel = e.File is { } f ? ResolveRel(f, carvedDir, rels) : null;
+            var useLine = e.Line;
+            var name = e.Name ?? "";
+            List<string> defs;
+            var defLine = 0;
+            if (e.Kind == BuildErrorKind.MissingHeader)
+            {
+                var h = name.Replace('\\', '/');
+                defs = rels.Where(r => r == h || r.EndsWith("/" + h, StringComparison.OrdinalIgnoreCase)).ToList();
+            }
+            else
+            {
+                var named = name.Length == 0 ? new List<Node>()
+                    : cx.Graph.Nodes.Where(n => n.Name == name && n.Kind != NodeKind.File && n.FilePath is not null).ToList();
+                defs = named.Select(n => n.FilePath!).Distinct(StringComparer.Ordinal).ToList();
+                if (named.Count == 1) defLine = named[0].Span.StartLine;
+                // A link error says no file: the use is any kept code with an edge to the name.
+                if (useRel is null && named.Count > 0)
+                {
+                    var ids = named.Select(n => n.Id).ToHashSet();
+                    var user = cx.Graph.Nodes.FirstOrDefault(n => n.Kind != NodeKind.File && cx.Plan.IsKept(n.Id) && n.FilePath is not null
+                                                                  && cx.Graph.OutEdges(n.Id).Any(x => ids.Contains(x.To)));
+                    if (user is not null) { useRel = user.FilePath; useLine = user.Span.StartLine; }
+                }
+            }
+            subjects.Add(new Subject(name, useRel, useLine, defs, defLine, "build." + e.Kind, Message: e.Message, MessageFile: e.File));
+        }
+        return Write(cx, subjects, Path.Combine(ccDir, "debug-build"), "errors building the carved tree");
+    }
+
+    // The tree-relative path a compiler printed: under the carved tree, or the longest tree path it ends with.
+    static string? ResolveRel(string printed, string carvedDir, IReadOnlyList<string> rels)
+    {
+        var p = printed.Replace('\\', '/');
+        try
+        {
+            if (Path.IsPathFullyQualified(printed))
+            {
+                var rel = Path.GetRelativePath(carvedDir, printed).Replace('\\', '/');
+                if (!rel.StartsWith("../", StringComparison.Ordinal) && !Path.IsPathFullyQualified(rel) && rels.Contains(rel)) return rel;
+            }
+        }
+        catch (ArgumentException) { }
+        if (p.StartsWith("./", StringComparison.Ordinal)) p = p[2..];
+        return rels.Where(r => p == r || p.EndsWith("/" + r, StringComparison.OrdinalIgnoreCase))
+                   .OrderByDescending(r => r.Length).FirstOrDefault();
+    }
+
+    static Outcome Write(Context cx, IReadOnlyList<Subject> subjects, string debugDir, string what)
+    {
         try { if (Directory.Exists(debugDir)) Directory.Delete(debugDir, recursive: true); } catch (IOException) { }
         var rawDir = Path.Combine(debugDir, "raw");
         var anonDir = Path.Combine(debugDir, "anon");
@@ -82,8 +151,8 @@ public static class FailureCases
         Directory.CreateDirectory(anonDir);
 
         // One case per distinct (cause, shape) first, then the rest, up to the cap.
-        var ordered = hard.GroupBy(v => (why.GetValueOrDefault(v) ?? "other") + "|" + ShapeOf(shapes, v))
-                          .SelectMany(g => g.Select((v, i) => (v, i))).OrderBy(x => x.i).Select(x => x.v).Take(MaxCases).ToList();
+        var ordered = subjects.GroupBy(s => s.Cause + "|" + s.Shape)
+                              .SelectMany(g => g.Select((s, i) => (s, i))).OrderBy(x => x.i).Select(x => x.s).Take(MaxCases).ToList();
         var text = new Dictionary<string, string>(StringComparer.Ordinal);
         string Text(string rel)
         {
@@ -97,13 +166,14 @@ public static class FailureCases
         var fileNode = cx.Graph.Nodes.Where(n => n.Kind == NodeKind.File)
                          .GroupBy(n => n.Name, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
         var cases = new List<Case>();
-        foreach (var v in ordered)
+        foreach (var s in ordered)
         {
-            var c = new Case { V = v, Cause = why.GetValueOrDefault(v) ?? "other", Shape = ShapeOf(shapes, v) };
-            c.Enclosing = nodesByFile.GetValueOrDefault(v.ReferencedIn)?
-                .Where(n => n.Kind is NodeKind.Function or NodeKind.Global && n.Span.IsKnown && n.Span.StartLine <= v.Line && v.Line <= n.Span.EndLine)
-                .OrderBy(n => n.Span.EndLine - n.Span.StartLine).FirstOrDefault();
-            c.Files = Closure(cx, fileNode, new[] { v.ReferencedIn }.Concat(v.DefinedInAll.DefaultIfEmpty(v.DefinedIn)), out c.Truncated);
+            var c = new Case { S = s };
+            if (s.UseRel is { } use)
+                c.Enclosing = nodesByFile.GetValueOrDefault(use)?
+                    .Where(n => n.Kind is NodeKind.Function or NodeKind.Global && n.Span.IsKnown && n.Span.StartLine <= s.UseLine && s.UseLine <= n.Span.EndLine)
+                    .OrderBy(n => n.Span.EndLine - n.Span.StartLine).FirstOrDefault();
+            c.Files = Closure(cx, fileNode, (s.UseRel is { } u ? new[] { u } : Array.Empty<string>()).Concat(s.DefRels), out c.Truncated);
             cases.Add(c);
         }
 
@@ -111,16 +181,17 @@ public static class FailureCases
         var a = new Anonymizer();
         var inputs = cases.Select(c => BundleInput(cx, c)).ToList();
         foreach (var inp in inputs) AnonymizedBundle.Learn(inp, a, f => SafeRead(f));
-        foreach (var c in cases) a.Learn(c.V.Name);
+        foreach (var c in cases) { a.Learn(c.S.Name); if (c.S.Message is { } msg) a.Learn(msg); }
 
+        var folder = Path.GetFileName(debugDir);
         var raw = new StringBuilder();
         var anon = new StringBuilder();
-        raw.AppendLine("# CodeCarver verify failures, in full. Real names and paths: keep this on this machine.");
-        raw.AppendLine("# The anonymized copy is debug/anon.zip; debug/raw/key.txt says which anonymized name is which.");
-        anon.AppendLine("# CodeCarver verify failures, anonymized: every name, path, string, number and comment rewritten.");
+        raw.AppendLine($"# CodeCarver {what}, in full. Real names and paths: keep this on this machine.");
+        raw.AppendLine($"# The anonymized copy is {folder}/anon.zip; {folder}/raw/key.txt says which anonymized name is which.");
+        anon.AppendLine($"# CodeCarver {what}, anonymized: every name, path, string, number and comment rewritten.");
         anon.AppendLine("# Each caseN/ folder is a replayable carve of the files involved. Each distinct file is stored once in store/;");
         anon.AppendLine("# rebuild the case trees with  powershell -File unpack.ps1  then  codecarver carve caseN/fs/anon/root --config caseN/carve.toml");
-        anon.AppendLine($"# {hard.Count} failure(s), {cases.Count} written.");
+        anon.AppendLine($"# {subjects.Count} failure(s), {cases.Count} written.");
         // Anonymized file text for the excerpts, checked like every bundle file: a word that survived is cut out.
         var anonText = new Dictionary<string, string>(StringComparer.Ordinal);
         string AnonText(string rel)
@@ -139,7 +210,7 @@ public static class FailureCases
             try
             {
                 bundle = AnonymizedBundle.Write(inputs[i], caseDir, a, f => SafeRead(f));
-                (c.Reproduced, c.ReproCause) = Replay(bundle, a.Name(c.V.Name));
+                (c.Reproduced, c.ReproCause) = Replay(bundle, a, c.S, root: cx.Root);
                 if (c.Reproduced == "yes") reproduced++;
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -334,7 +405,7 @@ public static class FailureCases
             LinkNames = cx.LinkNames,
             Wrapped = cx.Wrapped,
             EntryPoints = entry.Length > 0 ? entry : new[] { "main" },
-            ForceKeep = entry.Length > 0 ? Array.Empty<string>() : new[] { c.V.ReferencedIn },
+            ForceKeep = entry.Length > 0 || c.S.UseRel is null ? Array.Empty<string>() : new[] { c.S.UseRel },
             Languages = cx.Languages,
             Defines = cx.ManualDefines,
             CarveSource = cx.CarveSource,
@@ -343,9 +414,10 @@ public static class FailureCases
         };
     }
 
-    // Carves the bundle and reads its verify.txt: does the same name fail, and with what cause? The bundle's output
-    // folder is deleted afterwards (its report names this machine's paths).
-    static (string, string?) Replay(AnonymizedBundle.Result bundle, string anonName)
+    // Carves the bundle. A verify failure reproduces when the bundle's verify fails on the same name; a build error
+    // when it does, or when the bundle's carve drops every file that defines the name (or the missing header) too.
+    // The bundle's output folder is deleted afterwards (its report names this machine's paths).
+    static (string, string?) Replay(AnonymizedBundle.Result bundle, Anonymizer a, Subject s, string root)
     {
         var outDir = Path.Combine(Path.GetDirectoryName(bundle.ConfigPath)!, "out");
         var saved = (DiagState.Report, DiagState.Path, DiagState.DefaultPath);
@@ -354,12 +426,24 @@ public static class FailureCases
         {
             var code = CarveCommand.Run(new[] { "carve", bundle.SourceRoot, "--config", bundle.ConfigPath }, TextWriter.Null, TextWriter.Null);
             var verify = Path.Combine(outDir, bundle.StageName, "codecarver", "verify.txt");
-            var line = File.Exists(verify)
+            var anonName = a.Name(s.Name);
+            var line = File.Exists(verify) && s.Name.Length > 0
                 ? File.ReadLines(verify).FirstOrDefault(l => l.StartsWith("FAIL " + anonName + "\t", StringComparison.Ordinal))
                 : null;
-            if (line is null) return (code == 3 ? "no (verify failed on another name)" : $"no (exit {code})", null);
-            var cause = line.Split('\t').FirstOrDefault(p => p.StartsWith("cause ", StringComparison.Ordinal))?[6..];
-            return ("yes", cause);
+            if (line is not null)
+                return ("yes", line.Split('\t').FirstOrDefault(p => p.StartsWith("cause ", StringComparison.Ordinal))?[6..]);
+            if (s.FromBuild && s.DefRels.Count > 0)
+            {
+                var carved = Path.Combine(outDir, bundle.StageName, "carved");
+                bool Present(string rel)
+                {
+                    var f = Path.Combine(carved, a.Path(rel));
+                    return File.Exists(f) && !File.ReadAllText(f).Contains("Placeholder written by CodeCarver", StringComparison.Ordinal);
+                }
+                if (!s.DefRels.Any(Present)) return ("yes", "every defining file dropped");
+                return ("no (a defining file is kept)", null);
+            }
+            return (code == 3 ? "no (verify failed on another name)" : $"no (exit {code})", null);
         }
         finally
         {
@@ -373,10 +457,26 @@ public static class FailureCases
     {
         string N(string s) => a is null ? s : a.Name(s);
         string P(string s) => a is null ? s : a.Path(s);
-        var v = c.V;
+        var s = c.S;
         var sb = new StringBuilder();
         sb.AppendLine();
-        sb.AppendLine($"=== case {n}: {N(v.Name)}   cause {c.Cause}{(c.Shape.Length > 0 ? "   shape " + c.Shape : "")}");
+        var title = s.Name.Length == 0 ? "(no name)" : s.Cause == "build." + BuildErrorKind.MissingHeader ? P(s.Name.Replace('\\', '/')) : N(s.Name);
+        sb.AppendLine($"=== case {n}: {title}   cause {s.Cause}{(s.Shape.Length > 0 ? "   shape " + s.Shape : "")}");
+        if (s.Message is { } msg)
+        {
+            // The compiler's own line, its file shown as the tree path. Anonymized, the compiler's own words stay and
+            // every other word (a name, a path segment) is rewritten like the code: nothing else can get through.
+            if (a is not null)
+            {
+                if (s.MessageFile is { } mf && mf.Length > 0)
+                    msg = msg.Replace(mf, s.UseRel is { } ur ? P(ur) : a.Path(mf.Replace('\\', '/')), StringComparison.Ordinal);
+                if (s.Cause == "build." + BuildErrorKind.MissingHeader && s.Name.Length > 0)
+                    msg = msg.Replace(s.Name, P(s.Name.Replace('\\', '/')), StringComparison.Ordinal);
+                msg = MessageWord.Replace(msg, m => MessageVocabulary.Contains(m.Value.ToLowerInvariant()) || m.Value.All(char.IsAsciiDigit)
+                    || IsAnonToken(m.Value) ? m.Value : a.Name(m.Value));
+            }
+            sb.AppendLine($"error: {msg}");
+        }
         sb.AppendLine($"replay: {(c.Reproduced ?? "not tried")}{(c.ReproCause is { } rc ? " (cause " + rc + ")" : "")}"
                       + (bundle is null ? "" : $"   bundle case{n}/: {bundle.FilesWritten} file(s)"
                          + (bundle.FilesWithheld > 0 ? $", {bundle.FilesWithheld} withheld (still held an original word)" : "")
@@ -384,39 +484,67 @@ public static class FailureCases
                          + (c.Truncated ? ", closure capped" : "")));
         sb.AppendLine($"root used for the replay: {(c.Enclosing is { } en ? $"{en.Kind} {N(en.Name)}" : "the use's whole file (no enclosing function found)")}");
 
-        // The use.
-        var useText = text(v.ReferencedIn);
-        var (useDead, useUnc) = cx.LineMaps(v.ReferencedIn, SafeRead(cx.FullPath(v.ReferencedIn)));
-        sb.AppendLine($"use: {P(v.ReferencedIn)}:{v.Line}   line {State(useDead, useUnc, v.Line)}   {FileFacts(cx, v.ReferencedIn)}");
-        if (c.Enclosing is { } e)
-            sb.AppendLine($"  inside {e.Kind} {N(e.Name)} (lines {e.Span}), {(cx.Plan.IsKept(e.Id) ? "kept" : "NOT kept")}");
-        Ifs(sb, useText, v.Line);
-        Excerpt(sb, useText, v.Line - 4, v.Line + 3, v.Line);
-
-        // Every definition the check found, and what the carve knew about each.
-        var defs = v.DefinedInAll.Count > 0 ? v.DefinedInAll : new[] { v.DefinedIn };
-        sb.AppendLine($"defined only in dropped file(s): {defs.Count}");
-        foreach (var d in defs)
+        // The use (in the ORIGINAL file: a carved file's lines can differ where content was carved).
+        if (s.UseRel is { } use)
         {
-            var line = d == v.DefinedIn ? v.DefinedLine : 0;
+            var useText = text(use);
+            var (useDead, useUnc) = cx.LineMaps(use, SafeRead(cx.FullPath(use)));
+            sb.AppendLine($"use: {P(use)}:{s.UseLine}   line {State(useDead, useUnc, s.UseLine)}   {FileFacts(cx, use)}");
+            if (c.Enclosing is { } e)
+                sb.AppendLine($"  inside {e.Kind} {N(e.Name)} (lines {e.Span}), {(cx.Plan.IsKept(e.Id) ? "kept" : "NOT kept")}");
+            Ifs(sb, useText, s.UseLine);
+            Excerpt(sb, useText, s.UseLine - 4, s.UseLine + 3, s.UseLine);
+        }
+        else sb.AppendLine("use: not found in the tree");
+
+        // Every definition, and what the carve knew about each.
+        sb.AppendLine($"{(s.FromBuild ? "defined in" : "defined only in dropped")} file(s): {s.DefRels.Count}");
+        for (var i = 0; i < s.DefRels.Count; i++)
+        {
+            var d = s.DefRels[i];
+            var line = i == 0 ? s.DefLine : 0;
             var (dd, du) = cx.LineMaps(d, SafeRead(cx.FullPath(d)));
             sb.AppendLine($"  {P(d)}{(line > 0 ? ":" + line : "")}   {(line > 0 ? "line " + State(dd, du, line) + "   " : "")}{FileFacts(cx, d)}");
         }
-        if (v.DefinedLine > 0)
+        if (s.DefLine > 0 && s.DefRels.Count > 0)
         {
-            var defText = text(v.DefinedIn);
-            Ifs(sb, defText, v.DefinedLine);
-            Excerpt(sb, defText, v.DefinedLine - 12, v.DefinedLine + 4, v.DefinedLine);
+            var defText = text(s.DefRels[0]);
+            Ifs(sb, defText, s.DefLine);
+            Excerpt(sb, defText, s.DefLine - 12, s.DefLine + 4, s.DefLine);
         }
 
         // What the graph has under the name.
-        var named = cx.Graph.Nodes.Where(x => x.Name == v.Name).Take(20).ToList();
-        sb.AppendLine($"graph nodes named {N(v.Name)}: {named.Count}{(named.Count == 20 ? "+" : "")}");
+        var named = s.Name.Length == 0 ? new List<Node>() : cx.Graph.Nodes.Where(x => x.Name == s.Name).Take(20).ToList();
+        sb.AppendLine($"graph nodes named {(s.Name.Length > 0 ? N(s.Name) : "-")}: {named.Count}{(named.Count == 20 ? "+" : "")}");
         foreach (var x in named)
             sb.AppendLine($"  {x.Kind} {(x.FilePath is { } fp ? P(fp) + ":" + x.Span : "(no file)")}  {(cx.Plan.IsKept(x.Id) ? "kept" : "dropped")}"
                           + (x.Flags != NodeFlags.None ? "  flags " + x.Flags : ""));
         return sb.ToString();
     }
+
+    // A word, not the tail of a number (0x9, 1f).
+    static readonly System.Text.RegularExpressions.Regex MessageWord = new(@"(?<![0-9A-Za-z_])[A-Za-z_][A-Za-z0-9_]*");
+    // Words the compilers and linkers themselves print. Anything else in a message is a name or a path: rewritten.
+    static readonly HashSet<string> MessageVocabulary = new(StringComparer.Ordinal)
+    {
+        "error", "fatal", "warning", "note", "undefined", "reference", "references", "to", "implicit", "declaration", "of",
+        "function", "functions", "undeclared", "first", "use", "in", "this", "unknown", "type", "name", "no", "such", "file",
+        "or", "directory", "cannot", "open", "include", "source", "identifier", "is", "not", "a", "an", "was", "declared",
+        "scope", "storage", "size", "isn", "t", "known", "expected", "before", "after", "token", "unresolved", "external",
+        "symbol", "referenced", "by", "from", "definition", "for", "conflicting", "types", "incompatible", "pointer",
+        "integer", "without", "cast", "too", "many", "few", "arguments", "call", "iso", "and", "later", "do", "does",
+        "support", "declarations", "multiple", "redefinition", "previous", "here", "has", "incomplete", "field", "member",
+        "struct", "union", "enum", "named", "invalid", "initializer", "required", "as", "operand", "assignment", "makes",
+        "return", "value", "non", "void", "at", "end", "input", "missing", "terminating", "character", "stray", "program",
+        "collect2", "ld", "lld", "returned", "exit", "status", "the", "found", "not", "found", "text", "data", "bss",
+        "rodata", "section", "relocation", "truncated", "fit", "against", "lnk2019", "lnk2001", "c2065", "c1083",
+        "l6218e", "pe020", "pe1696", "li005", "referred", "line", "undefined", "symbol", "unresolved", "c99", "c11",
+        "wimplicit", "werror", "std", "int", "char", "long", "short", "unsigned", "signed", "const", "static", "extern",
+        "inline", "first", "defined", "macro", "passed", "takes", "only", "parameter", "parameters", "argument",
+        "incompatible", "implicitly", "declaring", "library", "built", "in", "did", "you", "mean", "use", "of",
+    };
+
+    static bool IsAnonToken(string w) => System.Text.RegularExpressions.Regex.IsMatch(w, @"^(?:[kK]q?\d+|p\d+)(?:_(?:[kK]q?\d+))*$");
 
     static string State(bool[]? dead, bool[]? unc, int line) =>
         dead is not null && line < dead.Length && dead[line] ? "dead (#if model)"

@@ -53,6 +53,17 @@ says how many), never written.
 happens there (`replay: yes`). A `yes` means the copy alone reproduces the bug: a developer can fix it from the zip
 without ever seeing your code. Counts are in `summary.txt` (`<stage>.debug.cases`, `<stage>.debug.reproduced`).
 
+## When the carved tree doesn't build: `build-output.txt`
+
+`verify` checks functions only; a missing header, type or macro shows up when you build the carved tree. Save
+everything that build printed as `<outputDirectory>/<stage>/build-output.txt` (beside that stage's `carved/`;
+`<outputDirectory>/build-output.txt` with no stages) and run the same carve again. CodeCarver reads the errors (gcc,
+clang, MSVC, Keil armcc/armclang, IAR, and the GNU, LLVM, Microsoft, Arm and IAR linkers) and writes them up exactly
+like verify failures, in `codecarver/debug-build/`: for each name the build missed, where the original tree defines it
+and why the carve dropped it, raw (`raw/`, keep local) and anonymized (`anon.zip`, to send). The compiler's own words
+stay in the anonymized error lines; every name and path in them is rewritten. A replay counts as reproduced when the
+anonymized copy's carve drops every file that defines the name (or the missing header) too.
+
 ## Checking a fix: `tools\selfcheck\selfcheck.ps1`
 
 The release ships a self-check that carves tiny made-up trees, one for each definition shape a past evaluation

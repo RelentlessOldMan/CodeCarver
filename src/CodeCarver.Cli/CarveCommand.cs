@@ -26,6 +26,9 @@ public static class CarveCommand
     /// must not dump a raw stack trace — report cleanly and, if a diagnostic report exists, still write a
     /// source-free package capturing the failure so a crash is diagnosable too.
     /// </summary>
+    /// <summary>Saved beside a stage's carved/ folder, the output of building that tree: the next carve writes up its errors.</summary>
+    public const string BuildOutputFile = "build-output.txt";
+
     public static int Run(string[] args, TextWriter @out, TextWriter err)
     {
         try { return RunCore(args, @out, err); }
@@ -1758,6 +1761,49 @@ public static class CarveCommand
             : (rel, text) => (perFileDefines?.Invoke(rel) ?? defines) is { } t ? PreprocessorScanner.DeadLineMap(text, t, closedWorld) : null;
         // Runs the emitted-tree check, prints the verdict, writes codecarver/verify.txt; true when it failed.
         string summaryStage = "run";   // key prefix for the stage being verified ("run" in analysis-only mode)
+        // What the failure write-ups (FailureCases) need from this run.
+        FailureCases.Context CasesContext(CarvePlan p, bool pruned) => new()
+        {
+            Root = Path.GetFullPath(dir),
+            FullPath = rel => fullByRel.TryGetValue(rel, out var fp) ? fp : Path.Combine(dir, rel),
+            Graph = graph, Plan = p, BuildCommands = buildCmds,
+            BuildOpened = buildFileTraces.Count > 0 ? buildObservedRel : null,
+            BuildTraceAll = buildFileTraces.Count > 0 ? buildTraceFull : null,
+            LinkNames = linkUses.Select(u => u.Name).Distinct(StringComparer.Ordinal).ToList(),
+            Wrapped = wrapped.ToList(),
+            NotBuilt = notBuilt, Unparsed = unparsedFiles,
+            LineMaps = (rel, text) =>
+            {
+                var t = (perFileDefines?.Invoke(rel) ?? defines) ?? new MacroTable();
+                return (deadLinesFor?.Invoke(rel, text), PreprocessorScanner.UncertainLineMap(text, t, closedWorld));
+            },
+            Languages = cv.Languages, ManualDefines = cv.Defines,
+            CarveSource = pruned, CarveHeaders = pruned && pruneHeaders,
+            Advanced = new[] { $"maxParseBytes = {maxParseBytes}", $"skipFilesNotBuilt = {(cv.SkipFilesNotBuilt ? "true" : "false")}",
+                               $"allowUnmatchedTraces = {(cv.AllowUnmatchedTraces ? "true" : "false")}" }
+                .Concat(maxSymbolsPerFile is { } msfc ? new[] { $"maxSymbolsPerFile = {msfc}" } : Array.Empty<string>())
+                .Concat(cv.ParseTimeout is { } ptc ? new[] { $"parseTimeout = {ptc}" } : Array.Empty<string>()).ToList(),
+        };
+        // The drop-in: the output of building this stage's carved tree, saved as <stage>/build-output.txt. Its errors
+        // are written up like verify's failures, in codecarver/debug-build/.
+        void BuildOutputCases(CarvePlan p, string baseDir, string carvedDir, string ccDir, bool pruned)
+        {
+            var path = Path.Combine(baseDir, BuildOutputFile);
+            if (FailureCases.Replaying || !File.Exists(path) || lang is not ("c" or "cpp")) return;
+            try
+            {
+                var fc = FailureCases.WriteBuildErrors(CasesContext(p, pruned), File.ReadAllText(path), carvedDir, ccDir);
+                @out.WriteLine($"  build   : {BuildOutputFile}: {fc.Cases} error(s) written up, {fc.Reproduced} reproduce in their anonymized bundle");
+                if (fc.AnonZip is { } z) @out.WriteLine($"            send: {z}  (anonymized, safe to share)");
+                @out.WriteLine($"            keep: {Path.Combine(ccDir, "debug-build", "raw")}  (real names: stays on this machine)");
+                summary[$"{summaryStage}.buildErrors.cases"] = fc.Cases;
+                summary[$"{summaryStage}.buildErrors.reproduced"] = fc.Reproduced;
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                err.WriteLine($"  warn    : could not write up {BuildOutputFile} ({ex.GetType().Name})");
+            }
+        }
         bool VerifyEmitted(CarvePlan p, IEnumerable<(string Rel, string Path)> emittedFiles, string ccDir, bool pruned = false)
         {
             if (!linkCheck) return false;
@@ -1857,29 +1903,7 @@ public static class CarveCommand
             {
                 try
                 {
-                    var cx = new FailureCases.Context
-                    {
-                        Root = Path.GetFullPath(dir),
-                        FullPath = rel => fullByRel.TryGetValue(rel, out var fp) ? fp : Path.Combine(dir, rel),
-                        Graph = graph, Plan = p, BuildCommands = buildCmds,
-                        BuildOpened = buildFileTraces.Count > 0 ? buildObservedRel : null,
-                        BuildTraceAll = buildFileTraces.Count > 0 ? buildTraceFull : null,
-                        LinkNames = linkUses.Select(u => u.Name).Distinct(StringComparer.Ordinal).ToList(),
-                        Wrapped = wrapped.ToList(),
-                        NotBuilt = notBuilt, Unparsed = unparsedFiles,
-                        LineMaps = (rel, text) =>
-                        {
-                            var t = (perFileDefines?.Invoke(rel) ?? defines) ?? new MacroTable();
-                            return (deadLinesFor?.Invoke(rel, text), PreprocessorScanner.UncertainLineMap(text, t, closedWorld));
-                        },
-                        Languages = cv.Languages, ManualDefines = cv.Defines,
-                        CarveSource = pruned, CarveHeaders = pruned && pruneHeaders,
-                        Advanced = new[] { $"maxParseBytes = {maxParseBytes}", $"skipFilesNotBuilt = {(cv.SkipFilesNotBuilt ? "true" : "false")}",
-                                           $"allowUnmatchedTraces = {(cv.AllowUnmatchedTraces ? "true" : "false")}" }
-                            .Concat(maxSymbolsPerFile is { } msfc ? new[] { $"maxSymbolsPerFile = {msfc}" } : Array.Empty<string>())
-                            .Concat(cv.ParseTimeout is { } ptc ? new[] { $"parseTimeout = {ptc}" } : Array.Empty<string>()).ToList(),
-                    };
-                    var fc = FailureCases.Write(cx, hard, why, shapes, ccDir);
+                    var fc = FailureCases.Write(CasesContext(p, pruned), hard, why, shapes, ccDir);
                     @out.WriteLine($"  debug   : {fc.Cases} failure case(s) written up, {fc.Reproduced} reproduce in their anonymized bundle");
                     if (fc.AnonZip is { } z) @out.WriteLine($"            send: {z}  (anonymized, safe to share)");
                     @out.WriteLine($"            keep: {Path.Combine(ccDir, "debug", "raw")}  (real names: stays on this machine)");
@@ -2169,6 +2193,7 @@ public static class CarveCommand
             // Verify the code plus the assembly files copied with it: those define symbols C calls (fast_copy in a .S).
             var verifyFiles = res.Written.Concat(infra.Files.Where(EmittedLinkCheck.IsAssembly)).Distinct(StringComparer.Ordinal);
             if (VerifyEmitted(splan, verifyFiles.Select(r => (r, Path.Combine(stageDir, r))).ToList(), ccDir, pruned: prune)) verifyFailed = true;
+            BuildOutputCases(splan, baseDir, outDir, ccDir, prune);
             carvedBytes += infra.Bytes;
             var origTotal = originalCodeBytes + infra.Bytes;   // delta-neutral passthrough (both sides)
             if (infra.Count > 0)
