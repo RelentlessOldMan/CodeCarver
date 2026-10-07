@@ -153,6 +153,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public int DefinitionsRecoveredByScan => _recoveredByScan;
     // CODECARVER_TIMING: where the per-file parse time goes (Stopwatch ticks), and how many files parsed with errors.
     private long _tPrep, _tParse, _tScan, _tRead; private int _errorFiles;
+    private readonly SortedDictionary<string, long> _timing = new(StringComparer.Ordinal);
+
+    /// <summary>Where the last graph build's time went, in ms, plus the slow-file counts: numbers only, for summary.txt.</summary>
+    public IReadOnlyDictionary<string, long> Timing => _timing;
 
     /// <summary>Files the front-end read but kept whole without extracting definitions or uses.</summary>
     public IReadOnlyCollection<string> UnparsedFiles => _unparsed;
@@ -380,8 +384,18 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _symbolBudgetKeptWhole.Clear();
         var graph = new CodeGraph();
         // CODECARVER_TIMING: sub-phases of the graph build (pre-pass, parse, resolution) to the log.
-        var phaseClock = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null ? System.Diagnostics.Stopwatch.StartNew() : null;
-        void Phase(string what) { if (phaseClock is null) return; Log.WriteLine($"  timing  :   {what,-14}{phaseClock.ElapsedMilliseconds,7} ms"); phaseClock.Restart(); }
+        // Always measured (summary.txt reports it); printed only with CODECARVER_TIMING.
+        var logTiming = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null;
+        _timing.Clear();
+        _tPrep = _tParse = _tScan = _tRead = 0;
+        _errorFiles = 0;
+        var phaseClock = System.Diagnostics.Stopwatch.StartNew();
+        void Phase(string what)
+        {
+            _timing[what.Replace(' ', '-').Replace('+', '-')] = phaseClock.ElapsedMilliseconds;
+            if (logTiming) Log.WriteLine($"  timing  :   {what,-14}{phaseClock.ElapsedMilliseconds,7} ms");
+            phaseClock.Restart();
+        }
         var (bytesTotal, filesTotal) = BuildScopeMacros(paths, read); // pre-pass: scope macros + parse work totals
         Phase("macro pre-pass");
 
@@ -408,8 +422,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         var keepNames = new HashSet<string>(StringComparer.Ordinal);
         var keepAt = new List<(string Name, string Path)>();   // where each keep attribute sits (translation units)
-        var timeFiles = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null;
+        var timeFiles = logTiming;
         var fsw = new System.Diagnostics.Stopwatch();
+        long slowestMs = 0, slowestBytes = 0, slowMsTotal = 0, parsedBytes = 0, largestBytes = 0;
+        int slowFiles = 0, verySlowFiles = 0, parsedFiles = 0, filesOver1MB = 0;
 
         long bytesDone = 0; var filesDone = 0;
 
@@ -419,7 +435,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var text = read(path);
             _tRead += System.Diagnostics.Stopwatch.GetTimestamp() - tr;
             if (text.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
-            if (timeFiles) fsw.Restart();
+            fsw.Restart();
             try
             {
                 // Per-file #ifdef config: when a build log supplies per-TU defines, PerFileDefines yields the
@@ -440,8 +456,15 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 ForceKeep(path);
                 if (fileNodeByPath.TryGetValue(path, out var failedFile)) KeptWholeRefs(path, text, failedFile, pendingRefs);
             }
-            if (timeFiles && fsw.ElapsedMilliseconds >= 300)
-                Log.WriteLine($"  slowfile: {fsw.ElapsedMilliseconds,6} ms  {path} ({text.Length:N0} B)");
+            var fileMs = fsw.ElapsedMilliseconds;
+            if (timeFiles && fileMs >= 300)
+                Log.WriteLine($"  slowfile: {fileMs,6} ms  {path} ({text.Length:N0} B)");
+            parsedFiles++; parsedBytes += text.Length;
+            largestBytes = Math.Max(largestBytes, text.Length);
+            if (text.Length >= 1 << 20) filesOver1MB++;
+            if (fileMs >= 1000) { slowFiles++; slowMsTotal += fileMs; }
+            if (fileMs >= 10_000) verySlowFiles++;
+            if (fileMs > slowestMs) { slowestMs = fileMs; slowestBytes = text.Length; }
 
             bytesDone += text.Length; filesDone++;
             OnParseProgress?.Invoke(filesDone, filesTotal, bytesDone, bytesTotal);
@@ -456,9 +479,23 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
 
         Phase("parse files");
-        if (phaseClock is not null)
+        static long Ms(long ticks) => ticks * 1000 / System.Diagnostics.Stopwatch.Frequency;
+        _timing["parse-files.rewrites"] = Ms(_tPrep);
+        _timing["parse-files.tree-sitter"] = Ms(_tParse);
+        _timing["parse-files.scan"] = Ms(_tScan);
+        _timing["parse-files.read"] = Ms(_tRead);
+        _timing["files.parsed"] = parsedFiles;
+        _timing["files.parsedBytes"] = parsedBytes;
+        _timing["files.largestBytes"] = largestBytes;
+        _timing["files.over1MB"] = filesOver1MB;
+        _timing["files.withParseErrors"] = _errorFiles;
+        _timing["files.slowOver1s"] = slowFiles;
+        _timing["files.slowOver10s"] = verySlowFiles;
+        _timing["files.slowOver1sTotalMs"] = slowMsTotal;
+        _timing["files.slowestMs"] = slowestMs;
+        _timing["files.slowestBytes"] = slowestBytes;
+        if (logTiming)
         {
-            static long Ms(long ticks) => ticks * 1000 / System.Diagnostics.Stopwatch.Frequency;
             Log.WriteLine($"  timing  :     rewrites    {Ms(_tPrep),7} ms");
             Log.WriteLine($"  timing  :     tree-sitter {Ms(_tParse),7} ms");
             Log.WriteLine($"  timing  :     scan 1d     {Ms(_tScan),7} ms  ({_errorFiles:N0} files with parse errors, {_recoveredByScan:N0} recovered)");

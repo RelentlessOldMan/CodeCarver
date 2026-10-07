@@ -1186,7 +1186,12 @@ public static class CarveCommand
             err.WriteLine($"  config  : {ambientMacros.Count:N0} macro name(s) #defined in the tree stay unknown unless the build defines them");
             summary["world.ambientMacros"] = ambientMacros.Count;
         }
+        // Everything before the parse (file walk, build logs, traces, macro scans) is its own phase.
+        Mark("pre-parse");
         var graph = fe.BuildGraph(parseRels, ReadRel, defines, closedWorld);
+        if (fe is TreeSitterFrontEnd tsTiming)
+            foreach (var (k, v) in tsTiming.Timing)
+                summary[k.StartsWith("files.", StringComparison.Ordinal) ? "parse." + k : $"time.build-graph.{k}.ms"] = v;
         // Files kept whole without extraction: the parser never saw them (big / macro-dense) or gave up on them.
         // verify uses this to say when a failure comes from such a file (cause useInUnparsedFile).
         var unparsedFiles = new HashSet<string>(skipParse, CodeCarver.Core.Util.PathComparer.Default);
