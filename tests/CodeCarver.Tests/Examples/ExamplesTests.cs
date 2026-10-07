@@ -37,7 +37,7 @@ public sealed class ExamplesTests
         // Guards the discovery itself: a rename or a broken glob must not quietly turn the theories below into
         // zero cases.
         var names = CarveTomlExamples().Select(a => (string)a[0]).ToList();
-        foreach (var expected in new[] { "cmm-trace", "csharp-app", "eldritch", "mixed-cpp-firmware", "multistage-firmware" })
+        foreach (var expected in new[] { "cmm-trace", "csharp-app", "eldritch", "hellbuild", "mixed-cpp-firmware", "multistage-firmware" })
             Assert.Contains(expected, names);
         var readmes = ReadmeExamples().Select(a => (string)a[0]).ToList();
         foreach (var expected in new[] { "cmm-trace", "csharp-app", "mixed-cpp-firmware", "multistage-firmware", "stringlib" })

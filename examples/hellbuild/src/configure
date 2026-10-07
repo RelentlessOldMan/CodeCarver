@@ -1,0 +1,10 @@
+#!/bin/sh
+# A configure step: probes the compiler in the build directory and writes config.h there, outside the tree.
+# It prints its probe compile, which names a conftest.c the tree never has.
+O=$1
+cd "$O"
+printf 'int main(void) { return 0; }\n' > conftest.c
+echo "gcc -c conftest.c -o conftest.o"
+if gcc -c conftest.c -o conftest.o 2>/dev/null; then echo '#define HAVE_SPELL 1' > config.h; else : > config.h; fi
+rm -f conftest.c conftest.o
+echo "checking whether the C compiler works... yes"

@@ -1,0 +1,36 @@
+capturing: sh /mnt/c/Playground/CodeCarver/examples/hellbuild/src/build.sh /mnt/c/Playground/CodeCarver/examples/hellbuild/src /tmp/hellbuild-orig /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk
+gcc -c conftest.c -o conftest.o
+checking whether the C compiler works... yes
+gcc -O0 -w -I/mnt/c/Playground/CodeCarver/examples/hellbuild/src/common/inc -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -DLNK=1 -c /tmp/hellbuild-orig/alias/lnk.c -o /tmp/hellbuild-orig/lnk.o
+gcc -O0 -w -I/mnt/c/Playground/CodeCarver/examples/hellbuild/src/common/inc -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include @/tmp/hellbuild-orig/rsp.args
+gcc -O0 -w -I/mnt/c/Playground/CodeCarver/examples/hellbuild/src/common/inc -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -c "/mnt/c/Playground/CodeCarver/examples/hellbuild/src/café.c" -o /tmp/hellbuild-orig/cafe.o
+gcc -O0 -w -I/mnt/c/Playground/CodeCarver/examples/hellbuild/src/common/inc -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -c "/mnt/c/Playground/CodeCarver/examples/hellbuild/src/it's here.c" -o /tmp/hellbuild-orig/its_here.o
+make: Entering directory '/tmp/hellbuild-orig'
+[ 42%] Building C object CMakeFiles/hell.dir/src/main.c.o
+make -C /mnt/c/Playground/CodeCarver/examples/hellbuild/src/liba
+/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig -I/mnt/c/Playground/CodeCarver/examples/hellbuild/src/common/inc -c /mnt/c/Playground/CodeCarver/examples/hellbuild/src/main.c -o main.o
+make[1]: Entering directory '/mnt/c/Playground/CodeCarver/examples/hellbuild/src/liba'
+make -C /mnt/c/Playground/CodeCarver/examples/hellbuild/src/libb
+make[1]: Entering directory '/mnt/c/Playground/CodeCarver/examples/hellbuild/src/libb'
+sed -e 's/@BIAS@/7/' /mnt/c/Playground/CodeCarver/examples/hellbuild/src/gen/table.c.in > table.c
+/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig -c /mnt/c/Playground/CodeCarver/examples/hellbuild/src/gen/hooks.c -o hooks.o
+sh /mnt/c/Playground/CodeCarver/examples/hellbuild/src/gen/mkhooks.sh mkhooks.c
+/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig -I/mnt/c/Playground/CodeCarver/examples/hellbuild/src/common/inc -c /mnt/c/Playground/CodeCarver/examples/hellbuild/src/cfg/feature.c -o feature.o
+/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig \
+    -DSPELL_POWER=4 -c /mnt/c/Playground/CodeCarver/examples/hellbuild/src/cfg/spell_real.c -o spell_real.o
+/bin/sh /mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ltwrap --mode=compile /mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig -I/mnt/c/Playground/CodeCarver/examples/hellbuild/src/common/inc -DLT_MODE=1 -c /mnt/c/Playground/CodeCarver/examples/hellbuild/src/lt.c -o lt.o
+sh -c '/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig -I/mnt/c/Playground/CodeCarver/examples/hellbuild/src/common/inc -DSHC_MODE=2 -c /mnt/c/Playground/CodeCarver/examples/hellbuild/src/shc.c -o shc.o'
+  CC      q1.o
+  CC      q2.o
+/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig -I../common/inc -DLIBA -c util.c -o /tmp/hellbuild-orig/liba_util.o
+/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig -c a_only.c -o /tmp/hellbuild-orig/a_only.o
+/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig -I/mnt/c/Playground/CodeCarver/examples/hellbuild/src/common/inc -c table.c -o table.o
+make[1]: Leaving directory '/mnt/c/Playground/CodeCarver/examples/hellbuild/src/liba'
+/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig -I/mnt/c/Playground/CodeCarver/examples/hellbuild/src/common/inc -c mkhooks.c -o mkhooks.o
+/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig -I../common/inc -DLIBB -c util.c -o /tmp/hellbuild-orig/libb_util.o
+/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -O0 -w -I /mnt/c/Playground/CodeCarver/examples/hellbuild/sdk/include -I/tmp/hellbuild-orig -c b_only.c -o /tmp/hellbuild-orig/b_only.o
+make[1]: Leaving directory '/mnt/c/Playground/CodeCarver/examples/hellbuild/src/libb'
+/mnt/c/Playground/CodeCarver/examples/hellbuild/src/tools/ccache gcc -o hell main.o liba_util.o a_only.o libb_util.o b_only.o table.o hooks.o mkhooks.o feature.o spell_real.o lt.o shc.o q1.o q2.o lnk.o rsp.o cafe.o its_here.o
+make: Leaving directory '/tmp/hellbuild-orig'
+wrote build.trace (158 unique path(s))
+add it to carve.toml:  buildTraceFiles = ["build.trace"]   (or runTraceFiles for a run capture)

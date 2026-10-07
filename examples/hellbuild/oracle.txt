@@ -1,0 +1,7 @@
+# tools/eldritch/eldritch-oracle.ps1 -Example hellbuild: the binary, and what log + trace carves must drop or stub
+binary hell
+dropped legacy/fallback.c
+dropped legacy/lt_decoy.c
+dropped legacy/shc_decoy.c
+placeholder it's here.c
+placeholder quiet/q2.c

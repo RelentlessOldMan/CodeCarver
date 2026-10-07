@@ -1,0 +1,22 @@
+#ifndef HB_H
+#define HB_H
+int liba_util(void);
+int libb_util(void);
+int liba_only(void);
+int libb_only(void);
+int table_sum(void);
+int hooks_total(void);
+int gen_hook_one(void);
+int gen_hook_two(void);
+int feature(void);
+int spell_real(void);
+int spell_fallback(void);
+int lt_fn(void);
+int lt_decoy(void);
+int shc_fn(void);
+int shc_decoy(void);
+int cafe_fn(void);
+int lnk_fn(void);
+int rsp_fn(void);
+int q1_fn(void);
+#endif

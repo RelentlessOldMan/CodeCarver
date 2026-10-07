@@ -17,22 +17,33 @@
   3. Each carved tree is built with its own build.sh and run. Carve exit must be 0, the build must succeed and the
      output must match. With log+trace the decoys must be dropped and compiled-but-unreached files must be placeholders.
 
+  -Example hellbuild runs the same oracle on examples/hellbuild: plain code, nightmare build (make -j with interleaved
+  sub-makes, generated sources, configure, wrappers, sh -c, quiet rules). Each example's oracle.txt names its binary and
+  what a log+trace carve must drop or turn into placeholders.
+
   Not ComputeWarden-gated: a few dozen tiny compiles.
 
 .EXAMPLE
   ./tools/eldritch/eldritch-oracle.ps1
+  ./tools/eldritch/eldritch-oracle.ps1 -Example hellbuild
 #>
 [CmdletBinding()]
 param(
+    # examples\<name>: src\build.sh <src> <out> <sdk> builds it, oracle.txt names its binary and its log+trace checks
+    [string]$Example = 'eldritch',
     [string]$CliDll = (Join-Path $PSScriptRoot '..\..\src\CodeCarver.Cli\bin\Debug\net8.0\codecarver.dll'),
     [switch]$SaveInputs,   # also refresh examples/eldritch/inputs (the captured log + trace CI carves with)
     [string]$Work = (Join-Path ([IO.Path]::GetTempPath()) ('eldritch-' + [guid]::NewGuid().ToString('N').Substring(0, 8)))
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$ex = Join-Path $repo 'examples\eldritch'
+$ex = Join-Path $repo "examples\$Example"
 $src = Join-Path $ex 'src'
 $sdk = Join-Path $ex 'sdk'
+# oracle.txt: "binary <name>", "dropped <rel>" and "placeholder <rel>" (checked with log + trace, every stage).
+$checks = @(Get-Content -Encoding utf8 (Join-Path $ex 'oracle.txt') | Where-Object { $_ -match '^\w+ ' } | ForEach-Object { $k, $v = $_ -split ' ', 2; [pscustomobject]@{ Kind = $k; Rel = $v } })
+$bin = ($checks | Where-Object Kind -eq 'binary' | Select-Object -First 1).Rel
+if (-not $bin) { throw "$ex\oracle.txt names no binary" }
 if (-not (Test-Path $CliDll)) { throw "CLI not built: $CliDll (dotnet build src/CodeCarver.Cli)" }
 New-Item -ItemType Directory -Force $Work | Out-Null
 $Work = (Resolve-Path $Work).Path
@@ -44,7 +55,7 @@ $srcW = ToWsl $src; $sdkW = ToWsl $sdk; $workW = ToWsl $Work
 $capture = ToWsl (Join-Path $repo 'tools\capture\capture-file-trace.sh')
 
 # 1. The original, traced.
-$r = Invoke-Wsl "set -e; cd '$workW'; rm -rf /tmp/eldritch-orig; bash '$capture' build.trace -- sh '$srcW/build.sh' '$srcW' /tmp/eldritch-orig '$sdkW' > build.log 2>&1; /tmp/eldritch-orig/eldritch > expected.txt"
+$r = Invoke-Wsl "set -e; cd '$workW'; rm -rf /tmp/$Example-orig; bash '$capture' build.trace -- sh '$srcW/build.sh' '$srcW' /tmp/$Example-orig '$sdkW' > build.log 2>&1; /tmp/$Example-orig/$bin > expected.txt"
 if ($SaveInputs -and $r.Code -eq 0) {
     # examples/eldritch/inputs: CI carves with these (no gcc there). They name only /mnt/c/... repo paths, /tmp and /usr.
     $in = Join-Path $ex 'inputs'
@@ -106,8 +117,7 @@ carveHeaderFileContents = true
         if ($vfails -gt 0) { $row.verify = "FAIL $vfails"; $fail++ } else { $row.verify = 'ok' }
         $tag = ($mode -replace '\+', '-') + "-$stage"
         $cW = ToWsl $carved
-        $skip = if ($mode -eq 'none') { 'SKIP_MISSING=1 ' } else { '' }
-        $b = Invoke-Wsl "cd '$workW'; rm -rf 'b-$tag'; ${skip}sh '$cW/build.sh' '$cW' 'b-$tag' '$sdkW' > 'b-$tag.log' 2>&1 && ./b-$tag/eldritch > 'b-$tag.txt'"
+        $b = Invoke-Wsl "cd '$workW'; rm -rf 'b-$tag'; sh '$cW/build.sh' '$cW' 'b-$tag' '$sdkW' > 'b-$tag.log' 2>&1 && ./b-$tag/$bin > 'b-$tag.txt'"
         if ($b.Code -ne 0) {
             $row.build = 'FAIL'; $fail++
             $errs = @(Get-Content (Join-Path $Work "b-$tag.log") | Where-Object { $_ -match 'error|undefined reference' } | Select-Object -First 4)
@@ -123,12 +133,12 @@ carveHeaderFileContents = true
                 $row.notes = 'got: ' + ($diff -join ' | ')
             }
         }
-        if ($mode -eq 'log+trace' -and $stage -eq 'safe') {
+        if ($mode -eq 'log+trace') {
             $bad = @()
-            foreach ($d in 'legacy\decoy.c', 'legacy\garbage.c') { if (Test-Path (Join-Path $carved $d)) { $bad += "$d kept" } }
-            foreach ($p in 'quiet.c', 'unused_compiled.c') {
+            foreach ($d in ($checks | Where-Object Kind -eq 'dropped').Rel) { if (Test-Path -LiteralPath (Join-Path $carved $d)) { $bad += "$d kept" } }
+            foreach ($p in ($checks | Where-Object Kind -eq 'placeholder').Rel) {
                 $f = Join-Path $carved $p
-                if (-not (Test-Path $f) -or -not ((Get-Content $f -Raw) -match 'Placeholder written by CodeCarver')) { $bad += "$p not a placeholder" }
+                if (-not (Test-Path -LiteralPath $f) -or -not ((Get-Content -LiteralPath $f -Raw) -match 'Placeholder written by CodeCarver')) { $bad += "$p not a placeholder" }
             }
             if ($bad.Count -gt 0) { $row.notes = ($row.notes + ' ' + ($bad -join ', ')).Trim(); $fail++ }
         }

@@ -316,7 +316,29 @@ public static class CarveCommand
                 File = MapPath(c.File),
                 Includes = c.Includes.Select(MapPath).ToList(),
                 ForcedIncludes = c.ForcedIncludes.Select(MapPath).ToList(),
+                AlternativeDirectories = c.AlternativeDirectories.Select(MapPath).ToList(),
             }));
+        }
+        // make -j: a command printed while several sub-makes were in progress may have run in any of their
+        // directories. Keep the ones where its file exists; when that is more than one, each copy gets the command
+        // but its define set is not trusted (open-world), since we can't tell which file had which flags.
+        if (buildCmds.Any(c => c.AlternativeDirectories.Count > 0))
+        {
+            var resolved = new List<CompileCommand>(buildCmds.Count);
+            foreach (var c in buildCmds)
+            {
+                if (c.AlternativeDirectories.Count == 0) { resolved.Add(c); continue; }
+                if (Path.IsPathFullyQualified(c.File)) { resolved.Add(c with { AlternativeDirectories = Array.Empty<string>() }); continue; }
+                var hits = new[] { c.Directory }.Concat(c.AlternativeDirectories)
+                    .Where(d => { try { var bd = Path.IsPathFullyQualified(d) ? d : Path.Combine(dir, d);
+                                        return File.Exists(Path.Combine(bd, c.File)); }
+                                  catch (ArgumentException) { return false; } })
+                    .Distinct(StringComparer.Ordinal).ToList();
+                if (hits.Count == 0) resolved.Add(c with { AlternativeDirectories = Array.Empty<string>() });
+                else if (hits.Count == 1) resolved.Add(c with { Directory = hits[0], AlternativeDirectories = Array.Empty<string>() });
+                else resolved.AddRange(hits.Select(d => c with { Directory = d, AlternativeDirectories = Array.Empty<string>(), Incomplete = true }));
+            }
+            buildCmds = resolved;
         }
         // Per-TU preprocessor config from the build log. A build can compile the SAME file in multiple configs;
         // unioning all TUs' -D and applying it globally would mark a macro "defined" for a file that was compiled
@@ -642,8 +664,10 @@ public static class CarveCommand
             if (complete) buildOpenedOutside = outside.ToList();
             if (complete && buildCmds.Count > 0)
             {
+                // Only files the tree has: a configure probe prints "gcc -c conftest.c" for a file it then deletes.
                 var compiled = buildCmds.Select(CmdRel).Where(r => r is not null).Select(r => r!)
-                                        .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                                        .Where(r => File.Exists(Path.Combine(dir, r))).ToList();
                 traceMissedCompiled = compiled.Count(r => !openedByBuild.Contains(r));
                 summary["build.traceMissedCompiledFiles"] = traceMissedCompiled;
                 if (traceMissedCompiled > 0)
@@ -672,7 +696,7 @@ public static class CarveCommand
             if (unlogged > 0)
                 err.WriteLine($"  build   : {unlogged} source file(s) appear in no compile command -> open-world for them (both #ifdef branches kept)");
             if (openWorldFiles.Count > 0)
-                err.WriteLine($"  build   : {openWorldFiles.Count} logged file(s) have an incomplete define set (unreadable @response or forced include) -> open-world");
+                err.WriteLine($"  build   : {openWorldFiles.Count} logged file(s) have an incomplete define set (unreadable @response or forced include, or make -j printed the compile while several directories were open) -> open-world");
         }
 
         // STREAMING ingestion: instead of reading the whole tree's text into a list up front (peak memory = every
@@ -879,10 +903,13 @@ public static class CarveCommand
 
         // The tree's own build scripts (makefiles, shell scripts, linker scripts...): their -D renames and link flags
         // count even when no build log was given.
-        var buildScripts = lang is "c" or "cpp"
+        // Also the C source templates the build fills in (table.c.in, config.h.in): see GeneratedCode.
+        var buildFiles = lang is "c" or "cpp"
             ? CodeCarver.Core.Util.SourceWalk.Files(dir).Select(p => (Rel: Path.GetRelativePath(dir, p).Replace('\\', '/'), Path: p))
-                .Where(f => LinkFlags.IsBuildScript(f.Rel) && !Excluded(f.Path) && SafeLength(f.Path) <= maxParseBytes).ToList()
+                .Where(f => (LinkFlags.IsBuildScript(f.Rel) || GeneratedCode.IsTemplate(f.Rel)) && !Excluded(f.Path) && SafeLength(f.Path) <= maxParseBytes).ToList()
             : new List<(string Rel, string Path)>();
+        var buildScripts = buildFiles.Where(f => LinkFlags.IsBuildScript(f.Rel)).ToList();
+        var templates = buildFiles.Where(f => GeneratedCode.IsTemplate(f.Rel)).ToList();
         var commandLineMacros = CodeCarver.Core.Preprocess.CommandLineMacros.FromSpecs(
             buildCmds.SelectMany(c => c.Defines).Concat(buildScripts.SelectMany(f => CodeCarver.Core.Preprocess.CommandLineMacros.SpecsInScript(SafeRead(f.Path)))));
 
@@ -1458,6 +1485,26 @@ public static class CarveCommand
                 .Select(r => r with { Kind = RootKind.LinkerKeep, Note = "named by the link" }).ToList()
             : new List<Root>();
         summary["roots.linkFlags"] = linkRoots.Count;
+        // Calls in code the build GENERATES into its build directory (a table.c.in filled in by sed, C printed by a
+        // generator script): the generated file is outside the tree, so its calls are seen only here.
+        var genUses = new List<(string Name, string Rel, int Line)>();
+        if (lang is "c" or "cpp")
+        {
+            foreach (var (rel, p) in buildScripts)
+                foreach (var (n, l) in GeneratedCode.Calls(SafeRead(p), template: false)) genUses.Add((n, rel, l));
+            foreach (var (rel, p) in templates)
+                foreach (var (n, l) in GeneratedCode.Calls(SafeRead(p), template: true)) genUses.Add((n, rel, l));
+        }
+        var genNames = genUses.Select(u => u.Name).ToHashSet(StringComparer.Ordinal);
+        var genRoots = genUses.Count > 0
+            ? new ExplicitRootProvider(symbols: genNames).Discover(graph)
+                .Where(r => graph.GetNode(r.Node).Kind == NodeKind.Function)
+                .Select(r => r with { Kind = RootKind.LinkerKeep, Note = "called by generated code" }).ToList()
+            : new List<Root>();
+        summary["roots.generatedCode"] = genRoots.Count;
+        linkRoots.AddRange(genRoots);
+        var definedFns = genRoots.Select(r => graph.GetNode(r.Node).Name).ToHashSet(StringComparer.Ordinal);
+        linkUses.AddRange(genUses.Where(u => definedFns.Contains(u.Name)));
 
         var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots).Concat(linkRoots)
                                    .Concat(forceKeepRoots).Concat(forcedRoots).Concat(traceRoots).Concat(fileTraceRoots).ToList();
@@ -1671,7 +1718,17 @@ public static class CarveCommand
             // from somewhere else (another build or a prebuilt library, an alias, a macro). A note, not a failure.
             // A WEAK reference (declared weak, no definition kept) links as null even when the trace can't be checked;
             // its only definitions being in never-compiled files means the real build left it null too.
-            var notBuiltOnly = hard.Where(v => (traceMissedCompiled == 0 || v.Weak)
+            // With a trace but no build log the trace can't be checked, but a use that sits in an #if branch the model
+            // can't decide (no -D to say which) and names only never-opened files is the branch the build didn't take.
+            var emittedByRel = emittedFiles.GroupBy(f => f.Rel, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.First().Path, StringComparer.Ordinal);
+            bool UseUncertain(LinkViolation v)
+            {
+                if (buildCmds.Count > 0 || !emittedByRel.TryGetValue(v.ReferencedIn, out var path)) return false;
+                var text = SafeRead(path);
+                var map = PreprocessorScanner.UncertainLineMap(text, (perFileDefines?.Invoke(v.ReferencedIn) ?? defines) ?? new MacroTable(), closedWorld);
+                return v.Line > 0 && v.Line < map.Length && map[v.Line];
+            }
+            var notBuiltOnly = hard.Where(v => (traceMissedCompiled == 0 || v.Weak || UseUncertain(v))
                                                && v.DefinedInAll.Count > 0 && v.DefinedInAll.All(notBuilt.Contains)).ToList();
             hard.RemoveAll(notBuiltOnly.Contains);
             var sb = new System.Text.StringBuilder();
@@ -1826,7 +1883,38 @@ public static class CarveCommand
         {
             foreach (var cc in buildCmds) if (CmdRel(cc) is { } crel) compiledTus.Add(crel);
             compiledTus.UnionWith(buildObservedRel);
+            // Without a complete build trace the compiled set is a lower bound (quiet "  CC q2.o" lines, a compile
+            // in a lost response file, no build inputs at all). A source the tree's build files name, by file name or
+            // by stem ($(addsuffix .o,q1 q2)), is taken as compiled too: a stand-in costs nothing, a missing file
+            // breaks the build.
+            if (!(cv.EveryBuildTraced && traceMissedCompiled <= 0 && buildObservedRel.Count > 0) && buildScripts.Count > 0)
+                compiledTus.UnionWith(NamedByBuildFiles(parseRels.Where(r => !compiledTus.Contains(r)
+                    && tuExtsP.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)))));
             compiledTus.RemoveWhere(r => !tuExtsP.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)));
+        }
+        IEnumerable<string> NamedByBuildFiles(IEnumerable<string> candidates)
+        {
+            var words = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var texts = new List<string>();
+            foreach (var (_, p) in buildScripts)
+            {
+                var text = SafeRead(p);
+                texts.Add(text);
+                foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(text, @"[\w.+\-]+"))
+                {
+                    var w = m.Value.Trim('.', '-');
+                    words.Add(w);
+                    var dot = w.LastIndexOf('.');
+                    if (dot > 0) words.Add(w[..dot]);
+                }
+            }
+            foreach (var rel in candidates)
+            {
+                var name = Path.GetFileName(rel);
+                if (words.Contains(name) || words.Contains(Path.GetFileNameWithoutExtension(name))) yield return rel;
+                else if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^[\w.+\-]+$") && texts.Any(t => t.Contains(name, StringComparison.Ordinal)))
+                    yield return rel;   // a name with a space or a quote: look for it whole
+            }
         }
         List<string> PlaceholderTus(CarvePlan p) => p.DroppedFiles.Where(compiledTus.Contains).OrderBy(r => r, StringComparer.Ordinal).ToList();
         static string PlaceholderText(string rel)

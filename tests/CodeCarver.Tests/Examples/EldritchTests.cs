@@ -10,35 +10,7 @@ namespace CodeCarver.Tests.Examples;
 /// </summary>
 public sealed class EldritchTests
 {
-    sealed class Run : IDisposable
-    {
-        readonly TempDir _work = new("cc-eldritch-");
-        public string Dir { get; }
-        public int Code { get; }
-        public string Output { get; }
-        public Run(string? buildSection = null)
-        {
-            Dir = _work.Sub("eldritch");
-            TempDir.CopyTree(Path.Combine(TestRepo.Root, "examples", "eldritch"), Dir);
-            var cfg = Path.Combine(Dir, "carve.toml");
-            if (buildSection is not null)
-            {
-                var text = File.ReadAllText(cfg);
-                var start = text.IndexOf("[builds.main]", StringComparison.Ordinal);
-                var end = text.IndexOf("[advanced]", StringComparison.Ordinal);
-                File.WriteAllText(cfg, text[..start] + buildSection + "\n" + text[end..]);
-            }
-            var w = new StringWriter();
-            Code = CarveCommand.Run(new[] { "carve", Path.Combine(Dir, "src"), "--config", cfg }, w, w);
-            Output = w.ToString();
-        }
-        public string Carved(string stage, string rel) => Path.Combine(Dir, "out", stage, "carved", rel);
-        public bool Kept(string stage, string rel) => File.Exists(Carved(stage, rel))
-            && !File.ReadAllText(Carved(stage, rel)).Contains("Placeholder written by CodeCarver");
-        public bool Placeholder(string stage, string rel) => File.Exists(Carved(stage, rel))
-            && File.ReadAllText(Carved(stage, rel)).Contains("Placeholder written by CodeCarver");
-        public void Dispose() => _work.Dispose();
-    }
+    sealed class Run : ExampleRun { public Run(string? buildSection = null) : base("eldritch", buildSection) { } }
 
     static readonly string[] Stages = { "safe", "headers", "aggressive", "max" };   // every combination of the two carve switches
 

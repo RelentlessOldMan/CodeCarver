@@ -73,6 +73,7 @@ internal sealed class TreeCarve : IDisposable
 
     public string CarvedPath(string rel) => Path.Combine(Root, "out", "carved", rel);
     public bool Kept(string rel) => File.Exists(CarvedPath(rel)) && !File.ReadAllText(CarvedPath(rel)).Contains("Placeholder written by CodeCarver");
+    public bool Placeholder(string rel) => File.Exists(CarvedPath(rel)) && File.ReadAllText(CarvedPath(rel)).Contains("Placeholder written by CodeCarver");
     public string Summary => File.ReadAllText(Path.Combine(Root, "out", "codecarver", "summary.txt"));
     public string VerifyLog => File.Exists(Path.Combine(Root, "out", "codecarver", "verify.txt"))
         ? File.ReadAllText(Path.Combine(Root, "out", "codecarver", "verify.txt")) : "";

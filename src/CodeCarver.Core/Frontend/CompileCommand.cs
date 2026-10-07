@@ -22,4 +22,9 @@ public sealed record CompileCommand
     /// <summary>True when the define set may be incomplete (an unreadable <c>@response</c> file): the file must
     /// not be resolved closed-world from this command.</summary>
     public bool Incomplete { get; init; }
+
+    /// <summary>Other directories the command may have run in: <c>make -j</c> runs sibling sub-makes at once, so
+    /// their "Entering directory" lines interleave and the last one entered is only a guess. The caller resolves
+    /// <see cref="File"/> against each and keeps the ones where it exists.</summary>
+    public IReadOnlyList<string> AlternativeDirectories { get; init; } = Array.Empty<string>();
 }

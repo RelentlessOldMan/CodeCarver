@@ -194,6 +194,24 @@ $cases = @(
          'main.c'   = "#include <dlfcn.h>`nint main(void) { int (*f)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, `"dl_target`"); return f ? f() : -1; }`n"
          'target.c' = "int dl_target(void) { return 55; }`n"
          'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'called only by a source template the build fills in'; Lang = 'c'; Expect = @('hooks.c')
+       Files = @{
+         'main.c'     = "int table_sum(void);`nint main(void) { return table_sum(); }`n"
+         'table.c.in' = "int gen_hook(void);`nint table_sum(void) { return gen_hook() + @BIAS@; }`n"
+         'hooks.c'    = "int gen_hook(void) { return 3; }`n"
+         'unused.c'   = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'called only by C a generator script prints'; Lang = 'c'; Expect = @('hooks.c')
+       Files = @{
+         'main.c'     = "int hooks_total(void);`nint main(void) { return hooks_total(); }`n"
+         'mkhooks.sh' = "#!/bin/sh`ncat > `"`$1`" <<EOC`nint gen_hook(void);`nint hooks_total(void) { return gen_hook() + 1; }`nEOC`n"
+         'hooks.c'    = "int gen_hook(void) { return 4; }`n"
+         'unused.c'   = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'a dropped source the makefile names by stem is a placeholder'; Lang = 'c'; Expect = @('q2.c')
+       Files = @{
+         'main.c'     = "int main(void) { return 0; }`n"
+         'q2.c'       = "int q2_fn(void) { return 2; }`n"
+         'Makefile'   = "OBJS := main.o `$(addsuffix .o,q2)`napp: `$(OBJS)`n`t`$(CC) -o app `$(OBJS)`n"
+         'unused.c'   = "int unused(void) { return 9; }`n" } }
 )
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("cc-selfcheck-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))

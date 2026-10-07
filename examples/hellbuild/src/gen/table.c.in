@@ -1,0 +1,4 @@
+/* A source template: the build writes table.c into the build directory with sed (@BIAS@ replaced) and compiles
+   that. Nothing in the tree calls gen_hook_one. */
+#include "hb.h"
+int table_sum(void) { return gen_hook_one() * 10 + @BIAS@; }

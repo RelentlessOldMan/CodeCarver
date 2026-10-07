@@ -1,0 +1,3 @@
+#!/bin/sh
+# A compiler cache stand-in: runs the compile it is given.
+exec "$@"

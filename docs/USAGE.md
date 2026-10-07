@@ -285,13 +285,16 @@ compiled.
     that uses a name defined **only** in files the build never compiled is a **note**, not a failure
     (`<stage>.verify.notBuiltDefinitions`): the real build linked without those files, so the name comes from
     somewhere else (another build or a prebuilt library, an alias, a macro). With a trace but no log the check
-    can't run, and such a name fails verify with cause `definedInFileNotBuilt`.
+    can't run, and such a name fails verify with cause `definedInFileNotBuilt`. The exception is a use inside an
+    `#if` branch nothing decides (no log means no `-D`), which is a note: that is the branch the build didn't take.
   - **Compiled files nothing reachable calls are dropped, as placeholders.** A build compiles files the image
     never calls into. Static reachability drops them. Build files that list sources (a Makefile, a `.vcxproj`)
     still name them, so each is written as a **placeholder**: a few lines that define nothing (an empty file is
     not valid ISO C). The unchanged build finds every file it lists, and the binary loses the code (unless the
     linker already discarded it, via `--gc-sections` or a static library). "Compiled" means named by a compile
-    command in `buildLogs` or opened by a build trace, so a build log alone gets placeholders too. The count is
+    command in `buildLogs` or opened by a build trace, so a build log alone gets placeholders too. Unless a
+    complete build trace says exactly what was compiled, a source the tree's build files name (by file name, or by
+    stem as in `$(addsuffix .o,q1 q2)`) counts as compiled too, even with no build inputs at all. The count is
     `<stage>.placeholderFiles`, and `manifest.json` lists them under `placeholderFiles`. With
     `[advanced] placeholderFiles = false` they are removed outright (edit the build's file list to match).
 
@@ -406,6 +409,29 @@ carries forward. `@response` files are read (relative to the command's directory
 and MSVC `/D /U /I` for `cl`-like drivers. For a vendor compiler in a text log, name it in
 `[builds.X] compilerNames`; a `compile_commands.json` must be a JSON array of
 `{directory, file, command|arguments}`. (`scan-log` previews with the built-in driver list only.)
+
+Messy logs are expected:
+- **Compiles behind a shell.** `sh -c '...'` is read inside the quotes, and a launcher such as
+  `/bin/sh ../libtool --mode=compile gcc ...` is read from the compiler on.
+- **Recursive `make -w`.** `Entering`/`Leaving directory` lines set the directory for relative paths. Under
+  `make -j`, sibling sub-makes run at once and their lines interleave, so the directory entered last is only a
+  guess. Every directory still open is tried, and the file is kept where it exists. When it exists in more than
+  one, each copy gets the command but is resolved open-world: both `#ifdef` branches are kept, since the log
+  can't say which copy got which flags.
+- **Gaps in the log** cost precision, never soundness:
+  - a quiet `  CC foo.o` line;
+  - a lost `@response` file;
+  - a source reached through a symlink outside the tree;
+  - a configure probe's `conftest.c`.
+  The file is resolved open-world. A compiled file the tree no longer has doesn't count against the build trace.
+- **Generated sources** live in the build directory, outside the tree, so their calls are read where they come
+  from:
+  - every call in a C source template (`table.c.in`, `config.h.in`, `.tmpl`, `.j2`);
+  - calls inside the string literals and here-documents of the tree's build scripts, such as a shell or Python
+    generator that prints C.
+  Those functions are kept, and verify checks them (`roots.generatedCode`).
+
+[`examples/hellbuild`](../examples/hellbuild/README.md) is all of this in one small build.
 
 ## Verify
 

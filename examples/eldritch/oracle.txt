@@ -1,0 +1,6 @@
+# tools/eldritch/eldritch-oracle.ps1 -Example eldritch: the binary, and what log + trace carves must drop or stub
+binary eldritch
+dropped legacy/decoy.c
+dropped legacy/garbage.c
+placeholder quiet.c
+placeholder unused_compiled.c

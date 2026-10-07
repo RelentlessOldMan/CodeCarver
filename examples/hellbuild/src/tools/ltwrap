@@ -1,0 +1,4 @@
+#!/bin/sh
+# A libtool-like wrapper: ltwrap --mode=compile <compiler> <args...>
+[ "$1" = "--mode=compile" ] && shift
+exec "$@"

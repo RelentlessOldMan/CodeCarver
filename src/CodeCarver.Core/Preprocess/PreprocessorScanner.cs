@@ -63,10 +63,19 @@ public static class PreprocessorScanner
 
     /// <summary>Returns a 1-based map (index 0 unused) where true = the line is in a dead branch.</summary>
     public static bool[] DeadLineMap(string text, MacroTable defines, bool closedWorld = false)
+        => LineMaps(text, defines, closedWorld).Dead;
+
+    /// <summary>A 1-based map where true = the line is live but only in SOME configurations: it sits in a branch whose
+    /// condition (or an enclosing one) the model can't decide.</summary>
+    public static bool[] UncertainLineMap(string text, MacroTable defines, bool closedWorld = false)
+        => LineMaps(text, defines, closedWorld).Uncertain;
+
+    static (bool[] Dead, bool[] Uncertain) LineMaps(string text, MacroTable defines, bool closedWorld)
     {
         text = SourceText.Trigraphs(text);   // ??=if is #if
         var lines = text.Split('\n');
         var dead = new bool[lines.Length + 1];
+        var uncertain = new bool[lines.Length + 1];
         var table = defines.Clone();
         var stack = new Stack<Frame>();
         var guardLine = IncludeGuardLine(lines);
@@ -98,9 +107,10 @@ public static class PreprocessorScanner
             }
 
             dead[idx + 1] = !active;
+            uncertain[idx + 1] = active && stack.Count > 0 && !stack.Peek().Certain;
         }
 
-        return dead;
+        return (dead, uncertain);
     }
 
     private static void HandleDirective(string body, bool active, MacroTable table, Stack<Frame> stack, bool closedWorld)

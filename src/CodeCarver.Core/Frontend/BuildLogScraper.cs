@@ -59,39 +59,81 @@ public static class BuildLogScraper
         // every recursive sub-build). Without this, a relative -I in those commands resolves against the wrong
         // base — real `make -w` logs use Entering/Leaving everywhere (eval-#10). A `cd DIR && gcc ...` on the
         // same line is still handled per-line by ExtractLeadingCd and overrides the tracked dir.
-        var currentDir = ".";
-        var dirStack = new Stack<string>();
+        // make -j runs sibling sub-makes at once: their Entering/Leaving lines interleave, so the directory entered
+        // last is only a guess for the next command. Every directory entered and not yet left is kept; a Leaving line
+        // removes the directory it names (not just the latest), and the others still open become alternatives.
+        var baseDir = ".";
+        var open = new List<string>();
         foreach (var line in JoinContinuations(log))
         {
             var em = EnteringDir.Match(line);
-            if (em.Success) { dirStack.Push(currentDir); currentDir = em.Groups[1].Value.Trim(); continue; }
+            if (em.Success) { open.Add(em.Groups[1].Value.Trim()); continue; }
             if (line.Contains("Leaving directory", StringComparison.Ordinal))
-            { currentDir = dirStack.Count > 0 ? dirStack.Pop() : "."; continue; }
+            {
+                var lm = LeavingDir.Match(line);
+                var at = lm.Success ? open.LastIndexOf(lm.Groups[1].Value.Trim()) : -1;
+                if (at < 0) at = open.Count - 1;
+                if (at >= 0) open.RemoveAt(at);
+                continue;
+            }
 
             var tokens = Tokenize(line);
             if (tokens.Count == 0) continue;
+            var currentDir = open.Count > 0 ? open[^1] : baseDir;
+            var alternatives = open.Count > 1 ? open.Take(open.Count - 1).Distinct().Where(d => d != currentDir).ToList() : new List<string>();
 
-            // One log line can hold several shell commands (`gcc a.c && gcc -DFOO b.c`, `cd x; cc ...`): each is
-            // its own compile with its own flags (review BL1). A `cd DIR` carries forward to the commands after
-            // it on the same line; a line holding nothing but `cd DIR` updates the tracked directory.
+            // A line holding nothing but `cd DIR` updates the tracked directory.
             var simple = SplitCommands(tokens);
             if (simple.Count == 1 && simple[0].Count >= 2 && simple[0][0] == "cd")
-            { currentDir = CombineDir(currentDir, simple[0][1]); continue; }
-            var dir = currentDir;
+            {
+                if (open.Count > 0) open[^1] = CombineDir(currentDir, simple[0][1]);
+                else baseDir = CombineDir(baseDir, simple[0][1]);
+                continue;
+            }
+            Commands(simple, currentDir, alternatives, depth: 0);
+        }
+        return results;
+
+        // One log line can hold several shell commands (`gcc a.c && gcc -DFOO b.c`, `cd x; cc ...`): each is its own
+        // compile with its own flags (review BL1). A `cd DIR` carries forward to the commands after it on the line.
+        void Commands(List<List<string>> simple, string dir, List<string> alternatives, int depth)
+        {
             foreach (var cmd in simple)
             {
                 if (cmd.Count == 0) continue;
-                if (cmd[0] == "cd") { if (cmd.Count >= 2) dir = CombineDir(dir, cmd[1]); continue; }
+                if (cmd[0] == "cd") { if (cmd.Count >= 2) { dir = CombineDir(dir, cmd[1]); alternatives = new(); } continue; }
                 var ci = DriverIndex(cmd, options, allowGeneric: true);
-                if (ci < 0) continue;
-                AddCommand(results, cmd[ci], cmd.GetRange(ci + 1, cmd.Count - ci - 1), dir, file: null, options);
+                if (ci < 0)
+                {
+                    // `sh -c '<commands>'`: the compile is one quoted word. `/bin/sh ../libtool --mode=compile gcc ...`:
+                    // a launcher whose arguments are the compile.
+                    var launcher = DriverName(cmd[0]);
+                    if (!Launchers.Contains(launcher, StringComparer.OrdinalIgnoreCase)) continue;
+                    if (Shells.Contains(launcher, StringComparer.OrdinalIgnoreCase))
+                    {
+                        // The shell's own options come first; -c (alone or bundled, -ec) takes the command string.
+                        var o = 1;
+                        while (o < cmd.Count && cmd[o].Length > 1 && cmd[o][0] == '-' && cmd[o][1] != '-' && !cmd[o][1..].Contains('c')) o++;
+                        if (o + 1 < cmd.Count && cmd[o].Length > 1 && cmd[o][0] == '-' && cmd[o][1] != '-')
+                        {
+                            if (depth < 4) Commands(SplitCommands(Tokenize(cmd[o + 1])), dir, alternatives, depth + 1);
+                            continue;
+                        }
+                    }
+                    ci = cmd.FindIndex(1, a => IsCompiler(a) || options.CompilerNames.Any(n => DriverName(a).Equals(DriverName(n), StringComparison.OrdinalIgnoreCase)));
+                    if (ci < 0 || !cmd.Skip(ci + 1).Any(IsSourceFile)) continue;
+                }
+                AddCommand(results, cmd[ci], cmd.GetRange(ci + 1, cmd.Count - ci - 1), dir, file: null, options, alternatives);
             }
         }
-        return results;
     }
 
+    // Programs that run a compile given as their arguments, or as a -c string (the shells).
+    static readonly string[] Shells = { "sh", "bash", "dash", "ksh", "zsh", "ash", "busybox" };
+    static readonly string[] Launchers = Shells.Concat(new[] { "libtool", "glibtool", "slibtool", "jlibtool" }).ToArray();
+
     static void AddCommand(List<CompileCommand> results, string driver, List<string> args, string dir, string? file,
-                           ScrapeOptions options)
+                           ScrapeOptions options, IReadOnlyList<string>? alternatives = null)
     {
         var incomplete = false;
         args = ExpandResponseFiles(args, dir, options, ref incomplete, depth: 0);
@@ -108,6 +150,7 @@ public static class BuildLogScraper
                 Includes = includes,
                 ForcedIncludes = forced,
                 Incomplete = incomplete,
+                AlternativeDirectories = alternatives ?? Array.Empty<string>(),
             });
     }
 
@@ -195,6 +238,8 @@ public static class BuildLogScraper
 
     private static readonly System.Text.RegularExpressions.Regex EnteringDir =
         new(@"Entering directory\s+[`'""]?(.+?)[`'""]?\s*$", System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex LeavingDir =
+        new(@"Leaving directory\s+[`'""]?(.+?)[`'""]?\s*$", System.Text.RegularExpressions.RegexOptions.Compiled);
 
     /// <summary>Combine a tracked base dir with a `cd`/entering target. An absolute target replaces it; a
     /// relative one is appended (kept as a path STRING — the CLI resolves the final Directory against the

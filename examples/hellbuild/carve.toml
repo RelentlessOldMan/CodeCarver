@@ -1,0 +1,36 @@
+# The hellbuild, carved with the build log and build trace captured from its real build (WSL: gcc, make -j, strace):
+#   tools/eldritch/eldritch-oracle.ps1 -Example hellbuild -SaveInputs   # rebuild, re-capture inputs/, carve every way, build + run each
+#   carve src --config carve.toml                                       # just the carve, from the captured inputs
+
+outputDirectory = "out"
+
+[common]
+entryPoints = ["main"]
+languages   = ["c"]
+
+[builds.main]
+buildLogs       = ["inputs/build.log"]
+buildTraceFiles = ["inputs/build.trace"]
+
+[advanced]
+# The inputs were captured in WSL: map its paths onto this checkout (to = relative to the carve root, src/).
+pathMap = [
+  { from = "/mnt/c/Playground/CodeCarver/examples/hellbuild/src", to = "." },
+  { from = "/mnt/c/Playground/CodeCarver/examples/hellbuild/sdk", to = "../sdk" },
+]
+
+[stages.safe]
+carveSourceFileContents = false
+carveHeaderFileContents = false
+
+[stages.headers]
+carveSourceFileContents = false
+carveHeaderFileContents = true
+
+[stages.aggressive]
+carveSourceFileContents = true
+carveHeaderFileContents = false
+
+[stages.max]
+carveSourceFileContents = true
+carveHeaderFileContents = true
