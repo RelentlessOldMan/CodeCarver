@@ -420,7 +420,15 @@ macro `name` is visible (the file or a header it includes) is a macro expansion,
 Aliases (`alias` attributes, alias macros, `#pragma weak a = b`, `_Pragma`, asm `.set`) define the alias and use the
 target; assembly files define what they export (`.globl`, `.weak`, `PUBLIC`, `name PROC`). A name declared weak
 (`__attribute__((weak))` on a declaration, `#pragma weak name`) links as null when undefined, so a failure on it
-whose only definitions are in files the build never compiled is a note. At a `carveSourceFileContents` stage, a
+whose only definitions are in files the build never compiled is a note. Names the linker or loader binds that no
+call spells out count the same way, both for what the carve keeps and for verify: an `ifunc` is defined by its
+resolver; an asm label (`__asm__("sym")`) or `#pragma redefine_extname` renames the symbol; `__wrap_X` stands for
+`X`; a C99 `inline` body in a header is emitted by the file that declares it `extern` (a GNU `extern inline` body
+emits nothing); `-D` macros that rename a definition (`-Dold=new`, `'-DNAME(n)=n##_impl'`); symbols the link
+names (`--defsym`'s right side, `--undefined`, `--require-defined`, `--entry`, a linker script's `ENTRY`/`EXTERN`/
+`PROVIDE`); and string literals in a file that looks symbols up by name (`dlsym`, `GetProcAddress`). The `-D`
+macros and link flags come from the build logs and from the tree's own build scripts (makefiles, shell scripts,
+CMake files, linker scripts), so a carve without a build log still sees them. At a `carveSourceFileContents` stage, a
 function **pruned from a kept file** that emitted code still uses fails too, with cause `prunedFromKeptFile`.
 
 Each failure also gets a **cause**, counted in `summary.txt` as `verify.failed.<cause>` (numbers only, safe to

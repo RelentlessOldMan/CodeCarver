@@ -3,6 +3,7 @@ using CodeCarver.Core.Graph;
 using CodeCarver.Core.Reachability;
 using CodeCarver.Core.Roots;
 using CodeCarver.Frontend;
+using CodeCarver.Core.Preprocess;
 using Xunit;
 
 namespace CodeCarver.Tests.Cli;

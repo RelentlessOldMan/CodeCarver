@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using CodeCarver.Core.Preprocess;
 
 namespace CodeCarver.Frontend;
 
@@ -297,71 +298,5 @@ public static class ImplicitInt
 
     /// <summary>The text with comments, string/char literals and preprocessor lines blanked to spaces
     /// (newlines kept), so indices map one-to-one onto the original.</summary>
-    internal static string CodeOnly(string text)
-    {
-        var sb = new StringBuilder(text.Length);
-        var i = 0;
-        var atLineStart = true;
-        while (i < text.Length)
-        {
-            var c = text[i];
-            if (atLineStart)
-            {
-                var j = i;
-                while (j < text.Length && text[j] is ' ' or '\t') j++;
-                if (j < text.Length && text[j] == '#')
-                {
-                    // A directive, with its backslash continuations.
-                    while (i < text.Length)
-                    {
-                        if (text[i] == '\n')
-                        {
-                            var k = i - 1;
-                            if (k >= 0 && text[k] == '\r') k--;
-                            if (k >= 0 && text[k] == '\\') { sb.Append('\n'); i++; continue; }
-                            break;
-                        }
-                        sb.Append(' ');
-                        i++;
-                    }
-                    continue;
-                }
-            }
-            atLineStart = false;
-            if (c == '\n') { sb.Append('\n'); i++; atLineStart = true; continue; }
-            if (c == '/' && i + 1 < text.Length && text[i + 1] == '/')
-            {
-                while (i < text.Length && text[i] != '\n') { sb.Append(' '); i++; }
-                continue;
-            }
-            if (c == '/' && i + 1 < text.Length && text[i + 1] == '*')
-            {
-                sb.Append("  ");
-                i += 2;
-                while (i < text.Length && !(text[i] == '*' && i + 1 < text.Length && text[i + 1] == '/'))
-                {
-                    sb.Append(text[i] == '\n' ? '\n' : ' ');
-                    i++;
-                }
-                if (i < text.Length) { sb.Append("  "); i += 2; }
-                continue;
-            }
-            if (c is '"' or '\'')
-            {
-                sb.Append(' ');
-                i++;
-                while (i < text.Length && text[i] != c && text[i] != '\n')
-                {
-                    if (text[i] == '\\' && i + 1 < text.Length) { sb.Append(text[i + 1] == '\n' ? " \n" : "  "); i += 2; continue; }
-                    sb.Append(' ');
-                    i++;
-                }
-                if (i < text.Length && text[i] == c) { sb.Append(' '); i++; }
-                continue;
-            }
-            sb.Append(c);
-            i++;
-        }
-        return sb.ToString();
-    }
+    internal static string CodeOnly(string text) => SourceText.CodeOnly(text);
 }

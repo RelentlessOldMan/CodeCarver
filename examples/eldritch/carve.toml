@@ -23,6 +23,10 @@ pathMap = [
 carveSourceFileContents = false
 carveHeaderFileContents = false
 
+[stages.headers]
+carveSourceFileContents = false
+carveHeaderFileContents = true
+
 [stages.aggressive]
 carveSourceFileContents = true
 carveHeaderFileContents = false

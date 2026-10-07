@@ -1,7 +1,7 @@
 # eldritch — the nightmare
 
 `death` is the big corpus: scale. `eldritch` is the opposite: one small program that packs every nasty C
-construct we know of into ~50 files. If CodeCarver can carve this and the carved tree still builds and prints the
+construct we know of into ~180 small files. If CodeCarver can carve this and the carved tree still builds and prints the
 same thing, it can carve a lot of real code.
 
 ## Run it
@@ -16,8 +16,8 @@ The oracle:
 
 1. builds the original with real gcc under `tools/capture` (strace), keeping the echoed compile commands
    (`build.log`) and the trace (`build.trace`), and runs it for the expected output;
-2. carves it with four input sets (log + trace, log only, trace only, nothing) at three stages
-   (`safe`, `aggressive`, `max`);
+2. carves it with four input sets (log + trace, log only, trace only, nothing) at four stages
+   (`safe`, `headers`, `aggressive`, `max`: every combination of carving inside .c files and inside headers);
 3. builds every carved tree with its own `build.sh` and runs it. Each carve must exit 0, build, and print exactly
    what the original printed. With log + trace, the decoys must be gone and the compiled-but-unreached files must
    be placeholders.
@@ -56,6 +56,36 @@ The test suite carves it too (`EldritchTests`, from `inputs/`), so CI checks it 
 | A function returning a function pointer, a compound literal holding a function, strings full of code-like junk | `horrors.c` |
 | `#line`, a non-ASCII identifier, unbalanced braces inside `#if 0`, a non-inline function defined in a header | `lined.c`, `unicode.c`, `if0.c`, `include/hdr_def.h` |
 | A compiled file nothing calls (a placeholder), and a file that isn't C at all | `unused_compiled.c`, `legacy/garbage.c` |
+| **Wave 3** | |
+| Linker `--wrap`: `__wrap_beast` is named by nobody, `__real_beast` is the original | `beast.c`, `wrap_beast.c`, `wrap.c` |
+| Asm labels: `int vessel(int) __asm__("deep_one")` (a call) and `int hidden_name(void) __asm__("surface_name")` (a definition) | `asmlabel.c`, `deep.c`, `asmdef.c` |
+| A template header included twice under different `#define`s: `int T_CAT(TNAME, get)(void)` defines `red_get` and `blue_get` | `include/tmpl.h`, `tmpl.c`, `tmpl_user.c` |
+| Functions registered by section placement and walked with `__start_`/`__stop_` | `include/rites.h`, `rites_a.c`, `rites_b.c`, `rites.c` |
+| A self-referential macro, `#undef` before a real call, `#define`/`#undef` changing the `#ifdef` world mid-file | `include/selfref.h`, `spell.c`, `undef.c`, `world*.c` |
+| `#if` arithmetic: function-like macros, `-1 < 0u`, character constants, octal, `?:` | `ifexpr*.c` |
+| A BOM, CRLF, form feeds and a name split by backslash-newline; trigraphs (`-trigraphs`) | `crlf.c`, `trigraph.c` |
+| A C file with another extension (`-x c`), GCC nested functions, computed `#include`s, braces from macros | `tome.inc`, `nested.c`, `curse.c`, `gate.c` |
+| Storage class after the type, C2x `[[attributes]]`, a function-like macro's name used as a function pointer | `soup.c`, `attrs.c`, `fnref.c` |
+| **Wave 4** | |
+| GNU `extern inline` in a header (its body emits nothing; `gnu_twin.c` is the symbol) | `include/gnuinl.h`, `gnuinl.c`, `gnu_twin.c` |
+| C99 `inline` in a header, emitted only by a file that declares it `extern` and calls nothing | `include/c99inl.h`, `c99inl_emit.c` |
+| An ifunc: the resolver is named only in an attribute string, the implementation only by the resolver | `ifunc.c`, `ifunc_impl.c` |
+| `-Wl,--defsym=omen_call=omen_real` on the link line | `defsym.c`, `defsym_real.c` |
+| Command-line `-Dsecret_rite=true_rite '-DHIDE(n)=hid_##n'` renaming what a file defines | `dren.c`, `dren_user.c` |
+| `#include_next`; headers found through `-iquote`, `-isystem`, `-idirafter` | `include2/next.h`, `dirs.c`, `quoted/`, `sys/`, `after/` |
+| A file name with a space; a compile run from another directory with relative `-I` | `spaced out.c`, `deep/abyss.c` |
+| Assembly calling a C function through a macro | `asm_caller.S`, `asm_callee.c` |
+| A universal character name (`spéll`) and a `$` in identifiers | `ucn.c`, `dollar.c` |
+| Lexer traps: a `//` comment continued by a backslash hiding a decoy, `"/*"` in strings, `'"'`, a spliced `*\`+`/` | `comments.c`, `ghost.c` |
+| `#pragma push_macro`/`pop_macro` switching a rename | `pushpop.c` |
+| C++ keywords as C names in a header (`new`, `class`, `delete`, `this`, `template`, `virtual`) | `include/cppkw.h`, `cppkw.c` |
+| A definition inside a macro argument; a body from a macro (`int f(void) BODY(44)`); a parameter list split by `#ifdef` | `macarg.c`, `splitp.c` |
+| A function found by `dlsym` (linked `-rdynamic`): dropping it still links, the run fails | `dl.c`, `dl_target.c` |
+| `#pragma redefine_extname`; a raw Latin-1 byte in a string; a NUL byte in a comment | `redef.c`, `latin1.c`, `nulbyte.c` |
+| **From the Book of Horrors** | |
+| `#define static` and `#define return return audit_tick(),`: keywords rebranded, a call hidden in every `return` | `include/debug_kw.h`, `keywords.c` |
+| `BEGIN`/`END`/`INTEGER`, `TRY`/`CATCH` made of loops, a body opened by a macro and closed by a brace | `pascal.c` |
+| `char *(*(*priest(int))[10])(double)`, Duff's device, the one-letter-macro final boss | `priest.c`, `duff.c`, `boss.c` |
 
 Every one of these was either already handled or found a real bug when it went in. Add the next horror here
 the same way: make the original print something that depends on it, and run the oracle.

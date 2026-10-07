@@ -45,18 +45,4 @@ int line_fn2(void);
 int café(void);
 int if0_fn(void);
 int hdr_demo(void);
-int chant2(void);
-int (*pick(int k))(int);
-int cl_demo(void);
-int weakref_demo(void);
-int field_demo(void);
-int tricky_demo(void);
-int pair_x(void);
-int pair_x_rev(void);
-int rename_demo(void);
-int line_fn(void);
-int line_fn2(void);
-int café(void);
-int if0_fn(void);
-int hdr_demo(void);
 #endif

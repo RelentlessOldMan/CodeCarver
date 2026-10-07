@@ -1,6 +1,6 @@
 using System.Text.RegularExpressions;
 
-namespace CodeCarver.Frontend;
+namespace CodeCarver.Core.Preprocess;
 
 /// <summary>
 /// Function-like macros that DEFINE a symbol named after an argument —
@@ -39,6 +39,30 @@ public static class DefinerMacros
 
     /// <summary>The definer macros among <paramref name="bodies"/> (name → function-like flag and the raw
     /// text after the name, which for a function-like macro starts with its parameter list).</summary>
+    /// <summary>Every <c>#define</c>: name, <c>(</c> when function-like, and the raw rest (parameters and body, continuations kept).</summary>
+    public static readonly Regex AnyDefine = new(
+        @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(\()?((?:[^\n\\]|\\\r?\n|\\.)*)", RegexOptions.Compiled | RegexOptions.Multiline);
+
+    /// <summary>The definers and a regex matching a use of any of them.</summary>
+    public sealed record Set(IReadOnlyDictionary<string, List<Template>> Definers, Regex Use);
+
+    public static Set? MakeSet(IReadOnlyDictionary<string, List<Template>> definers)
+        => definers.Count == 0 ? null
+         : new Set(definers, new Regex(@"\b(" + string.Join("|", definers.Keys.Select(Regex.Escape)) + @")\s*\(", RegexOptions.Compiled));
+
+    /// <summary>The definers <paramref name="text"/>'s own <c>#define</c>s make.</summary>
+    public static Dictionary<string, List<Template>> FromText(string text)
+    {
+        var bodies = new Dictionary<string, (bool FnLike, List<string> Bodies)>(StringComparer.Ordinal);
+        foreach (Match m in AnyDefine.Matches(text))
+        {
+            if (!m.Groups[2].Success) continue;
+            if (!bodies.TryGetValue(m.Groups[1].Value, out var b)) bodies[m.Groups[1].Value] = b = (true, new List<string>());
+            b.Bodies.Add(m.Groups[3].Value);
+        }
+        return Build(bodies);
+    }
+
     public static Dictionary<string, List<Template>> Build(IReadOnlyDictionary<string, (bool FnLike, List<string> Bodies)> bodies)
     {
         var parsed = new List<(string Name, List<string> Params, List<string> Tokens)>();
@@ -52,7 +76,7 @@ public static class DefinerMacros
                 if (close < 0) continue;
                 var ps = flat[..close].Split(',').Select(p => p.Trim()).ToList();
                 // Comments and string literals blanked: `/* protects n state */` must not read as a declarator.
-                var toks = Token.Matches(ImplicitInt.CodeOnly(flat[(close + 1)..])).Select(m => m.Value).ToList();
+                var toks = Token.Matches(SourceText.CodeOnly(flat[(close + 1)..])).Select(m => m.Value).ToList();
                 if (toks.Count > 0) parsed.Add((name, ps, toks));
             }
         }
@@ -165,7 +189,7 @@ public static class DefinerMacros
     public static IEnumerable<Use> Uses(string text, Regex use, IReadOnlyDictionary<string, List<Template>> definers)
     {
         if (!use.IsMatch(text)) yield break;   // cheap: most files use no definer at all
-        var code = ImplicitInt.CodeOnly(text);
+        var code = SourceText.CodeOnly(text);
         var matches = use.Matches(code);
         if (matches.Count == 0) yield break;
 

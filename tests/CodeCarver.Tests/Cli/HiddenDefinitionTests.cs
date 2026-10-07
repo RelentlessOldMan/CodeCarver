@@ -1,5 +1,6 @@
 using CodeCarver.Cli;
 using CodeCarver.Frontend;
+using CodeCarver.Core.Preprocess;
 using Xunit;
 
 namespace CodeCarver.Tests.Cli;

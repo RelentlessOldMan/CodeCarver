@@ -45,6 +45,7 @@ public static class PreprocessorScanner
     /// and a parser or tokenizer that reads it loses the real code after it. Directive lines stay.</summary>
     public static string BlankAlwaysDead(string text)
     {
+        text = SourceText.Trigraphs(text);
         if (!text.Contains("if", StringComparison.Ordinal) || !ConstantIf.IsMatch(text)) return text;
         var dead = DeadLineMap(text, new MacroTable(), closedWorld: false);
         var lines = text.Split('\n');
@@ -63,6 +64,7 @@ public static class PreprocessorScanner
     /// <summary>Returns a 1-based map (index 0 unused) where true = the line is in a dead branch.</summary>
     public static bool[] DeadLineMap(string text, MacroTable defines, bool closedWorld = false)
     {
+        text = SourceText.Trigraphs(text);   // ??=if is #if
         var lines = text.Split('\n');
         var dead = new bool[lines.Length + 1];
         var table = defines.Clone();

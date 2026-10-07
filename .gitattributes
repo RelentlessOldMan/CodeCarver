@@ -17,6 +17,8 @@
 # runner grew every count. The example scripts keep their own rules above (*.ps1 CRLF, *.sh LF).
 examples/** text eol=lf
 examples/**/*.ps1 text eol=crlf
+# The CRLF horror must keep its CRLF line endings (and its BOM and form feeds).
+examples/eldritch/src/crlf.c -text
 
 # Visual Studio solution files are CRLF by convention.
 *.sln text eol=crlf

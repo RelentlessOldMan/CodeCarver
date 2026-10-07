@@ -877,9 +877,19 @@ public static class CarveCommand
                     + "-> using the universal #ifdef config for them (unity/jumbo-safe)");
         }
 
+        // The tree's own build scripts (makefiles, shell scripts, linker scripts...): their -D renames and link flags
+        // count even when no build log was given.
+        var buildScripts = lang is "c" or "cpp"
+            ? CodeCarver.Core.Util.SourceWalk.Files(dir).Select(p => (Rel: Path.GetRelativePath(dir, p).Replace('\\', '/'), Path: p))
+                .Where(f => LinkFlags.IsBuildScript(f.Rel) && !Excluded(f.Path) && SafeLength(f.Path) <= maxParseBytes).ToList()
+            : new List<(string Rel, string Path)>();
+        var commandLineMacros = CodeCarver.Core.Preprocess.CommandLineMacros.FromSpecs(
+            buildCmds.SelectMany(c => c.Defines).Concat(buildScripts.SelectMany(f => CodeCarver.Core.Preprocess.CommandLineMacros.SpecsInScript(SafeRead(f.Path)))));
+
         if (fe is TreeSitterFrontEnd tsfe)
         {
             tsfe.Log = err;
+            if (commandLineMacros.Count > 0) tsfe.CommandLineMacros = commandLineMacros;
             if (parseTimeoutMs is not null) tsfe.ParseBudgetMs = parseTimeoutMs.Value;
             if (maxSymbolsPerFile is not null) tsfe.PerFileSymbolBudget = maxSymbolsPerFile.Value;
             if (refIncludes.Count > 0) tsfe.ReferenceOnlyIncludes = refIncludes;
@@ -963,9 +973,11 @@ public static class CarveCommand
         {
             // PP1: every macro name #defined/#undef'd anywhere in the tree. Parsed files are read in full; the
             // big/dense headers the parser skips are streamed, keeping only names some #if actually tests.
-            var defRe = new System.Text.RegularExpressions.Regex(@"^\s*#\s*(?:define|undef)\s+([A-Za-z_]\w*)",
+            // Any directive spelling: #, the digraph %:, the trigraph ??=.
+            var hash = CodeCarver.Core.Preprocess.SourceText.DirectiveStart;
+            var defRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:define|undef)\s+([A-Za-z_]\w*)",
                 System.Text.RegularExpressions.RegexOptions.Multiline);
-            var condRe = new System.Text.RegularExpressions.Regex(@"^\s*#\s*(?:if|ifdef|ifndef|elif)\b(.*(?:\\\r?\n.*)*)",
+            var condRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:if|ifdef|ifndef|elif)\b(.*(?:\\\r?\n.*)*)",
                 System.Text.RegularExpressions.RegexOptions.Multiline);
             var identRe = new System.Text.RegularExpressions.Regex(@"[A-Za-z_]\w*");
             var condIdents = new HashSet<string>(StringComparer.Ordinal);
@@ -1429,7 +1441,25 @@ public static class CarveCommand
         var forcedRoots = forcedGraphFiles.Count > 0
             ? new ExplicitRootProvider(files: forcedGraphFiles).Discover(graph).ToList() : new List<Root>();
 
-        var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots)
+        // Symbols the LINK needs (--defsym's right side, --undefined, --entry, a linker script's EXTERN/PROVIDE...):
+        // named on a link line or in the tree's build scripts, never in C. Rooted, and verify counts them as uses.
+        var linkUses = new List<(string Name, string Rel, int Line)>();
+        if (lang is "c" or "cpp")
+        {
+            foreach (var bl in buildLogs.Distinct())
+                foreach (var (n, l) in LinkFlags.RequiredSymbols(SafeRead(bl), linkerScript: false))
+                    linkUses.Add((n, Path.GetFileName(bl), l));
+            foreach (var (rel, p) in buildScripts)
+                foreach (var (n, l) in LinkFlags.RequiredSymbols(SafeRead(p), LinkFlags.IsLinkerScript(rel)))
+                    linkUses.Add((n, rel, l));
+        }
+        var linkRoots = linkUses.Count > 0
+            ? new ExplicitRootProvider(symbols: linkUses.Select(u => u.Name).Distinct(StringComparer.Ordinal)).Discover(graph)
+                .Select(r => r with { Kind = RootKind.LinkerKeep, Note = "named by the link" }).ToList()
+            : new List<Root>();
+        summary["roots.linkFlags"] = linkRoots.Count;
+
+        var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots).Concat(linkRoots)
                                    .Concat(forceKeepRoots).Concat(forcedRoots).Concat(traceRoots).Concat(fileTraceRoots).ToList();
         if (rootSet.Count == 0)
         {
@@ -1631,7 +1661,9 @@ public static class CarveCommand
             if (!linkCheck) return false;
             var droppedForCheck = p.DroppedFiles.Select(r => (r, Path.Combine(dir, r)));
             var r = EmittedLinkCheck.Run(emittedFiles, droppedForCheck, deadLinesFor, maxParseBytes,
-                                         original: pruned ? rel => Path.Combine(dir, rel) : null);
+                                         original: pruned ? rel => Path.Combine(dir, rel) : null,
+                                         definerMacros: (fe as TreeSitterFrontEnd)?.DefinerSet, linkUses: linkUses,
+                                         commandLineMacros: commandLineMacros, c99InlineFns: (fe as TreeSitterFrontEnd)?.C99InlineFunctions);
             var hard = r.Hard.ToList();
             var soft = r.DeadOnly;
             // Defined only in files the traced build never compiled, with the build log confirming the trace is

@@ -12,7 +12,8 @@
 
   1. The original is built in WSL under tools/capture (strace): build.log (echoed compiles) + build.trace.
      Its output is the expected output.
-  2. It is carved with four input sets (log+trace, log, trace, none) at three stages (safe, aggressive, max).
+  2. It is carved with four input sets (log+trace, log, trace, none) at four stages (safe, headers, aggressive, max:
+     every combination of carveSourceFileContents x carveHeaderFileContents).
   3. Each carved tree is built with its own build.sh and run. Carve exit must be 0, the build must succeed and the
      output must match. With log+trace the decoys must be dropped and compiled-but-unreached files must be placeholders.
 
@@ -77,6 +78,9 @@ pathMap = [{ from = "$srcW", to = "." }, { from = "$sdkW", to = "../sdk" }]
 [stages.safe]
 carveSourceFileContents = false
 carveHeaderFileContents = false
+[stages.headers]
+carveSourceFileContents = false
+carveHeaderFileContents = true
 [stages.aggressive]
 carveSourceFileContents = true
 carveHeaderFileContents = false
@@ -87,26 +91,37 @@ carveHeaderFileContents = true
     $ErrorActionPreference = 'Continue'
     $carve = @(& dotnet $CliDll carve $src --config $cfg 2>&1 | ForEach-Object { "$_" })
     $code = $LASTEXITCODE
-    foreach ($stage in 'safe', 'aggressive', 'max') {
+    foreach ($stage in 'safe', 'headers', 'aggressive', 'max') {
         $carved = Join-Path $out "$stage\carved"
-        $row = [ordered]@{ mode = $mode; stage = $stage; carve = $code; build = '-'; output = '-'; notes = '' }
-        if ($code -ne 0) {
+        $row = [ordered]@{ mode = $mode; stage = $stage; carve = $code; verify = '-'; build = '-'; output = '-'; notes = '' }
+        # Exit 3 = verify failed: the tree was still emitted, so build it anyway. A verify FAIL that builds is a
+        # false alarm; a verify OK that does not build is a silent miss - the worst kind. Both count.
+        if ($code -ne 0 -and $code -ne 3) {
             $row.notes = 'carve failed'; $fail++
             $rows += [pscustomobject]$row
             continue
         }
+        $vlog = Join-Path $out "$stage\codecarver\verify.txt"
+        $vfails = if (Test-Path $vlog) { @(Get-Content $vlog | Where-Object { $_ -match '^FAIL ' }).Count } else { 0 }
+        if ($vfails -gt 0) { $row.verify = "FAIL $vfails"; $fail++ } else { $row.verify = 'ok' }
+        $tag = ($mode -replace '\+', '-') + "-$stage"
         $cW = ToWsl $carved
         $skip = if ($mode -eq 'none') { 'SKIP_MISSING=1 ' } else { '' }
-        $b = Invoke-Wsl "cd '$workW'; rm -rf 'b-$stage'; ${skip}sh '$cW/build.sh' '$cW' 'b-$stage' '$sdkW' > 'b-$stage.log' 2>&1 && ./b-$stage/eldritch > 'b-$stage.txt'"
+        $b = Invoke-Wsl "cd '$workW'; rm -rf 'b-$tag'; ${skip}sh '$cW/build.sh' '$cW' 'b-$tag' '$sdkW' > 'b-$tag.log' 2>&1 && ./b-$tag/eldritch > 'b-$tag.txt'"
         if ($b.Code -ne 0) {
             $row.build = 'FAIL'; $fail++
-            $errs = @(Get-Content (Join-Path $Work "b-$stage.log") | Where-Object { $_ -match 'error|undefined reference' } | Select-Object -First 4)
+            $errs = @(Get-Content (Join-Path $Work "b-$tag.log") | Where-Object { $_ -match 'error|undefined reference' } | Select-Object -First 4)
             $row.notes = ($errs -join ' | ')
         }
         else {
             $row.build = 'ok'
-            $got = Get-Content (Join-Path $Work "b-$stage.txt") -Raw
-            if ($got -eq $expected) { $row.output = 'same' } else { $row.output = 'DIFFERENT'; $fail++ }
+            $got = Get-Content (Join-Path $Work "b-$tag.txt") -Raw
+            if ($got -eq $expected) { $row.output = 'same' }
+            else {
+                $row.output = 'DIFFERENT'; $fail++
+                $diff = @(Compare-Object ($expected -split "`n") ($got -split "`n") | Where-Object SideIndicator -eq '=>' | ForEach-Object { $_.InputObject.Trim() })
+                $row.notes = 'got: ' + ($diff -join ' | ')
+            }
         }
         if ($mode -eq 'log+trace' -and $stage -eq 'safe') {
             $bad = @()
@@ -119,7 +134,7 @@ carveHeaderFileContents = true
         }
         $rows += [pscustomobject]$row
     }
-    if ($code -ne 0) { Write-Host "--- carve ($mode) exit ${code}:"; $carve | Select-Object -Last 25 | ForEach-Object { Write-Host "  $_" } }
+    if ($code -ne 0 -and $code -ne 3) { Write-Host "--- carve ($mode) exit ${code}:"; $carve | Select-Object -Last 25 | ForEach-Object { Write-Host "  $_" } }
 }
 $rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 if ($fail -gt 0) { Write-Host "ELDRITCH: FAIL ($fail problem(s)); work dir $Work"; exit 1 }

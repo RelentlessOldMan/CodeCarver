@@ -199,6 +199,20 @@ public sealed class NameBindingTests
         new object[] { "wrappedNameParens", "#define API(n) (n)\nint API(odd_fn)(int a) { return a; }\n" },
         new object[] { "parenthesisedName", "int (odd_fn)(int a) { return a; }\n" },
         new object[] { "parenthesisedAndMacro", "#define odd_fn(a) ((a) + 1)\nint (odd_fn)(int a) { return a; }\n" },
+        // Trigraphs (gcc -trigraphs / strict -std): ??< is {, ??> is }, ??( is [, ??= is #.
+        new object[] { "trigraphs", "??=define BASE 7\nint odd_fn(int a) ??< int v??(1??) = ??< a ??>; return v??(0??) ??' BASE; ??>\n" },
+        // Line splicing: a backslash-newline may split a name anywhere, with LF or CRLF.
+        new object[] { "splitNameLf", "int odd_\\\nfn(int a) { return a; }\n" },
+        new object[] { "splitNameCrlf", "int odd_\\\r\nfn(int a)\r\n{\r\n    return a;\r\n}\r\n" },
+        new object[] { "crlfBomFormFeed", "﻿/* x */\r\n\f\r\nint odd_fn(int a)\r\n{\f\r\n    return a;\r\n}\r\n" },
+        // An asm label: the C name is hidden, the symbol is odd_fn.
+        new object[] { "asmLabel", "int hidden(int) __asm__(\"odd_fn\");\nint hidden(int a) { return a; }\n" },
+        new object[] { "asmLabelPlain", "int hidden(int) asm (\"odd_fn\");\nint hidden(int a) { return a; }\n" },
+        // Head and body braces from macros.
+        new object[] { "braceMacros", "#define BEGIN_FN(name) int name(int a) {\n#define END_FN }\nBEGIN_FN(odd_fn)\n    return a;\nEND_FN\n" },
+        // Storage class after the type.
+        new object[] { "specifierSoup", "long unsigned static long int helper(void) { return 1; }\nint static odd_fn(int a);\nint odd_fn(int a) { return a + (int)helper(); }\n" },
+        new object[] { "c2xAttributes", "[[gnu::noinline]] [[maybe_unused]] int odd_fn(int a) { return a; }\n" },
     };
 
     [Theory]
@@ -254,6 +268,105 @@ public sealed class NameBindingTests
         var r = t.Carve(log: false, extraToml: "[advanced]\n", common: "");
         AssertOk(t, r);
         Assert.True(t.Kept("alias.c"), r.Out + r.Err);
+    }
+
+    // ---- the linker renames: --wrap, asm labels ----------------------------------------------------------------
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LinkerWrap_WrapperIsKeptWhenTheWrappedNameIs(bool prune)
+    {
+        // Linked with -Wl,--wrap=beast: every beast() call goes to __wrap_beast, which nothing names. __real_beast
+        // is the original beast.
+        using var t = new TreeCarve()
+            .W("main.c", "int beast(int);\nint main(void){ return beast(3); }\n")
+            .W("beast.c", "int beast(int x) { return x; }\n")
+            .W("wrap.c", "int __real_beast(int);\nstatic int extra(void) { return 1; }\nint __wrap_beast(int x) { return __real_beast(x) + extra(); }\n");
+        t.Compile("main.c").Compile("beast.c").Compile("wrap.c").TraceCompiled();
+        var r = t.Carve(common: prune ? "carveSourceFileContents = true\n" : "");
+        AssertOk(t, r);
+        Assert.True(t.Kept("wrap.c"), r.Out + r.Err);
+        Assert.True(t.Kept("beast.c"), r.Out + r.Err);
+        if (prune) Assert.Contains("__wrap_beast", File.ReadAllText(t.CarvedPath("wrap.c")));
+        // Verify sees the wrapper as a use of the original and the original as the wrapper's target.
+        var uses = CodeCarver.Core.Reachability.EmittedLinkCheck.Scan("int __real_beast(int);\nint __wrap_beast(int x) { return __real_beast(x); }\n").Uses.Select(u => u.Name);
+        Assert.Contains("beast", uses);
+    }
+
+    [Fact]
+    public void AsmLabelDeclaration_CallBindsToTheLabel()
+    {
+        using var t = new TreeCarve()
+            .W("main.c", "extern int vessel(int) __asm__(\"deep_one\");\nint main(void){ return vessel(4); }\n")
+            .W("deep.c", "int deep_one(int x) { return x; }\n")
+            .W("decoy.c", "int vessel(int x) { return 0; }\n");
+        t.Compile("main.c").Compile("deep.c").TraceCompiled();
+        var r = t.Carve();
+        AssertOk(t, r);
+        Assert.True(t.Kept("deep.c"), r.Out + r.Err);
+        Assert.False(t.Kept("decoy.c"), r.Out + r.Err);
+        Assert.Contains("deep_one", CodeCarver.Core.Reachability.EmittedLinkCheck.Scan("extern int vessel(int) __asm__(\"deep_one\");\nint f(void){ return vessel(4); }\n").Uses.Select(u => u.Name));
+    }
+
+    // ---- a header instantiated more than once ----------------------------------------------------------------
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TemplateHeader_EveryInstantiationIsDefinedByItsIncluder(bool prune)
+    {
+        const string tmplH = "#define T_CAT2(a, b) a##_##b\n#define T_CAT(a, b) T_CAT2(a, b)\n"
+                           + "static int T_CAT(TNAME, helper)(void) { return TVAL; }\n"
+                           + "int T_CAT(TNAME, get)(void) { return T_CAT(TNAME, helper)(); }\n#undef T_CAT\n#undef T_CAT2\n";
+        using var t = new TreeCarve()
+            .W("tmpl.h", tmplH)
+            .W("tmpl.c", "#define TNAME red\n#define TVAL 5\n#include \"tmpl.h\"\n#undef TNAME\n#undef TVAL\n"
+                       + "#define TNAME blue\n#define TVAL 6\n#include \"tmpl.h\"\n")
+            .W("main.c", "int red_get(void); int blue_get(void);\nint main(void){ return red_get() + blue_get(); }\n");
+        t.Compile("main.c").Compile("tmpl.c").TraceCompiled(t.S("tmpl.h"));
+        var r = t.Carve(common: prune ? "carveSourceFileContents = true\n" : "");
+        AssertOk(t, r);
+        Assert.True(t.Kept("tmpl.c"), r.Out + r.Err);
+        Assert.True(t.Kept("tmpl.h"), r.Out + r.Err);
+    }
+
+    [Fact]
+    public void TemplateHeader_VerifyFailsWhenTheIncluderIsDropped()
+    {
+        // The emitted tree has the caller but not the includer: verify must know tmpl.c defined red_get.
+        using var t = new TreeCarve()
+            .W("tmpl.h", "#define T_CAT2(a, b) a##_##b\n#define T_CAT(a, b) T_CAT2(a, b)\nint T_CAT(TNAME, get)(void) { return 1; }\n")
+            .W("tmpl.c", "#define TNAME red\n#include \"tmpl.h\"\n")
+            .W("main.c", "int red_get(void);\nint main(void){ return red_get(); }\n");
+        var v = CodeCarver.Core.Reachability.EmittedLinkCheck.Run(
+            new[] { ("main.c", Path.Combine(t.Src, "main.c")), ("tmpl.h", Path.Combine(t.Src, "tmpl.h")) },
+            new[] { ("tmpl.c", Path.Combine(t.Src, "tmpl.c")) });
+        Assert.Contains(v.Hard, x => x.Name == "red_get");
+    }
+
+    // ---- linker sections walked by __start_/__stop_ ----------------------------------------------------------
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SectionEntries_WalkedByStartStop_AreKept(bool prune)
+    {
+        using var t = new TreeCarve()
+            .W("rites.h", "typedef int (*rite_fn)(void);\n#define R_CAT2(a, b) a##b\n#define R_CAT(a, b) R_CAT2(a, b)\n"
+                        + "#define RITE(v) static int R_CAT(rite_, __LINE__)(void) { return v; } \\\n"
+                        + "    const rite_fn R_CAT(rite_ptr_, __LINE__) __attribute__((section(\"my_rites\"))) = R_CAT(rite_, __LINE__);\n")
+            .W("a.c", "#include \"rites.h\"\nRITE(1)\n")
+            .W("b.c", "#include \"rites.h\"\nstatic int named(void) { return 10; }\n"
+                    + "const rite_fn named_ptr __attribute__((section(\"my_rites\"))) = named;\n")
+            .W("main.c", "#include \"rites.h\"\nextern const rite_fn __start_my_rites[], __stop_my_rites[];\n"
+                       + "int main(void){ int s = 0; for (const rite_fn *p = __start_my_rites; p < __stop_my_rites; p++) s += (*p)(); return s; }\n");
+        t.Compile("main.c").Compile("a.c").Compile("b.c").TraceCompiled(t.S("rites.h"));
+        var r = t.Carve(common: prune ? "carveSourceFileContents = true\n" : "");
+        AssertOk(t, r);
+        Assert.True(t.Kept("a.c"), r.Out + r.Err);
+        Assert.True(t.Kept("b.c"), r.Out + r.Err);
+        if (prune) Assert.Contains("static int named(void)", File.ReadAllText(t.CarvedPath("b.c")));
     }
 
     [Fact]

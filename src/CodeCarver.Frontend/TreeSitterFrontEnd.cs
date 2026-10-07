@@ -41,12 +41,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// aliasing name IS the target function, so without an edge to the target, dropping the target breaks
     /// the link. Ubiquitous in embedded startup, where every unused handler aliases a Default_Handler.</summary>
     private static readonly Regex AliasAttr = new(
-        @"(?<name>[A-Za-z_]\w*)\s*\([^()]*\)\s*__attribute__\s*\(\(\s*[^()]*?\balias\s*\(\s*""(?<target>[A-Za-z_]\w*)""",
+        @"(?<name>[A-Za-z_]\w*)\s*\([^()]*\)\s*__attribute__\s*\(\(\s*[^()]*?\b(?:alias|ifunc)\s*\(\s*""(?<target>[A-Za-z_]\w*)""",
         RegexOptions.Compiled);
     // The other ways C text makes one name an alias of another (pass 2b):
     //   __attribute__((alias("impl"))) void hook(void);     #pragma weak hook = impl     __asm__(".set hook, impl")
     private static readonly Regex AliasAttrBefore = new(
-        @"__attribute__\s*\(\([^;{}]*?\balias\s*\(\s*""(?<target>[A-Za-z_]\w*)""\s*\)[^;{}]*?\)\)[\w\s\*]*?\b(?<name>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*;",
+        @"__attribute__\s*\(\([^;{}]*?\b(?:alias|ifunc)\s*\(\s*""(?<target>[A-Za-z_]\w*)""\s*\)[^;{}]*?\)\)[\w\s\*]*?\b(?<name>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*;",
         RegexOptions.Compiled);
     private static readonly Regex PragmaWeakAlias = new(
         @"(?:^[ \t]*#[ \t]*pragma[ \t]+weak|\b_Pragma\s*\(\s*""\s*weak)[ \t]+(?<name>[A-Za-z_]\w*)[ \t]*=[ \t]*(?<target>[A-Za-z_]\w*)",
@@ -66,14 +66,33 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         @"__attribute(?:__)?\s*\(\((?<body>(?:[^()]|\([^()]*\))*)\)\)|\[\[\s*(?<body>gnu::(?:[^\[\]]|\[[^\]]*\])*)\]\]",
         RegexOptions.Compiled);
     private static readonly Regex KeepKeyword = new(
-        @"\b(?:constructor|destructor|used|retain)\b|section\s*\(\s*""\.(?:init_array|preinit_array|fini_array)",
+        @"\b(?:constructor|destructor|used|retain)\b|section\s*\(\s*""\.(?:init_array|preinit_array|fini_array)"
+        // A section named like a C identifier: the linker defines __start_/__stop_ for it, so code can walk every entry
+        // without naming one (a registration table).
+        + @"|section\s*\(\s*""[A-Za-z_]\w*""\s*\)",
         RegexOptions.Compiled);
+    // A macro placing what it defines in such a section: a file using it registers something nobody names.
+    private static readonly Regex IdentifierSection = new(@"section\s*\(\s*""[A-Za-z_]\w*""\s*\)", RegexOptions.Compiled);
+    private HashSet<string> _registerMacros = new(StringComparer.Ordinal);
     private static readonly Regex NameBeforeAttr = new( // trailing:  name / name(...) / name[...]  __attribute__
         @"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]|\([^()]*\))?\s*$", RegexOptions.Compiled);
     private static readonly Regex NameAfterAttr = new(  // leading:   __attribute__ ... name( / name[ / name =
         @"^\s*(?:[A-Za-z_][\w*]*[\s*]+)*?([A-Za-z_]\w*)\s*(?:[\(\[=;,]|$)", RegexOptions.Compiled);
 
-    private static readonly Regex AsmKeyword = new(@"\b(?:__asm__|__asm|asm)\b", RegexOptions.Compiled);
+    private static readonly Regex AsmLabelDecl = new(
+        @"\b(?<name>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*(?:__asm__|__asm|asm)\s*\(\s*""(?<sym>[A-Za-z_.$][\w.$]*)""\s*\)", RegexOptions.Compiled);
+    // `#pragma redefine_extname old new`: from the first declaration of old on, its symbol is new (an asm label by pragma).
+    private static readonly Regex RedefineExtname = new(
+        @"^[ \t]*#[ \t]*pragma[ \t]+redefine_extname[ \t]+(?<name>[A-Za-z_]\w*)[ \t]+(?<sym>[A-Za-z_.$][\w.$]*)", RegexOptions.Compiled | RegexOptions.Multiline);
+    // Header functions that are C99 inline definitions (see C99Inline): the translation unit declaring one extern emits it.
+    private readonly HashSet<string> _c99InlineFns = new(StringComparer.Ordinal);
+    /// <summary>Header functions that are C99 inline definitions (no symbol of their own; verify reads this).</summary>
+    public IReadOnlySet<string> C99InlineFunctions => _c99InlineFns;
+
+    /// <summary>The build's command-line macros that rename what a file defines (see <see cref="CommandLineMacros"/>).</summary>
+    public IReadOnlyDictionary<string, (List<string>? Params, string Body)>? CommandLineMacros { get; set; }
+
+    private static readonly Regex AsmKeyword =new(@"\b(?:__asm__|__asm|asm)\b", RegexOptions.Compiled);
     private static readonly Regex Identifier = new(@"[A-Za-z_]\w*", RegexOptions.Compiled);
 
     // Function names used as DATA — global/array/struct initializers (vector tables, dispatch tables,
@@ -169,6 +188,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public IReadOnlyList<string> Warnings => _warnings;
 
     private readonly List<string> _forceKeepFiles = new();
+    private Func<string, string>? _read;
+    // Headers with a definition whose name a macro computes (a template header: see TemplateInstances).
+    private readonly HashSet<string> _macroNamedHeaders = new(StringComparer.Ordinal);
     /// <summary>Files whose extraction threw and were skipped (kept whole rather than crashing the run) —
     /// the CLI roots these so their code is emitted intact, since we couldn't analyse them.</summary>
     public IReadOnlyList<string> ForceKeepFiles => _forceKeepFiles;
@@ -252,6 +274,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // Function-like macros that define a symbol named after an argument (see DefinerMacros), and a regex of
     // their names for finding uses.
     private Dictionary<string, List<DefinerMacros.Template>> _definers = new(StringComparer.Ordinal);
+    /// <summary>The tree's definer macros, for the emitted-tree check (null when there are none).</summary>
+    public DefinerMacros.Set? DefinerSet { get; private set; }
     private Regex? _definerUse;
     private HashSet<string> _keepMacrosFnLike = new(StringComparer.Ordinal);
     private Regex? _keepMacroUse;
@@ -342,6 +366,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     {
         _warnings.Clear();
         _forceKeepFiles.Clear();
+        _read = read;
+        _macroNamedHeaders.Clear();
+        _c99InlineFns.Clear();
         _fileLocal.Clear();
         _unparsed.Clear();
         _symbolBudgetKeptWhole.Clear();
@@ -374,6 +401,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var pendingPastes = new List<(NodeId Macro, PasteKind Kind, string Frag)>();
 
         var keepNames = new HashSet<string>(StringComparer.Ordinal);
+        var keepAt = new List<(string Name, string Path)>();   // where each keep attribute sits (translation units)
         var timeFiles = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null;
         var fsw = new System.Diagnostics.Stopwatch();
 
@@ -396,7 +424,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 ProcessFile(graph, path, text, fileNodeByPath, pathsByBasename,
                             functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
                             pendingMacroRefs, pendingPastes, fileDefines, closedWorldDefines);
-                foreach (var n in ScanKeepAttributes(text)) keepNames.Add(n);
+                foreach (var n in ScanKeepAttributes(text)) { keepNames.Add(n); if (IsTranslationUnit(path)) keepAt.Add((n, path)); }
                 if (_keepMacroUse is not null && fileNodeByPath.TryGetValue(path, out var kfile))
                     ScanKeepMacroUses(graph, text, kfile, keepNames, pendingRefs);
             }
@@ -482,6 +510,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (functionsByName.TryGetValue(name, out var fns)) foreach (var id in fns) graph.AddFlag(id, NodeFlags.Keep);
             if (globalsByName.TryGetValue(name, out var gs)) foreach (var id in gs) graph.AddFlag(id, NodeFlags.Keep);
         }
+        // A kept symbol the parse made no node for in its file (an attribute between the declarator and its initializer):
+        // its translation unit stays whole, so what it registers and what that references survive.
+        foreach (var (name, kpath) in keepAt)
+            if (!(functionsByName.TryGetValue(name, out var kf) && kf.Any(id => graph.GetNode(id).FilePath == kpath))
+                && !(globalsByName.TryGetValue(name, out var kg) && kg.Any(id => graph.GetNode(id).FilePath == kpath))
+                && !_forceKeepFiles.Contains(kpath))
+                _forceKeepFiles.Add(kpath);
 
         Phase("pastes+rest");
         return graph;
@@ -541,6 +576,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 foreach (Match id in Identifier.Matches(text[start..i])) pendingRefs.Add((fileNode, id.Value));
                 end = i;
             }
+            // A registration nobody names (`RITE(1)` placing a static's pointer in a walked section): the
+            // translation unit stays whole.
+            if (_registerMacros.Contains(m.Value) && IsTranslationUnit(graph.GetNode(fileNode).Name) && !_forceKeepFiles.Contains(graph.GetNode(fileNode).Name))
+                _forceKeepFiles.Add(graph.GetNode(fileNode).Name);
             var before = text.AsSpan(0, m.Index);
             var mb = NameBeforeAttr.Match(before.Length > 200 ? before[^200..].ToString() : before.ToString());
             if (mb.Success && mb.Groups[1].Value is var bn && !_keepMacros.Contains(bn)) keepNames.Add(bn);
@@ -593,9 +632,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // saving a separate pass. Each file's text is released before the next.
         foreach (var path in paths)
         {
-            var text = read(path);
+            var text = SourceText.Normalize(read(path));
             if (text.Length == 0) continue;
             bytesTotal += text.Length; filesTotal++;
+            if (!IsTranslationUnit(path) && TemplateInstances.HasMacroNamedHead(text)) _macroNamedHeaders.Add(path);
+            if (!IsTranslationUnit(path)) _c99InlineFns.UnionWith(C99Inline.HeaderDefinitions(text));
 
             foreach (Match m in ObjectLikeDefine.Matches(text))
             {
@@ -640,11 +681,21 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 { keep.Add(kv.Key); changed = true; }
         }
         _keepMacros = keep;
+        var register = new HashSet<string>(bodies.Where(kv => kv.Value.Bodies.Any(b => IdentifierSection.IsMatch(b))).Select(kv => kv.Key), StringComparer.Ordinal);
+        for (var changed = register.Count > 0; changed;)
+        {
+            changed = false;
+            foreach (var kv in bodies)
+                if (!register.Contains(kv.Key) && kv.Value.Bodies.Any(b => Identifier.Matches(b).Any(id => register.Contains(id.Value))))
+                { register.Add(kv.Key); changed = true; }
+        }
+        _registerMacros = register;
         _keepMacrosFnLike = new HashSet<string>(keep.Where(k => bodies[k].FnLike), StringComparer.Ordinal);
         _keepMacroUse = keep.Count == 0 ? null
             : new Regex(@"\b(?:" + string.Join("|", keep.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
 
         _definers = DefinerMacros.Build(bodies);
+        DefinerSet = DefinerMacros.MakeSet(_definers);
         _definerUse = _definers.Count == 0 ? null
             : new Regex(@"\b(" + string.Join("|", _definers.Keys.Select(Regex.Escape)) + @")\s*\(", RegexOptions.Compiled);
 
@@ -795,6 +846,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
     /// <summary>`static` on a function DEFINITION at file scope (not a class member, not inside a namespace
     /// block where it could still be a member) — internal linkage.</summary>
+    /// <summary>The name heads a call-shaped declarator that is itself called: <c>CAT(TNAME, get)(void)</c>.</summary>
+    private static bool ComputedName(TsNode nameNode)
+        => nameNode.Parent is { Type: "function_declarator" } p && p.Parent is { Type: "function_declarator" };
+
     private static bool IsFileScopeStatic(TsNode nameNode)
     {
         TsNode? def = nameNode;
@@ -1074,6 +1129,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         if (_funcLikeMacroNames.Contains(name)) shapes.Add("nameIsAFunctionLikeMacro");
         shapes.AddRange(DefinitionHead.TextShapes(text, line, name));
 
+        text = SourceText.Normalize(text);
         var parseText = PrepareParseText(path, text, out var bare, out _);
         if (bare is not null && bare.Any(b => b.Name == name && b.Line == line)) shapes.Add("bareKAndRHead");
         using var parser = new Parser(_lang);
@@ -1193,6 +1249,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                              MacroTable? defines,
                              bool closedWorldDefines)
     {
+        text = SourceText.Normalize(text);   // trigraphs, names split by a backslash-newline (offsets and lines kept)
         // Finding A: some headers are #include fragments (e.g. a bare byte list pasted inside an array
         // initializer) — valid in context, invalid alone. tree-sitter's error recovery on them is
         // super-linear (a 2.4 MB blob can stall for minutes). Detect the obvious data-fragment shape and
@@ -1284,6 +1341,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 Add(functionsByName, name, fid);
                 funcSpans.Add((span.Value.Start, span.Value.End, fid));
                 if (IsTranslationUnit(path) && IsFileScopeStatic(node)) { _fileLocal.Add(fid); graph.AddFlag(fid, NodeFlags.FileLocal); }
+                // `int CAT(TNAME, get)(void) { ... }`: the real name is computed (see TemplateInstances), so nothing
+                // calls this one by name. It stays whenever its file does.
+                if (_macroNamedHeaders.Contains(path) || (_funcLikeMacroNames.Contains(name) && ComputedName(node)))
+                    graph.AddEdge(fileNode, fid, EdgeKind.References);
             }
             else if (cap.Name == "macro")
             {
@@ -1439,13 +1500,41 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     graph.AddEdge(fileNode, fileNodeByPath[tp], EdgeKind.Includes);
         }
 
+        // Pass 2a: names a template header defines in this translation unit (`#define TNAME red` / `#include "tmpl.h"`
+        // with `int CAT(TNAME, get)(void) { ... }` inside). Each instance is a node at the instantiating line, kept
+        // with the file (removing that #include would remove every instance), so a call to red_get keeps this unit.
+        // The build's function-like -D macros name heads too (`'-DHIDE(n)=hid_##n'`: `int HIDE(den)(void) {`).
+        var cmdFnMacros = CodeCarver.Core.Preprocess.CommandLineMacros.AnyFunctionLike(CommandLineMacros);
+        if (_read is not null && IsTranslationUnit(path)
+            && ((text.Contains("define", StringComparison.Ordinal) && _macroNamedHeaders.Count > 0) || TemplateInstances.HasMacroNamedHead(text))
+            && (text.Contains("define", StringComparison.Ordinal) || cmdFnMacros))
+        {
+            string? ReadInclude(string raw)
+            {
+                var hit = ResolveInclude(path, raw, true, fileNodeByPath);
+                if (hit.Count == 0 && pathsByBasename.TryGetValue(BaseName(raw), out var byBase)) hit = byBase;
+                var h = hit.FirstOrDefault(_macroNamedHeaders.Contains);
+                return h is null ? null : SourceText.Normalize(_read(h));
+            }
+            foreach (var (name, line) in TemplateInstances.Find(text, ReadInclude, CommandLineMacros))
+            {
+                if (Keywords.Contains(name) || (dead is not null && line < dead.Length && dead[line])) continue;
+                if (functionsByName.TryGetValue(name, out var have) && have.Any(h => graph.GetNode(h).FilePath == path)) continue;
+                var iid = graph.GetOrAddNode(NodeKind.Function, name, path, new SourceSpan(line, line));
+                graph.AddEdge(iid, fileNode, EdgeKind.DefinedIn);
+                graph.AddEdge(fileNode, iid, EdgeKind.References);
+                Add(functionsByName, name, iid);
+            }
+        }
+
         // Pass 2b: symbol aliases. `void NMI_Handler(void) __attribute__((alias("Default_Handler")))` is a
         // bodyless declaration tree-sitter treats as a prototype (uncaptured), yet it IS a real symbol the
         // vector table points at — and it REQUIRES its target. Register the alias name as a function and
         // link it to the target, so a reference to the alias (e.g. from the vector table) keeps the target.
         IEnumerable<Match> aliases = Array.Empty<Match>();
-        if (text.Contains("alias", StringComparison.Ordinal))
-            aliases = aliases.Concat(AliasAttr.Matches(text)).Concat(AliasAttrBefore.Matches(text));
+        // An ifunc (`int f(int) __attribute__((ifunc("resolve_f")))`) is defined here too: by its resolver.
+        if (text.Contains("alias", StringComparison.Ordinal) || text.Contains("ifunc", StringComparison.Ordinal))
+            aliases =aliases.Concat(AliasAttr.Matches(text)).Concat(AliasAttrBefore.Matches(text));
         if (text.Contains("ragma", StringComparison.Ordinal)) aliases = aliases.Concat(PragmaWeakAlias.Matches(text));   // #pragma and _Pragma
         if (text.Contains("asm", StringComparison.Ordinal)) aliases = aliases.Concat(AsmSetAlias.Matches(text));
         if (_aliasMacroUse is not null) aliases = aliases.Concat(_aliasMacroUse.Matches(text));
@@ -1462,11 +1551,60 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             pendingCalls.Add((aid, m.Groups["target"].Value)); // alias -> target: keeping the alias keeps it
         }
 
+        // Pass 2b': symbols the linker sees under another name. An asm label (`int hidden(int) __asm__("sym");`): when
+        // the C name has a body here, this file defines sym (sym -> the body); otherwise a call to the C name here is a
+        // call to sym (the C name -> sym). Linked with --wrap=X, every call to X goes to __wrap_X: a file defining
+        // __wrap_X also stands for X (X -> __wrap_X), so the wrapper stays whenever X is called (pass 3 sends
+        // __real_X to X). Over-approximate when the link doesn't wrap: the wrapper is kept for nothing.
+        // `#pragma redefine_extname cname sym` renames the same way.
+        void LinkerName(string cname, string sym, int index)
+        {
+            if (Keywords.Contains(cname)) return;
+            var ln = 1;
+            for (var k = 0; k < index && k < text.Length; k++) if (text[k] == '\n') ln++;
+            if (dead is not null && ln < dead.Length && dead[ln]) return;
+            var bodyHere = functionsByName.TryGetValue(cname, out var have) && have.Any(h => graph.GetNode(h).FilePath == path);
+            var (defined, target) = bodyHere ? (sym, cname) : (cname, sym);
+            var lid = graph.GetOrAddNode(NodeKind.Function, defined, path, new SourceSpan(ln, ln));
+            graph.AddEdge(lid, fileNode, EdgeKind.DefinedIn);
+            Add(functionsByName, defined, lid);
+            pendingCalls.Add((lid, target));
+        }
+        if (text.Contains("asm", StringComparison.Ordinal))
+            foreach (Match m in AsmLabelDecl.Matches(text)) LinkerName(m.Groups["name"].Value, m.Groups["sym"].Value, m.Index);
+        if (text.Contains("redefine_extname", StringComparison.Ordinal))
+            foreach (Match m in RedefineExtname.Matches(text)) LinkerName(m.Groups["name"].Value, m.Groups["sym"].Value, m.Index);
+        // A command-line rename (-Dsecret_rite=true_rite): a function defined here as secret_rite is the symbol true_rite.
+        if (CommandLineMacros is { Count: > 0 } clm)
+            foreach (var (s, e, id) in funcSpans.ToList())
+                if (clm.TryGetValue(graph.GetNode(id).Name, out var mac) && mac.Params is null)
+                {
+                    var rid = graph.GetOrAddNode(NodeKind.Function, mac.Body, path, new SourceSpan(s, e));
+                    graph.AddEdge(rid, fileNode, EdgeKind.DefinedIn);
+                    Add(functionsByName, mac.Body, rid);
+                    pendingCalls.Add((rid, graph.GetNode(id).Name));
+                }
+        // C99 inline: the header holds the body, this translation unit (declaring it extern, or without inline) emits it.
+        if (_c99InlineFns.Count > 0 && IsTranslationUnit(path))
+            foreach (var (name, index) in C99Inline.Emitters(text, _c99InlineFns)) LinkerName(name, name, index);
+        if (text.Contains("__wrap_", StringComparison.Ordinal))
+            foreach (var (s, e, id) in funcSpans.ToList())
+                if (graph.GetNode(id).Name is { Length: > 7 } wn && wn.StartsWith("__wrap_", StringComparison.Ordinal))
+                {
+                    var xid = graph.GetOrAddNode(NodeKind.Function, wn[7..], path, new SourceSpan(s, e));
+                    graph.AddEdge(xid, fileNode, EdgeKind.DefinedIn);
+                    Add(functionsByName, wn[7..], xid);
+                    pendingCalls.Add((xid, wn));
+                }
+
         // Pass 2c: inline-asm symbol references. A function/global named only inside asm("...") is kept
         // via the file (attributed to fileNode, like a file-scope address-take), so it survives if this
         // translation unit is kept. Sound over-approximation for the inline-asm blind spot.
         foreach (var id in ScanAsmIdentifiers(text))
             pendingRefs.Add((fileNode, id));
+        // A by-name lookup (dlsym(h, "name")): the string is the reference (see DynamicLookup).
+        foreach (var (name, _) in DynamicLookup.Names(text))
+            pendingRefs.Add((fileNode, name));
 
         // O(1) enclosing-function lookup. Fill a per-line array with the SMALLEST span covering each line
         // (widest first, so nested/smaller spans overwrite). This turns the per-identifier enclosing
@@ -1494,7 +1632,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             // or `void ZLIB_INTERNAL _tr_flush_block`). That function stays in the emitted file, so keep
             // its callees whenever the file is kept — attribute the call to the file node.
             var from = Enclosing(sp.Row + 1) ?? fileNode;
-            pendingCalls.Add((from, node.Text));
+            var callee = node.Text;
+            pendingCalls.Add((from, callee));
+            if (callee.Length > 7 && callee.StartsWith("__real_", StringComparison.Ordinal)) pendingCalls.Add((from, callee[7..]));   // --wrap's original
         }
 
         // Pass 4: non-call references INSIDE functions (address-taken: a callback passed/assigned).

@@ -125,6 +125,75 @@ $cases = @(
          'main.c'   = "#include `"log.h`"`nint main(void) { return log_it(1); }`n"
          'real.c'   = "int real_log(int x) { return x; }`n"
          'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'trigraphs ??< ??>'; Lang = 'c'; Expect = @('odd.c')
+       Files = @{
+         'main.c'   = "int odd(int);`nint main(void) { return odd(1); }`n"
+         'odd.c'    = "??=define BASE 7`nint odd(int a) ??< int v??(1??) = ??< a ??>; return v??(0??) + BASE; ??>`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'name split by backslash-newline (CRLF)'; Lang = 'c'; Expect = @('odd.c')
+       Files = @{
+         'main.c'   = "int odd(int);`nint main(void) { return odd(1); }`n"
+         'odd.c'    = "int od\`r`nd(int a)`r`n{`r`n    return a;`r`n}`r`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'asm label renames the symbol'; Lang = 'c'; Expect = @('odd.c', 'deep.c')
+       Files = @{
+         'main.c'   = "extern int vessel(int) __asm__(`"deep_one`");`nint surface(void);`nint main(void) { return vessel(1) + surface(); }`n"
+         'odd.c'    = "int hidden(void) __asm__(`"surface`");`nint hidden(void) { return 2; }`n"
+         'deep.c'   = "int deep_one(int x) { return x; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'linker --wrap: __wrap_X kept when X is called'; Lang = 'c'; Expect = @('wrap.c', 'beast.c')
+       Files = @{
+         'main.c'   = "int beast(int);`nint main(void) { return beast(3); }`n"
+         'beast.c'  = "int beast(int x) { return x; }`n"
+         'wrap.c'   = "int __real_beast(int);`nint __wrap_beast(int x) { return __real_beast(x) + 1; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'template header instantiated by its includer'; Lang = 'c'; Expect = @('tmpl.c', 'tmpl.h')
+       Files = @{
+         'tmpl.h'   = "#define T_CAT2(a, b) a##_##b`n#define T_CAT(a, b) T_CAT2(a, b)`nint T_CAT(TNAME, get)(void) { return TVAL; }`n#undef T_CAT`n#undef T_CAT2`n"
+         'tmpl.c'   = "#define TNAME red`n#define TVAL 5`n#include `"tmpl.h`"`n#undef TNAME`n#undef TVAL`n#define TNAME blue`n#define TVAL 6`n#include `"tmpl.h`"`n"
+         'main.c'   = "int red_get(void); int blue_get(void);`nint main(void) { return red_get() + blue_get(); }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'section entries walked by __start_/__stop_'; Lang = 'c'; Expect = @('a.c', 'b.c')
+       Files = @{
+         'rites.h'  = "typedef int (*rite_fn)(void);`n#define R_CAT2(a, b) a##b`n#define R_CAT(a, b) R_CAT2(a, b)`n#define RITE(v) static int R_CAT(rite_, __LINE__)(void) { return v; } \`n    const rite_fn R_CAT(rite_ptr_, __LINE__) __attribute__((section(`"my_rites`"))) = R_CAT(rite_, __LINE__);`n"
+         'a.c'      = "#include `"rites.h`"`nRITE(1)`n"
+         'b.c'      = "#include `"rites.h`"`nstatic int named(void) { return 10; }`nconst rite_fn named_ptr __attribute__((section(`"my_rites`"))) = named;`n"
+         'main.c'   = "#include `"rites.h`"`nextern const rite_fn __start_my_rites[], __stop_my_rites[];`nint main(void) { int s = 0; for (const rite_fn *p = __start_my_rites; p < __stop_my_rites; p++) s += (*p)(); return s; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'link-line --defsym target'; Lang = 'c'; Expect = @('real.c')
+       Files = @{
+         'main.c'   = "int omen_call(int);`nint main(void) { return omen_call(4); }`n"
+         'real.c'   = "int omen_real(int x) { return x * 11; }`n"
+         'build.sh' = "gcc -c main.c real.c`ngcc -Wl,--defsym=omen_call=omen_real -o app main.o real.o`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'ifunc: resolver and implementation'; Lang = 'c'; Expect = @('ifunc.c', 'impl.c')
+       Files = @{
+         'main.c'   = "int mul7(int);`nint main(void) { return mul7(6); }`n"
+         'ifunc.c'  = "int mul7_impl(int x);`nstatic int (*resolve_mul7(void))(int) { return mul7_impl; }`nint mul7(int) __attribute__((ifunc(`"resolve_mul7`")));`n"
+         'impl.c'   = "int mul7_impl(int x) { return x * 7; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = '#pragma redefine_extname'; Lang = 'c'; Expect = @('redef.c')
+       Files = @{
+         'main.c'   = "int new_name(void);`nint main(void) { return new_name(); }`n"
+         'redef.c'  = "#pragma redefine_extname old_name new_name`nint old_name(void);`nint old_name(void) { return 61; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'C99 inline emitted by an extern declaration'; Lang = 'c'; Expect = @('emit.c')
+       Files = @{
+         'inl.h'    = "inline int twin(int x) { return x * 3; }`n"
+         'main.c'   = "#include `"inl.h`"`nint main(void) { return twin(5); }`n"
+         'emit.c'   = "#include `"inl.h`"`nextern inline int twin(int x);`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'command-line -D renames a definition'; Lang = 'c'; Expect = @('dren.c')
+       Files = @{
+         'main.c'   = "int true_rite(void);`nint hid_den(void);`nint main(void) { return true_rite() + hid_den(); }`n"
+         'dren.c'   = "int secret_rite(void) { return 37; }`nint HIDE(den)(void) { return 5; }`n"
+         'Makefile' = "dren.o: dren.c`n`t`$(CC) -Dsecret_rite=true_rite '-DHIDE(n)=hid_##n' -c dren.c`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'dlsym by name'; Lang = 'c'; Expect = @('target.c')
+       Files = @{
+         'main.c'   = "#include <dlfcn.h>`nint main(void) { int (*f)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, `"dl_target`"); return f ? f() : -1; }`n"
+         'target.c' = "int dl_target(void) { return 55; }`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
 )
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("cc-selfcheck-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))

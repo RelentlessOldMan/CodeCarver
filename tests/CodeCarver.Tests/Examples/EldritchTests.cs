@@ -40,7 +40,7 @@ public sealed class EldritchTests
         public void Dispose() => _work.Dispose();
     }
 
-    static readonly string[] Stages = { "safe", "aggressive", "max" };
+    static readonly string[] Stages = { "safe", "headers", "aggressive", "max" };   // every combination of the two carve switches
 
     [Fact]
     public void LogAndTrace_EveryStageVerifies_DecoysGo_UnreachedCompiledFilesAreStubs()
@@ -56,7 +56,12 @@ public sealed class EldritchTests
             // What only odd constructs reach: aliases, asm, attribute-only, inline-asm-only, #if 0 neighbours, ...
             foreach (var need in new[] { "aliases.c", "asm_target.c", "cleanup_fn.c", "digraph.c", "wrapped.c", "if0.c",
                                          "rename.c", "horrors.c", "bodyhelp.c", "handlers.c", "shoggoth.c", "forced.c",
-                                         "rune.c", "linuxy.c", "inlhelp.c", "unicode.c", "lined.c", "hdr_user.c" })
+                                         "rune.c", "linuxy.c", "inlhelp.c", "unicode.c", "lined.c", "hdr_user.c",
+                                         // waves 3 and 4: linker, loader and command-line names
+                                         "wrap_beast.c", "deep.c", "asmdef.c", "tmpl.c", "rites_b.c", "c99inl_emit.c", "gnu_twin.c",
+                                         "ifunc.c", "ifunc_impl.c", "defsym_real.c", "dren.c", "next_two.c", "dirs_q.c", "dirs_sys.c",
+                                         "dirs_after.c", "asm_callee.c", "ucn.c", "dollar.c", "ghost.c", "pp_alpha.c", "pp_beta.c",
+                                         "audit_tick.c", "dl_target.c", "abyss_three.c", "redef.c", "spaced out.c", "deep/abyss.c" })
                 Assert.True(r.Kept(s, need), $"{s}: {need} not kept\n{r.Output}");
             Assert.True(File.Exists(r.Carved(s, "asm_fast.S")), $"{s}: asm_fast.S not copied");
         }
