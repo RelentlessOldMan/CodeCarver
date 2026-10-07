@@ -47,6 +47,9 @@ public sealed class HorrorBuildTests
     [Theory]
     [InlineData("sh -c 'gcc -DSHC_MODE=2 -c shc.c -o shc.o'", "shc.c", "SHC_MODE=2")]
     [InlineData("bash -c \"cd sub && gcc -DX=1 -c x.c\"", "x.c", "X=1")]
+    [InlineData("bash --norc -c 'gcc -DX=1 -c x.c'", "x.c", "X=1")]
+    [InlineData("bash -o pipefail -ec 'gcc -DX=1 -c x.c'", "x.c", "X=1")]
+    [InlineData("busybox sh -c 'gcc -DX=1 -c x.c'", "x.c", "X=1")]
     [InlineData("/bin/sh ../tools/ltwrap --mode=compile /opt/ccache gcc -DLT_MODE=1 -c lt.c -o lt.o", "lt.c", "LT_MODE=1")]
     [InlineData("/bin/bash ../libtool --tag=CC --mode=compile gcc -DLT_MODE=1 -c lt.c -o lt.lo", "lt.c", "LT_MODE=1")]
     public void CompilesBehindAShell_AreFound(string line, string file, string define)

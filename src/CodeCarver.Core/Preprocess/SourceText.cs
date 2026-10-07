@@ -167,6 +167,8 @@ public static class SourceText
                 i++;
                 while (i < text.Length && text[i] != c && text[i] != '\n')
                 {
+                    // A backslash-newline continues the literal, CR LF included.
+                    if (text[i] == '\\' && i + 2 < text.Length && text[i + 1] == '\r' && text[i + 2] == '\n') { sb.Append("  \n"); i += 3; continue; }
                     if (text[i] == '\\' && i + 1 < text.Length) { sb.Append(text[i + 1] == '\n' ? " \n" : "  "); i += 2; continue; }
                     sb.Append(' ');
                     i++;

@@ -47,7 +47,8 @@ public static class PreprocessorScanner
     {
         text = SourceText.Trigraphs(text);
         if (!text.Contains("if", StringComparison.Ordinal) || !ConstantIf.IsMatch(text)) return text;
-        var dead = DeadLineMap(text, new MacroTable(), closedWorld: false);
+        var (dead, _, balanced) = LineMaps(text, new MacroTable(), closedWorld: false);
+        if (!balanced) return text;   // an #if that never closes (inside a raw string, a cut-off file): blank nothing
         var lines = text.Split('\n');
         var any = false;
         for (var i = 0; i < lines.Length; i++)
@@ -70,7 +71,8 @@ public static class PreprocessorScanner
     public static bool[] UncertainLineMap(string text, MacroTable defines, bool closedWorld = false)
         => LineMaps(text, defines, closedWorld).Uncertain;
 
-    static (bool[] Dead, bool[] Uncertain) LineMaps(string text, MacroTable defines, bool closedWorld)
+    /// <summary>Balanced: every #if closed by the end of the text.</summary>
+    static (bool[] Dead, bool[] Uncertain, bool Balanced) LineMaps(string text, MacroTable defines, bool closedWorld)
     {
         text = SourceText.Trigraphs(text);   // ??=if is #if
         var lines = text.Split('\n');
@@ -80,15 +82,22 @@ public static class PreprocessorScanner
         var stack = new Stack<Frame>();
         var guardLine = IncludeGuardLine(lines);
         var inComment = false;
+        string? rawEnd = null;   // inside a C++ raw string R"d( ... )d": its lines are text, not directives
 
         for (var idx = 0; idx < lines.Length; idx++)
         {
             var active = stack.Count == 0 || stack.Peek().Active;
             var trimmed = lines[idx].TrimStart();
             var startsInComment = inComment;
-            inComment = EndsInComment(lines[idx], inComment);
+            var startsInRaw = rawEnd is not null;
+            if (rawEnd is not null) { if (lines[idx].Contains(rawEnd, StringComparison.Ordinal)) rawEnd = null; }
+            else
+            {
+                inComment = EndsInComment(lines[idx], inComment);
+                if (!inComment && lines[idx].Contains("R\"", StringComparison.Ordinal)) rawEnd = OpenRawString(lines[idx]);
+            }
 
-            if (!startsInComment && trimmed.Length > 0 && trimmed[0] == '#')
+            if (!startsInComment && !startsInRaw && trimmed.Length > 0 && trimmed[0] == '#')
             {
                 var last = idx;
                 var joined = lines[idx].TrimEnd('\r');
@@ -110,7 +119,21 @@ public static class PreprocessorScanner
             uncertain[idx + 1] = active && stack.Count > 0 && !stack.Peek().Certain;
         }
 
-        return (dead, uncertain);
+        return (dead, uncertain, stack.Count == 0 && rawEnd is null);
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex RawStart = new(
+        @"(?<![A-Za-z0-9_])(?:u8|u|U|L)?R""([^()\\\s]{0,16})\(", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>The closing <c>)d"</c> of a C++ raw string <paramref name="line"/> opens and doesn't close, or null.</summary>
+    private static string? OpenRawString(string line)
+    {
+        foreach (System.Text.RegularExpressions.Match m in RawStart.Matches(line))
+        {
+            var end = ")" + m.Groups[1].Value + "\"";
+            if (line.IndexOf(end, m.Index + m.Length, StringComparison.Ordinal) < 0) return end;
+        }
+        return null;
     }
 
     private static void HandleDirective(string body, bool active, MacroTable table, Stack<Frame> stack, bool closedWorld)
@@ -233,7 +256,25 @@ public static class PreprocessorScanner
             var m = System.Text.RegularExpressions.Regex.Match(r1, @"^!\s*defined\s*\(?\s*(\w+)\s*\)?$");
             if (m.Success) guard = m.Groups[1].Value;
         }
-        return guard is { Length: > 0 } && FirstToken(r2) == guard ? first : -1;
+        if (guard is not { Length: > 0 } || FirstToken(r2) != guard) return -1;
+        // A guard spans the file: no #else/#elif of its own, and its #endif is the last directive. `#ifndef X /
+        // #define X 0 / #else ...` is a default, and its #else branch is live whenever the build defines X.
+        var depth = 0;
+        var closedAt = -1;
+        inComment = false;
+        for (var i = first; i < lines.Length; i++)
+        {
+            var starts = inComment;
+            inComment = EndsInComment(lines[i], inComment);
+            var t = lines[i].TrimStart();
+            if (starts || t.Length == 0 || t[0] != '#') continue;
+            if (closedAt >= 0) return -1;   // a directive after the guard closed
+            var (k, _) = SplitKeyword(StripComments(t.TrimStart('#')));
+            if (k is "if" or "ifdef" or "ifndef") depth++;
+            else if (k is "else" or "elif" or "elifdef" or "elifndef" && depth == 1) return -1;
+            else if (k == "endif" && --depth == 0) closedAt = i;
+        }
+        return closedAt >= 0 ? first : -1;
     }
 
     /// <summary>Is a block comment open at the end of this line? (Strings are skipped so "/*" in a literal

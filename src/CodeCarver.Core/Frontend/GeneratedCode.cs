@@ -85,7 +85,8 @@ public static class GeneratedCode
                 }
                 code.Append(c);
             }
-            var hd = HereDoc.Match(code.ToString());
+            // On the whole line: the quote handling above has already eaten a quoted delimiter (<<'EOF').
+            var hd = code.ToString().Contains("<<", StringComparison.Ordinal) ? HereDoc.Match(line) : Match.Empty;
             if (hd.Success && triple is null)
                 hereEnd = hd.Groups[1].Success ? hd.Groups[1].Value : hd.Groups[2].Success ? hd.Groups[2].Value : hd.Groups[3].Value;
         }

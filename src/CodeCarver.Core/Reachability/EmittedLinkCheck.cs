@@ -62,8 +62,9 @@ public static class EmittedLinkCheck
         Func<string, string?>? original = null,
         CodeCarver.Core.Preprocess.DefinerMacros.Set? definerMacros = null,
         IEnumerable<(string Name, string Rel, int Line)>? linkUses = null,
-        IReadOnlyDictionary<string, (List<string>? Params, string Body)>? commandLineMacros = null,
-        IReadOnlySet<string>? c99InlineFns = null)
+        IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? commandLineMacros = null,
+        IReadOnlySet<string>? c99InlineFns = null,
+        IReadOnlySet<string>? wrapped = null)
     {
         emitted = emitted.ToList();
         dropped = dropped.ToList();
@@ -74,18 +75,36 @@ public static class EmittedLinkCheck
         var byBase = emitted.Concat(dropped).GroupBy(f => Path.GetFileName(f.Rel), StringComparer.OrdinalIgnoreCase)
                             .ToDictionary(g => g.Key, g => g.Select(f => f.Path).ToList(), StringComparer.OrdinalIgnoreCase);
         var templateText = new Dictionary<string, string?>(StringComparer.Ordinal);
-        string? ReadTemplate(string raw)
+        var templates = new HashSet<string>(StringComparer.Ordinal);
+        // A header's text as TemplateInstances reads it: whole for a template, its directive lines otherwise (a config
+        // header still carries macros a template after it uses). The same string every time.
+        string? ReadHeader(string p)
         {
-            if (!byBase.TryGetValue(Path.GetFileName(raw), out var ps)) return null;
-            var p = ps[0];
             if (!templateText.TryGetValue(p, out var t))
             {
                 t = TryRead(p, maxBytes);
                 if (t is not null) t = CodeCarver.Core.Preprocess.SourceText.Normalize(t);
-                if (t is not null && !CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(t)) t = null;
+                if (t is not null && CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(t)) templates.Add(p);
+                else if (t is not null) t = CodeCarver.Core.Preprocess.TemplateInstances.DirectivesOnly(t);
                 templateText[p] = t;
             }
             return t;
+        }
+        string? ReadTemplate(string raw)
+        {
+            if (!byBase.TryGetValue(Path.GetFileName(raw), out var ps)) return null;
+            foreach (var p in ps) ReadHeader(p);
+            return ReadHeader(ps.FirstOrDefault(templates.Contains) ?? ps[0]);
+        }
+        bool? anyTemplate = null;
+        bool AnyTemplate()
+        {
+            if (anyTemplate is null)
+            {
+                foreach (var p in byBase.Values.SelectMany(ps => ps).Where(p => IsHeader(p))) ReadHeader(p);
+                anyTemplate = templates.Count > 0;
+            }
+            return anyTemplate.Value;
         }
         var cmdFnMacros = CodeCarver.Core.Preprocess.CommandLineMacros.AnyFunctionLike(commandLineMacros);
         // Names a translation unit defines beyond its own function heads: template-header instances (with the build's
@@ -94,8 +113,9 @@ public static class EmittedLinkCheck
         {
             if (IsHeader(rel) || IsAssembly(rel)) return Array.Empty<Definition>();
             var r = new List<Definition>();
-            if ((text.Contains("define", StringComparison.Ordinal) && text.Contains("include", StringComparison.Ordinal))
-                || (cmdFnMacros && CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(text)))
+            if ((text.Contains("include", StringComparison.Ordinal) && AnyTemplate())
+                || (CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(text)
+                    && (cmdFnMacros || text.Contains("define", StringComparison.Ordinal))))
                 r.AddRange(CodeCarver.Core.Preprocess.TemplateInstances.Find(text, ReadTemplate, commandLineMacros)
                                .Select(i => new Definition(i.Name, i.Line, false, false)));
             if (c99InlineFns is { Count: > 0 })
@@ -111,7 +131,7 @@ public static class EmittedLinkCheck
         {
             if (commandLineMacros is not { Count: > 0 }) return;
             foreach (var d in s.Definitions.ToList())
-                if (commandLineMacros.TryGetValue(d.Name, out var m) && m.Params is null) s.Definitions.Add(d with { Name = m.Body });
+                foreach (var to in CodeCarver.Core.Preprocess.CommandLineMacros.RenamesOf(commandLineMacros, d.Name)) s.Definitions.Add(d with { Name = to });
         }
 
         // 1. Candidate definitions from dropped files (name -> first defining file).
@@ -186,8 +206,13 @@ public static class EmittedLinkCheck
         var macroCalls = new List<(string Name, string Rel, int Line, bool Dead)>();
         var aliasMacros = new HashSet<string>(StringComparer.Ordinal);
         var macroDeclarators = new List<(string Name, string Macro, string Target, string Rel, int Line)>();
+        // Weak: declared weak in a header (it may be included anywhere), or every use sits in a file that declares it weak
+        // itself. One file's weak declaration does not make another file's reference weak: ELF fails the link on that one.
         var weakNames = new HashSet<string>(StringComparer.Ordinal);
-        var anyWrap = droppedDefs.Keys.Any(k => k.StartsWith("__wrap_", StringComparison.Ordinal));
+        var strongUse = new HashSet<string>(StringComparer.Ordinal);
+        var weakUse = new HashSet<string>(StringComparer.Ordinal);
+        // Only a symbol the build wraps (--wrap=X): a __wrap_X elsewhere is a unit-test mock, not part of this link.
+        var anyWrap = wrapped is { Count: > 0 } && droppedDefs.Keys.Any(k => k.StartsWith("__wrap_", StringComparison.Ordinal));
         foreach (var (rel, path) in emitted.OrderBy(e => e.Rel, StringComparer.Ordinal))
         {
             var text = TryRead(path, maxBytes);
@@ -210,7 +235,8 @@ public static class EmittedLinkCheck
                 else emittedDefs.Add(d.Name);
             aliasMacros.UnionWith(scan.AliasMacros);
             foreach (var md in scan.MacroDeclarators) if (!IsDead(md.Line)) macroDeclarators.Add((md.Name, md.Macro, md.Target, rel, md.Line));
-            weakNames.UnionWith(scan.WeakDeclarations);
+            if (IsHeader(rel)) weakNames.UnionWith(scan.WeakDeclarations);
+            foreach (var (name, _) in scan.Uses) (scan.WeakDeclarations.Contains(name) ? weakUse : strongUse).Add(name);
             if (prunedStatics.TryGetValue(rel, out var pruned))
             {
                 var definedHere = scan.Definitions.Select(d => d.Name).ToHashSet(StringComparer.Ordinal);
@@ -224,7 +250,7 @@ public static class EmittedLinkCheck
             foreach (var (name, line) in scan.Uses)
             {
                 // Linked with --wrap=X, every X call goes to __wrap_X: a dropped wrapper breaks the link.
-                if (anyWrap && droppedDefs.ContainsKey("__wrap_" + name)) (IsDead(line) ? dead : live).TryAdd("__wrap_" + name, (rel, line));
+                if (anyWrap && wrapped!.Contains(name) && droppedDefs.ContainsKey("__wrap_" + name)) (IsDead(line) ? dead : live).TryAdd("__wrap_" + name, (rel, line));
                 if (!droppedDefs.ContainsKey(name)) continue;
                 if (scan.CallUses.Contains((name, line))) { macroCalls.Add((name, rel, line, IsDead(line))); continue; }
                 var into = IsDead(line) ? dead : live;
@@ -240,7 +266,7 @@ public static class EmittedLinkCheck
         // them whatever the C code calls.
         if (linkUses is not null)
             foreach (var (name, rel, line) in linkUses)
-                if (droppedDefs.ContainsKey(name)) live.TryAdd(name, (rel, line));
+                if (droppedDefs.ContainsKey(name)) { live.TryAdd(name, (rel, line)); strongUse.Add(name); }
         // Function-like macros visible in a file: its own, plus those of every emitted header it includes (by basename,
         // transitively). Memoised; a cycle just stops.
         var visible = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
@@ -284,7 +310,7 @@ public static class EmittedLinkCheck
             var isLive = live.TryGetValue(name, out var at);
             if (!isLive) at = dead[name];
             var def = droppedDefs[name];
-            violations.Add(new LinkViolation(name, def.Rel, at.Rel, at.Line, DeadOnly: !isLive, DefinedLine: def.Line) { DefinedInAll = definers[name], Weak = weakNames.Contains(name) });
+            violations.Add(new LinkViolation(name, def.Rel, at.Rel, at.Line, DeadOnly: !isLive, DefinedLine: def.Line) { DefinedInAll = definers[name], Weak = weakNames.Contains(name) || (weakUse.Contains(name) && !strongUse.Contains(name)) });
         }
         violations.AddRange(staticViolations);
         return new LinkCheckResult(violations, checkedFiles, skipped);
@@ -494,7 +520,7 @@ public static class EmittedLinkCheck
     public static ScanResult Scan(string text, bool header = false, bool declarators = true,
                                   CodeCarver.Core.Preprocess.DefinerMacros.Set? definerMacros = null,
         IEnumerable<(string Name, string Rel, int Line)>? linkUses = null,
-        IReadOnlyDictionary<string, (List<string>? Params, string Body)>? commandLineMacros = null,
+        IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? commandLineMacros = null,
         IReadOnlySet<string>? c99InlineFns = null)
     {
         // Trigraphs and names split by a backslash-newline, as the compiler reads them.

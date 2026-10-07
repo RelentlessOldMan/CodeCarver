@@ -39,7 +39,10 @@ public static class ParamListConditionals
         for (int s = 0, i = 0; i <= code.Length; i++)
             if (i == code.Length || code[i] == '\n') { lines.Add((s, i)); s = i + 1; }
 
-        var frames = new Stack<(bool InParams, bool Blanking)>();
+        // Each #if frame remembers the parenthesis depth at its #if and at the end of its first branch: the branches are
+        // alternatives, so a head split across them (`#ifdef W / int f(int a, long b, / #else / int f(int a, / #endif`)
+        // opens one parenthesis, not two.
+        var frames = new Stack<(bool InParams, bool Blanking, int ParensAtIf, int ParensAfterFirst)>();
         var parens = 0;
         // Open braces: 'T' transparent (namespace, extern "C"), 'I' an initializer list, 'O' anything else.
         var braces = new Stack<char>();
@@ -75,18 +78,22 @@ public static class ParamListConditionals
                     var inParams = parens > 0 && AtFileScope()
                                    || initializers && parens == 0 && braces.Count > 0 && braces.Peek() == 'I';
                     blankThis = inParams || Blanking();   // the C++ grammar takes no directive inside a parameter list
-                    frames.Push((inParams, false));
+                    frames.Push((inParams, false, parens, -1));
                 }
                 else if (word is "elif" or "else" && frames.Count > 0)
                 {
                     var f = frames.Pop();
                     if (f.InParams) f.Blanking = true;
+                    if (f.ParensAfterFirst < 0) f.ParensAfterFirst = parens;
+                    parens = f.ParensAtIf;
                     frames.Push(f);
                     blankThis = Blanking();
                 }
                 else if (word == "endif" && frames.Count > 0)
                 {
-                    blankThis = frames.Pop().InParams || Blanking();
+                    var f = frames.Pop();
+                    if (f.ParensAfterFirst >= 0) parens = f.ParensAfterFirst;
+                    blankThis = f.InParams || Blanking();
                 }
                 else blankThis = Blanking();
                 if (blankThis)

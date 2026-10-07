@@ -90,7 +90,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public IReadOnlySet<string> C99InlineFunctions => _c99InlineFns;
 
     /// <summary>The build's command-line macros that rename what a file defines (see <see cref="CommandLineMacros"/>).</summary>
-    public IReadOnlyDictionary<string, (List<string>? Params, string Body)>? CommandLineMacros { get; set; }
+    public IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? CommandLineMacros { get; set; }
 
     private static readonly Regex AsmKeyword =new(@"\b(?:__asm__|__asm|asm)\b", RegexOptions.Compiled);
     private static readonly Regex Identifier = new(@"[A-Za-z_]\w*", RegexOptions.Compiled);
@@ -188,9 +188,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public IReadOnlyList<string> Warnings => _warnings;
 
     private readonly List<string> _forceKeepFiles = new();
+    private readonly HashSet<string> _forceKeepSet = new(StringComparer.Ordinal);
+    private void ForceKeep(string path) { if (_forceKeepSet.Add(path)) _forceKeepFiles.Add(path); }
     private Func<string, string>? _read;
     // Headers with a definition whose name a macro computes (a template header: see TemplateInstances).
     private readonly HashSet<string> _macroNamedHeaders = new(StringComparer.Ordinal);
+    /// <summary>Header text as TemplateInstances reads it (whole for a template header, directive lines otherwise), by path.</summary>
+    private readonly Dictionary<string, string> _includeDirectives = new(StringComparer.Ordinal);
     /// <summary>Files whose extraction threw and were skipped (kept whole rather than crashing the run) —
     /// the CLI roots these so their code is emitted intact, since we couldn't analyse them.</summary>
     public IReadOnlyList<string> ForceKeepFiles => _forceKeepFiles;
@@ -366,8 +370,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     {
         _warnings.Clear();
         _forceKeepFiles.Clear();
+        _forceKeepSet.Clear();
         _read = read;
         _macroNamedHeaders.Clear();
+        _includeDirectives.Clear();
         _c99InlineFns.Clear();
         _fileLocal.Clear();
         _unparsed.Clear();
@@ -431,7 +437,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             catch (Exception ex)   // never let one pathological file sink a whole-repo carve
             {
                 _warnings.Add($"{path}: extraction failed ({ex.GetType().Name}: {ex.Message}) — kept whole, not carved");
-                _forceKeepFiles.Add(path);
+                ForceKeep(path);
                 if (fileNodeByPath.TryGetValue(path, out var failedFile)) KeptWholeRefs(path, text, failedFile, pendingRefs);
             }
             if (timeFiles && fsw.ElapsedMilliseconds >= 300)
@@ -515,8 +521,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         foreach (var (name, kpath) in keepAt)
             if (!(functionsByName.TryGetValue(name, out var kf) && kf.Any(id => graph.GetNode(id).FilePath == kpath))
                 && !(globalsByName.TryGetValue(name, out var kg) && kg.Any(id => graph.GetNode(id).FilePath == kpath))
-                && !_forceKeepFiles.Contains(kpath))
-                _forceKeepFiles.Add(kpath);
+                && !_forceKeepSet.Contains(kpath))
+                ForceKeep(kpath);
 
         Phase("pastes+rest");
         return graph;
@@ -578,8 +584,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             }
             // A registration nobody names (`RITE(1)` placing a static's pointer in a walked section): the
             // translation unit stays whole.
-            if (_registerMacros.Contains(m.Value) && IsTranslationUnit(graph.GetNode(fileNode).Name) && !_forceKeepFiles.Contains(graph.GetNode(fileNode).Name))
-                _forceKeepFiles.Add(graph.GetNode(fileNode).Name);
+            if (_registerMacros.Contains(m.Value) && IsTranslationUnit(graph.GetNode(fileNode).Name) && !_forceKeepSet.Contains(graph.GetNode(fileNode).Name))
+                ForceKeep(graph.GetNode(fileNode).Name);
             var before = text.AsSpan(0, m.Index);
             var mb = NameBeforeAttr.Match(before.Length > 200 ? before[^200..].ToString() : before.ToString());
             if (mb.Success && mb.Groups[1].Value is var bn && !_keepMacros.Contains(bn)) keepNames.Add(bn);
@@ -1276,7 +1282,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             _warnings.Add($"{path}: parse exceeded the {ParseBudgetMs} ms budget — kept whole, not carved");
             // Its definitions are unknown, so nothing could reach it: a translation unit must be force-kept like
             // one over the symbol budget, or a call into it finds no definition and the file is dropped.
-            if (IsTranslationUnit(path)) _forceKeepFiles.Add(path);
+            if (IsTranslationUnit(path)) ForceKeep(path);
             KeptWholeRefs(path, text, fileNodeByPath[path], pendingRefs);
             return;
         }
@@ -1298,7 +1304,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 _symbolBudgetKeptWhole.Add((path, symbols));
                 var how = IsTranslationUnit(path) ? "force-rooted, kept whole" : "kept whole via #include-closure";
                 _warnings.Add($"{path}: would mint {symbols:N0} symbols (> {PerFileSymbolBudget:N0} budget) — {how}, not carved (guards graph-memory blow-up)");
-                if (IsTranslationUnit(path)) _forceKeepFiles.Add(path);
+                if (IsTranslationUnit(path)) ForceKeep(path);
                 // A translation unit is emitted whole and compiled: every name counts (a handler table has no '(').
                 // A generated header over budget is mostly field/register names: its calls are what can need code.
                 KeptWholeRefs(path, text, fileNodeByPath[path], pendingRefs, callShapedOnly: !IsTranslationUnit(path));
@@ -1505,16 +1511,26 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // with the file (removing that #include would remove every instance), so a call to red_get keeps this unit.
         // The build's function-like -D macros name heads too (`'-DHIDE(n)=hid_##n'`: `int HIDE(den)(void) {`).
         var cmdFnMacros = CodeCarver.Core.Preprocess.CommandLineMacros.AnyFunctionLike(CommandLineMacros);
+        // The template's macros may come from any header the unit includes first (a config header), so with a template
+        // header in the tree every unit that includes anything is walked.
         if (_read is not null && IsTranslationUnit(path)
-            && ((text.Contains("define", StringComparison.Ordinal) && _macroNamedHeaders.Count > 0) || TemplateInstances.HasMacroNamedHead(text))
-            && (text.Contains("define", StringComparison.Ordinal) || cmdFnMacros))
+            && ((_macroNamedHeaders.Count > 0 && text.Contains("include", StringComparison.Ordinal))
+                || (TemplateInstances.HasMacroNamedHead(text) && (text.Contains("define", StringComparison.Ordinal) || cmdFnMacros))))
         {
             string? ReadInclude(string raw)
             {
                 var hit = ResolveInclude(path, raw, true, fileNodeByPath);
                 if (hit.Count == 0 && pathsByBasename.TryGetValue(BaseName(raw), out var byBase)) hit = byBase;
-                var h = hit.FirstOrDefault(_macroNamedHeaders.Contains);
-                return h is null ? null : SourceText.Normalize(_read(h));
+                var h = hit.FirstOrDefault(_macroNamedHeaders.Contains) ?? hit.FirstOrDefault();
+                if (h is null) return null;
+                // Same string per header: TemplateInstances reads a header with no template once per unit.
+                if (!_includeDirectives.TryGetValue(h, out var t))
+                {
+                    t = SourceText.Normalize(_read(h));
+                    if (!_macroNamedHeaders.Contains(h)) t = TemplateInstances.DirectivesOnly(t);
+                    _includeDirectives[h] = t;
+                }
+                return t;
             }
             foreach (var (name, line) in TemplateInstances.Find(text, ReadInclude, CommandLineMacros))
             {
@@ -1577,11 +1593,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // A command-line rename (-Dsecret_rite=true_rite): a function defined here as secret_rite is the symbol true_rite.
         if (CommandLineMacros is { Count: > 0 } clm)
             foreach (var (s, e, id) in funcSpans.ToList())
-                if (clm.TryGetValue(graph.GetNode(id).Name, out var mac) && mac.Params is null)
+                foreach (var to in CodeCarver.Core.Preprocess.CommandLineMacros.RenamesOf(clm, graph.GetNode(id).Name))
                 {
-                    var rid = graph.GetOrAddNode(NodeKind.Function, mac.Body, path, new SourceSpan(s, e));
+                    var rid = graph.GetOrAddNode(NodeKind.Function, to, path, new SourceSpan(s, e));
                     graph.AddEdge(rid, fileNode, EdgeKind.DefinedIn);
-                    Add(functionsByName, mac.Body, rid);
+                    Add(functionsByName, to, rid);
                     pendingCalls.Add((rid, graph.GetNode(id).Name));
                 }
         // C99 inline: the header holds the body, this translation unit (declaring it extern, or without inline) emits it.

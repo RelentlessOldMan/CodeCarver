@@ -112,8 +112,15 @@ public static class BuildLogScraper
                     if (Shells.Contains(launcher, StringComparer.OrdinalIgnoreCase))
                     {
                         // The shell's own options come first; -c (alone or bundled, -ec) takes the command string.
-                        var o = 1;
-                        while (o < cmd.Count && cmd[o].Length > 1 && cmd[o][0] == '-' && cmd[o][1] != '-' && !cmd[o][1..].Contains('c')) o++;
+                        // `busybox sh -c`, `bash --norc -c`, `bash -o pipefail -c`.
+                        var o = launcher.Equals("busybox", StringComparison.OrdinalIgnoreCase) && cmd.Count > 1
+                                && Shells.Contains(DriverName(cmd[1]), StringComparer.OrdinalIgnoreCase) ? 2 : 1;
+                        while (o < cmd.Count && cmd[o].Length > 1 && cmd[o][0] is '-' or '+')
+                        {
+                            if (cmd[o] is "-o" or "+o" or "-O" or "+O") { o += 2; continue; }   // an option with an argument
+                            if (cmd[o].StartsWith("--", StringComparison.Ordinal) || cmd[o][0] == '+' || !cmd[o][1..].Contains('c')) { o++; continue; }
+                            break;
+                        }
                         if (o + 1 < cmd.Count && cmd[o].Length > 1 && cmd[o][0] == '-' && cmd[o][1] != '-')
                         {
                             if (depth < 4) Commands(SplitCommands(Tokenize(cmd[o + 1])), dir, alternatives, depth + 1);
@@ -192,7 +199,7 @@ public static class BuildLogScraper
                                           "env", "stdbuf", "chrt", "taskset", "xcrun" };
     // First words that are never a compile, even with a source name and -c/-D after them.
     static readonly string[] NeverCompiler = { "echo", "printf", "cp", "mv", "rm", "ln", "cat", "sed", "awk", "grep",
-        "python", "python3", "perl", "sh", "bash", "make", "gmake", "cmake", "ninja", "ar", "ld", "mkdir", "touch",
+        "python", "python3", "perl", "sh", "bash", "dash", "ksh", "zsh", "ash", "busybox", "make", "gmake", "cmake", "ninja", "ar", "ld", "mkdir", "touch",
         "test", "install", "git", "tar", "zip", "objcopy", "strip", "doxygen", "clang-tidy", "clang-format" };
 
     /// <summary>Index of the compiler driver in one simple command, or -1. The driver is the first word after

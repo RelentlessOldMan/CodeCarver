@@ -212,6 +212,30 @@ $cases = @(
          'q2.c'       = "int q2_fn(void) { return 2; }`n"
          'Makefile'   = "OBJS := main.o `$(addsuffix .o,q2)`napp: `$(OBJS)`n`t`$(CC) -o app `$(OBJS)`n"
          'unused.c'   = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'a template name set in either #if branch'; Lang = 'c'; Expect = @('inst.c')
+       Files = @{
+         'main.c'     = "int blue_get(void);`nint main(void) { return blue_get(); }`n"
+         'inst.c'     = "#include `"cfg.h`"`n#ifdef USE_RED`n#define TNAME red`n#else`n#define TNAME blue`n#endif`n#include `"tmpl.h`"`n"
+         'cfg.h'      = "#define CAT2(a,b) a##b`n#define CAT(a,b) CAT2(a,b)`n"
+         'tmpl.h'     = "int CAT(TNAME,_get)(void) { return 1; }`n"
+         'unused.c'   = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'renamed two ways by two -D'; Lang = 'c'; Expect = @('rite.c')
+       Files = @{
+         'main.c'     = "int blue_rite(void);`nint main(void) { return blue_rite(); }`n"
+         'rite.c'     = "int secret_rite(void) { return 7; }`n"
+         'Makefile'   = "red:`n`tcc -Dsecret_rite=red_rite -o red main.c rite.c`nblue:`n`tcc -Dsecret_rite=blue_rite -o blue main.c rite.c`n"
+         'unused.c'   = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'the #else of #ifndef X / #define X default'; Lang = 'c'; Expect = @('compat.c')
+       Files = @{
+         'main.c'     = "int fast_impl(void);`nint main(void) { return fast_impl(); }`n"
+         'compat.c'   = "#ifndef USE_FAST`n#define USE_FAST 0`n#else`nint fast_impl(void) { return 1; }`n#endif`n#if 0`nold`n#endif`n"
+         'unused.c'   = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'called only by C a quoted here-document prints'; Lang = 'c'; Expect = @('hooks.c')
+       Files = @{
+         'main.c'     = "int main(void) { return 0; }`n"
+         'mkhooks.sh' = "#!/bin/sh`ncat > `"`$1`" <<'EOC'`nint hooks_total(void) { return gen_hook(); }`nEOC`n"
+         'hooks.c'    = "int gen_hook(void) { return 4; }`n"
+         'unused.c'   = "int unused(void) { return 9; }`n" } }
 )
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("cc-selfcheck-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))

@@ -639,6 +639,7 @@ public static class CarveCommand
             var opened = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var openedByBuild = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var outside = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var objectStems = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // objects the build read (linked)
             var complete = true;
             foreach (var tp in buildFileTraces.Concat(runFileTraces))
             {
@@ -650,6 +651,7 @@ public static class CarveCommand
                         string full;
                         try { var mp = MapPath(cand); full = Path.IsPathFullyQualified(mp) ? Path.GetFullPath(mp) : Path.GetFullPath(Path.Combine(rootF, mp)); }
                         catch { continue; }   // not a usable path token (noise)
+                        if (isBuild && Path.GetExtension(full).ToLowerInvariant() is ".o" or ".obj") objectStems.Add(Path.GetFileNameWithoutExtension(full));
                         if (full.StartsWith(rootF, StringComparison.OrdinalIgnoreCase))
                         {
                             var rel = Path.GetRelativePath(rootF, full).Replace('\\', '/');
@@ -674,6 +676,22 @@ public static class CarveCommand
                     err.WriteLine($"  build   : WARNING - the build trace is incomplete: {traceMissedCompiled:N0} of {compiled.Count:N0} source file(s) the build log "
                         + "compiled were never opened in it. Likely: strace without -f, a build inside a container or a build server/daemon started "
                         + "before tracing, a compiler cache, an incremental build, or paths that need [advanced] pathMap. Every file is read instead.");
+            }
+            if (complete && objectStems.Count > 0)
+            {
+                // An incremental build links helper.o without compiling helper.c: the object was built before tracing,
+                // so the trace never opened its source. Such a source can't count as "not built".
+                var stale = parseRels.Where(r => !CodeCarver.Core.Reachability.EmittedLinkCheck.IsHeader(r)
+                                                 && objectStems.Contains(Path.GetFileNameWithoutExtension(r)))
+                                     .GroupBy(r => Path.GetFileNameWithoutExtension(r), StringComparer.OrdinalIgnoreCase)
+                                     .Count(g => !g.Any(openedByBuild.Contains));
+                summary["build.traceLinkedObjectsWithUnopenedSource"] = stale;
+                if (stale > 0)
+                {
+                    traceMissedCompiled = Math.Max(0, traceMissedCompiled) + stale;
+                    err.WriteLine($"  build   : WARNING - the build trace is incomplete: the build linked {stale:N0} object(s) whose source in the tree it "
+                        + "never opened (an incremental build: capture a clean, full one). Every file is read instead.");
+                }
             }
             if (cv.SkipFilesNotBuilt && complete && opened.Count > 0 && traceMissedCompiled <= 0)
             {
@@ -906,9 +924,20 @@ public static class CarveCommand
         // Also the C source templates the build fills in (table.c.in, config.h.in): see GeneratedCode.
         var buildFiles = lang is "c" or "cpp"
             ? CodeCarver.Core.Util.SourceWalk.Files(dir).Select(p => (Rel: Path.GetRelativePath(dir, p).Replace('\\', '/'), Path: p))
-                .Where(f => (LinkFlags.IsBuildScript(f.Rel) || GeneratedCode.IsTemplate(f.Rel)) && !Excluded(f.Path) && SafeLength(f.Path) <= maxParseBytes).ToList()
+                .Where(f => (IsScript(f) || GeneratedCode.IsTemplate(f.Rel)) && !Excluded(f.Path) && SafeLength(f.Path) <= maxParseBytes).ToList()
             : new List<(string Rel, string Path)>();
-        var buildScripts = buildFiles.Where(f => LinkFlags.IsBuildScript(f.Rel)).ToList();
+        var buildScripts = buildFiles.Where(IsScript).ToList();
+        // A build script by name, or an extensionless file starting with "#!" (a generator: tools/mkhooks).
+        bool IsScript((string Rel, string Path) f) => LinkFlags.IsBuildScript(f.Rel) || (Path.GetExtension(f.Rel).Length == 0 && Shebang(f.Path));
+        static bool Shebang(string path)
+        {
+            try
+            {
+                using var s = File.OpenRead(path);
+                return s.ReadByte() == '#' && s.ReadByte() == '!';
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
+        }
         var templates = buildFiles.Where(f => GeneratedCode.IsTemplate(f.Rel)).ToList();
         var commandLineMacros = CodeCarver.Core.Preprocess.CommandLineMacros.FromSpecs(
             buildCmds.SelectMany(c => c.Defines).Concat(buildScripts.SelectMany(f => CodeCarver.Core.Preprocess.CommandLineMacros.SpecsInScript(SafeRead(f.Path)))));
@@ -1094,16 +1123,21 @@ public static class CarveCommand
             // Quoted includes: follow the ones that leave the tree; one that resolves nowhere hides its macros.
             var basenames = new HashSet<string>(fullByRel.Keys.Select(r => Path.GetFileName(r)), StringComparer.OrdinalIgnoreCase);
             var unresolved = 0;
+            // Each (dir, name) once, and each name's -I search once: thousands of files x hundreds of -I dirs.
+            var seenQuoted = new HashSet<(string, string)>();
+            var viaIncDirs = new Dictionary<string, string?>(StringComparer.Ordinal);
+            string? Probe(string cand, string raw)
+            {
+                try { var full = Path.GetFullPath(Path.Combine(cand, raw)); return File.Exists(full) ? full : null; }
+                catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return null; }
+            }
             for (var qi = 0; qi < quoted.Count; qi++)
             {
                 var (fromDir, raw) = quoted[qi];
-                string? hit = null;
-                foreach (var cand in new[] { fromDir }.Concat(incDirs))
-                {
-                    string full;
-                    try { full = Path.GetFullPath(Path.Combine(cand, raw)); } catch { continue; }
-                    if (File.Exists(full)) { hit = full; break; }
-                }
+                if (!seenQuoted.Add((fromDir, raw))) continue;
+                var hit = Probe(fromDir, raw);
+                if (hit is null && !viaIncDirs.TryGetValue(raw, out hit))
+                    viaIncDirs[raw] = hit = incDirs.Select(d => Probe(d, raw)).FirstOrDefault(p => p is not null);
                 if (hit is not null) { ScanFile(hit); continue; }
                 if (!basenames.Contains(Path.GetFileName(raw))) unresolved++;
             }
@@ -1471,14 +1505,23 @@ public static class CarveCommand
         // Symbols the LINK needs (--defsym's right side, --undefined, --entry, a linker script's EXTERN/PROVIDE...):
         // named on a link line or in the tree's build scripts, never in C. Rooted, and verify counts them as uses.
         var linkUses = new List<(string Name, string Rel, int Line)>();
+        var wrapped = new HashSet<string>(StringComparer.Ordinal);   // --wrap=X: every call to X goes to __wrap_X
         if (lang is "c" or "cpp")
         {
             foreach (var bl in buildLogs.Distinct())
-                foreach (var (n, l) in LinkFlags.RequiredSymbols(SafeRead(bl), linkerScript: false))
+            {
+                var text = SafeRead(bl);
+                foreach (var (n, l) in LinkFlags.RequiredSymbols(text, linkerScript: false))
                     linkUses.Add((n, Path.GetFileName(bl), l));
+                wrapped.UnionWith(LinkFlags.WrappedSymbols(text));
+            }
             foreach (var (rel, p) in buildScripts)
-                foreach (var (n, l) in LinkFlags.RequiredSymbols(SafeRead(p), LinkFlags.IsLinkerScript(rel)))
+            {
+                var text = SafeRead(p);
+                foreach (var (n, l) in LinkFlags.RequiredSymbols(text, LinkFlags.IsLinkerScript(rel)))
                     linkUses.Add((n, rel, l));
+                wrapped.UnionWith(LinkFlags.WrappedSymbols(text));
+            }
         }
         var linkRoots = linkUses.Count > 0
             ? new ExplicitRootProvider(symbols: linkUses.Select(u => u.Name).Distinct(StringComparer.Ordinal)).Discover(graph)
@@ -1710,7 +1753,8 @@ public static class CarveCommand
             var r = EmittedLinkCheck.Run(emittedFiles, droppedForCheck, deadLinesFor, maxParseBytes,
                                          original: pruned ? rel => Path.Combine(dir, rel) : null,
                                          definerMacros: (fe as TreeSitterFrontEnd)?.DefinerSet, linkUses: linkUses,
-                                         commandLineMacros: commandLineMacros, c99InlineFns: (fe as TreeSitterFrontEnd)?.C99InlineFunctions);
+                                         commandLineMacros: commandLineMacros, c99InlineFns: (fe as TreeSitterFrontEnd)?.C99InlineFunctions,
+                                         wrapped: wrapped);
             var hard = r.Hard.ToList();
             var soft = r.DeadOnly;
             // Defined only in files the traced build never compiled, with the build log confirming the trace is
@@ -1919,7 +1963,7 @@ public static class CarveCommand
         List<string> PlaceholderTus(CarvePlan p) => p.DroppedFiles.Where(compiledTus.Contains).OrderBy(r => r, StringComparer.Ordinal).ToList();
         static string PlaceholderText(string rel)
         {
-            var id = new string(Path.GetFileNameWithoutExtension(rel).Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
+            var id = new string(Path.GetFileNameWithoutExtension(rel).Select(c => char.IsAsciiLetterOrDigit(c) ? c : '_').ToArray());
             return "/* Placeholder written by CodeCarver: nothing the carved program reaches is defined in this file, so its\n"
                  + "   code was removed. It stays so build files that list it still work. (An empty file is not valid ISO C.) */\n"
                  + $"typedef int codecarver_placeholder_{id};\n";

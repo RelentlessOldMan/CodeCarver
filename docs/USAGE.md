@@ -281,7 +281,9 @@ compiled.
     in-root source the log compiled must appear in the trace as opened. If any don't, the trace is incomplete
     (strace without `-f`, a build in a container or a build server started before tracing, a compiler cache, an
     incremental build, or paths that need `pathMap`): the run says so (`build : WARNING`), counts them in
-    `build.traceMissedCompiledFiles`, and reads every file instead of skipping. When the trace checks out, kept code
+    `build.traceMissedCompiledFiles`, and reads every file instead of skipping. With or without a log, a traced build
+    that links an object (`helper.o`) whose source in the tree it never opened was incremental, and is treated the
+    same way (`build.traceLinkedObjectsWithUnopenedSource`). When the trace checks out, kept code
     that uses a name defined **only** in files the build never compiled is a **note**, not a failure
     (`<stage>.verify.notBuiltDefinitions`): the real build linked without those files, so the name comes from
     somewhere else (another build or a prebuilt library, an alias, a macro). With a trace but no log the check
@@ -427,8 +429,8 @@ Messy logs are expected:
 - **Generated sources** live in the build directory, outside the tree, so their calls are read where they come
   from:
   - every call in a C source template (`table.c.in`, `config.h.in`, `.tmpl`, `.j2`);
-  - calls inside the string literals and here-documents of the tree's build scripts, such as a shell or Python
-    generator that prints C.
+  - calls inside the string literals and here-documents (quoted or not) of the tree's build scripts and generator
+    scripts: shell, Python, Perl, awk, Ruby, Lua, Tcl, m4, and any file without an extension that starts with `#!`.
   Those functions are kept, and verify checks them (`roots.generatedCode`).
 
 [`examples/hellbuild`](../examples/hellbuild/README.md) is all of this in one small build.
@@ -449,10 +451,11 @@ target; assembly files define what they export (`.globl`, `.weak`, `PUBLIC`, `na
 whose only definitions are in files the build never compiled is a note. Names the linker or loader binds that no
 call spells out count the same way, both for what the carve keeps and for verify: an `ifunc` is defined by its
 resolver; an asm label (`__asm__("sym")`) or `#pragma redefine_extname` renames the symbol; `__wrap_X` stands for
-`X`; a C99 `inline` body in a header is emitted by the file that declares it `extern` (a GNU `extern inline` body
-emits nothing); `-D` macros that rename a definition (`-Dold=new`, `'-DNAME(n)=n##_impl'`); symbols the link
-names (`--defsym`'s right side, `--undefined`, `--require-defined`, `--entry`, a linker script's `ENTRY`/`EXTERN`/
-`PROVIDE`); and string literals in a file that looks symbols up by name (`dlsym`, `GetProcAddress`). The `-D`
+`X` when the build links with `--wrap=X`; a C99 `inline` body in a header is emitted by the file that declares it `extern` (a GNU `extern inline` body
+emits nothing); `-D` macros that rename a definition (`-Dold=new`, `'-DNAME(n)=n##_impl'`; a name renamed differently by different
+compiles is every one of them); symbols the link
+names (`--defsym`'s right side, `--undefined`, `--require-defined`, `--entry`, the driver's `-u` and `-e`, each
+also through `-Wl,` or `-Xlinker`, and a linker script's `ENTRY`/`EXTERN`/`PROVIDE`); and string literals in a file that looks symbols up by name (`dlsym`, `GetProcAddress`). The `-D`
 macros and link flags come from the build logs and from the tree's own build scripts (makefiles, shell scripts,
 CMake files, linker scripts), so a carve without a build log still sees them. At a `carveSourceFileContents` stage, a
 function **pruned from a kept file** that emitted code still uses fails too, with cause `prunedFromKeptFile`.

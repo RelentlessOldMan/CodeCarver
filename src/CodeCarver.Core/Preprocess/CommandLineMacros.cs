@@ -23,30 +23,34 @@ public static class CommandLineMacros
         foreach (Match m in ScriptDefine.Matches(text)) yield return m.Groups["spec"].Value;
     }
 
-    /// <summary>The naming-relevant macros among <paramref name="specs"/>. A name given two different values keeps
-    /// its first (more names, never fewer, is all a caller relies on).</summary>
-    public static Dictionary<string, (List<string>? Params, string Body)> FromSpecs(IEnumerable<string> specs)
+    /// <summary>The naming-relevant macros among <paramref name="specs"/>. A name given different values by different
+    /// compiles keeps every value: each is a name the file may define.</summary>
+    public static Dictionary<string, List<(List<string>? Params, string Body)>> FromSpecs(IEnumerable<string> specs)
     {
-        var r = new Dictionary<string, (List<string>?, string)>(StringComparer.Ordinal);
+        var r = new Dictionary<string, List<(List<string>? Params, string Body)>>(StringComparer.Ordinal);
+        void Add(string name, List<string>? ps, string body)
+        {
+            if (!r.TryGetValue(name, out var l)) r[name] = l = new();
+            if (!l.Any(v => v.Body == body && (v.Params is null) == (ps is null))) l.Add((ps, body));
+        }
         foreach (var s in specs)
         {
             var m = Spec.Match(s.Trim());
             if (!m.Success) continue;
             var body = m.Groups["body"].Value.Trim();
             if (m.Groups["params"].Success)
-                r.TryAdd(m.Groups["name"].Value,
-                         (m.Groups["params"].Value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList(), body));
+                Add(m.Groups["name"].Value, m.Groups["params"].Value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList(), body);
             else if (Identifier.IsMatch(body) && body != m.Groups["name"].Value)
-                r.TryAdd(m.Groups["name"].Value, (null, body));
+                Add(m.Groups["name"].Value, null, body);
         }
         return r;
     }
 
-    /// <summary>Object-like renames: defined name → the symbol it becomes.</summary>
-    public static IEnumerable<(string Name, string Symbol)> Renames(IReadOnlyDictionary<string, (List<string>? Params, string Body)> macros)
-        => macros.Where(kv => kv.Value.Params is null).Select(kv => (kv.Key, kv.Value.Body));
-
     /// <summary>True when any of <paramref name="macros"/> is function-like.</summary>
-    public static bool AnyFunctionLike(IReadOnlyDictionary<string, (List<string>? Params, string Body)>? macros)
-        => macros is not null && macros.Values.Any(v => v.Params is not null);
+    public static bool AnyFunctionLike(IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? macros)
+        => macros is not null && macros.Values.Any(l => l.Any(v => v.Params is not null));
+
+    /// <summary>The symbols an object-like rename of <paramref name="name"/> makes it.</summary>
+    public static IEnumerable<string> RenamesOf(IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? macros, string name)
+        => macros is not null && macros.TryGetValue(name, out var l) ? l.Where(v => v.Params is null).Select(v => v.Body) : Enumerable.Empty<string>();
 }
