@@ -17,18 +17,28 @@ On a successful carve it also says where the carve could get tighter and where t
 `keep.files.<reason>` / `keep.bytes.<reason>` count each kept file once under why it is kept (`root`;
 `indirectOnly`: kept only because its address is taken, a vtable or inline asm names it, the price of soundness;
 `header`: included by kept code; `reached`: called or referenced from a root), `keep.bytes.largest10Percent` is the
-share of kept bytes in the ten largest kept files, and `time.<phase>.ms` is each phase's time.
+share of kept bytes in the ten largest kept files, and `time.<phase>.ms` is each phase's time, in run order from
+the start: `buildLogs`, `defines` (per-file define sets, compiler probe), `walk` (the tree walk and file sizes),
+`buildTraces`, `input+refscan`, `pre-parse`, `build-graph`, `roots`, `reachability`, `precision`, `emit`. Those
+add up to the run. A key with a further dot inside (`time.pre-parse.<part>.ms`, `time.build-graph.<part>.ms`,
+`time.outsideIncludes.ms`, which is part of `roots`) is part of a phase, not added to it.
 `time.pre-parse.<part>.ms` splits the macro scan before parsing: `treeMacros` (the tree's own files),
 `outsideHeaders` (headers the build reads outside the root), `quotedIncludes` (following `#include "..."` out of the
 tree) and `unparsedHeaders` (big and dense headers, streamed).
+`stageN` is a stage's position in that run, least aggressive first: with no `--stage` and stages `safe` and `max`,
+`max` is `stage1`; run alone with `--stage max`, it is `stage0`. `stageN.carveSourceFileContents` and
+`stageN.carveHeaderFileContents` say which stage it is.
 What content carving did, per stage: `stageN.sourceCarve.filesPruned` / `.bytesRemoved` (unreached definitions cut
 from kept source files; headers are never pruned) and `stageN.headerCarve.*` (unused `#define`s cut from big
 generated headers: `bigHeadersKept`, `wholeIncludedFromOutside` (left whole, see below), `bytesBefore`, `bytesAfter`,
 `definesDropped`). Two stages that differ little in size usually show why here.
 `roots.includedFromOutside` counts headers in the carve root that code outside it `#include`s (found through the
 build log's outside compiles and the build trace's outside files); they are kept whole in every stage, since the
-rest of the build compiles against them. `roots.namedFromOutsideHeaders` counts the module functions those headers
-name (prototypes, macros that expand to calls): they are rooted, so outside code still links in every stage.
+rest of the build compiles against them, and so are the root headers they include in turn.
+`roots.namedFromOutsideHeaders` counts the module functions and variables those headers name (prototypes, `extern`
+data, macros that expand to either): they are rooted, so outside code still links in every stage. Both are 0 when
+the build has no code outside the root. `outsideIncludes.filesRead` counts the files followed to find them;
+`outsideIncludes.capped = True` means the scan stopped at its limit and may have missed some (a warning says so).
 
 ## When `verify` fails: `codecarver/debug/`
 

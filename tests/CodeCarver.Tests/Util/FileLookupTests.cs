@@ -31,6 +31,16 @@ public sealed class FileLookupTests : IDisposable
         Assert.Null(f.Probe(a, "sub"));                          // a directory is not a file
         Assert.Null(f.Probe(Path.Combine(work, "nowhere"), "top.h"));
         Assert.Null(f.Probe(a, "bad\0name.h"));
+        Assert.Null(f.Probe(a, "sub/\0.h"));                     // not a path at all
+    }
+
+    [Fact]
+    public void EachDirectory_IsListedOnce()
+    {
+        var f = new FileLookup();
+        var a = Path.Combine(work, "a");
+        for (var i = 0; i < 50; i++) { f.Probe(a, "top.h"); f.Probe(a, $"no{i}.h"); f.Exists(Path.Combine(a, "sub", $"x{i}.h")); }
+        Assert.Equal(2, f.DirectoriesListed);
     }
 
     [Fact]

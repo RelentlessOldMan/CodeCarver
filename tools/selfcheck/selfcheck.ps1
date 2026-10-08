@@ -189,6 +189,11 @@ $cases = @(
          'dren.c'   = "int secret_rite(void) { return 37; }`nint HIDE(den)(void) { return 5; }`n"
          'Makefile' = "dren.o: dren.c`n`t`$(CC) -Dsecret_rite=true_rite '-DHIDE(n)=hid_##n' -c dren.c`n"
          'unused.c' = "int unused(void) { return 9; }`n" } }
+    @{ Name = 'data-only file (scalar, struct, pointer, tentative)'; Lang = 'c'; Expect = @('data.c')
+       Files = @{
+         'main.c'   = "struct cfg { int a; };`nextern int counter; extern int level; extern const struct cfg board; extern const char *tag;`nint main(void) { return counter + level + board.a + tag[0]; }`n"
+         'data.c'   = "struct cfg { int a; };`nint counter;`nint level = 3;`nconst struct cfg board = { 1 };`nconst char *tag = `"x`";`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
     @{ Name = 'dlsym by name'; Lang = 'c'; Expect = @('target.c')
        Files = @{
          'main.c'   = "#include <dlfcn.h>`nint main(void) { int (*f)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, `"dl_target`"); return f ? f() : -1; }`n"

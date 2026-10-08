@@ -273,6 +273,7 @@ public static class FileTreeEmitter
         var known = new HashSet<string>(keptFiles, CodeCarver.Core.Util.PathComparer.Default);
         foreach (var f in droppedFiles) known.Add(f);               // graph-known drops: leave dropped
         var added = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
+        var missing = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
         var result = new List<string>();
         var queue = new Queue<string>(emitted);                      // scan every emitted file for includes
 
@@ -298,9 +299,10 @@ public static class FileTreeEmitter
                 try { target = Path.GetFullPath(Path.Combine(fromDir, m.Groups[1].Value)); } catch { continue; }
                 // Under the root WITH a separator: "/repo2" must not pass for root "/repo" (review RB9).
                 if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue; // outside the tree
-                if (!File.Exists(target)) continue;                  // unresolved here (system/other -I dir)
                 var trel = Path.GetRelativePath(sourceRoot, target).Replace(Path.DirectorySeparatorChar, '/');
-                if (known.Contains(trel) || !added.Add(trel)) continue; // graph-known or already added
+                if (known.Contains(trel) || added.Contains(trel) || missing.Contains(trel)) continue;   // decided: no disk query
+                if (!File.Exists(target)) { missing.Add(trel); continue; }   // unresolved here (system/other -I dir)
+                added.Add(trel);
                 result.Add(trel);
                 queue.Enqueue(trel);                                 // its own includes may be needed too
             }

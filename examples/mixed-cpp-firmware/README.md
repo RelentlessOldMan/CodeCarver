@@ -64,7 +64,7 @@ Two builds + two runs, all unioned by default (no `[use]`); the config shows a c
   files   : 2 observed in-tree from 0 build + 1 run file-trace(s) (0 code file(s) rooted)
   roots   : main
   trace   : 5 function(s) from 1 trace(s) rooted; 5 resolved in-scope
-  nodes   : 15/32 kept (47%), 17 carved
+  nodes   : 17/34 kept (50%), 17 carved
   files   : 8/9 kept, 1 dropped
   dropped : unused.cpp
   cmm     : 3 script(s) kept; 1 observed + 1 via DO/GOSUB closure, 1 neither (kept: one run is one scenario — set [runs.X] dropUnobservedCmm = true to drop them)

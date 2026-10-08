@@ -111,6 +111,149 @@ public sealed class IncludedFromOutsideTests
         Assert.Contains("#define MODF_REG_399", File.ReadAllText(Path.Combine(t.Root, "out", "max", "carved", "api", "pub", "modf_tbl.h")));
     }
 
+    static void Glue(TreeCarve t, string flags) =>
+        t.LogLines.Add($"cd {t.Outside("glue")} && gcc {flags} -c {t.Outside("glue/glue.c")} -o glue.o");
+
+    /// <summary>Windows and macOS open a header whatever case the #include or the -I dir spells it in.</summary>
+    [Theory]
+    [InlineData("pub/MODG_API.h", "api")]
+    [InlineData("pub/modg_api.h", "API")]
+    public void IncludeOrIncludeDirInAnotherCase_StillKeepsTheHeader(string include, string incDir)
+    {
+        if (!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS()) return;   // a case-sensitive build fails too
+        using var t = Module();
+        t.WOut("glue/glue.c", $"#include \"{include}\"\nint glue(void){{ return MODG_LIMIT; }}\n");
+        t.Compile("main.c");
+        Glue(t, $"-I{t.S("").TrimEnd('/')}/{incDir}");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("api/pub/modg_api.h"), e);
+        Assert.Contains("roots.includedFromOutside = 1", t.Summary);
+    }
+
+    /// <summary>Data the header declares links from outside as surely as functions do.</summary>
+    [Fact]
+    public void GlobalsTheHeaderDeclares_AreKept()
+    {
+        using var t = new TreeCarve();
+        t.W("main.c", "int main(void){ return 0; }\n")
+         .W("api/pub/modg_api.h", "extern int modg_state;\nextern const int modg_table[4];\n")
+         .W("core/modg_data.c", "int modg_state;\nconst int modg_table[4] = { 1, 2, 3, 4 };\n")
+         .WOut("glue/glue.c", "#include \"pub/modg_api.h\"\nint glue(void){ return modg_state + modg_table[0]; }\n");
+        t.Compile("main.c").Compile("core/modg_data.c");
+        Glue(t, $"-I{t.S("api")}");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("core/modg_data.c"), e);
+        Assert.True(t.Summary.Contains("roots.namedFromOutsideHeaders = 2"), t.Summary);
+    }
+
+    /// <summary>The header outside code includes includes another module header: what that one names is used from
+    /// outside too, and it is kept whole like its includer.</summary>
+    [Fact]
+    public void HeadersTheIncludedHeaderIncludes_AreCoveredToo()
+    {
+        using var t = new TreeCarve();
+        t.W("main.c", "int main(void){ return 0; }\n")
+         .W("api/pub/modg_api.h", "#include \"modg_ext.h\"\n")
+         .W("api/pub/modg_ext.h", "#define MODG_GET() modg_get()\nint modg_put(int v);\n" + string.Concat(Enumerable.Range(0, 400).Select(i => $"#define MODG_REG_{i} {i}\n")))
+         .W("core/modg.c", "int modg_get(void){ return 1; }\nint modg_put(int v){ return v; }\n")
+         .WOut("glue/glue.c", "#include \"pub/modg_api.h\"\nint glue(void){ return modg_put(MODG_GET()) + MODG_REG_7; }\n");
+        t.Compile("main.c").Compile("core/modg.c");
+        Glue(t, $"-I{t.S("api")}");
+        var (code, o, e) = t.Carve(extraToml: "[stages.max]\ncarveSourceFileContents = true\ncarveHeaderFileContents = true\n"
+            + "[advanced]\nmaxParseBytes = 2000\n");
+        Assert.True(code == 0, o + e);
+        var core = File.ReadAllText(Path.Combine(t.Root, "out", "max", "carved", "core", "modg.c"));
+        Assert.Contains("int modg_get(void)", core);
+        Assert.Contains("int modg_put(int v)", core);
+        Assert.Contains("#define MODG_REG_7 ", File.ReadAllText(Path.Combine(t.Root, "out", "max", "carved", "api", "pub", "modg_ext.h")));
+        Assert.Contains("roots.includedFromOutside = 2", File.ReadAllText(Path.Combine(t.Root, "out", "max", "codecarver", "summary.txt")));
+    }
+
+    /// <summary>Another compile's -I dir holds a header of the same name: the include list is the union of every
+    /// command's, so the glue's own copy (in the root) must still count.</summary>
+    [Fact]
+    public void SameNameInAnotherCommandsIncludeDir_StillFindsTheRootHeader()
+    {
+        using var t = Module();
+        t.WOut("sdk/pub/modg_api.h", "#define SDK_ONLY 1\n");
+        t.Compile("main.c", $"-I{t.Outside("sdk")}");
+        Glue(t, $"-I{t.S("api")}");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("api/pub/modg_api.h"), e);
+    }
+
+    [Fact]
+    public void IncludeNext_ThroughAWrapper_FindsTheRootHeader()
+    {
+        using var t = Module();
+        t.WOut("glue/glue.c", "#include <pub/modg_api.h>\nint glue(void){ return MODG_LIMIT; }\n")
+         .WOut("wrap/pub/modg_api.h", "#include_next <pub/modg_api.h>\n");
+        t.Compile("main.c");
+        Glue(t, $"-I{t.Outside("wrap")} -I{t.S("api")}");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("api/pub/modg_api.h"), e);
+    }
+
+    [Fact]
+    public void OutsideHeaderWithoutExtension_IsFollowed()
+    {
+        using var t = Module();
+        t.WOut("glue/glue.c", "#include \"bridge\"\nint glue(void){ return MODG_LIMIT; }\n")
+         .WOut("glue/bridge", "#include \"pub/modg_api.h\"\n");
+        t.Compile("main.c");
+        Glue(t, $"-I{t.S("api")}");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("api/pub/modg_api.h"), e);
+    }
+
+    [Theory]
+    [InlineData("-isystem{0}")]
+    [InlineData("-iquote{0}")]
+    [InlineData("-idirafter{0}")]
+    [InlineData("--include-directory={0}")]
+    public void JoinedIncludeDirFlags_AreFollowed(string flag)
+    {
+        using var t = Module();
+        t.WOut("glue/glue.c", "#include \"bridge.h\"\nint glue(void){ return MODG_LIMIT; }\n")
+         .WOut("brinc/bridge.h", "#include \"pub/modg_api.h\"\n")
+         .W("other/pub/modg_api.h", "#define MODG_LIMIT 8\n");                  // a bare path match would keep this too
+        t.Compile("main.c");
+        Glue(t, string.Format(flag, t.Outside("brinc")) + $" -I{t.S("api")}");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("api/pub/modg_api.h"), e);
+        Assert.False(t.Kept("other/pub/modg_api.h"), e);   // resolved through the -I, not guessed by path
+    }
+
+    /// <summary><c>#include MACRO</c>: the header name is a string the file spells somewhere.</summary>
+    [Fact]
+    public void ComputedInclude_IsFollowed()
+    {
+        using var t = Module();
+        t.WOut("glue/glue.c", "#define MODG_HDR \"pub/modg_api.h\"\n#include MODG_HDR\nint glue(void){ return MODG_LIMIT; }\n");
+        t.Compile("main.c");
+        Glue(t, $"-I{t.S("api")}");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("api/pub/modg_api.h"), e);
+    }
+
+    [Fact]
+    public void NoOutsideCode_ReportsZero()
+    {
+        using var t = Module();
+        t.Compile("main.c");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.Contains("roots.includedFromOutside = 0", t.Summary);
+        Assert.Contains("roots.namedFromOutsideHeaders = 0", t.Summary);
+    }
+
     [Fact]
     public void EveryStage_KeepsTheHeaderWhole()
     {

@@ -123,8 +123,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         "extern", "auto", "inline", "restrict", "_Static_assert", "static_assert",
     };
 
+    // Every declarator of every declaration; GlobalName keeps the file-scope variable definitions among them.
     private const string GlobalQuery = """
-        (declaration declarator: (init_declarator declarator: (array_declarator declarator: (identifier) @global)))
+        (declaration declarator: (_) @global)
         """;
 
     private readonly Language _lang;
@@ -1112,6 +1113,34 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         return clean;
     }
 
+    /// <summary>The name a declaration's declarator defines when it is a variable (through initializers, pointers,
+    /// arrays, parentheses and function-pointer declarators), or null for a prototype or anything unnamed.</summary>
+    private static TsNode? GlobalName(TsNode declarator)
+    {
+        var d = declarator;
+        for (var i = 0; i < 12 && d is not null; i++)
+            switch (d.Type)
+            {
+                case "identifier": return d;
+                case "qualified_identifier": return d.GetChildForField("name") is { Type: "identifier" } q ? q : null;
+                case "init_declarator" or "array_declarator" or "attributed_declarator":
+                    d = d.GetChildForField("declarator"); break;
+                case "pointer_declarator" or "reference_declarator":
+                    d = d.GetChildForField("declarator") ?? d.NamedChildren.LastOrDefault(); break;
+                case "parenthesized_declarator":
+                    d = d.NamedChildren.FirstOrDefault(c => c.Type != "comment"); break;
+                case "function_declarator":
+                    // `int (*hook)(int)` is a pointer variable; `int f(void)` and `int (f)(void)` are prototypes.
+                    var inner = d.GetChildForField("declarator");
+                    if (inner?.Type != "parenthesized_declarator"
+                        || inner.NamedChildren.FirstOrDefault(c => c.Type != "comment")?.Type is not ("pointer_declarator" or "reference_declarator"))
+                        return null;
+                    d = inner; break;
+                default: return null;
+            }
+        return null;
+    }
+
     /// <summary>The name node of a declaration whose declarator is a function declarator, or null.</summary>
     private static TsNode? HeadName(TsNode declaration)
     {
@@ -1275,7 +1304,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         if (globalsByName.TryGetValue(name, out var globals))
         {
             foreach (var target in globals)
-                graph.AddEdge(from, target, EdgeKind.References);
+                if (visible is null || visible(from, target))
+                    graph.AddEdge(from, target, EdgeKind.References);
         }
     }
 
@@ -1335,7 +1365,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // counted (a captured symbol needs >=2 bytes), so the overwhelming majority of small files pay nothing.
         if (PerFileSymbolBudget > 0 && text.Length >= (long)PerFileSymbolBudget * 2)
         {
-            var symbols = CountCaptures(_defs, root) + CountCaptures(_globals, root);
+            var symbols = CountCaptures(_defs, root) + _globals.Execute(root).Captures.Count(c => GlobalName(c.Node) is not null);
             if (symbols > PerFileSymbolBudget)
             {
                 _symbolBudgetKeptWhole.Add((path, symbols));
@@ -1507,18 +1537,40 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 funcSpans.Add((use.StartLine, use.EndLine, ids[0]));   // the body's calls belong to the defined name
             }
 
-        // Pass 1b: file-scope INITIALIZED globals (data tables). Span = the whole declaration, so a big
-        // lookup table can be removed wholesale when nothing reachable references it.
+        // Pass 1b: file-scope variable DEFINITIONS of every shape (scalars, structs, pointers, arrays, initialized
+        // or tentative), so a use keeps the file that defines them: a data-only file is otherwise dropped and the
+        // carved tree fails to link. Span = the whole declaration, so a big lookup table can be removed wholesale
+        // when nothing reachable references it. An `extern` without initializer only declares; a file-scope
+        // `static` is its translation unit's own.
         foreach (var cap in _globals.Execute(root).Captures)
         {
-            var node = cap.Node;
-            if (IsDead(node)) continue;
-            if (scopes.InBody(node.StartIndex)) continue; // a LOCAL variable, not a file-scope global
+            var decl = cap.Node;
+            if (IsDead(decl)) continue;
+            if (scopes.InBody(decl.StartIndex)) continue; // a LOCAL variable, not a file-scope global
+            if (decl.Parent is not { Type: "declaration" } declaration) continue;
+            var storage = declaration.Children.Where(c => c.Type == "storage_class_specifier").Select(c => c.Text).ToList();
+            if (storage.Contains("extern") && decl.Type != "init_declarator") continue;
+            if (GlobalName(decl) is not { IsMissing: false } node || node.Text is not { Length: > 0 } gname) continue;
             var span = GlobalDeclarationSpan(node);
             if (span is null) continue;
-            var gid = graph.GetOrAddNode(NodeKind.Global, node.Text, path, new SourceSpan(span.Value.Start, span.Value.End));
+            var gid = graph.GetOrAddNode(NodeKind.Global, gname, path, new SourceSpan(span.Value.Start, span.Value.End));
             graph.AddEdge(gid, fileNode, EdgeKind.DefinedIn);
-            Add(globalsByName, node.Text, gid);
+            Add(globalsByName, gname, gid);
+            if (storage.Contains("static") && IsTranslationUnit(path)) { _fileLocal.Add(gid); graph.AddFlag(gid, NodeFlags.FileLocal); }
+            // What its initializer names, read from the text after the name: a section-placed entry
+            // (`const fn_t e __attribute__((section("x"))) = handler;`) doesn't parse as an initializer at all, and
+            // the entry is kept by itself (a linker KEEP root) while the file around it may be pruned.
+            var inBlock = false;
+            var nameCol = node.EndPosition.Column;
+            for (var r = span.Value.Start; r <= span.Value.End && r - 1 < srcLines.Length; r++)
+            {
+                if (dead is not null && r < dead.Length && dead[r]) continue;
+                var line = srcLines[r - 1];
+                if (line.TrimStart().StartsWith('#')) continue;
+                var from = r == node.StartPosition.Row + 1 ? Math.Min(nameCol, line.Length) : 0;
+                foreach (var id in LineIdentifiers(StripNonCode(line[from..], ref inBlock)))
+                    if (id != gname) pendingRefs.Add((gid, id));
+            }
         }
 
         // Pass 2: #includes → file/header edges. Scanned from TEXT, not the parse tree: #include is a

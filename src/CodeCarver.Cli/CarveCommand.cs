@@ -29,6 +29,9 @@ public static class CarveCommand
     /// <summary>Saved beside a stage's carved/ folder, the output of building that tree: the next carve writes up its errors.</summary>
     public const string BuildOutputFile = "build-output.txt";
 
+    private static readonly System.Text.RegularExpressions.Regex Identifier =
+        new(@"[A-Za-z_]\w*", System.Text.RegularExpressions.RegexOptions.Compiled);
+
     public static int Run(string[] args, TextWriter @out, TextWriter err)
     {
         try { return RunCore(args, @out, err); }
@@ -279,6 +282,16 @@ public static class CarveCommand
         diag.Set("closedWorld", closedWorld);
         diag.Set("stageCount", cv.Stages.Count);
         diag.Event("args parsed");
+        // Phase timing, from here to the end: summary time.<phase>.ms (and stderr with CODECARVER_TIMING=1).
+        var _tsw = System.Diagnostics.Stopwatch.StartNew();
+        var _timing = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null;
+        void Mark(string phase)
+        {
+            if (_timing) err.WriteLine($"  timing  : {phase,-14} {_tsw.ElapsedMilliseconds,7} ms");
+            diag.Event($"phase {phase}: {_tsw.ElapsedMilliseconds} ms"); // breadcrumb for the diagnostic package
+            summary[$"time.{phase}.ms"] = _tsw.ElapsedMilliseconds;     // where a long run spends its time
+            _tsw.Restart();
+        }
 
         // Preprocessor config: explicit --define plus -D flags scraped from EVERY --build-log (parsed once here
         // and reused for include-dir resolution below). A named-but-missing log is a silent-config trap -> warn.
@@ -343,6 +356,7 @@ public static class CarveCommand
             }
             buildCmds = resolved;
         }
+        Mark("buildLogs");
         // Per-TU preprocessor config from the build log. A build can compile the SAME file in multiple configs;
         // unioning all TUs' -D and applying it globally would mark a macro "defined" for a file that was compiled
         // WITHOUT it, dropping the #else branch that TU really compiles (UNSOUND — eval-#9). Instead: resolve each
@@ -475,6 +489,7 @@ public static class CarveCommand
                 foreach (var n in MacroProbe.FlagDependentNames(probeBase)) probeBase.ForceUnknown(n);
             probeBase.Ambient = ambientMacros;
         }
+        Mark("defines");   // per-file define sets, compiler probe
         // Closed-world only when inputs that tell us the define set actually loaded (review PP4/BL3).
         closedWorld = probeBase is not null || buildCmds.Count > 0;
         var worldReason = closedWorld
@@ -623,6 +638,7 @@ public static class CarveCommand
         // Both populations skip the parser and are kept whole via include-closure.
         var skipParse = new HashSet<string>(bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)),
                                             StringComparer.Ordinal);
+        Mark("walk");   // the tree walk, file sizes, dense-header sampling
         // A build trace for EVERY selected build is the list of files a clean, full build opened. A code file none of
         // them opened is not part of the build, so it is never read or parsed: it stays a file in the graph, with no
         // definitions, and is dropped as dead code (on a 100 GB tree that is most of the read and parse time, and on a
@@ -709,6 +725,7 @@ public static class CarveCommand
             }
             if (cv.SkipFilesNotBuilt) summary["parse.filesNotBuiltSkipped"] = notBuilt.Count;
         }
+        Mark("buildTraces");
         if (perFileSpecs.Count > 0)
         {
             // D-B: translation units no compile command covers are resolved open-world; say how many.
@@ -770,6 +787,8 @@ public static class CarveCommand
         // from such a table (LLVM-style GenDisassemblerTables.inc) would otherwise be dropped and left dangling
         // once the emitter copies the include. Gather them (recursively) so the front-end keeps what they name.
         var refIncludes = new List<(string Rel, string Text)>();
+        // Directory listings shared by everything below that follows #includes (FileLookup).
+        var fileLookup = new CodeCarver.Core.Util.FileLookup();
         if (closureLang && lang is "c" or "cpp")
         {
             var rootFull = Path.GetFullPath(dir);
@@ -790,16 +809,17 @@ public static class CarveCommand
             // basename fallback (eval-#9 HIGH). An absolute 'directory' (the JSON-DB norm) is used as-is; a
             // relative or "." directory is taken under the carve root. Out-of-tree resolutions are dropped by
             // the in-tree check in TryCand below, falling back to the (sound, warning) basename search.
+            // Thousands of commands repeat the same -I list: each distinct directory is asked about once.
             var searchDirs = new List<string>();
+            var askedDirs = new HashSet<string>(StringComparer.Ordinal);
             foreach (var c in buildCmds)
             {
                 string baseDir;
                 try { baseDir = Path.IsPathFullyQualified(c.Directory) ? c.Directory : Path.GetFullPath(Path.Combine(dir, c.Directory)); }
                 catch { baseDir = Path.GetFullPath(dir); }
                 foreach (var incDir in c.Includes)
-                    try { var f = Path.GetFullPath(Path.Combine(baseDir, incDir)); if (Directory.Exists(f)) searchDirs.Add(f); } catch { }
+                    try { var f = Path.GetFullPath(Path.Combine(baseDir, incDir)); if (askedDirs.Add(f) && Directory.Exists(f)) searchDirs.Add(f); } catch { }
             }
-            searchDirs = searchDirs.Distinct().ToList();
 
             // Last-resort basename index of EVERY file in the tree (names only — cheap even on a huge tree),
             // built lazily on the first include that neither a sibling nor a -I dir resolves.
@@ -820,6 +840,7 @@ public static class CarveCommand
             }
 
             var unresolved = new HashSet<(string, string)>();
+            var refViaDirs = new Dictionary<string, List<string>>(StringComparer.Ordinal);
             // Stream the include scan too: the queue holds PATHS, not text — each includer is read, scanned, and
             // released before the next, so this phase also never holds the whole tree in memory. Seeds are the
             // parsed source files (skip/keep-whole files aren't scanned for includes, matching the prior behavior).
@@ -839,13 +860,13 @@ public static class CarveCommand
 
                     // Resolve in order: beside the includer, then each -I dir, then (last resort) by basename
                     // anywhere in the tree. Over-approximate: take every in-tree match (sound for building).
+                    // Existence comes from directory listings, and each name's -I search runs once.
                     var cands = new List<string>();
-                    void TryCand(string cand)
-                    {
-                        try { var f = Path.GetFullPath(cand); if (f.StartsWith(rootUnder, StringComparison.OrdinalIgnoreCase) && File.Exists(f)) cands.Add(f); } catch { }
-                    }
-                    TryCand(Path.Combine(fromDir, inc));
-                    foreach (var sd in searchDirs) TryCand(Path.Combine(sd, inc));
+                    if (fileLookup.Probe(fromDir, inc) is { } beside && beside.StartsWith(rootUnder, StringComparison.OrdinalIgnoreCase)) cands.Add(beside);
+                    if (!refViaDirs.TryGetValue(inc, out var viaDirs))
+                        refViaDirs[inc] = viaDirs = searchDirs.Select(sd => fileLookup.Probe(sd, inc))
+                            .OfType<string>().Where(f => f.StartsWith(rootUnder, StringComparison.OrdinalIgnoreCase)).ToList();
+                    cands.AddRange(viaDirs);
                     if (cands.Count == 0 && BaseIndex().TryGetValue(Path.GetFileName(inc), out var hits))
                     {
                         cands.AddRange(hits);
@@ -989,17 +1010,7 @@ public static class CarveCommand
                     : (incUnion, false);
             }
         }
-        // Opt-in phase timing (CODECARVER_TIMING=1) to stderr — used for the performance work.
-        var _tsw = System.Diagnostics.Stopwatch.StartNew();
-        var _timing = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null;
-        void Mark(string phase)
-        {
-            if (_timing) err.WriteLine($"  timing  : {phase,-14} {_tsw.ElapsedMilliseconds,7} ms");
-            diag.Event($"phase {phase}: {_tsw.ElapsedMilliseconds} ms"); // breadcrumb for the diagnostic package
-            summary[$"time.{phase}.ms"] = _tsw.ElapsedMilliseconds;     // where a long run spends its time
-            _tsw.Restart();
-        }
-        Mark("input+refscan"); // time spent gathering inputs + reference includes above
+        Mark("input+refscan"); // reference includes, unity-build .c detection, build scripts
 
         // Sign of life for a large tree so a multi-minute analyze isn't a silent black box (and you can see
         // how far it got if it's interrupted). CODECARVER_TIMING=1 adds a per-phase + slow-file breakdown.
@@ -1032,8 +1043,6 @@ public static class CarveCommand
                     + (etaSec < 0 ? "estimating..." : FormatEta(etaSec)));
             };
         }
-        // Directory listings shared by everything below that follows #includes (FileLookup).
-        var fileLookup = new CodeCarver.Core.Util.FileLookup();
         if (defines is not null && closedWorld && closureLang)
         {
             // pre-parse is often the longest phase on a product tree: say which part.
@@ -1045,7 +1054,8 @@ public static class CarveCommand
             var hash = CodeCarver.Core.Preprocess.SourceText.DirectiveStart;
             var defRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:define|undef)\s+([A-Za-z_]\w*)",
                 System.Text.RegularExpressions.RegexOptions.Multiline);
-            var condRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:if|ifdef|ifndef|elif)\b(.*(?:\\\r?\n.*)*)",
+            // The condition runs on over backslash-newline splices (`#if defined(A) && \` / `defined(B)`).
+            var condRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:if|ifdef|ifndef|elif)\b((?:\\\r?\n|[^\r\n])*)",
                 System.Text.RegularExpressions.RegexOptions.Multiline);
             var identRe = new System.Text.RegularExpressions.Regex(@"[A-Za-z_]\w*");
             var condIdents = new HashSet<string>(StringComparer.Ordinal);
@@ -1390,6 +1400,12 @@ public static class CarveCommand
                     systemDirs.Add(Path.TrimEndingDirectorySeparator(tc) + Path.DirectorySeparatorChar);
             }
             catch { /* best effort */ }
+        // A workspace can live under one of those (a CI agent's work dir under ProgramData or /opt, a toolchain
+        // checked in beside the code): that one is the product, not the system.
+        {
+            var rootFwd = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)).Replace('\\', '/') + "/";
+            systemDirs.RemoveAll(sd => rootFwd.StartsWith(sd.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase));
+        }
         bool IsSystemPath(string full)
         {
             var fwd = full.Replace('\\', '/');
@@ -1420,7 +1436,8 @@ public static class CarveCommand
                         string full;
                         try { full = Path.IsPathFullyQualified(cand) ? Path.GetFullPath(cand) : Path.GetFullPath(Path.Combine(rootFull, cand)); }
                         catch { continue; } // not a usable path token (noise)
-                        if (full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) && File.Exists(full))
+                        // A trace names every path the build touched, many times over: existence from directory listings.
+                        if (full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) && fileLookup.Exists(full))
                         {
                             var obs = Path.GetRelativePath(rootFull, full).Replace('\\', '/');
                             observedRel.Add(obs);
@@ -1430,7 +1447,7 @@ public static class CarveCommand
                         }
                         if (Path.IsPathRooted(cand) && absoluteMisses.Count < 400) absoluteMisses.Add(cand);
                         if (!exts.Concat(tuExts).Any(e => cand.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue;
-                        if (full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) || !File.Exists(full)) continue;
+                        if (full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) || !fileLookup.Exists(full)) continue;
                         if (IsSystemPath(full)) continue;
                         if (tuExts.Any(e => full.EndsWith(e, StringComparison.OrdinalIgnoreCase))) externalTu++; else externalHeaders++;
                     }
@@ -1500,12 +1517,16 @@ public static class CarveCommand
                 catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { }
             }
             outsideCode.AddRange(buildTraceFull);
+            summary["roots.includedFromOutside"] = 0;
             if (outsideCode.Count > 0)
             {
                 var extSw = System.Diagnostics.Stopwatch.StartNew();
-                var ext = ExternalIncluders.Find(outsideCode, logIncDirs, rootFullX, fullByRel.Keys, IsSystemPath, SafeRead, fileLookup);
+                var ext = ExternalIncluders.Find(outsideCode, logIncDirs, rootFullX, fullByRel.Keys, IsSystemPath, p => File.ReadLines(p), fileLookup);
                 summary["time.outsideIncludes.ms"] = extSw.ElapsedMilliseconds;
                 summary["outsideIncludes.filesRead"] = ext.FilesScanned;
+                summary["outsideIncludes.capped"] = ext.Capped;
+                if (ext.Capped)
+                    err.WriteLine($"  warn    : stopped following outside #includes after {ext.FilesScanned:N0} file(s) — headers outside code includes past that may be missed");
                 var traced = cv.EveryBuildTraced && buildFileTraces.Count > 0;
                 foreach (var h in ext.Headers)
                     if (fullByRel.ContainsKey(h) && !Excluded(fullByRel[h]) && (!traced || buildObservedRel.Contains(h)))
@@ -1519,24 +1540,31 @@ public static class CarveCommand
         var outsideRoots = includedFromOutside.Count == 0 ? new List<Root>()
             : graph.Nodes.Where(n => n.FilePath is { } fp && includedFromOutside.Contains(fp))
                    .Select(n => new Root(n.Id, RootKind.Exported, "included from outside the carve root")).ToList();
+        if (lang is "c" or "cpp") summary["roots.namedFromOutsideHeaders"] = 0;
         if (includedFromOutside.Count > 0)
         {
-            // Outside code reaches module functions through these headers: prototypes it calls, macros that expand
-            // to calls. A prototype is no graph node, and a header too big or macro-dense to parse has none at all,
-            // so every function the header's text names is rooted (sound: one named only in a comment is kept too).
-            var fnByName = graph.Nodes.Where(n => n.Kind == NodeKind.Function).ToLookup(n => n.Name, StringComparer.Ordinal);
+            // Outside code reaches module functions and data through these headers: prototypes it calls, extern
+            // objects it reads, macros that expand to either. A declaration is no graph node, and a header too big or
+            // macro-dense to parse has none at all, so everything with linkage the header's text names is rooted
+            // (sound: one named only in a comment is kept too). A file-local static function can't be what it means.
+            var byName = graph.Nodes.Where(n => n.Kind is NodeKind.Function or NodeKind.Global && (n.Flags & NodeFlags.FileLocal) == 0)
+                              .ToLookup(n => n.Name, StringComparer.Ordinal);
+            var hashes = byName.Select(g => string.GetHashCode(g.Key.AsSpan())).ToHashSet();
             var named = new HashSet<string>(StringComparer.Ordinal);
-            var ident = new System.Text.RegularExpressions.Regex(@"[A-Za-z_]\w*");
             foreach (var h in includedFromOutside)
                 try
                 {
+                    // Generated register headers run to millions of identifiers: a string only for a likely name.
                     foreach (var line in File.ReadLines(fullByRel[h]))
-                        foreach (System.Text.RegularExpressions.Match m in ident.Matches(line))
-                            if (fnByName.Contains(m.Value)) named.Add(m.Value);
+                        foreach (var m in Identifier.EnumerateMatches(line))
+                        {
+                            var span = line.AsSpan(m.Index, m.Length);
+                            if (hashes.Contains(string.GetHashCode(span)) && span.ToString() is var name && byName.Contains(name)) named.Add(name);
+                        }
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
             foreach (var name in named)
-                foreach (var n in fnByName[name])
+                foreach (var n in byName[name])
                     outsideRoots.Add(new Root(n.Id, RootKind.Exported, "named in a header code outside the carve root includes"));
             summary["roots.namedFromOutsideHeaders"] = named.Count;
         }

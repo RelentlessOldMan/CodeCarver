@@ -41,6 +41,20 @@ public sealed class MacroWorldTests
         AssertFeatKept(t, t.Carve());
     }
 
+    /// <summary>The macro is tested only on a continuation line of the #if.</summary>
+    [Fact]
+    public void HeaderOutsideTheRoot_MacroTestedOnAContinuationLine()
+    {
+        using var t = new TreeCarve()
+            .W("main.c", "#include \"cfg.h\"\nvoid feat(void); void plain(void);\nint main(void){\n#if defined(OTHER) || \\\n    defined(FEAT)\n  feat();\n#else\n  plain();\n#endif\n  return 0;\n}\n")
+            .W("feat.c", "void feat(void){}\n")
+            .W("plain.c", "void plain(void){}\n");
+        t.WOut("sdk/inc/cfg.h", "#define FEAT 1\n");
+        var inc = "-I" + t.Outside("sdk/inc");
+        t.Compile("main.c", inc).Compile("feat.c", inc).Compile("plain.c", inc);
+        AssertFeatKept(t, t.Carve());
+    }
+
     [Fact]
     public void HeaderOutsideTheRoot_NestedInclude()
     {

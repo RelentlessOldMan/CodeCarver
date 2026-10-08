@@ -378,12 +378,27 @@ public static class BuildLogScraper
             // embedded builds for toolchain / CMSIS / HAL headers. They take the dir as the NEXT token. Feeding
             // these to include resolution matters -- a non-sibling .inc reached via -isystem otherwise falls to
             // the (over-approximate, warning) basename fallback.
-            else if (a is "-isystem" or "-iquote" or "-idirafter") { if (i + 1 < args.Count) includes.Add(args[++i]); }
+            else if (a is "-isystem" or "-iquote" or "-idirafter" or "-isystem-after" or "--include-directory" or "--include-directory-after")
+            { if (i + 1 < args.Count) includes.Add(args[++i]); }
+            else if (JoinedIncludeDir(a) is { } joined) includes.Add(joined);
             else if (Flag(a, 'I')) includes.Add(a[2..]);
         }
         var defines = eff.Select(kv => kv.Value is null ? kv.Key : $"{kv.Key}={kv.Value}").ToList();
         return (defines, includes, forced);
     }
+
+    /// <summary>The dir of an include flag written joined: <c>-isystemDIR</c>, <c>-iquoteDIR</c>, <c>-idirafterDIR</c>,
+    /// <c>--include-directory=DIR</c>, and other vendors' <c>--include_path=DIR</c> / <c>--sys_include=DIR</c>.</summary>
+    private static string? JoinedIncludeDir(string a)
+    {
+        foreach (var p in JoinedIncludePrefixes)
+            if (a.Length > p.Length && a.StartsWith(p, StringComparison.Ordinal)) return a[p.Length..];
+        return null;
+    }
+
+    private static readonly string[] JoinedIncludePrefixes =
+        { "--include-directory-after=", "--include-directory=", "--include_path=", "--sys_include=",
+          "-isystem", "-iquote", "-idirafter" };
 
     private static bool IsCompiler(string token)
     {

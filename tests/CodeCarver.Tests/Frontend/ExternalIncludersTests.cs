@@ -33,13 +33,45 @@ public sealed class ExternalIncludersTests
                                      + (i == 1234 ? "#include \"pub/mod_api.h\"\n" : "") + "int x;\n");
                 files.Add(f);
             }
+            var lookup = new CodeCarver.Core.Util.FileLookup();
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var r = ExternalIncluders.Find(files, dirs, root, new[] { "pub/mod_api.h" }, _ => false, File.ReadAllText);
+            var r = ExternalIncluders.Find(files, dirs, root, new[] { "pub/mod_api.h" }, _ => false, File.ReadLines, lookup);
             sw.Stop();
             Assert.Equal(new[] { "pub/mod_api.h" }, r.Headers);
-            Assert.Equal(3000 + 3000, r.FilesScanned);
-            // Probing each (dir, name) with File.Exists took 13 s here on Windows; from directory listings, under 1 s.
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"took {sw.Elapsed}");
+            Assert.Equal(3000 + 3000 + 1, r.FilesScanned);   // and the root header, followed for what it includes
+            // Every directory is listed once, whatever the number of (dir, name) probes: 300 -I dirs and the pub/ each
+            // could hold, 30 glue dirs, the root and its pub/. Probing each pair with File.Exists took 13 s here on
+            // Windows; this, under 1 s.
+            Assert.True(lookup.DirectoriesListed <= 2 * 301 + 30 + 2, $"listed {lookup.DirectoriesListed}");
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), $"took {sw.Elapsed}");
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
+    /// <summary>The cap counts code files followed, not every path a trace lists (objects, libraries, tools), and
+    /// reaching it is reported: a capped scan may have missed headers.</summary>
+    [Fact]
+    public void Cap_CountsCodeFilesOnly_AndIsReported()
+    {
+        var work = Path.Combine(Path.GetTempPath(), "cc-ext-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var root = Path.Combine(work, "mod");
+            Directory.CreateDirectory(Path.Combine(root, "pub"));
+            File.WriteAllText(Path.Combine(root, "pub", "mod_api.h"), "int mod_api(void);\n");
+            var glue = Path.Combine(work, "glue");
+            Directory.CreateDirectory(glue);
+            var files = Enumerable.Range(0, 50).Select(i => Path.Combine(glue, $"o{i}.o")).ToList();
+            foreach (var f in files) File.WriteAllText(f, "");
+            File.WriteAllText(Path.Combine(glue, "g.c"), "#include \"pub/mod_api.h\"\n");
+            files.Add(Path.Combine(glue, "g.c"));
+            var r = ExternalIncluders.Find(files, new[] { root }, root, new[] { "pub/mod_api.h" }, _ => false, File.ReadLines, maxFiles: 10);
+            Assert.Equal(new[] { "pub/mod_api.h" }, r.Headers);
+            Assert.False(r.Capped);
+            var many = Enumerable.Range(0, 20).Select(i => Path.Combine(glue, $"c{i}.c")).ToList();
+            foreach (var f in many) File.WriteAllText(f, "int x;\n");
+            r = ExternalIncluders.Find(many.Append(Path.Combine(glue, "g.c")), new[] { root }, root, new[] { "pub/mod_api.h" }, _ => false, File.ReadLines, maxFiles: 10);
+            Assert.True(r.Capped);
         }
         finally { try { Directory.Delete(work, true); } catch { } }
     }
