@@ -48,7 +48,7 @@ The build/run traces here are tiny hand-written samples; on a real project you c
   dropped : debug.c
   world   : closed-world (dead #ifdef branches dropped) - have 5 compile command(s); ...
   stage   : safe  [source-contents=whole, header-contents=whole]
-  verify  : OK - emitted code uses no function or variable defined only in a dropped file (7 file(s) checked)
+  verify  : OK - emitted code uses no function or variable defined only in a dropped file (8 file(s) checked)
   size    : 2,761 B -> 2,567 B  (7% smaller, saved 194 B)
   stage   : aggressive  [source-contents=carved, header-contents=whole]
   size    : 2,761 B -> 2,300 B  (17% smaller, saved 461 B)

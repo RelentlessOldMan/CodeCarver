@@ -459,11 +459,20 @@ also through `-Wl,` or `-Xlinker`, and a linker script's `ENTRY`/`EXTERN`/`PROVI
 macros and link flags come from the build logs and from the tree's own build scripts (makefiles, shell scripts,
 CMake files, linker scripts), so a carve without a build log still sees them. At a `carveSourceFileContents` stage, a
 function **pruned from a kept file** that emitted code still uses fails too, with cause `prunedFromKeptFile`.
+Variables are checked where they are defined in a `.c`/`.cpp` file; a definition inside a header is not.
+
+**Before** it reports, each stage closes over what verify finds: a definition the emitted code uses but the plan
+left out (the graph missed that use) is kept, and the stage is emitted again from the larger plan, until nothing is
+missing (at most 8 rounds). What that added is counted by cause as `<stage>.verify.keptByCheck.<cause>` and listed
+as `KEPT` lines in `verify.txt`, so the gap stays visible while the carved tree links. Not kept this way: a name
+defined only in a header (a header compiles only where it is included) or only in files the build never compiled.
+Whatever is still missing after that fails as below.
 
 Each failure also gets a **cause**, counted in `summary.txt` as `verify.failed.<cause>` (numbers only, safe to
 send back) and named per failure in `verify.txt`: `definitionNotRecognized` (the dropped file's definition never
 became part of the graph: an unusual definition shape), `definitionFileLocal` (only a file-scope `static`),
 `useNotModelled` / `useInHeaderNotModelled` (the definition is known but the use was not captured),
+`useInUnparsedFile` (the use is in a file kept whole without parsing),
 `useInUnreachedCode` (only code the carve did not reach uses it), `definedInFileNotBuilt` (only in files a build
 trace never opened, with no build log to check the trace), `prunedFromKeptFile`, or `other`.
 

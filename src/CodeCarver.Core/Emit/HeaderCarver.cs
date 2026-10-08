@@ -60,6 +60,7 @@ public static class HeaderCarver
             {
                 AddIdentifiers(needed, line);
                 pastes.Learn(line, fragments);
+                pastes.LearnObject(line);
             }
         }
         // A paste macro's own call sites name the pieces (`CAT(UART, 2)` builds UART2): learned macros first,
@@ -102,6 +103,7 @@ public static class HeaderCarver
                     var n = fragments.Count;
                     if (kind == LineKind.Define) pastes.Learn(text, fragments);
                     pastes.AddCallArguments(text, fragments);
+                    if (kind == LineKind.Define && name is not null) pastes.ExpandDefine(name, text, fragments);
                     grew |= fragments.Count != n;
                 }
         }
@@ -136,11 +138,11 @@ public static class HeaderCarver
     {
         using var r = new StreamReader(path, Encoding.Latin1);
         string? line;
-        var inComment = false;
+        var inComment = Comment.None;
         while ((line = r.ReadLine()) is not null)
         {
             var t = line.TrimStart();
-            var commented = inComment;   // a #define inside a block comment is comment text
+            var commented = inComment != Comment.None;   // a #define inside a comment is comment text
             var isDefine = !commented && IsDefineDirective(t);
             var isCond = !commented && !isDefine && IsConditionalDirective(t);
             inComment = CommentOpenAfter(line, inComment);
@@ -154,17 +156,20 @@ public static class HeaderCarver
             var full = sb.ToString();
             // A define that leaves a comment open is kept whatever it names (the rewrite can't cut the comment):
             // read it as plain text, so what it names counts.
-            yield return isDefine && !inComment ? (DefineName(full), full, LineKind.Define)
+            yield return isDefine && inComment == Comment.None ? (DefineName(full), full, LineKind.Define)
                  : isCond ? (null, full, LineKind.Conditional)
                  : (null, full, LineKind.Other);
         }
     }
 
-    /// <summary>A file's lines with backslash-continuations joined, streamed.</summary>
+    /// <summary>A file's lines with backslash-continuations joined, streamed. Latin-1, or what a byte-order mark says
+    /// (a UTF-16 source an MSVC-style toolchain compiles).</summary>
     private static IEnumerable<string> LogicalLines(string path)
     {
         var sb = new StringBuilder();
-        foreach (var line in File.ReadLines(path, Encoding.Latin1))
+        using var r = new StreamReader(path, Encoding.Latin1, detectEncodingFromByteOrderMarks: true);
+        string? line;
+        while ((line = r.ReadLine()) is not null)
         {
             if (EndsWithContinuation(line)) { sb.Append(line).Append('\n'); continue; }
             if (sb.Length == 0) { yield return line; continue; }
@@ -175,10 +180,13 @@ public static class HeaderCarver
         if (sb.Length > 0) yield return sb.ToString();
     }
 
-    /// <summary>Is a block comment open after <paramref name="line"/>, given whether one was open before it?
-    /// String and character literals and line comments open nothing.</summary>
-    private static bool CommentOpenAfter(string line, bool inBlock)
+    /// <summary>Is a comment open after <paramref name="line"/>, given whether one was open before it? A block
+    /// comment, or a line comment ending in a backslash: the splice makes the next line comment text too
+    /// (<c>// path: C:\vendor\regs\</c>). String and character literals open nothing.</summary>
+    private static Comment CommentOpenAfter(string line, Comment open)
     {
+        if (open == Comment.Line) return EndsWithContinuation(line) ? Comment.Line : Comment.None;   // all comment text
+        var inBlock = open == Comment.Block;
         var quote = '\0';
         for (var c = 0; c < line.Length; c++)
         {
@@ -186,25 +194,29 @@ public static class HeaderCarver
             if (inBlock) { if (ch == '*' && c + 1 < line.Length && line[c + 1] == '/') { inBlock = false; c++; } }
             else if (quote != '\0') { if (ch == '\\') c++; else if (ch == quote) quote = '\0'; }
             else if (ch is '"' or '\'') quote = ch;
-            else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '/') break;
+            else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '/') return EndsWithContinuation(line) ? Comment.Line : Comment.None;
             else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '*') { inBlock = true; c++; }
         }
-        return inBlock;
+        return inBlock ? Comment.Block : Comment.None;
     }
 
+    /// <summary>What comment is open at a line's end: none, a block comment, or a line comment a backslash continues.</summary>
+    private enum Comment { None, Block, Line }
+
     /// <summary>Copy <paramref name="src"/> to <paramref name="dst"/>, omitting #defines the predicate rejects.
-    /// Byte-transparent (Latin-1) and every kept line keeps its own line ending (review E1). A line inside a block
-    /// comment is text, and a define that leaves a comment open is kept: dropping it would cut the comment.</summary>
+    /// Byte-transparent (Latin-1) and every kept line keeps its own line ending (review E1). A line inside a comment
+    /// (a block comment, or a line comment a trailing backslash continues) is text, and a define that leaves a
+    /// comment open is kept: dropping it would cut the comment, or splice the next line into one.</summary>
     private static void RewriteDroppingUnneeded(string src, string dst, Func<string, bool> wanted, ref int kept, ref int dropped)
     {
         using var w = new StreamWriter(dst, false, Encoding.Latin1);
         using var e = ReadLinesWithEol(src).GetEnumerator();
-        var inComment = false;
+        var inComment = Comment.None;
         var define = new List<(string Line, string Eol)>();
         while (e.MoveNext())
         {
             var (line, eol) = e.Current;
-            if (!inComment && IsDefineDirective(line.TrimStart()))
+            if (inComment == Comment.None && IsDefineDirective(line.TrimStart()))
             {
                 // Read the whole (possibly multi-line) define, then decide.
                 define.Clear();
@@ -218,7 +230,7 @@ public static class HeaderCarver
                     inComment = CommentOpenAfter(cont, inComment);
                 }
                 var name = DefineName(line);
-                var drop = name is not null && !inComment && !wanted(name);
+                var drop = name is not null && inComment == Comment.None && !wanted(name);
                 if (drop) { dropped++; continue; }
                 kept++;
                 foreach (var (l, el) in define) { w.Write(l); w.Write(el); }
@@ -251,7 +263,8 @@ public static class HeaderCarver
         if (sb.Length > 0) yield return (sb.ToString(), "");
     }
 
-    /// <summary>A NUL byte in the first 8 KB: treat as binary (no identifiers to seed from).</summary>
+    /// <summary>A NUL byte in the first 8 KB: treat as binary (no identifiers to seed from). UTF-16/32 text with a
+    /// byte-order mark is full of NULs but is text: <see cref="LogicalLines"/> decodes it by its mark.</summary>
     private static bool LooksBinary(string path)
     {
         try
@@ -259,6 +272,8 @@ public static class HeaderCarver
             using var fs = File.OpenRead(path);
             var buf = new byte[8192];
             var n = fs.Read(buf, 0, buf.Length);
+            if (n >= 2 && ((buf[0] == 0xFF && buf[1] == 0xFE) || (buf[0] == 0xFE && buf[1] == 0xFF))) return false;
+            if (n >= 4 && buf[0] == 0 && buf[1] == 0 && buf[2] == 0xFE && buf[3] == 0xFF) return false;
             return Array.IndexOf(buf, (byte)0, 0, n) >= 0;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return true; }
@@ -305,9 +320,10 @@ public static class HeaderCarver
 
     /// <summary>
     /// The identifier pieces next to each <c>##</c> paste (<c>REG_ ## n ## _BASE</c> → "REG_", "n", "_BASE"),
-    /// spaces around the <c>##</c> allowed.
+    /// spaces around the <c>##</c> allowed. <c>AfterComma</c>: the piece follows <c>, ##</c> — GNU's
+    /// <c>, ##__VA_ARGS__</c>, which deletes the comma for an empty argument list and pastes nothing.
     /// </summary>
-    private static IEnumerable<(string Piece, bool Pasted)> PastePieces(string text)
+    private static IEnumerable<(string Piece, bool AfterComma)> PastePieces(string text)
     {
         var i = text.IndexOf("##", StringComparison.Ordinal);
         while (i >= 0)
@@ -316,12 +332,12 @@ public static class HeaderCarver
             while (e > 0 && text[e - 1] is ' ' or '\t') e--;
             var b = e;
             while (b > 0 && IsIdentChar(text[b - 1])) b--;
-            if (e > b && IsIdentStart(text[b])) yield return (text[b..e], true);
+            if (e > b && IsIdentStart(text[b])) yield return (text[b..e], false);
             var s = i + 2;
             while (s < text.Length && text[s] is ' ' or '\t') s++;
             var j = s;
             while (j < text.Length && IsIdentChar(text[j])) j++;
-            if (j > s) yield return (text[s..j], true);
+            if (j > s) yield return (text[s..j], e > 0 && text[e - 1] == ',');
             i = text.IndexOf("##", i + 2, StringComparison.Ordinal);
         }
     }
@@ -343,7 +359,7 @@ public static class HeaderCarver
         public void Learn(string text, HashSet<string>? literals)
         {
             if (!text.Contains('#')) return;
-            var (name, parms, body) = FunctionLike(text);
+            var (name, parms, body, variadic) = FunctionLike(text);
             if (name is null)
             {
                 if (literals is not null && text.Contains("##", StringComparison.Ordinal))
@@ -351,8 +367,9 @@ public static class HeaderCarver
                 return;
             }
             var pastesParam = false;
-            foreach (var (piece, _) in PastePieces(body))
-                if (parms.Contains(piece)) pastesParam = true;
+            foreach (var (piece, afterComma) in PastePieces(body))
+                if (afterComma && piece == variadic) continue;   // `, ##__VA_ARGS__` (a logging macro) builds no name
+                else if (parms.Contains(piece)) pastesParam = true;
                 else literals?.Add(piece);
             if (pastesParam) { if (pasters.Add(name)) Propagate(); return; }
             if (parms.Count > 0 && body.Contains('('))
@@ -367,7 +384,7 @@ public static class HeaderCarver
         public void AddCallArguments(string text, HashSet<string> fragments)
         {
             if (pasters.Count == 0) return;
-            var (_, parms, _) = FunctionLike(text);
+            var (_, parms, _, _) = FunctionLike(text);
             var i = 0;
             while (i < text.Length)
             {
@@ -387,8 +404,43 @@ public static class HeaderCarver
                 }
                 var args = new HashSet<string>(StringComparer.Ordinal);
                 AddIdentifiers(args, text[(p + 1)..Math.Min(a, text.Length)]);
-                foreach (var id in args) if (!parms.Contains(id)) fragments.Add(id);
+                foreach (var id in args)
+                    if (!parms.Contains(id)) { fragments.Add(id); Expand(id, fragments); }
             }
+        }
+
+        // Object-like defines of the kept files (name -> body), and the argument names whose expansion counts.
+        private readonly Dictionary<string, string> objects = new(StringComparer.Ordinal);
+        private readonly HashSet<string> expanded = new(StringComparer.Ordinal);
+
+        /// <summary>Remember an object-like define of a kept file: a paste argument naming it may expand to it.</summary>
+        public void LearnObject(string text)
+        {
+            if (!text.Contains("define", StringComparison.Ordinal)) return;
+            if (ObjectBody(text, out var name) is { } body && name is not null && body.Length <= 512) objects[name] = body;
+        }
+
+        /// <summary>
+        /// An argument passed through a forwarding macro is macro-expanded before the paste:
+        /// <c>CAT(UART_PREFIX, UART_NUM)</c> with <c>#define UART_PREFIX USART</c> builds USART2. So what an argument
+        /// that is an object-like macro expands to (recursively) is a fragment too. Bodies in the kept files resolve
+        /// here; one in a carved header resolves when the fixpoint reads it (<see cref="ExpandDefine"/>).
+        /// </summary>
+        private void Expand(string id, HashSet<string> fragments)
+        {
+            if (!expanded.Add(id) || !objects.TryGetValue(id, out var body)) return;
+            var ids = new HashSet<string>(StringComparer.Ordinal);
+            AddIdentifiers(ids, body);
+            foreach (var b in ids) { fragments.Add(b); Expand(b, fragments); }
+        }
+
+        /// <summary>A carved header's define for an argument name passed to a paster: its expansion is a fragment.</summary>
+        public void ExpandDefine(string name, string text, HashSet<string> fragments)
+        {
+            if (!expanded.Contains(name) || ObjectBody(text, out _) is not { } body) return;
+            var ids = new HashSet<string>(StringComparer.Ordinal);
+            AddIdentifiers(ids, body);
+            foreach (var b in ids) { fragments.Add(b); Expand(b, fragments); }
         }
 
         private bool CallsPaster(string body)
@@ -409,9 +461,11 @@ public static class HeaderCarver
         }
 
         /// <summary>Name, parameters and body of a function-like <c>#define NAME(params) body</c>, or a null name.</summary>
-        private static (string? Name, HashSet<string> Params, string Body) FunctionLike(string text)
+        /// <summary>Name, parameters, body and variadic parameter (<c>__VA_ARGS__</c>, or <c>args</c> for GNU's
+        /// <c>args...</c>; null when not variadic) of a function-like <c>#define NAME(params) body</c>, or a null name.</summary>
+        private static (string? Name, HashSet<string> Params, string Body, string? Variadic) FunctionLike(string text)
         {
-            var none = (default(string), new HashSet<string>(), "");
+            var none = (default(string), new HashSet<string>(), "", default(string));
             if (!IsDefineDirective(text.TrimStart())) return none;
             var name = DefineName(text);
             if (name is null) return none;
@@ -419,10 +473,25 @@ public static class HeaderCarver
             if (at >= text.Length || text[at] != '(') return none;   // object-like
             var close = text.IndexOf(')', at);
             if (close < 0) return none;
-            var parms = text[(at + 1)..close].Split(',').Select(p => p.Trim()).Where(p => p.Length > 0)
-                            .Select(p => p == "..." ? "__VA_ARGS__" : p.TrimEnd('.').Trim()).ToHashSet(StringComparer.Ordinal);
+            var list = text[(at + 1)..close].Split(',').Select(p => p.Trim()).Where(p => p.Length > 0).ToList();
+            string? variadic = list.Count > 0 && list[^1].EndsWith("...", StringComparison.Ordinal)
+                ? (list[^1] == "..." ? "__VA_ARGS__" : list[^1].TrimEnd('.').Trim()) : null;
+            var parms = list.Select(p => p == "..." ? "__VA_ARGS__" : p.TrimEnd('.').Trim()).ToHashSet(StringComparer.Ordinal);
             parms.Add("__VA_ARGS__");
-            return (name, parms, text[(close + 1)..]);
+            return (name, parms, text[(close + 1)..], variadic);
+        }
+
+        /// <summary>The body of an object-like <c>#define NAME body</c>, or null.</summary>
+        public static string? ObjectBody(string text, out string? name)
+        {
+            name = null;
+            if (!IsDefineDirective(text.TrimStart())) return null;
+            var n = DefineName(text);
+            if (n is null) return null;
+            var at = text.IndexOf(n, text.IndexOf("define", StringComparison.Ordinal) + 6, StringComparison.Ordinal) + n.Length;
+            if (at < text.Length && text[at] == '(') return null;   // function-like
+            name = n;
+            return text[at..];
         }
     }
 

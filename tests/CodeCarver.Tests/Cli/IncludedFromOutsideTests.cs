@@ -243,6 +243,42 @@ public sealed class IncludedFromOutsideTests
         Assert.True(t.Kept("api/pub/modg_api.h"), e);
     }
 
+    /// <summary>An outside compile force-includes a module header (`-include`): no #include names it, yet the outside
+    /// code is compiled against it. Spelled with its path, and by name through the -I list.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ForcedIncludeOfAModuleHeader_IsKeptWhole(bool fullPath)
+    {
+        using var t = Module();
+        t.WOut("glue/glue.c", "int glue(void){ return MODG_LIMIT; }\n");
+        t.Compile("main.c");
+        Glue(t, fullPath ? $"-include {t.S("api/pub/modg_api.h")}" : $"-I{t.S("api/pub")} -include modg_api.h");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("api/pub/modg_api.h"), e);
+        Assert.Contains("roots.includedFromOutside = 1", t.Summary);
+    }
+
+    /// <summary>A root under a system dir (/usr/src/app, a CI work dir under ProgramData) exempts only itself: the
+    /// rest of that system dir is still the system, and a toolchain inside the root is still a toolchain. Before, the
+    /// whole system dir stopped counting, and glibc's headers became "outside product code".</summary>
+    [Fact]
+    public void SystemDirHoldingTheRoot_ExemptsOnlyTheRoot()
+    {
+        var isSystem = CodeCarver.Cli.CarveCommand.SystemPathTest(new[] { "/usr/", "/opt/", "/usr/src/app/tools/gcc/" }, "/usr/src/app");
+        Assert.False(isSystem("/usr/src/app/drv/uart.h"));
+        Assert.True(isSystem("/usr/include/stdio.h"));
+        Assert.True(isSystem("/usr/src/app2/x.h"));                 // a sibling, not under the root
+        Assert.True(isSystem("/opt/sdk/inc/sdk.h"));
+        Assert.True(isSystem("/usr/src/app/tools/gcc/include/stddef.h"));
+        Assert.False(isSystem("/home/build/glue/glue.c"));
+        // A root at a file-system root holds the system dirs, it isn't held by them: they stay the system.
+        isSystem = CodeCarver.Cli.CarveCommand.SystemPathTest(new[] { "/usr/" }, "/");
+        Assert.True(isSystem("/usr/include/stdio.h"));
+        Assert.False(isSystem("/srv/glue/glue.c"));
+    }
+
     [Fact]
     public void NoOutsideCode_ReportsZero()
     {

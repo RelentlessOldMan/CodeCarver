@@ -8,22 +8,34 @@ namespace CodeCarver.Core.Util;
 public sealed class FileLookup
 {
     private readonly Dictionary<string, HashSet<string>> listings = new(PathComparer.Default);
+    // Directories that couldn't be listed (a network or permission error): asked about file by file from then on.
+    private readonly HashSet<string> unlistable = new(PathComparer.Default);
+    private readonly Func<string, IEnumerable<string>> enumerate;
 
-    /// <summary>Directories whose listing was read (each once).</summary>
+    /// <param name="enumerate">A directory's files (full paths); <see cref="Directory.EnumerateFiles(string)"/> unless a
+    /// test stands in for an unreachable share.</param>
+    public FileLookup(Func<string, IEnumerable<string>>? enumerate = null) => this.enumerate = enumerate ?? Directory.EnumerateFiles;
+
+    /// <summary>Directories looked up (each once): listed, or found absent (an empty listing).</summary>
     public int DirectoriesListed { get; private set; }
 
-    /// <summary>The directory's file names; null when it couldn't be listed (a network or permission error), which is
-    /// not remembered: a hiccup must not make every file there "missing" for the rest of the run.</summary>
+    /// <summary>The directory's file names; null when it couldn't be listed (a network or permission error). That is
+    /// remembered as "ask per file", never as "empty": a hiccup must not make every file there "missing", and a dead
+    /// share must not cost one more listing attempt (a network timeout) per probe.</summary>
     private HashSet<string>? Listing(string dir)
     {
         if (listings.TryGetValue(dir, out var names)) return names;
+        if (unlistable.Contains(dir)) return null;
         names = new HashSet<string>(PathComparer.Default);
-        try { foreach (var f in Directory.EnumerateFiles(dir)) names.Add(Path.GetFileName(f)); }
+        try { foreach (var f in enumerate(dir)) names.Add(Path.GetFileName(f)); }
         catch (Exception ex) when (ex is DirectoryNotFoundException or ArgumentException) { names.Clear(); }   // truly absent
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { unlistable.Add(dir); return null; }
         DirectoriesListed++;
         return listings[dir] = names;
     }
+
+    /// <summary>Directories that couldn't be listed; their files are checked one by one.</summary>
+    public int DirectoriesUnlistable => unlistable.Count;
 
     /// <summary>True when <paramref name="full"/> (a full path) is an existing file.</summary>
     public bool Exists(string full)

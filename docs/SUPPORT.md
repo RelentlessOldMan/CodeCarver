@@ -19,8 +19,8 @@ On a successful carve it also says where the carve could get tighter and where t
 `header`: included by kept code; `reached`: called or referenced from a root), `keep.bytes.largest10Percent` is the
 share of kept bytes in the ten largest kept files, and `time.<phase>.ms` is each phase's time, in run order from
 the start: `buildLogs`, `defines` (per-file define sets, compiler probe), `walk` (the tree walk and file sizes),
-`buildTraces`, `input+refscan`, `pre-parse`, `build-graph`, `roots`, `reachability`, `precision`, `emit`. Those
-add up to the run. A key with a further dot inside (`time.pre-parse.<part>.ms`, `time.build-graph.<part>.ms`,
+`buildTraces`, `input+refscan`, `pre-parse`, `build-graph`, `roots`, `reachability`, `precision`, then `emit` (a
+carve) or `analyze` (an analysis-only run, which writes no tree). Those add up to the run. A key with a further dot inside (`time.pre-parse.<part>.ms`, `time.build-graph.<part>.ms`,
 `time.outsideIncludes.ms`, which is part of `roots`) is part of a phase, not added to it.
 `time.pre-parse.<part>.ms` splits the macro scan before parsing: `treeMacros` (the tree's own files),
 `outsideHeaders` (headers the build reads outside the root), `quotedIncludes` (following `#include "..."` out of the
@@ -149,7 +149,10 @@ use `--why` then.
 Every C/C++ carve checks the tree it **emitted**, with its own tokenizer and without using the carve's graph:
 if emitted code uses a function or file-scope variable that only a **dropped** file defines, the tree would not link, the `verify`
 line says `FAILED` with the name and where it is used, and the run exits **3** so it can gate CI. A use on
-an `#ifdef`-dead line is a note, not a failure. The full list is in `codecarver/verify.txt`. `verify` cannot see
+an `#ifdef`-dead line is a note, not a failure. Variables are checked where a `.c`/`.cpp` file defines them, not in
+headers. Before it reports, a stage keeps what the check finds used but left out of a source file and emits again
+(`closure : N use(s) the graph missed ...`); those are counted as `<stage>.verify.keptByCheck.<cause>` and listed as
+`KEPT` lines. They are worth sending: each is a use the carve's graph missed. The full list is in `codecarver/verify.txt`. `verify` cannot see
 a missing type, macro or header — if a carved tree won't build but `verify` is OK, the compiler's first error is
 the lead.
 

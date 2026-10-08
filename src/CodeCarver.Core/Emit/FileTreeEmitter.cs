@@ -116,10 +116,13 @@ public static class FileTreeEmitter
                 {
                     // Bytes in, bytes out: ReadAllText would honour (and strip) a UTF-8 BOM even when told Latin-1.
                     var original = File.ReadAllBytes(src);
-                    var statics = defsByFile[rel].Where(n => n.Kind == NodeKind.Function && (n.Flags & NodeFlags.FileLocal) != 0
-                                                           && n.Span.IsKnown && !plan.IsKept(n.Id))
-                                                 .Select(n => (n.Span.StartLine, n.Name)).ToList();
-                    var pruned = Encoding.Latin1.GetBytes(RemoveLineRanges(Encoding.Latin1.GetString(original), ranges, statics));
+                    // Every function removed from this file, static or not (a `STATIC`/`PRIVATE` macro hides the keyword),
+                    // unless the same name also has a kept definition here (#if-split twins): its prototypes go with it.
+                    var fns = defsByFile[rel].Where(n => n.Kind == NodeKind.Function && n.Span.IsKnown).ToList();
+                    var keptNames = fns.Where(n => plan.IsKept(n.Id)).Select(n => n.Name).ToHashSet(StringComparer.Ordinal);
+                    var removed = fns.Where(n => !plan.IsKept(n.Id) && !keptNames.Contains(n.Name))
+                                     .Select(n => (n.Span.StartLine, n.Name)).ToList();
+                    var pruned = Encoding.Latin1.GetBytes(RemoveLineRanges(Encoding.Latin1.GetString(original), ranges, removed));
                     File.WriteAllBytes(dst, pruned);
                     if (pruned.Length < original.Length) { prunedFiles++; prunedBytes += original.Length - pruned.Length; }
                 }
@@ -233,7 +236,7 @@ public static class FileTreeEmitter
     }
 
     private static readonly Regex LocalInclude = new(
-        "^\\s*#\\s*include\\s+\"([^\"]+)\"", RegexOptions.Compiled | RegexOptions.Multiline);
+        "^\\s*#\\s*include\\s*\"([^\"]+)\"", RegexOptions.Compiled | RegexOptions.Multiline);
 
     /// <summary>
     /// Copy files that emitted code <c>#include</c>s but the carve never modelled — a local include with
@@ -377,6 +380,19 @@ public static class FileTreeEmitter
         return last[(close + 1)..].Any(ch => !char.IsWhiteSpace(ch) && ch != ';');
     }
 
+    /// <summary>Code (comments and literals already blanked) that reads as a function head opening its body:
+    /// a parameter list's <c>)</c> and then <c>{</c> ending it, and no scope or control keyword leading it.</summary>
+    private static bool IsFunctionHead(string code)
+    {
+        var t = code.Trim();
+        if (!t.EndsWith('{')) return false;
+        t = t[..^1].TrimEnd();
+        if (!t.EndsWith(')') || t.IndexOf('(') is var open and (< 0 or 0)) return false;
+        var first = new string(t.TakeWhile(ch => char.IsAsciiLetterOrDigit(ch) || ch == '_').ToArray());
+        return first is not ("namespace" or "extern" or "struct" or "class" or "union" or "enum" or "typedef"
+                             or "if" or "for" or "while" or "switch" or "do" or "else" or "return");
+    }
+
     /// <summary>A line with comments removed and string/char literals emptied (one line; a block comment opened
     /// on an earlier line is not tracked — callers only use this to decide to keep MORE).</summary>
     private static string CodeOnly(string line)
@@ -473,16 +489,24 @@ public static class FileTreeEmitter
             or "diag_remark" or "optimize" or "STDC" or "comment" or "mark" or "ident";
     }
 
-    /// <summary>For each 1-based line (and one past the last): does it begin inside a block comment? Strings,
-    /// character literals and line comments are skipped, so a <c>/*</c> inside them opens nothing.</summary>
-    private static bool[] CommentStateAtLineStart(string[] lines)
+    /// <summary>For each 1-based line (and one past the last): does it begin inside a comment — a block comment, or a
+    /// <c>//</c> comment whose line ends in a backslash (the splice continues it onto the next line)? Strings and
+    /// character literals are skipped, so a <c>/*</c> inside them opens nothing.</summary>
+    private static bool[] CommentStateAtLineStart(string[] lines) => CommentStateAtLineStart(lines, out _);
+
+    /// <param name="inLineComment">Per line: it begins inside a spliced // comment (and so is comment to its end).</param>
+    private static bool[] CommentStateAtLineStart(string[] lines, out bool[] inLineComment)
     {
         var at = new bool[lines.Length + 2];
+        inLineComment = new bool[lines.Length + 2];
         var inBlock = false;
+        var inLine = false;   // a // comment spliced onto this line
         for (var i = 1; i <= lines.Length; i++)
         {
-            at[i] = inBlock;
+            at[i] = inBlock || inLine;
+            inLineComment[i] = inLine;
             var line = lines[i - 1];
+            if (inLine) { inLine = Spliced(line); continue; }
             var quote = '\0';
             for (var c = 0; c < line.Length; c++)
             {
@@ -490,38 +514,86 @@ public static class FileTreeEmitter
                 if (inBlock) { if (ch == '*' && c + 1 < line.Length && line[c + 1] == '/') { inBlock = false; c++; } }
                 else if (quote != '\0') { if (ch == '\\') c++; else if (ch == quote) quote = '\0'; }
                 else if (ch is '"' or '\'') quote = ch;
-                else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '/') break;
+                else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '/') { inLine = Spliced(line); break; }
                 else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '*') { inBlock = true; c++; }
             }
         }
-        at[lines.Length + 1] = inBlock;
+        at[lines.Length + 1] = inBlock || inLine;
+        inLineComment[lines.Length + 1] = inLine;
         return at;
     }
 
+    /// <summary>Does the line end in a backslash (spliced onto the next one)? Trailing blanks and the CR are allowed,
+    /// as compilers allow them.</summary>
+    private static bool Spliced(string line) => line.TrimEnd().EndsWith('\\');
+
+    /// <summary>A line's code when it starts inside a comment: what follows the comment's end (none when it doesn't
+    /// end here), with comments and literals blanked like <see cref="CodeOnly"/>.</summary>
+    private static string LineCode(string[] lines, bool[] inComment, bool[] inLineComment, int i)
+    {
+        var line = lines[i - 1];
+        if (inLineComment[i]) return "";      // a spliced // comment holds the whole line
+        if (inComment[i])
+        {
+            var close = line.IndexOf("*/", StringComparison.Ordinal);
+            if (close < 0) return "";
+            line = line[(close + 2)..];
+        }
+        return CodeOnly(line);
+    }
+
+    /// <summary>The text after a directive's introducer (<c>#</c>, <c>%:</c> or <c>??=</c>), past leading block comments
+    /// on the line (comments are gone before directives are recognised); null when the line is no directive.</summary>
+    private static string? DirectiveBody(string line)
+    {
+        var t = line.TrimStart();
+        while (t.StartsWith("/*", StringComparison.Ordinal))
+        {
+            var close = t.IndexOf("*/", 2, StringComparison.Ordinal);
+            if (close < 0) return null;
+            t = t[(close + 2)..].TrimStart();
+        }
+        if (t.StartsWith('#')) return t[1..];
+        if (t.StartsWith("%:", StringComparison.Ordinal)) return t[2..];
+        if (t.StartsWith("??=", StringComparison.Ordinal)) return t[3..];
+        return null;
+    }
+
     /// <summary>True when every directive line in lines <paramref name="s"/>..<paramref name="e"/> is real (not inside a
-    /// comment) and part of #if structure.</summary>
+    /// comment), part of #if structure, and leaves no comment open: directives stay when the span goes, so one that opens
+    /// a comment the span's code closes (`#if FAST /* enable the` / `fast path */`) would swallow what follows.</summary>
     private static bool OnlyConditionalDirectives(string[] lines, bool[] inComment, int s, int e)
     {
         for (var i = s; i <= e; i++)
         {
-            var t = lines[i - 1].TrimStart();
-            if (t.Length == 0 || t[0] != '#') continue;
-            if (inComment[i]) return false;
-            var d = t[1..].TrimStart();
-            var word = new string(d.TakeWhile(char.IsAsciiLetter).ToArray());
+            if (inComment[i])
+            {
+                // A directive-looking line inside a comment isn't one, and keeping it would make it one. Code after
+                // the comment's end that is a directive (`*/ #if`) is too unusual to judge: keep the span.
+                var raw = lines[i - 1];
+                if (raw.TrimStart().StartsWith('#')) return false;
+                var close = raw.IndexOf("*/", StringComparison.Ordinal);
+                if (close >= 0 && DirectiveBody(raw[(close + 2)..]) is not null) return false;
+                continue;
+            }
+            if (DirectiveBody(lines[i - 1]) is not { } d) continue;
+            var word = new string(d.TrimStart().TakeWhile(char.IsAsciiLetter).ToArray());
             if (word is not ("if" or "ifdef" or "ifndef" or "elif" or "elifdef" or "elifndef" or "else" or "endif")) return false;
-            while (lines[i - 1].TrimEnd().EndsWith('\\') && i < e) i++;   // its continuation lines
+            var j = i;
+            while (Spliced(lines[j - 1]) && j < lines.Length) j++;   // its continuation lines
+            if (j > e || inComment[j + 1]) return false;            // it leaves a comment open (or runs past the span)
+            i = j;
         }
         return true;
     }
 
     /// <summary>Remove the given 1-based inclusive line ranges from text, preserving the rest verbatim.</summary>
     private static string RemoveLineRanges(string text, List<(int Start, int End)> ranges,
-                                           IReadOnlyList<(int Start, string Name)>? droppedStatics = null)
+                                           IReadOnlyList<(int Start, string Name)>? droppedFunctions = null)
     {
         var lines = text.Split('\n');
         var drop = DropLines(lines, ranges, null);
-        if (droppedStatics is { Count: > 0 }) DropStaticPrototypes(lines, drop, droppedStatics);
+        if (droppedFunctions is { Count: > 0 }) DropPrototypes(lines, drop, droppedFunctions);
         var sb = new StringBuilder(text.Length);
         for (var i = 1; i <= lines.Length; i++)
         {
@@ -533,29 +605,99 @@ public static class FileTreeEmitter
     }
 
     /// <summary>
-    /// A removed static function's forward declaration (`static void helper(void);`) would be left declaring a
-    /// function never defined: "declared 'static' but never defined", an error under -Werror. Remove the one-line
-    /// file-scope prototypes of each static whose definition was removed. Anything less plain stays (a warning
+    /// A removed function's forward declaration is left declaring a function never defined. For a static one
+    /// (`static void helper(void);`, or spelled `STATIC`/`PRIVATE` through a macro) that is "declared 'static' but
+    /// never defined", an error under -Werror. Remove the file-scope prototypes, one line or several, of each
+    /// function whose definition was removed: a whole statement at brace depth 0, from a line start to a `;` that
+    /// ends its line, with one declarator, no body, initializer or directive. Anything less plain stays (a warning
     /// at worst).
     /// </summary>
-    private static void DropStaticPrototypes(string[] lines, bool[] drop, IReadOnlyList<(int Start, string Name)> statics)
+    private static void DropPrototypes(string[] lines, bool[] drop, IReadOnlyList<(int Start, string Name)> removed)
     {
-        var names = statics.Where(s => s.Start >= 1 && s.Start <= lines.Length && drop[s.Start]).Select(s => s.Name)
+        var names = removed.Where(s => s.Start >= 1 && s.Start <= lines.Length && drop[s.Start]).Select(s => s.Name)
                            .ToHashSet(StringComparer.Ordinal);
         if (names.Count == 0) return;
-        var inComment = CommentStateAtLineStart(lines);
-        var depth = 0;
+        var inComment = CommentStateAtLineStart(lines, out var inLineComment);
+        var depth = DepthAtLineStart(lines);
+        var statementStart = true;   // the last code line ended a statement (or a block): a new one may start here
         for (var i = 1; i <= lines.Length; i++)
         {
-            var atFileScope = depth == 0;
-            depth += NetBraces(lines, i, i);
-            if (drop[i] || !atFileScope || inComment[i] || inComment[i + 1]) continue;
-            var code = CodeOnly(lines[i - 1]).Trim();
-            if (!code.StartsWith("static", StringComparison.Ordinal) || !code.EndsWith(';') || code.IndexOfAny(NotInPrototype) >= 0
-                || code.IndexOf(';') != code.Length - 1) continue;
-            var m = PrototypeName.Match(code);
-            if (m.Success && names.Contains(m.Groups[1].Value)) drop[i] = true;
+            if (drop[i]) { statementStart = true; continue; }   // a removed definition ended with its `}`
+            if (DirectiveBody(lines[i - 1]) is not null && !inComment[i])
+            {
+                while (Spliced(lines[i - 1]) && i < lines.Length) i++;   // its continuation lines
+                continue;
+            }
+            var code = LineCode(lines, inComment, inLineComment, i).Trim();
+            if (code.Length == 0) continue;
+            var startsHere = statementStart && depth[i] == 0 && !inComment[i];
+            statementStart = code[^1] is ';' or '{' or '}';
+            if (!startsHere || code[^1] == '{') continue;
+
+            // Collect the statement to its `;` — every line plain code at file scope, none removed or a directive.
+            var j = i;
+            var stmt = new StringBuilder(code);
+            while (stmt.ToString().IndexOfAny(StatementEnd) < 0 && j < lines.Length && j - i < 32)
+            {
+                j++;
+                if (drop[j] || inComment[j] || depth[j] != 0 || DirectiveBody(lines[j - 1]) is not null) { j = -1; break; }
+                stmt.Append(' ').Append(LineCode(lines, inComment, inLineComment, j).Trim());
+            }
+            if (j < 0) continue;
+            var text = stmt.ToString().Trim();
+            if (j > i) { statementStart = text.Length > 0 && text[^1] is ';' or '{' or '}'; }
+            if (!text.EndsWith(';') || text.IndexOf(';') != text.Length - 1 || text.IndexOfAny(NotInPrototype) >= 0
+                || inComment[j + 1] || text.StartsWith("typedef", StringComparison.Ordinal) || TopLevelComma(text)) { i = j; continue; }
+            var m = PrototypeName.Match(text);
+            if (m.Success && names.Contains(m.Groups[1].Value))
+                for (var k = i; k <= j; k++) drop[k] = true;
+            i = j;
         }
+    }
+
+    private static readonly char[] StatementEnd = { ';', '{', '}' };
+
+    /// <summary>A comma outside every parenthesis: a second declarator (`int a, f(void);`), which must stay.</summary>
+    private static bool TopLevelComma(string code)
+    {
+        var paren = 0;
+        foreach (var ch in code)
+        {
+            if (ch == '(') paren++;
+            else if (ch == ')') paren--;
+            else if (ch == ',' && paren == 0) return true;
+        }
+        return false;
+    }
+
+    /// <summary>Brace depth at the start of each 1-based line, carried across lines with comment (block and spliced
+    /// //) and string state, so a `{` inside a doc comment doesn't count.</summary>
+    private static int[] DepthAtLineStart(string[] lines)
+    {
+        var at = new int[lines.Length + 2];
+        var depth = 0;
+        var inBlock = false;
+        var inLine = false;
+        for (var i = 1; i <= lines.Length; i++)
+        {
+            at[i] = depth;
+            var line = lines[i - 1];
+            if (inLine) { inLine = Spliced(line); continue; }
+            var quote = '\0';
+            for (var c = 0; c < line.Length; c++)
+            {
+                var ch = line[c];
+                if (inBlock) { if (ch == '*' && c + 1 < line.Length && line[c + 1] == '/') { inBlock = false; c++; } }
+                else if (quote != '\0') { if (ch == '\\') c++; else if (ch == quote) quote = '\0'; }
+                else if (ch is '"' or '\'') quote = ch;
+                else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '/') { inLine = Spliced(line); break; }
+                else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '*') { inBlock = true; c++; }
+                else if (ch == '{') depth++;
+                else if (ch == '}') depth = Math.Max(0, depth - 1);
+            }
+        }
+        at[lines.Length + 1] = depth;
+        return at;
     }
 
     private static readonly char[] NotInPrototype = { '{', '}', '=', '#' };
@@ -573,7 +715,7 @@ public static class FileTreeEmitter
     private static bool[] DropLines(string[] lines, List<(int Start, int End)> ranges, HashSet<(int, int)>? applied)
     {
         var drop = new bool[lines.Length + 2];
-        var inComment = CommentStateAtLineStart(lines);
+        var inComment = CommentStateAtLineStart(lines, out var inLineComment);
         foreach (var (s, e) in ranges)
         {
             // A whole definition has balanced braces. If a span's braces don't balance, tree-sitter
@@ -589,6 +731,11 @@ public static class FileTreeEmitter
             // A comment the span starts inside, or one its last line opens and a later line closes: removing the
             // lines would cut it in half.
             if (s < 1 || e > lines.Length || inComment[s] || inComment[e + 1]) continue;
+
+            // A backslash splices lines: the span's last line ending in one (`} // see C:\tmp\`) carries the next line
+            // along, and a span starting right after a spliced line is that line's tail. Removing either way would turn
+            // comment into code or code into comment.
+            if (Spliced(lines[e - 1]) || (s > 1 && Spliced(lines[s - 2]))) continue;
 
             // Directives inside the span stay (below), so only #if structure may be there: an #include inside a
             // table or body (X-macro rows) left at file scope breaks the build, and so would a #define, #undef or
@@ -616,17 +763,26 @@ public static class FileTreeEmitter
                     if (NetBraces(lines, k, k) > 0 && NetBraces(lines, k, s - 1) == pre)
                         candidate = k; // the orphaned open-brace signature line
                 var sharedUnderPreproc = false;
-                for (var k = candidate; candidate != s && k < s; k++)
-                    if (lines[k - 1].TrimStart().StartsWith('#')) { sharedUnderPreproc = true; break; }
-                // (a) dual-signature: the orphaned open-brace line is a FUNCTION SIGNATURE (has a
-                // parameter list) sharing the drop's body. A bare `{` / `namespace X {` / `class X {`
-                // scope-opener has no parens — extending up into it would delete the ENCLOSING scope's
-                // brace (and any complete kept definition between), shattering the file. That false
-                // positive is exactly what a `namespace pugi {` immediately followed by `#ifndef` hits
-                // (real pugixml xpath_exception bug). Require parens on the candidate; when unsure, don't
-                // extend (keep more = sound).
-                var candidateIsSignature = lines[candidate - 1].Contains('(') || lines[candidate - 1].Contains(')');
-                if (sharedUnderPreproc && candidateIsSignature) start = candidate; // (a) dual-signature — extend up
+                var onlyDirectivesBetween = true;   // nothing but directives, blanks and comments between the two heads
+                for (var k = candidate + 1; candidate != s && k < s; k++)
+                {
+                    if (DirectiveBody(lines[k - 1]) is not null && !inComment[k])
+                    {
+                        sharedUnderPreproc = true;
+                        while (Spliced(lines[k - 1]) && k < s - 1) k++;   // its continuation lines
+                        continue;
+                    }
+                    if (LineCode(lines, inComment, inLineComment, k).Trim().Length > 0) { onlyDirectivesBetween = false; break; }
+                }
+                // (a) dual-signature: the orphaned open-brace line is a FUNCTION HEAD (its code, comments and strings
+                // gone, ends in a parameter list's `)` and then `{`) sharing the drop's body. A `{` / `namespace X {` /
+                // `extern "C" {` / `class X {` scope-opener is no head — extending up into it would delete the ENCLOSING
+                // scope's brace (and any complete kept definition between), shattering the file. That false positive is
+                // what a `namespace pugi {` immediately followed by `#ifndef` hits (real pugixml xpath_exception bug), and
+                // a `namespace drv {  // internals (private)` whose comment holds the parens. When unsure, don't extend
+                // (keep more = sound).
+                if (sharedUnderPreproc && onlyDirectivesBetween && IsFunctionHead(LineCode(lines, inComment, inLineComment, candidate)))
+                    start = candidate; // (a) dual-signature — extend up
                 // else (b): enclosing scope, leave start = s; remove the balanced span alone.
             }
 
@@ -645,10 +801,10 @@ public static class FileTreeEmitter
         // removed; a stray #if/#endif left behind is a harmless empty conditional.
         for (var i = 1; i <= lines.Length; i++)
         {
-            if (!drop[i] || !lines[i - 1].TrimStart().StartsWith('#')) continue;
+            if (!drop[i] || inComment[i] || DirectiveBody(lines[i - 1]) is null) continue;
             drop[i] = false;
             var j = i;
-            while (j <= lines.Length && lines[j - 1].TrimEnd().EndsWith('\\'))
+            while (j <= lines.Length && Spliced(lines[j - 1]))
             {
                 j++;
                 if (j <= lines.Length) drop[j] = false;

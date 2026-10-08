@@ -43,6 +43,50 @@ public sealed class FileLookupTests : IDisposable
         Assert.Equal(2, f.DirectoriesListed);
     }
 
+    /// <summary>A directory that can't be listed (a dead share, no permission) is tried once: after that its files are
+    /// asked about one by one — still answered right, never "all missing", and without another listing attempt (a
+    /// network timeout each) per probe.</summary>
+    [Fact]
+    public void UnlistableDirectory_IsTriedOnce_ThenCheckedPerFile()
+    {
+        var b = Path.Combine(work, "b");
+        var attempts = 0;
+        var f = new FileLookup(d =>
+        {
+            if (string.Equals(d, b, StringComparison.OrdinalIgnoreCase)) { attempts++; throw new IOException("network name no longer available"); }
+            return Directory.EnumerateFiles(d);
+        });
+        for (var i = 0; i < 20; i++)
+        {
+            Assert.True(f.Exists(Path.Combine(b, "other.h")));
+            Assert.Equal(Path.Combine(b, "other.h"), f.Probe(b, "other.h"));
+            Assert.Null(f.Probe(b, $"no{i}.h"));
+        }
+        Assert.Equal(1, attempts);
+        Assert.Equal(1, f.DirectoriesUnlistable);
+        Assert.Equal(0, f.DirectoriesListed);
+        Assert.True(f.Exists(Path.Combine(work, "a", "top.h")));   // other directories are listed as usual
+        Assert.Equal(1, f.DirectoriesListed);
+    }
+
+    /// <summary>A root directory already ends in its separator: the prefix must not get a second one (a carve root at
+    /// a drive or share root matched nothing).</summary>
+    [Fact]
+    public void DirectoryPrefix_NeverDoublesTheSeparator()
+    {
+        var sep = Path.DirectorySeparatorChar;
+        Assert.Equal("/", PathComparer.DirectoryPrefix("/", '/'));
+        Assert.Equal("/usr/src/", PathComparer.DirectoryPrefix("/usr/src", '/'));
+        Assert.Equal("/usr/src/", PathComparer.DirectoryPrefix("/usr/src/", '/'));
+        Assert.Equal("a" + sep + "b" + sep, PathComparer.DirectoryPrefix("a" + sep + "b"));
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Equal(@"C:\", PathComparer.DirectoryPrefix(@"C:\"));
+            Assert.Equal(@"\\host\share\", PathComparer.DirectoryPrefix(@"\\host\share\"));
+            Assert.Equal(@"C:\work\", PathComparer.DirectoryPrefix(@"C:\work"));
+        }
+    }
+
     [Fact]
     public void Exists_MatchesTheFileSystem()
     {

@@ -656,7 +656,7 @@ public static class CarveCommand
         var traceMissedCompiled = -1;
         if (closureLang && cv.EveryBuildTraced)
         {
-            var rootF = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)) + Path.DirectorySeparatorChar;
+            var rootF = CodeCarver.Core.Util.PathComparer.DirectoryPrefix(Path.GetFullPath(dir));
             var opened = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var openedByBuild = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var outside = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1391,7 +1391,7 @@ public static class CarveCommand
         var systemDirs = new List<string> { "/usr/", "/opt/", "/lib/", "/etc/", "/proc/", "/sys/", "/dev/" };
         foreach (var sf in new[] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86,
                                    Environment.SpecialFolder.Windows, Environment.SpecialFolder.CommonApplicationData })
-            try { var f = Environment.GetFolderPath(sf); if (f.Length > 0) systemDirs.Add(Path.TrimEndingDirectorySeparator(f) + Path.DirectorySeparatorChar); } catch { }
+            try { var f = Environment.GetFolderPath(sf); if (f.Length > 0) systemDirs.Add(CodeCarver.Core.Util.PathComparer.DirectoryPrefix(f)); } catch { }
         if (probeCompiler is not null)
             try
             {
@@ -1400,25 +1400,17 @@ public static class CarveCommand
                         .Select(d => { try { return Path.Combine(d, probeCompiler); } catch { return ""; } })
                         .FirstOrDefault(c => File.Exists(c) || File.Exists(c + ".exe"));
                 // <toolchain>/bin/gcc -> <toolchain>/
-                if (!string.IsNullOrEmpty(exe) && Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(exe))) is { } tc)
-                    systemDirs.Add(Path.TrimEndingDirectorySeparator(tc) + Path.DirectorySeparatorChar);
+                // (Not a whole drive: a compiler in C:\bin or /bin doesn't make every file there the system.)
+                if (!string.IsNullOrEmpty(exe) && Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(exe))) is { } tc
+                    && !string.Equals(Path.TrimEndingDirectorySeparator(tc), Path.TrimEndingDirectorySeparator(Path.GetPathRoot(tc) ?? ""), StringComparison.OrdinalIgnoreCase))
+                    systemDirs.Add(CodeCarver.Core.Util.PathComparer.DirectoryPrefix(tc));
             }
             catch { /* best effort */ }
-        // A workspace can live under one of those (a CI agent's work dir under ProgramData or /opt, a toolchain
-        // checked in beside the code): that one is the product, not the system.
-        {
-            var rootFwd = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)).Replace('\\', '/') + "/";
-            systemDirs.RemoveAll(sd => rootFwd.StartsWith(sd.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase));
-        }
-        bool IsSystemPath(string full)
-        {
-            var fwd = full.Replace('\\', '/');
-            return systemDirs.Any(sd => fwd.StartsWith(sd.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase));
-        }
+        var isSystemPath = SystemPathTest(systemDirs, Path.GetFullPath(dir));
         if (buildFileTraces.Count + runFileTraces.Count > 0)
         {
             var rootFull = Path.GetFullPath(dir);
-            var rootPrefix = Path.TrimEndingDirectorySeparator(rootFull) + Path.DirectorySeparatorChar;
+            var rootPrefix = CodeCarver.Core.Util.PathComparer.DirectoryPrefix(rootFull);
             var tuExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".s", ".asm" };
 
             // Returns false (after printing why) when a trace can't be used: unreadable, or nothing in it maps here.
@@ -1452,7 +1444,7 @@ public static class CarveCommand
                         if (Path.IsPathRooted(cand) && absoluteMisses.Count < 400) absoluteMisses.Add(cand);
                         if (!exts.Concat(tuExts).Any(e => cand.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue;
                         if (full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) || !fileLookup.Exists(full)) continue;
-                        if (IsSystemPath(full)) continue;
+                        if (isSystemPath(full)) continue;
                         if (tuExts.Any(e => full.EndsWith(e, StringComparison.OrdinalIgnoreCase))) externalTu++; else externalHeaders++;
                     }
                     if (cands.Count > 0 && inTree == 0)
@@ -1505,6 +1497,7 @@ public static class CarveCommand
             var rootFullX = Path.GetFullPath(dir);
             var outsideCode = new List<string>();
             var logIncDirs = new List<string>();
+            var outsideForced = new List<(string Dir, string Raw)>();
             foreach (var cc in buildCmds)
             {
                 var bd = Path.IsPathFullyQualified(cc.Directory) ? cc.Directory : Path.Combine(dir, cc.Directory);
@@ -1515,22 +1508,23 @@ public static class CarveCommand
                 try
                 {
                     outsideCode.Add(Path.GetFullPath(Path.IsPathFullyQualified(cc.File) ? cc.File : Path.Combine(bd, cc.File)));
-                    foreach (var fi in cc.ForcedIncludes)
-                        outsideCode.Add(Path.GetFullPath(Path.IsPathFullyQualified(fi) ? fi : Path.Combine(bd, fi)));
+                    var fullBd = Path.GetFullPath(bd);
+                    foreach (var fi in cc.ForcedIncludes) outsideForced.Add((fullBd, fi));
                 }
                 catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { }
             }
             outsideCode.AddRange(buildTraceFull);
             summary["roots.includedFromOutside"] = 0;
-            if (outsideCode.Count > 0)
+            if (outsideCode.Count + outsideForced.Count > 0)
             {
                 var extSw = System.Diagnostics.Stopwatch.StartNew();
-                var ext = ExternalIncluders.Find(outsideCode, logIncDirs, rootFullX, fullByRel.Keys, IsSystemPath, p => File.ReadLines(p), fileLookup);
+                var ext = ExternalIncluders.Find(outsideCode, logIncDirs, rootFullX, fullByRel.Keys, isSystemPath, p => File.ReadLines(p), fileLookup,
+                                                 forcedIncludes: outsideForced);
                 summary["time.outsideIncludes.ms"] = extSw.ElapsedMilliseconds;
                 summary["outsideIncludes.filesRead"] = ext.FilesScanned;
                 summary["outsideIncludes.capped"] = ext.Capped;
                 if (ext.Capped)
-                    err.WriteLine($"  warn    : stopped following outside #includes after {ext.FilesScanned:N0} file(s) — headers outside code includes past that may be missed");
+                    err.WriteLine($"  warn    : stopped following outside #includes at the limit of {ext.Followed:N0} included file(s) ({ext.FilesScanned:N0} file(s) read) — headers outside code includes past that may be missed");
                 var traced = cv.EveryBuildTraced && buildFileTraces.Count > 0;
                 foreach (var h in ext.Headers)
                     if (fullByRel.ContainsKey(h) && !Excluded(fullByRel[h]) && (!traced || buildObservedRel.Contains(h)))
@@ -1736,12 +1730,15 @@ public static class CarveCommand
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
         }
         var stagePlans = new Dictionary<bool, CarvePlan>();
+        // Definitions the link check found emitted code using after a stage's plan left them out (see the stage loop):
+        // rooted in every later plan of the same kind, so the next stage of that kind starts from them.
+        var checkRoots = new Dictionary<bool, List<Root>> { [false] = new(), [true] = new() };
         CarvePlan PlanFor(bool pruned)
         {
             if (!closeOverEmit) return plan;
             if (stagePlans.TryGetValue(pruned, out var sp)) return sp;
             var (gate, initial) = NewCtorGate();
-            sp = EmitClosure.Close(graph, rootSet.Concat(initial),
+            sp = EmitClosure.Close(graph, rootSet.Concat(initial).Concat(checkRoots[pruned]),
                 (f, kept) => FileTreeEmitter.RetainedWhenEmitted(f, defsByFile!.GetValueOrDefault(f), kept, SourceText, pruned),
                 constructorsIn: CtorsIn(gate));
             return stagePlans[pruned] = sp;
@@ -1915,9 +1912,13 @@ public static class CarveCommand
                 err.WriteLine($"  warn    : could not write up {BuildOutputFile} ({ex.GetType().Name})");
             }
         }
-        bool VerifyEmitted(CarvePlan p, IEnumerable<(string Rel, string Path)> emittedFiles, string ccDir, bool pruned = false)
+        const int MaxCheckRounds = 8;
+        var keptByCheckLog = new List<string>();   // this stage's KEPT lines for verify.txt
+        // The link check over one stage's emitted files: hard failures, #ifdef-dead-only uses, and uses whose only
+        // definitions are in files the build never compiled (notes, not failures).
+        (LinkCheckResult R, List<LinkViolation> Hard, List<LinkViolation> NotBuiltOnly) CheckEmitted(
+            CarvePlan p, IReadOnlyList<(string Rel, string Path)> emittedFiles, bool pruned)
         {
-            if (!linkCheck) return false;
             var droppedForCheck = p.DroppedFiles.Select(r => (r, Path.Combine(dir, r)));
             var r = EmittedLinkCheck.Run(emittedFiles, droppedForCheck, deadLinesFor, maxParseBytes,
                                          original: pruned ? rel => Path.Combine(dir, rel) : null,
@@ -1925,7 +1926,6 @@ public static class CarveCommand
                                          commandLineMacros: commandLineMacros, c99InlineFns: (fe as TreeSitterFrontEnd)?.C99InlineFunctions,
                                          wrapped: wrapped);
             var hard = r.Hard.ToList();
-            var soft = r.DeadOnly;
             // Defined only in files the traced build never compiled, with the build log confirming the trace is
             // complete: the real build linked without those files, so dropping them can't break it. The name comes
             // from somewhere else (another build or a prebuilt library, an alias, a macro). A note, not a failure.
@@ -1944,9 +1944,54 @@ public static class CarveCommand
             var notBuiltOnly = hard.Where(v => (traceMissedCompiled == 0 || v.Weak || UseUncertain(v))
                                                && v.DefinedInAll.Count > 0 && v.DefinedInAll.All(notBuilt.Contains)).ToList();
             hard.RemoveAll(notBuiltOnly.Contains);
+            return (r, hard, notBuiltOnly);
+        }
+        // Definitions the emitted code uses that this stage left out (the graph missed the use): what to root so the
+        // next plan keeps them. A node defined in that file, or the file itself when its definition is no node. Never
+        // for a file the build didn't compile (keeping it can't be what the real build linked). Counted by cause.
+        List<Root> RootsForMissing(CarvePlan p, List<LinkViolation> hard, Dictionary<string, int> byCause)
+        {
+            // A header is compiled only where it is included: keeping one that defines the name links nothing.
+            var missing = hard.Where(v => !notBuilt.Contains(v.DefinedIn) && !EmittedLinkCheck.IsHeader(v.DefinedIn)).ToList();
+            if (missing.Count == 0) return new List<Root>();
+            var why = ClassifyViolations(graph, p, missing, unparsedFiles);
+            var keptSet = p.KeptFiles.ToHashSet(StringComparer.Ordinal);
+            var wanted = missing.Select(v => (v.Name, v.DefinedIn)).ToHashSet();
+            var files = missing.Select(v => v.DefinedIn).ToHashSet(StringComparer.Ordinal);
+            var add = new List<Root>();
+            var covered = new HashSet<(string, string)>();
+            foreach (var n in graph.Nodes)
+            {
+                if (n.FilePath is not { } f || !files.Contains(f)) continue;
+                if (n.Kind is NodeKind.Function or NodeKind.Global && wanted.Contains((n.Name, f)))
+                {
+                    covered.Add((n.Name, f));
+                    if (!p.IsKept(n.Id)) add.Add(new Root(n.Id, RootKind.EmittedWhole, "used by emitted code"));
+                }
+            }
+            foreach (var v in missing)
+            {
+                if (covered.Contains((v.Name, v.DefinedIn))) continue;
+                var fileNode = graph.Nodes.FirstOrDefault(n => n.Kind == NodeKind.File && n.Name == v.DefinedIn);
+                if (fileNode is not null && !p.IsKept(fileNode.Id)) add.Add(new Root(fileNode.Id, RootKind.EmittedWhole, "used by emitted code"));
+            }
+            foreach (var v in missing)
+            {
+                var cause = keptSet.Contains(v.DefinedIn) ? "prunedFromKeptFile" : why[v];
+                byCause[cause] = byCause.GetValueOrDefault(cause) + 1;
+            }
+            return add.DistinctBy(r => r.Node).ToList();
+        }
+        bool VerifyEmitted(CarvePlan p, IReadOnlyList<(string Rel, string Path)> emittedFiles, string ccDir, bool pruned = false,
+                           (LinkCheckResult R, List<LinkViolation> Hard, List<LinkViolation> NotBuiltOnly)? checkedAlready = null)
+        {
+            if (!linkCheck) return false;
+            var (r, hard, notBuiltOnly) = checkedAlready ?? CheckEmitted(p, emittedFiles, pruned);
+            var soft = r.DeadOnly;
             var sb = new System.Text.StringBuilder();
             sb.AppendLine($"# CodeCarver emitted-tree verify — {r.FilesChecked} file(s) checked, {r.FilesSkipped} too large/unreadable");
-            sb.AppendLine("# A violation: emitted code uses a function that only a DROPPED file defines.");
+            sb.AppendLine("# A violation: emitted code uses a function or variable that only a DROPPED file defines (or one removed from a kept file).");
+            foreach (var k in keptByCheckLog) sb.AppendLine(k);
             // Why each failure happened, as counts (summary.txt stays source-free), so a remote eval can say which
             // part of the tool missed without sending a name or a path. Per-violation causes go to verify.txt.
             var why = hard.Count == 0 ? new Dictionary<LinkViolation, string>() : ClassifyViolations(graph, p, hard, unparsedFiles);
@@ -2000,11 +2045,11 @@ public static class CarveCommand
                         : "            definedInFileNotBuilt: the build trace is incomplete (see the build: WARNING above)");
             }
             if (notBuiltOnly.Count > 0)
-                @out.WriteLine($"  verify  : note — {notBuiltOnly.Count} function(s) kept code uses are defined only in files this build never compiled "
+                @out.WriteLine($"  verify  : note — {notBuiltOnly.Count} function(s) or variable(s) kept code uses are defined only in files this build never compiled "
                     + "(another build or a prebuilt library provides them, or an alias/macro the build resolves elsewhere); dropping those files "
                     + "can't break this build (see verify.txt)");
             if (soft.Count > 0)
-                @out.WriteLine($"  verify  : note — {soft.Count} function(s) used only on #ifdef-dead lines are defined only in dropped files "
+                @out.WriteLine($"  verify  : note — {soft.Count} function(s) or variable(s) used only on #ifdef-dead lines are defined only in dropped files "
                     + "(correct if the #ifdef world is; see verify.txt)");
             if (r.FilesSkipped > 0)
                 @out.WriteLine($"  verify  : note — {r.FilesSkipped} file(s) over {maxParseBytes:N0} B or unreadable were not checked");
@@ -2203,7 +2248,7 @@ public static class CarveCommand
                 var rel = Path.GetRelativePath(dir, f).Replace('\\', '/');
                 if (!droppedInfra.Contains(rel)) wouldWrite.Add(rel);
             }
-            if (VerifyEmitted(aplan, wouldWrite.Select(r => (r, Path.Combine(dir, r))), ccDir)) verifyFailed = true;
+            if (VerifyEmitted(aplan, wouldWrite.Select(r => (r, Path.Combine(dir, r))).ToList(), ccDir)) verifyFailed = true;
             summary["run.keptFiles"] = aplan.KeptFiles.Count;
             summary["run.droppedFiles"] = aplan.DroppedFiles.Count;
             summary["run.closureAddedFiles"] = aplan.KeptFiles.Count - plan.KeptFiles.Count;
@@ -2276,9 +2321,6 @@ public static class CarveCommand
             summaryStage = $"stage{stageIndex}";
             summary[$"{summaryStage}.carveSourceFileContents"] = prune;
             summary[$"{summaryStage}.carveHeaderFileContents"] = pruneHeaders;
-            summary[$"{summaryStage}.keptFiles"] = splan.KeptFiles.Count;
-            summary[$"{summaryStage}.droppedFiles"] = splan.DroppedFiles.Count;
-            summary[$"{summaryStage}.closureAddedFiles"] = splan.KeptFiles.Count - plan.KeptFiles.Count;
             var baseDir = stage.Name.Length == 0 ? outputDirectory : Path.Combine(outputDirectory, stage.Name);
             var outDir = Path.Combine(baseDir, "carved");
             var ccDir = Path.Combine(baseDir, "codecarver");
@@ -2290,9 +2332,53 @@ public static class CarveCommand
             var stageDir = staged.Dir;
             CancelHook.Track(staged);
 
+            // Emit, then close over what the emitted text USES: the link check reads the written code with its own
+            // tokenizer, and a definition it finds used but left out (the graph missed that use: an unusual shape, a
+            // macro) is rooted and the stage emitted again from the larger plan, until nothing is missing. So a stage
+            // never ships a tree that fails to link over a use the check can see; what it had to add is counted by
+            // cause (stageN.verify.keptByCheck.*), so the parser gap stays visible.
+            EmitResult res;
+            InfraEmitResult infra;
+            List<(string Rel, string Path)> verifyFiles;
+            (LinkCheckResult R, List<LinkViolation> Hard, List<LinkViolation> NotBuiltOnly)? checkedAlready = null;
+            var keptByCheck = new Dictionary<string, int>(StringComparer.Ordinal);
+            var addedByCheck = 0;
+            keptByCheckLog.Clear();
+            for (var round = 0; ; round++)
+            {
+                res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir) : FileTreeEmitter.Emit(splan, dir, stageDir);
+                // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
+                // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
+                infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel);
+                // Verify the code plus the assembly files copied with it: those define symbols C calls (fast_copy in a .S).
+                verifyFiles = res.Written.Concat(infra.Files.Where(EmittedLinkCheck.IsAssembly)).Distinct(StringComparer.Ordinal)
+                                 .Select(r => (r, Path.Combine(stageDir, r))).ToList();
+                if (!linkCheck || !closeOverEmit) break;
+                checkedAlready = CheckEmitted(splan, verifyFiles, prune);
+                if (round >= MaxCheckRounds || checkedAlready.Value.Hard.Count == 0) break;
+                var add = RootsForMissing(splan, checkedAlready.Value.Hard, keptByCheck);
+                if (add.Count == 0) break;
+                foreach (var v in checkedAlready.Value.Hard)
+                    keptByCheckLog.Add($"KEPT {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined in {v.DefinedIn}:{v.DefinedLine}");
+                addedByCheck += add.Count;
+                checkRoots[prune].AddRange(add);
+                stagePlans.Remove(prune);
+                splan = PlanFor(prune);
+                checkedAlready = null;
+                // A fresh tree: the larger plan writes a superset, but pruned files are written differently.
+                try { Directory.Delete(stageDir, recursive: true); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                Directory.CreateDirectory(stageDir);
+            }
+            summary[$"{summaryStage}.keptFiles"] = splan.KeptFiles.Count;
+            summary[$"{summaryStage}.droppedFiles"] = splan.DroppedFiles.Count;
+            summary[$"{summaryStage}.closureAddedFiles"] = splan.KeptFiles.Count - plan.KeptFiles.Count;
+            summary[$"{summaryStage}.verify.keptByCheck"] = keptByCheck.Values.Sum();
+            foreach (var (cause, n) in keptByCheck) summary[$"{summaryStage}.verify.keptByCheck.{cause}"] = n;
             if (splan.KeptFiles.Count > plan.KeptFiles.Count)
                 @out.WriteLine($"  closure : +{splan.KeptFiles.Count - plan.KeptFiles.Count} file(s) kept because code this stage writes uses them (the output must link)");
-            var res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir) : FileTreeEmitter.Emit(splan, dir, stageDir);
+            if (addedByCheck > 0)
+                @out.WriteLine($"  closure : {keptByCheck.Values.Sum()} use(s) the graph missed were found in the emitted code and kept ("
+                    + string.Join(", ", keptByCheck.OrderBy(k => k.Key, StringComparer.Ordinal).Select(k => $"{k.Key} {k.Value}")) + "; see verify.txt)");
             if (prune)
             {
                 // Source carving cuts unreached definitions out of kept .c files only; headers are never pruned.
@@ -2304,12 +2390,7 @@ public static class CarveCommand
             @out.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{(prune ? "intra-file (unused functions removed)" : "file-level (whole kept files)")}]");
             if (prune) @out.WriteLine("  note    : carveSourceFileContents is EXPERIMENTAL — always build-verify.");
 
-            // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
-            // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
-            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel);
-            // Verify the code plus the assembly files copied with it: those define symbols C calls (fast_copy in a .S).
-            var verifyFiles = res.Written.Concat(infra.Files.Where(EmittedLinkCheck.IsAssembly)).Distinct(StringComparer.Ordinal);
-            if (VerifyEmitted(splan, verifyFiles.Select(r => (r, Path.Combine(stageDir, r))).ToList(), ccDir, pruned: prune)) verifyFailed = true;
+            if (VerifyEmitted(splan, verifyFiles, ccDir, pruned: prune, checkedAlready)) verifyFailed = true;
             BuildOutputCases(splan, baseDir, outDir, ccDir, prune);
             carvedBytes += infra.Bytes;
             var origTotal = originalCodeBytes + infra.Bytes;   // delta-neutral passthrough (both sides)
@@ -2467,6 +2548,23 @@ public static class CarveCommand
             }
         }
         return d[b.Length];
+    }
+
+    /// <summary>Whether a full path is in a compiler/system include tree (never a missing dependency, nor code that
+    /// uses the module). A workspace can live under one of those (a CI agent's work dir under ProgramData or /opt):
+    /// the root is the product, not the system. Only paths under the root are exempt from a system dir holding it —
+    /// the rest of /usr stays the system when the root is /usr/src/app, and a toolchain inside the root stays one.</summary>
+    public static Func<string, bool> SystemPathTest(IEnumerable<string> systemDirs, string rootFull)
+    {
+        var rootFwd = CodeCarver.Core.Util.PathComparer.DirectoryPrefix(rootFull.Replace('\\', '/'), '/');
+        var dirs = systemDirs.Select(sd => sd.Replace('\\', '/'))
+                             .Select(sd => (Dir: sd, HoldsRoot: rootFwd.StartsWith(sd, StringComparison.OrdinalIgnoreCase))).ToList();
+        return full =>
+        {
+            var fwd = full.Replace('\\', '/');
+            var underRoot = fwd.StartsWith(rootFwd, StringComparison.OrdinalIgnoreCase);
+            return dirs.Any(sd => fwd.StartsWith(sd.Dir, StringComparison.OrdinalIgnoreCase) && !(sd.HoldsRoot && underRoot));
+        };
     }
 
     /// <summary>For absolute trace paths that miss the carve root, find the prefix most of them share once their

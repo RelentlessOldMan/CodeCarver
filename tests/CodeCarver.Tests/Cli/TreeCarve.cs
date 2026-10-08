@@ -48,10 +48,11 @@ internal sealed class TreeCarve : IDisposable
 
     /// <param name="common">Extra lines for [common].</param>
     /// <param name="extraToml">Extra sections after [builds.b] (e.g. "[advanced]\n...").</param>
-    public (int Code, string Out, string Err) Carve(string entry = "main", string extraToml = "", bool log = true, string common = "")
+    public (int Code, string Out, string Err) Carve(string entry = "main", string extraToml = "", bool log = true, string common = "",
+                                                   string languages = "\"c\"")
     {
         var sb = new System.Text.StringBuilder();
-        sb.Append($"outputDirectory = \"{F(Path.Combine(Root, "out"))}\"\n[common]\nentryPoints = [\"{entry}\"]\nlanguages = [\"c\"]\n{common}");
+        sb.Append($"outputDirectory = \"{F(Path.Combine(Root, "out"))}\"\n[common]\nentryPoints = [\"{entry}\"]\nlanguages = [{languages}]\n{common}");
         if (log || TracePaths is not null) sb.Append("[builds.b]\n");
         if (log && LogLines.Count > 0)
         {

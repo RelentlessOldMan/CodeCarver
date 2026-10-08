@@ -14,4 +14,15 @@ public static class PathComparer
 
     public static StringComparison Comparison { get; } =
         OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    /// <summary>A directory as a prefix that paths under it start with: one trailing separator. A drive, share or
+    /// file-system root already ends in one (<c>C:\</c>, <c>/</c>), and appending another matched nothing.</summary>
+    public static string DirectoryPrefix(string dir, char separator)
+    {
+        dir = Path.TrimEndingDirectorySeparator(dir);
+        return dir.EndsWith('/') || dir.EndsWith('\\') ? dir : dir + separator;
+    }
+
+    /// <inheritdoc cref="DirectoryPrefix(string, char)"/>
+    public static string DirectoryPrefix(string dir) => DirectoryPrefix(dir, Path.DirectorySeparatorChar);
 }

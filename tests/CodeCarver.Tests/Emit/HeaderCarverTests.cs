@@ -141,13 +141,14 @@ public class HeaderCarverTests
         }
     }
 
-    static string CarveOne(string appC, string chipH, IEnumerable<string>? extraNames = null)
+    static string CarveOne(string appC, string chipH, IEnumerable<string>? extraNames = null, System.Text.Encoding? appEncoding = null)
     {
         var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdr-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         try
         {
-            File.WriteAllText(Path.Combine(dir, "app.c"), appC);
+            if (appEncoding is null) File.WriteAllText(Path.Combine(dir, "app.c"), appC);
+            else File.WriteAllText(Path.Combine(dir, "app.c"), appC, appEncoding);
             File.WriteAllText(Path.Combine(dir, "chip.h"), chipH);
             HeaderCarver.Carve(dir, new[] { "chip.h" }, extraNames);
             return File.ReadAllText(Path.Combine(dir, "chip.h")).Replace("\r\n", "\n");
@@ -208,5 +209,78 @@ public class HeaderCarverTests
         var carved = CarveOne("int u(void){ return 0; }\n", "#define CFG_HAS_FPU 1\n#define CFG_OTHER 2\n", new[] { "CFG_HAS_FPU" });
         Assert.Contains("CFG_HAS_FPU", carved);
         Assert.DoesNotContain("CFG_OTHER", carved);
+    }
+
+    /// <summary>A line comment ending in a backslash continues onto the next line: the define there is comment
+    /// text. Dropping it would splice the comment into the define after it, which then vanishes.</summary>
+    [Fact]
+    public void Carve_LineCommentEndingInBackslash_ContinuesOntoTheNextLine()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            int u(void){ return USED_B; }
+            """, """
+            // legacy path: C:\vendor\regs\
+            #define UNUSED_A 1
+            #define USED_B 2
+            #define UNUSED_C 3
+            """);
+        Assert.Contains("// legacy path: C:\\vendor\\regs\\\n#define UNUSED_A 1\n#define USED_B 2", carved);
+        Assert.DoesNotContain("UNUSED_C", carved);
+    }
+
+    /// <summary>A forwarding macro expands its arguments before the paste: <c>CAT(UART_PREFIX, UART_NUM)</c> builds
+    /// USART2 when UART_PREFIX is USART, whether that define is in the kept code or in the carved header itself.</summary>
+    [Fact]
+    public void Carve_KeepsNamesAPasteBuildsFromExpandedMacroArguments()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define _CAT(a, b) a##b
+            #define CAT(a, b) _CAT(a, b)
+            #define UART_PREFIX USART
+            #define UART_NUM 2
+            int u(void){ return CAT(UART_PREFIX, UART_NUM) + CAT(DBG_PORT, 1); }
+            """, """
+            #define DBG_PORT LPUART
+            #define USART2 40
+            #define LPUART1 9
+            #define SPI3 7
+            #define I2C1 3
+            """);
+        Assert.Contains("#define USART2 40", carved);
+        Assert.Contains("#define LPUART1 9", carved);
+        Assert.DoesNotContain("SPI3", carved);
+        Assert.DoesNotContain("I2C1", carved);
+    }
+
+    /// <summary>GNU's <c>, ##__VA_ARGS__</c> only swallows a comma: a logging macro is not a paste, and the short
+    /// names passed to it don't keep every define that starts or ends with them.</summary>
+    [Fact]
+    public void Carve_VariadicCommaPaste_IsNotAPaste()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define LOG(fmt, ...) printf(fmt, ##__VA_ARGS__)
+            #define LOGN(fmt, args...) printf(fmt, ## args)
+            int u(int n){ LOG("x %d", n); LOGN("y %d", n); return USED; }
+            """, """
+            #define USED 1
+            #define CH_n 5
+            #define nVIC 2
+            """);
+        Assert.Contains("#define USED 1", carved);
+        Assert.DoesNotContain("CH_n", carved);
+        Assert.DoesNotContain("nVIC", carved);
+    }
+
+    /// <summary>A UTF-16 source (with a byte-order mark) is text: the macros it uses are counted.</summary>
+    [Fact]
+    public void Carve_CountsUsesInUtf16Sources()
+    {
+        var carved = CarveOne("#include \"chip.h\"\nint u(void){ return WIDE_ONLY; }\n",
+                              "#define WIDE_ONLY 1\n#define WIDE_OTHER 2\n", appEncoding: System.Text.Encoding.Unicode);
+        Assert.Contains("#define WIDE_ONLY 1", carved);
+        Assert.DoesNotContain("WIDE_OTHER", carved);
     }
 }

@@ -16,7 +16,9 @@ namespace CodeCarver.Core.Frontend;
 public static class ExternalIncluders
 {
     /// <param name="Capped">The scan stopped at its file limit: headers past it may have been missed.</param>
-    public sealed record Result(IReadOnlyList<string> Headers, int FilesScanned, bool Capped = false);
+    /// <param name="Followed">Files queued by following an #include (what the limit counts; the outside files the
+    /// build names are always read).</param>
+    public sealed record Result(IReadOnlyList<string> Headers, int FilesScanned, bool Capped = false, int Followed = 0);
 
     private static readonly Regex Include = new(@"^[ \t]*" + SourceText.DirectiveStart + @"[ \t]*include(_next)?[ \t]*(?:""([^""\r\n]+)""|<([^>\r\n]+)>)",
         RegexOptions.Compiled);
@@ -36,13 +38,25 @@ public static class ExternalIncluders
     /// <param name="skip">Outside paths never to read (compiler and system include trees).</param>
     /// <param name="readLines">A file's lines, streamed (a generated header can be gigabytes), or null.</param>
     /// <param name="files">The run's shared directory listings, or null for fresh ones.</param>
-    /// <param name="maxFiles">Code files followed at most.</param>
+    /// <param name="maxFiles">Files followed through #includes at most (the outside files themselves don't count).</param>
+    /// <param name="forcedIncludes">What outside commands force-include (<c>-include</c>), as spelled, with the
+    /// command's directory: looked for there first, then through the include directories, like the compiler does.</param>
+    /// <param name="realDirectory">A directory's real path through links (junctions, symlinks, subst and mapped
+    /// drives), or null; defaults to <see cref="RealPath.Directory"/>.</param>
     public static Result Find(IEnumerable<string> outsideFiles, IEnumerable<string> includeDirs, string root,
                               IEnumerable<string> rootFiles, Func<string, bool> skip, Func<string, IEnumerable<string>?> readLines,
-                              FileLookup? files = null, int maxFiles = 200_000)
+                              FileLookup? files = null, int maxFiles = 200_000,
+                              IEnumerable<(string Dir, string Raw)>? forcedIncludes = null,
+                              Func<string, string?>? realDirectory = null)
     {
         var cmp = PathComparer.Comparison;
-        var rootPrefix = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)) + Path.DirectorySeparatorChar;
+        var rootFull = Path.GetFullPath(root);
+        var rootPrefix = PathComparer.DirectoryPrefix(rootFull);
+        realDirectory ??= RealPath.Directory;
+        // The root as the disk sees it: an -I dir can reach it through a junction, a symlink, a subst or mapped drive,
+        // and the plain spelling then never matches.
+        var realRootPrefix = realDirectory(rootFull) is { } rr ? PathComparer.DirectoryPrefix(rr) : rootPrefix;
+        var realDirs = new Dictionary<string, string?>(PathComparer.Default);
         var dirs = includeDirs.Select(Path.TrimEndingDirectorySeparator).Distinct(PathComparer.Default).ToList();
         var rootList = rootFiles.ToList();
         var byName = rootList.GroupBy(r => r[(r.LastIndexOf('/') + 1)..], StringComparer.OrdinalIgnoreCase)
@@ -55,24 +69,39 @@ public static class ExternalIncluders
         var queue = new Queue<string>();
         var queued = 0;
         var capped = false;
-        bool InRoot(string full) => full.StartsWith(rootPrefix, cmp);
+        // The file's path relative to the root, or null outside it: by spelling first, then through the real path of
+        // its directory (resolved once per directory).
+        string? RootRel(string full)
+        {
+            if (full.StartsWith(rootPrefix, cmp)) return Path.GetRelativePath(rootPrefix, full).Replace('\\', '/');
+            if (Path.GetDirectoryName(full) is not { } d) return null;
+            if (!realDirs.TryGetValue(d, out var real)) realDirs[d] = real = realDirectory(d);
+            if (real is null) return null;
+            var realFull = Path.Combine(real, Path.GetFileName(full));
+            return realFull.StartsWith(realRootPrefix, cmp) ? Path.GetRelativePath(realRootPrefix, realFull).Replace('\\', '/') : null;
+        }
         // A header is reached by thousands of includes: decide once. Build and trace seeds are filtered to code (a
-        // trace lists objects, libraries and tools too); whatever an #include reaches is code, extension or not.
+        // trace lists objects, libraries and tools too); whatever an #include reaches is code, extension or not. Only
+        // what an #include reaches counts toward the limit: the build's own outside files are always read.
         void Enqueue(string full, bool included)
         {
             if (!seen.Add(full) || (!included && !CodeExt.Contains(Path.GetExtension(full))) || skip(full)) return;
-            if (queued >= maxFiles) { capped = true; return; }
-            queued++;
+            if (included)
+            {
+                if (queued >= maxFiles) { capped = true; return; }
+                queued++;
+            }
             queue.Enqueue(full);
         }
-        void Found(string full)
+        // Under the root (as the walk spells it): found, and followed. Outside it: followed.
+        void Reached(string full)
         {
-            var rel = Path.GetRelativePath(rootPrefix, full).Replace('\\', '/');
+            if (RootRel(full) is not { } rel) { Enqueue(full, included: true); return; }
             found.Add(walkSpelling.TryGetValue(rel, out var w) ? w : rel);
-            Enqueue(full, included: true);
+            Enqueue(Path.Combine(rootPrefix, rel.Replace('/', Path.DirectorySeparatorChar)), included: true);
         }
         foreach (var f in outsideFiles)
-            try { var full = Path.GetFullPath(f); if (!InRoot(full)) Enqueue(full, included: false); }
+            try { var full = Path.GetFullPath(f); if (RootRel(full) is null) Enqueue(full, included: false); }
             catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { }
 
         // Thousands of files x hundreds of -I dirs: each name's -I search runs once, each unresolved name's root
@@ -92,11 +121,11 @@ public static class ExternalIncluders
             if (quoted && !next)
             {
                 if (!local.TryGetValue((fromDir, raw), out var hit)) local[(fromDir, raw)] = hit = files.Probe(fromDir, raw);
-                if (hit is not null) { if (InRoot(hit)) Found(hit); else Enqueue(hit, included: true); return; }
+                if (hit is not null) { Reached(hit); return; }
             }
             if (!viaDirs.TryGetValue(raw, out var hits))
                 viaDirs[raw] = hits = dirs.Select(d => files.Probe(d, raw)).OfType<string>().Distinct(PathComparer.Default).ToList();
-            foreach (var h in hits) if (InRoot(h)) Found(h); else Enqueue(h, included: true);
+            foreach (var h in hits) Reached(h);
             if (hits.Count > 0) return;
             // Resolves nowhere we know: every root file the include could name.
             if (!byTail.TryGetValue(raw, out var matches))
@@ -107,8 +136,15 @@ public static class ExternalIncluders
                     matches.AddRange(cands.Where(c => c.Equals(tail, StringComparison.OrdinalIgnoreCase)
                                                    || c.EndsWith("/" + tail, StringComparison.OrdinalIgnoreCase)));
             }
-            foreach (var m in matches) Found(Path.Combine(rootPrefix, m.Replace('/', Path.DirectorySeparatorChar)));
+            foreach (var m in matches) Reached(Path.Combine(rootPrefix, m.Replace('/', Path.DirectorySeparatorChar)));
         }
+
+        // A forced include is compiled into the outside code like an #include on its first line — a config header
+        // under the root (`-include <root>/cfg/autoconf.h`) is used by the outside code though nothing includes it.
+        if (forcedIncludes is not null)
+            foreach (var (fdir, fraw) in forcedIncludes)
+                try { Resolve(Path.GetFullPath(fdir), fraw, quoted: true, next: false); }
+                catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { }
 
         var scanned = 0;
         var literals = new List<string>();
@@ -130,7 +166,8 @@ public static class ExternalIncluders
                         if (m.Success) { Resolve(fromDir, m.Groups[2].Success ? m.Groups[2].Value : m.Groups[3].Value, m.Groups[2].Success, m.Groups[1].Success); continue; }
                         if (Computed.IsMatch(line)) computed = true;
                     }
-                    if (line.Contains('"') || line.Contains('<'))
+                    // The header a computed include expands to is spelled where its macro is #defined: only those lines.
+                    if (line.Contains("define", StringComparison.Ordinal) && (line.Contains('"') || line.Contains('<')))
                         foreach (Match l in HeaderLiteral.Matches(line))
                             if (literals.Count < 10_000) literals.Add(l.Groups[1].Success ? l.Groups[1].Value : l.Groups[2].Value);
                 }
@@ -139,6 +176,6 @@ public static class ExternalIncluders
             // #include MACRO: the header it expands to is one of the names the file spells (sound: maybe all of them).
             if (computed) foreach (var l in literals.ToList()) Resolve(fromDir, l, quoted: true, next: false);
         }
-        return new Result(found.OrderBy(r => r, StringComparer.Ordinal).ToList(), scanned, capped);
+        return new Result(found.OrderBy(r => r, StringComparer.Ordinal).ToList(), scanned, capped, queued);
     }
 }

@@ -373,32 +373,44 @@ public static class BuildLogScraper
             else if (Flag(a, 'D')) Define(a[2..]);
             else if (a.Length == 2 && Flag(a, 'U')) { if (i + 1 < args.Count) Undef(args[++i]); }
             else if (Flag(a, 'U')) Undef(a[2..]);
-            else if (a.Length == 2 && Flag(a, 'I')) { if (i + 1 < args.Count) includes.Add(args[++i]); }
+            // `-I-` splits the quote and angle search lists (old GCC): not a directory.
+            else if (a == "-I-") continue;
+            else if (a.Length == 2 && Flag(a, 'I')) { if (i + 1 < args.Count) includes.Add(SysrootRelative(args[++i])); }
             // -isystem / -iquote / -idirafter DIR: the other GCC/Clang include-search forms, used heavily by
             // embedded builds for toolchain / CMSIS / HAL headers. They take the dir as the NEXT token. Feeding
             // these to include resolution matters -- a non-sibling .inc reached via -isystem otherwise falls to
             // the (over-approximate, warning) basename fallback.
-            else if (a is "-isystem" or "-iquote" or "-idirafter" or "-isystem-after" or "--include-directory" or "--include-directory-after")
-            { if (i + 1 < args.Count) includes.Add(args[++i]); }
-            else if (JoinedIncludeDir(a) is { } joined) includes.Add(joined);
-            else if (Flag(a, 'I')) includes.Add(a[2..]);
+            else if (a is "-isystem" or "-iquote" or "-idirafter" or "-isystem-after" or "--include-directory" or "--include-directory-after"
+                       or "--include_path" or "--sys_include"
+                     || (msvc && a is "/external:I" or "-external:I"))
+            { if (i + 1 < args.Count) includes.Add(SysrootRelative(args[++i])); }
+            else if (JoinedIncludeDir(a, msvc) is { } joined) includes.Add(SysrootRelative(joined));
+            else if (Flag(a, 'I')) includes.Add(SysrootRelative(a[2..]));
         }
         var defines = eff.Select(kv => kv.Value is null ? kv.Key : $"{kv.Key}={kv.Value}").ToList();
         return (defines, includes, forced);
     }
 
     /// <summary>The dir of an include flag written joined: <c>-isystemDIR</c>, <c>-iquoteDIR</c>, <c>-idirafterDIR</c>,
-    /// <c>--include-directory=DIR</c>, and other vendors' <c>--include_path=DIR</c> / <c>--sys_include=DIR</c>.</summary>
-    private static string? JoinedIncludeDir(string a)
+    /// <c>--include-directory=DIR</c>, other vendors' <c>--include_path=DIR</c> / <c>--sys_include=DIR</c>, and MSVC's
+    /// <c>/external:IDIR</c>. Longer prefixes first: <c>-isystem-afterDIR</c> is not <c>-isystem</c> of "-afterDIR".</summary>
+    private static string? JoinedIncludeDir(string a, bool msvc)
     {
         foreach (var p in JoinedIncludePrefixes)
             if (a.Length > p.Length && a.StartsWith(p, StringComparison.Ordinal)) return a[p.Length..];
+        if (msvc)
+            foreach (var p in MsvcJoinedIncludePrefixes)
+                if (a.Length > p.Length && a.StartsWith(p, StringComparison.OrdinalIgnoreCase)) return a[p.Length..];
         return null;
     }
 
     private static readonly string[] JoinedIncludePrefixes =
         { "--include-directory-after=", "--include-directory=", "--include_path=", "--sys_include=",
-          "-isystem", "-iquote", "-idirafter" };
+          "-isystem-after", "-isystem", "-iquote", "-idirafter" };
+    private static readonly string[] MsvcJoinedIncludePrefixes = { "/external:I", "-external:I" };
+
+    /// <summary>GCC's <c>-I=DIR</c> / <c>-isystem=DIR</c>: DIR under the sysroot. Without one that is DIR itself.</summary>
+    private static string SysrootRelative(string dir) => dir.Length > 1 && dir[0] == '=' ? dir[1..] : dir;
 
     private static bool IsCompiler(string token)
     {

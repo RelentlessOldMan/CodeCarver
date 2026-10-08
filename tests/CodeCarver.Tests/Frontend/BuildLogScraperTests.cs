@@ -102,6 +102,20 @@ public class BuildLogScraperTests
         Assert.Equal(new[] { "core", "/opt/cmsis/inc", "local", "after" }, cmd.Includes);
     }
 
+    /// <summary>The joined and vendor spellings: <c>-isystem-afterDIR</c> is not <c>-isystem</c> of "-afterDIR",
+    /// <c>-I=DIR</c> / <c>-isystem=DIR</c> are sysroot-relative DIR, <c>--sys_include DIR</c> takes the next token,
+    /// <c>-I-</c> is no directory, and MSVC's <c>/external:I</c> comes both ways.</summary>
+    [Fact]
+    public void IncludeFlag_JoinedSysrootAndVendorForms()
+    {
+        var c = Assert.Single(BuildLogScraper.Parse(
+            "gcc -isystem-after/opt/late -isystem=/usr/sys -I=/usr/inc -I- -Icore --sys_include /tc/sys --include_path /tc/inc -c m.c"));
+        Assert.Equal(new[] { "/opt/late", "/usr/sys", "/usr/inc", "core", "/tc/sys", "/tc/inc" }, c.Includes);
+
+        c = Assert.Single(BuildLogScraper.Parse("cl.exe /c /external:I ext\\one /external:Iext\\two /Iown foo.cpp"));
+        Assert.Equal(new[] { "ext\\one", "ext\\two", "own" }, c.Includes);
+    }
+
     [Fact]
     public void SiblingToolchainTools_AreNotTreatedAsCompiles()
     {

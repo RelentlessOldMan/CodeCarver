@@ -104,23 +104,163 @@ public class IntraFilePruneTests
         }
     }
 
-    static string Prune(string src)
+    static string Prune(string src, bool cpp = false)
     {
         var work = Path.Combine(Path.GetTempPath(), "codecarver-safe-" + Guid.NewGuid().ToString("N"));
         var srcDir = Path.Combine(work, "src");
         var outDir = Path.Combine(work, "out");
         Directory.CreateDirectory(srcDir);
+        var name = cpp ? "t.cpp" : "t.c";
         try
         {
-            File.WriteAllText(Path.Combine(srcDir, "t.c"), src);
-            using var fe = new CFrontEnd();
-            var graph = fe.BuildGraph(new[] { ("t.c", src) });
+            File.WriteAllText(Path.Combine(srcDir, name), src);
+            using TreeSitterFrontEnd fe = cpp ? new CppFrontEnd() : new CFrontEnd();
+            var graph = fe.BuildGraph(new[] { (name, src) });
             var reader = graph.Nodes.First(n => n.Name == "reader").Id;
             var plan = ReachabilityEngine.Compute(graph, new[] { new Root(reader, RootKind.ExplicitSymbol) });
             FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
-            return File.ReadAllText(Path.Combine(outDir, "t.c")).Replace("\r\n", "\n");
+            return File.ReadAllText(Path.Combine(outDir, name)).Replace("\r\n", "\n");
         }
         finally { TempDir.Delete(work); }
+    }
+
+    /// <summary>The carved text compiles cleanly (-Wall -Werror) with the repo's gcc/g++, when that toolchain is present
+    /// (the text assertions carry the test without it).</summary>
+    static void AssertCompiles(string carved, bool cpp = false, bool werror = true)
+    {
+        var cc = cpp ? Toolchain.Gxx() : Toolchain.Gcc();
+        if (cc is null) return;
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-cc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            var file = Path.Combine(work, cpp ? "t.cpp" : "t.c");
+            File.WriteAllText(file, carved);
+            var args = werror ? new[] { "-fsyntax-only", "-Wall", "-Werror", file } : new[] { "-fsyntax-only", file };
+            var (code, output) = Toolchain.Run(cc, args, work);
+            Assert.True(code == 0, output + "\n---\n" + carved);
+        }
+        finally { TempDir.Delete(work); }
+    }
+
+    [Fact]
+    public void IncludeClosure_FindsAnIncludeWrittenWithoutASpace()
+    {
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-inc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            File.WriteAllText(Path.Combine(work, "a.c"), "#include\"rows.inc\"\nint a;\n");
+            File.WriteAllText(Path.Combine(work, "rows.inc"), "1, 2,\n");
+            var extra = FileTreeEmitter.IncludeClosure(new[] { "a.c" }, new[] { "a.c" }, Array.Empty<string>(), work);
+            Assert.Equal(new[] { "rows.inc" }, extra);
+        }
+        finally { TempDir.Delete(work); }
+    }
+
+    [Fact]
+    public void EmitPruned_DirectiveOpeningAComment_KeepsTheSpanWhole()
+    {
+        // `#if FAST /* enable the` stays when its function goes; the comment's end goes with the body, so the comment
+        // would swallow the #endif and the code after it.
+        const string src = """
+            void fast(void);
+            void dead_h(void) {
+            #if FAST /* enable the
+               fast path */
+                fast();
+            #endif
+            }
+            void fast(void) { }
+            int reader(void) { return 0; }
+            """;
+        var result = Prune(src);
+        Assert.Contains("#if FAST /* enable the\n   fast path */", result);
+        AssertCompiles(result);
+    }
+
+    [Fact]
+    public void EmitPruned_CommentWithParensAboveAnIfdefedFirstMember_KeepsTheNamespace()
+    {
+        // The line above holds an open brace and parentheses, but only in its comment: a scope, not a second head.
+        const string src = """
+            namespace drv {  // driver internals (private)
+            #ifndef NO_DEBUG
+            void k_dead() { }
+            #endif
+            void k_helper() { }
+            }
+            int reader() { drv::k_helper(); return 0; }
+            """;
+        var result = Prune(src, cpp: true);
+        Assert.Contains("namespace drv {", result);
+        Assert.DoesNotContain("k_dead", result);
+        AssertCompiles(result, cpp: true);
+    }
+
+    [Fact]
+    public void EmitPruned_LineCommentSplicedByABackslash_IsNotCut()
+    {
+        // A // comment ending in a backslash continues onto the next line. Removing the function whose last line
+        // holds it would make that next line code; one whose first line follows it is part of the comment.
+        const string src = """
+            void dead_tail(void) {
+            } // legacy path: C:\vendor\regs\
+            this line is a comment continuation
+            int reader(void) { return 0; }
+            """;
+        var result = Prune(src);
+        Assert.Contains("} // legacy path: C:\\vendor\\regs\\\nthis line is a comment continuation", result);
+        AssertCompiles(result, werror: false);   // -Wall's -Wcomment flags the splice itself, in the original too
+    }
+
+    [Fact]
+    public void EmitPruned_RemovedFunction_TakesMultiLineAndMacroSpelledPrototypesAlong()
+    {
+        const string src = """
+            #define STATIC static
+            static void helper2(int a,
+                                int b);
+            STATIC void helper3(void);
+            int helper4(void), helper6(void);
+            /* { not a scope */
+            static void helper5(void);
+            void b_dead(void) { helper2(1, 2); helper3(); helper5(); }
+            static void helper2(int a,
+                                int b) { (void)a; (void)b; }
+            STATIC void helper3(void) { }
+            static void helper5(void) { }
+            int helper4(void) { return 0; }
+            int reader(void) { return 0; }
+            """;
+        var result = Prune(src);
+        foreach (var gone in new[] { "helper2", "helper3", "helper5", "int helper4(void) {" })
+            Assert.False(result.Contains(gone), gone + " left in:\n" + result);
+        Assert.Contains("int helper4(void), helper6(void);", result);   // a second declarator: stays
+        AssertCompiles(result);
+    }
+
+    [Fact]
+    public void EmitPruned_DirectiveSpelledWithACommentOrDigraph_StaysOrKeepsTheSpan()
+    {
+        const string src = """
+            void dead_a(void) {
+            /* why */ #define LIMIT 4
+                (void)LIMIT;
+            }
+            void dead_b(void) {
+            %:if 1
+                (void)0;
+            %:endif
+            }
+            int reader(void) { return 0; }
+            """;
+        var result = Prune(src);
+        Assert.Contains("/* why */ #define LIMIT 4", result);   // a #define is no #if structure: the span stays
+        Assert.Contains("dead_a", result);
+        Assert.DoesNotContain("dead_b", result);               // %:if structure alone: removed, the directives stay
+        Assert.Contains("%:if 1\n%:endif", result);
+        AssertCompiles(result);
     }
 
     /// <summary>Directives inside a removed span stay behind; anything but #if structure must not, so such a span

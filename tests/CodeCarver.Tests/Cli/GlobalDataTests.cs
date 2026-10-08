@@ -64,6 +64,92 @@ public sealed class GlobalDataTests
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
+    const string Pruned = "[stages.p]\ncarveSourceFileContents = true\n";
+    static string Stage(TreeCarve t, string rel) => Path.Combine(t.Root, "out", "p", "carved", rel);
+
+    /// <summary>An unused variable whose declaration also defines its type is not cut: kept code still names the type.</summary>
+    [Fact]
+    public void Prune_KeepsUnusedGlobalThatDefinesItsType()
+    {
+        using var t = new TreeCarve();
+        t.W("main.c", "struct modd_cfg { int a; } modd_dead_cfg = { 1 };\nint main(void){ struct modd_cfg c = { 2 }; return c.a; }\n");
+        var (code, o, e) = t.Carve(extraToml: Pruned);
+        Assert.True(code == 0, o + e);
+        Assert.Contains("struct modd_cfg { int a; }", File.ReadAllText(Stage(t, "main.c")));
+    }
+
+    /// <summary>A C++ object of class type can register itself in its constructor: it stays with its file.</summary>
+    [Fact]
+    public void Prune_KeepsCppObjectsWithConstructors()
+    {
+        using var t = new TreeCarve();
+        t.W("main.cpp", "int modd_count;\nstruct Registrar { Registrar(){ modd_count++; } };\nRegistrar modd_entry;\n"
+                      + "int modd_register(void){ return ++modd_count; }\nint modd_slot = modd_register();\nint modd_plain = 4;\n"
+                      + "int main(void){ return modd_count; }\n");
+        var (code, o, e) = t.Carve(extraToml: Pruned, languages: "\"cpp\"");
+        Assert.True(code == 0, o + e);
+        var text = File.ReadAllText(Stage(t, "main.cpp"));
+        Assert.Contains("Registrar modd_entry;", text);
+        Assert.Contains("int modd_slot = modd_register();", text);
+        Assert.DoesNotContain("modd_plain", text);
+    }
+
+    /// <summary>The EXTERN idiom: one unit defines the header's variables by turning EXTERN off before including it.</summary>
+    [Fact]
+    public void ExternMacroHeader_KeepsTheUnitThatDefinesIt()
+    {
+        using var t = new TreeCarve();
+        t.W("modd_globals.h", "#ifdef MODD_DEFINE_GLOBALS\n#define MODD_EXTERN\n#else\n#define MODD_EXTERN extern\n#endif\nMODD_EXTERN int modd_ticks;\n")
+         .W("globals.c", "#define MODD_DEFINE_GLOBALS\n#include \"modd_globals.h\"\n")
+         .W("other.c", "#include \"modd_globals.h\"\nint modd_other(void){ return 1; }\n")
+         .W("main.c", "#include \"modd_globals.h\"\nint main(void){ return modd_ticks; }\n");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("globals.c"), o + e);
+        Assert.False(t.Kept("other.c"), o + e);
+    }
+
+    /// <summary>A header that defines a variable defines it in the unit including it: that unit is kept.</summary>
+    [Fact]
+    public void HeaderDefinition_KeepsTheIncludingUnit()
+    {
+        using var t = new TreeCarve();
+        t.W("modd_def.h", "int modd_level = 1;\n")
+         .W("x.c", "#include \"modd_def.h\"\n")
+         .W("main.c", "extern int modd_level;\nint main(void){ return modd_level; }\n");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("x.c"), o + e);
+    }
+
+    /// <summary>An address or a cast in a file-scope initializer is a use, also for a variable that is no graph node.</summary>
+    [Theory]
+    [InlineData("static int *modd_p = &modd_counter;\nint main(void){ return *modd_p; }\n")]
+    [InlineData("static long modd_p = (long)&modd_counter;\nint main(void){ return (int)modd_p; }\n")]
+    public void AddressInStaticInitializer_KeepsTheDefiningFile(string main)
+    {
+        using var t = new TreeCarve();
+        t.W("data.c", "int modd_counter = 3;\n")
+         .W("main.c", "extern int modd_counter;\n" + main);
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("data.c"), o + e);
+    }
+
+    /// <summary>Data the parse can't read (an attribute after the name) is still defined by its file.</summary>
+    [Theory]
+    [InlineData("int modd_v __attribute__((aligned(4)));")]
+    [InlineData("int modd_v __attribute__((section(\".modd\"))) = 1;")]
+    public void AttributedData_KeepsItsFile(string definition)
+    {
+        using var t = new TreeCarve();
+        t.W("data.c", definition + "\n")
+         .W("main.c", "extern int modd_v;\nint main(void){ return modd_v; }\n");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("data.c"), o + e);
+    }
+
     /// <summary>A declaration is not a definition: the header's extern doesn't stand in for the file defining it.</summary>
     [Fact]
     public void ExternDeclarationInAHeader_DoesNotHideTheDefinition()
