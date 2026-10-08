@@ -91,6 +91,9 @@ anonymized copy's carve drops every file that defines the name (or the missing h
 `.WarningAsError.unused-function`), `Redefinition`, `Syntax` (the text no longer parses: a cut in the wrong place) and
 `Other`, beside `<stage>.buildErrors.cases` / `.reproduced`.
 
+For the counts alone there is no need to carve again: `tools\builderrors\count-build-errors.ps1 -Path
+<out>\<stage>\build-output.txt` prints the same kinds in seconds (Windows PowerShell 5.1 or later, or `pwsh`).
+
 ## Checking a fix: `tools\selfcheck\selfcheck.ps1`
 
 The release ships a self-check that carves tiny made-up trees, one for each definition shape a past evaluation

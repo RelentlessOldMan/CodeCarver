@@ -119,7 +119,10 @@ Copy-Item -Recurse -Force $capture (Join-Path $pub 'tools\capture')
 $selfcheck = Join-Path $root 'tools\selfcheck'
 if (-not (Test-Path $selfcheck)) { throw "tools\selfcheck missing" }
 Copy-Item -Recurse -Force $selfcheck (Join-Path $pub 'tools\selfcheck')
-Write-Host "  bundled README.md, LICENSE, THIRD-PARTY-NOTICES.txt, tools/capture/, tools/selfcheck/ into the release" -ForegroundColor DarkGray
+$builderrors = Join-Path $root 'tools\builderrors'
+if (-not (Test-Path $builderrors)) { throw "tools\builderrors missing - SUPPORT.md tells users to run it" }
+Copy-Item -Recurse -Force $builderrors (Join-Path $pub 'tools\builderrors')
+Write-Host "  bundled README.md, LICENSE, THIRD-PARTY-NOTICES.txt, tools/capture/, tools/selfcheck/, tools/builderrors/ into the release" -ForegroundColor DarkGray
 
 # --- 5. zip (only reached AFTER push is confirmed) ---
 if (-not $Output) { $Output = Join-Path $root 'dist' }

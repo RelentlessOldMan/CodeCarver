@@ -47,6 +47,8 @@ public static class BuildErrors
     static readonly Regex Lnk = new(@"error LNK\d+:\s*unresolved external symbol\s+(?<name>[^\s(]+)", RegexOptions.Compiled);
     static readonly Regex Armlink = new(@"L6218E:\s*Undefined symbol\s+(?<name>[^\s(]+)", RegexOptions.Compiled);
     static readonly Regex IarLink = new(@"Error\[Li005\]:\s*no definition for\s+""(?<name>[^""]+)""", RegexOptions.Compiled);
+    // The linker's own prefix (`/usr/bin/ld: obj/a.o:(.text+0x9): undefined reference ...`): stripped before matching.
+    static readonly Regex LinkerPrefix = new(@"^(?:\S*[/\\])?(?:[\w.+-]*-)?ld(?:\.exe)?:\s+", RegexOptions.Compiled);
 
     static readonly Regex WerrorFlag = new(@"\[-Werror=(?<flag>[\w+-]+)\]", RegexOptions.Compiled);
 
@@ -68,7 +70,7 @@ public static class BuildErrors
         var lines = log.Replace("\r", "").Split('\n');
         for (var i = 0; i < lines.Length; i++)
         {
-            var line = lines[i].Trim();
+            var line = LinkerPrefix.Replace(lines[i].Trim(), "");
             if (line.Length == 0) continue;
             Match m;
             if ((m = Lld.Match(line)).Success)
