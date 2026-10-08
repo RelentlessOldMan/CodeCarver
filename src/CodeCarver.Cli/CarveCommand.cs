@@ -1519,6 +1519,27 @@ public static class CarveCommand
         var outsideRoots = includedFromOutside.Count == 0 ? new List<Root>()
             : graph.Nodes.Where(n => n.FilePath is { } fp && includedFromOutside.Contains(fp))
                    .Select(n => new Root(n.Id, RootKind.Exported, "included from outside the carve root")).ToList();
+        if (includedFromOutside.Count > 0)
+        {
+            // Outside code reaches module functions through these headers: prototypes it calls, macros that expand
+            // to calls. A prototype is no graph node, and a header too big or macro-dense to parse has none at all,
+            // so every function the header's text names is rooted (sound: one named only in a comment is kept too).
+            var fnByName = graph.Nodes.Where(n => n.Kind == NodeKind.Function).ToLookup(n => n.Name, StringComparer.Ordinal);
+            var named = new HashSet<string>(StringComparer.Ordinal);
+            var ident = new System.Text.RegularExpressions.Regex(@"[A-Za-z_]\w*");
+            foreach (var h in includedFromOutside)
+                try
+                {
+                    foreach (var line in File.ReadLines(fullByRel[h]))
+                        foreach (System.Text.RegularExpressions.Match m in ident.Matches(line))
+                            if (fnByName.Contains(m.Value)) named.Add(m.Value);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            foreach (var name in named)
+                foreach (var n in fnByName[name])
+                    outsideRoots.Add(new Root(n.Id, RootKind.Exported, "named in a header code outside the carve root includes"));
+            summary["roots.namedFromOutsideHeaders"] = named.Count;
+        }
 
         // Assembly startup (.s/.S) references C handlers by name (vector table `.word Handler`) — root them.
         var asmRoots = new List<Root>();

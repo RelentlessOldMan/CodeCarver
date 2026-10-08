@@ -27,7 +27,8 @@ generated headers: `bigHeadersKept`, `wholeIncludedFromOutside` (left whole, see
 `definesDropped`). Two stages that differ little in size usually show why here.
 `roots.includedFromOutside` counts headers in the carve root that code outside it `#include`s (found through the
 build log's outside compiles and the build trace's outside files); they are kept whole in every stage, since the
-rest of the build compiles against them.
+rest of the build compiles against them. `roots.namedFromOutsideHeaders` counts the module functions those headers
+name (prototypes, macros that expand to calls): they are rooted, so outside code still links in every stage.
 
 ## When `verify` fails: `codecarver/debug/`
 

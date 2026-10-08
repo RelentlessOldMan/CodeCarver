@@ -65,6 +65,11 @@ public class IntraFilePruneTests
             #define MULTI(a) \
                 do { a; } while (0)
             int after_define(void) { return 6; }
+            __attribute__((deprecated))
+            __attribute__((noinline))
+            int gone_two_attrs(void) { return 7; }
+            DEPRECATED_MSG("use x") ALIASED(other)
+            int gone_two_macros(void) { return 8; }
             int reader(void) { return used() + table[0]; }
             """;
 
@@ -89,6 +94,9 @@ public class IntraFilePruneTests
             Assert.DoesNotContain("gone_spelled", result);
             Assert.DoesNotContain("\n__attribute__((weak))\n", result);
             Assert.DoesNotContain("after_define", result);                          // a #define's tail ends it
+            Assert.True(!result.Contains("gone_two_attrs") && !result.Contains("__attribute__((deprecated))")
+                        && !result.Contains("__attribute__((noinline))"), result);  // attributes go with it
+            Assert.Contains("DEPRECATED_MSG(\"use x\") ALIASED(other)\nint gone_two_macros(void)", result);
         }
         finally
         {
