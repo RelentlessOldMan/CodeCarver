@@ -97,7 +97,7 @@ public static class EmitClosure
         if (string.IsNullOrEmpty(headerText)) yield break;
         var emitting = new HashSet<(string, int)>();
         foreach (var d in EmittedLinkCheck.Scan(headerText).Definitions)
-            if (!d.Static && !d.Inline) emitting.Add((d.Name, d.Line));
+            if (!d.Static && !d.Inline && !d.Data) emitting.Add((d.Name, d.Line));
         if (emitting.Count == 0) yield break;
         foreach (var n in defs)
         {

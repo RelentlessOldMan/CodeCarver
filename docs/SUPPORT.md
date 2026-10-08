@@ -76,7 +76,7 @@ without ever seeing your code. Counts are in `summary.txt` (`<stage>.debug.cases
 
 ## When the carved tree doesn't build: `build-output.txt`
 
-`verify` checks functions only; a missing header, type or macro shows up when you build the carved tree. Save
+`verify` checks functions and variables only; a missing header, type or macro shows up when you build the carved tree. Save
 everything that build printed as `<outputDirectory>/<stage>/build-output.txt` (beside that stage's `carved/`;
 `<outputDirectory>/build-output.txt` with no stages) and run the same carve again. CodeCarver reads the errors (gcc,
 clang, MSVC, Keil armcc/armclang, IAR, and the GNU, LLVM, Microsoft, Arm and IAR linkers) and writes them up exactly
@@ -147,8 +147,8 @@ use `--why` then.
 ## The `verify` check
 
 Every C/C++ carve checks the tree it **emitted**, with its own tokenizer and without using the carve's graph:
-if emitted code uses a function that only a **dropped** file defines, the tree would not link, the `verify`
-line says `FAILED` with the function and where it is used, and the run exits **3** so it can gate CI. A use on
+if emitted code uses a function or file-scope variable that only a **dropped** file defines, the tree would not link, the `verify`
+line says `FAILED` with the name and where it is used, and the run exits **3** so it can gate CI. A use on
 an `#ifdef`-dead line is a note, not a failure. The full list is in `codecarver/verify.txt`. `verify` cannot see
 a missing type, macro or header — if a carved tree won't build but `verify` is OK, the compiler's first error is
 the lead.

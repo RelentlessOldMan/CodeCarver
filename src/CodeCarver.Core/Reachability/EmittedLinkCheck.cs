@@ -335,7 +335,8 @@ public static class EmittedLinkCheck
     // ---- tokenizer + scope tracking ------------------------------------------------------------------
 
     /// <param name="Bare">Nothing but #define lines precedes the name in its statement (no return type).</param>
-    public readonly record struct Definition(string Name, int Line, bool Static, bool Inline, bool Bare = false);
+    /// <param name="Data">A file-scope variable, not a function.</param>
+    public readonly record struct Definition(string Name, int Line, bool Static, bool Inline, bool Bare = false, bool Data = false);
 
     public sealed class ScanResult
     {
@@ -671,6 +672,7 @@ public static class EmittedLinkCheck
             if (next.Text == "(") result.CallUses.Add((name, t.Line));   // `(name)(x)` has ")" next: never a macro call
         }
         DefinerDefinitions(text, result, definerMacros);
+        if (!header) DataDefinitions(toks, result);
         foreach (var (cname, sym, line) in result.AsmLabels)
             if (result.Definitions.Any(d => d.Name == cname && !d.Bare && d.Line != line)) result.Definitions.Add(new Definition(sym, line, false, false));
             else result.Uses.Add((sym, line));
@@ -708,6 +710,109 @@ public static class EmittedLinkCheck
         foreach (var use in CodeCarver.Core.Preprocess.DefinerMacros.Uses(text, set.Use, set.Definers))
             foreach (var (name, _) in use.Defines)
                 if (have.Add(name)) result.Definitions.Add(new Definition(name, use.StartLine, Static: false, Inline: false));
+    }
+
+    /// <summary>
+    /// File-scope variable definitions of a translation unit (<c>int counter;</c>, <c>const struct cfg board = {...};</c>,
+    /// <c>int (*hook)(int) = 0;</c>, <c>int a, b[4];</c>): a dropped file holding data kept code uses fails the link as
+    /// surely as a dropped function. Declarations that define nothing are skipped: <c>extern</c>, <c>typedef</c>,
+    /// prototypes, macro invocations, a bare <c>struct tag;</c>. A <c>static</c> one is marked so.
+    /// </summary>
+    static void DataDefinitions(List<Tok> all, ScanResult result)
+    {
+        var toks = all.Where(t => !t.InDefine).ToList();
+        var stmt = new List<Tok>();
+        for (var i = 0; i < toks.Count; i++)
+        {
+            var s = toks[i].Text;
+            if (s == "{")
+            {
+                if (IsTransparentOpen(toks, i)) { stmt.Clear(); continue; }   // namespace / extern "C": look inside
+                var close = MatchBrace(toks, i);
+                // An initializer or a struct body belongs to the declaration; anything else (a function body) ends it.
+                var partOfDeclaration = stmt.Count > 0 && stmt[^1].Text != ")"
+                    && stmt.Any(t => t.Text is "=" or "struct" or "union" or "enum" or "class");
+                if (!partOfDeclaration) stmt.Clear();
+                if (close < 0) return;
+                i = close;
+                continue;
+            }
+            if (s == "}") { stmt.Clear(); continue; }
+            if (s == ";") { DataStatement(stmt, result); stmt.Clear(); continue; }
+            stmt.Add(toks[i]);
+        }
+    }
+
+    static readonly HashSet<string> NoDefinition = new(StringComparer.Ordinal)
+        { "typedef", "extern", "using", "template", "namespace", "friend", "static_assert", "_Static_assert", "return", "operator" };
+    static readonly HashSet<string> AttributeWords = new(StringComparer.Ordinal)
+        { "__attribute__", "__attribute", "__declspec", "alignas", "_Alignas", "__asm__", "__asm", "asm", "__pragma", "_Pragma" };
+
+    static void DataStatement(List<Tok> stmt, ScanResult result)
+    {
+        if (stmt.Count < 2 || stmt.Any(t => NoDefinition.Contains(t.Text))) return;
+        var isStatic = stmt.Any(t => t.Text == "static");
+        // Attributes and asm labels carry parentheses that aren't a parameter list.
+        var f = new List<Tok>();
+        for (var k = 0; k < stmt.Count; k++)
+        {
+            if (AttributeWords.Contains(stmt[k].Text) && k + 1 < stmt.Count && stmt[k + 1].Text == "(")
+            {
+                var depth = 0;
+                for (k++; k < stmt.Count; k++)
+                    if (stmt[k].Text == "(") depth++;
+                    else if (stmt[k].Text == ")" && --depth == 0) break;
+                continue;
+            }
+            f.Add(stmt[k]);
+        }
+        // Declarators: split at top-level commas.
+        var parts = new List<List<Tok>> { new() };
+        var level = 0;
+        foreach (var t in f)
+        {
+            if (t.Text is "(" or "[") level++;
+            else if (t.Text is ")" or "]") level--;
+            if (t.Text == "," && level == 0) { parts.Add(new()); continue; }
+            parts[^1].Add(t);
+        }
+        for (var p = 0; p < parts.Count; p++)
+        {
+            var d = parts[p];
+            var eq = d.FindIndex(t => t.Text == "=");
+            var left = eq < 0 ? d : d.GetRange(0, eq);
+            Tok? name = null;
+            var paren = left.FindIndex(t => t.Text == "(");
+            if (paren >= 0)
+            {
+                // `(*hook)(int)`: a pointer variable. Any other parameter list is a prototype or a macro invocation.
+                if (paren + 1 < left.Count && left[paren + 1].Text is "*" or "&")
+                    name = left.Skip(paren + 1).FirstOrDefault(t => t.Ident && !NotNames.Contains(t.Text));
+                if (name is null) { if (p == 0) return; continue; }
+            }
+            else
+            {
+                var bracket = left.FindIndex(t => t.Text == "[");
+                var head = bracket < 0 ? left : left.GetRange(0, bracket);
+                var idx = head.FindLastIndex(t => t.Ident);
+                if (idx < 0) continue;
+                // The first declarator needs a type before its name; `struct tag;` declares a tag, not a variable.
+                if (p == 0 && (idx == 0 || head[idx - 1].Text is "struct" or "union" or "enum" or "class")) return;
+                name = head[idx];
+            }
+            var n = name.Value;
+            if (NotNames.Contains(n.Text)) continue;
+            result.Definitions.Add(new Definition(n.Text, n.Line, isStatic, false, Data: true));
+        }
+    }
+
+    static int MatchBrace(List<Tok> toks, int open)
+    {
+        var depth = 0;
+        for (var k = open; k < toks.Count; k++)
+            if (toks[k].Text == "{") depth++;
+            else if (toks[k].Text == "}" && --depth == 0) return k;
+        return -1;
     }
 
     static bool StaticBefore(List<Tok> toks, int from, int to)

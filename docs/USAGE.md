@@ -37,7 +37,7 @@ CodeCarver 1.0.142+3065c25b8 — carve of src
   world   : closed-world (dead #ifdef branches dropped) — have 5 compile command(s); macros #defined in the tree and compiler built-ins not probed for the TU stay unknown
   stage   : safe  [source-contents=whole, header-contents=whole]
   emitted : 6 files -> out/safe/carved  [file-level (whole kept files)]
-  verify  : OK — emitted code uses no function defined only in a dropped file (7 file(s) checked)
+  verify  : OK — emitted code uses no function or variable defined only in a dropped file (7 file(s) checked)
   passthru: 5 non-code file(s) copied verbatim (541 B) — complete buildable project
   excluded: 3 non-input file(s) NOT copied (53 B) — VCS/scratch/editor (forceKeepFiles to keep)
   size    : 2,761 B -> 2,567 B  (7% smaller, saved 194 B)
@@ -438,7 +438,7 @@ Messy logs are expected:
 ## Verify
 
 Every C/C++ carve runs `verify` on the **emitted** tree. It is an independent, tokenizer-only check that does
-not use the carve's graph: it fails the run (**exit 3**) when emitted code uses a function that only a
+not use the carve's graph: it fails the run (**exit 3**) when emitted code uses a function or variable that only a
 **dropped** file defines — the carved tree would not link. Such a use on a line that is dead under the
 `#ifdef` world is reported as a note, not a failure (it is correct if the world is). Files over
 `maxParseBytes` are not checked and are counted. Details go to `codecarver/verify.txt`.

@@ -41,6 +41,29 @@ public sealed class GlobalDataTests
         Assert.False(t.Kept("other.c"), e);
     }
 
+    /// <summary>verify, independent of the graph, fails when emitted code uses data only a dropped file defines, and
+    /// stays quiet for what defines nothing (extern, typedef, prototypes, macro calls, tags) and for locals.</summary>
+    [Fact]
+    public void Verify_FailsOnDataOnlyADroppedFileDefines()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "cc-vdata-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string W(string name, string text) { var p = Path.Combine(dir, name); File.WriteAllText(p, text); return p; }
+            var data = W("data.c", "struct cfg { int a; } modd_board = { 1 };\nint modd_counter, modd_buf[4];\nint (*modd_hook)(int) = 0;\n"
+                                 + "static int modd_private;\nextern int modd_ext;\ntypedef int modd_t;\nint modd_proto(void);\n"
+                                 + "REGISTER(modd_reg);\nstruct modd_tag;\nint modd_fn(void) { int modd_local = 0; return modd_local; }\n");
+            var main = W("main.c", "extern int modd_counter, modd_buf[4], modd_private, modd_ext;\nextern int (*modd_hook)(int);\n"
+                                 + "int main(void) { int modd_local = 1; return modd_counter + modd_buf[0] + (modd_hook != 0)\n"
+                                 + "  + modd_private + modd_ext + modd_local + sizeof(modd_t) + modd_reg; }\n");
+            var r = CodeCarver.Core.Reachability.EmittedLinkCheck.Run(new[] { ("main.c", main) }, new[] { ("data.c", data) });
+            var failed = r.Hard.Select(v => v.Name).OrderBy(n => n).ToList();
+            Assert.Equal(new[] { "modd_buf", "modd_counter", "modd_hook" }, failed);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
     /// <summary>A declaration is not a definition: the header's extern doesn't stand in for the file defining it.</summary>
     [Fact]
     public void ExternDeclarationInAHeader_DoesNotHideTheDefinition()

@@ -40,7 +40,7 @@ carve src --config carve.toml
   dropped : dead.c
   cmm     : 4/6 script(s) kept (1 observed + 3 via DO/GOSUB closure), 2 dropped
   world   : open-world (both #ifdef branches kept) — no build log or compiler given
-  verify  : OK — emitted code uses no function defined only in a dropped file (3 file(s) checked)
+  verify  : OK — emitted code uses no function or variable defined only in a dropped file (3 file(s) checked)
 ```
 
 What happened, visible in [`carved/`](carved):

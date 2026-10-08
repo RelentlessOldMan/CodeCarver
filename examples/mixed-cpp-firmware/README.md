@@ -64,13 +64,13 @@ Two builds + two runs, all unioned by default (no `[use]`); the config shows a c
   files   : 2 observed in-tree from 0 build + 1 run file-trace(s) (0 code file(s) rooted)
   roots   : main
   trace   : 5 function(s) from 1 trace(s) rooted; 5 resolved in-scope
-  nodes   : 17/34 kept (50%), 17 carved
+  nodes   : 16/33 kept (48%), 17 carved
   files   : 8/9 kept, 1 dropped
   dropped : unused.cpp
   cmm     : 3 script(s) kept; 1 observed + 1 via DO/GOSUB closure, 1 neither (kept: one run is one scenario — set [runs.X] dropUnobservedCmm = true to drop them)
   world   : closed-world (dead #ifdef branches dropped) — have 4 compile command(s); macros #defined in the tree and compiler built-ins not probed for the TU stay unknown
   stage   : safe  [source-contents=whole, header-contents=whole]
-  verify  : OK — emitted code uses no function defined only in a dropped file (9 file(s) checked)
+  verify  : OK — emitted code uses no function or variable defined only in a dropped file (9 file(s) checked)
   size    : 6,228 B -> 5,611 B  (10% smaller, saved 617 B)
   stage   : aggressive  [source-contents=carved, header-contents=whole]
   size    : 6,228 B -> 5,407 B  (13% smaller, saved 821 B)

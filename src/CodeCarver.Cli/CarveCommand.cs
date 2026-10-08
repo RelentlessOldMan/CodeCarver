@@ -1985,10 +1985,10 @@ public static class CarveCommand
             Directory.CreateDirectory(ccDir);
             WriteArtifact(Path.Combine(ccDir, "verify.txt"), sb.ToString(), "verifylog");
             if (hard.Count == 0)
-                @out.WriteLine($"  verify  : OK — emitted code uses no function defined only in a dropped file ({r.FilesChecked} file(s) checked)");
+                @out.WriteLine($"  verify  : OK — emitted code uses no function or variable defined only in a dropped file ({r.FilesChecked} file(s) checked)");
             else
             {
-                @out.WriteLine($"  verify  : FAILED — emitted code uses {hard.Count} function(s) defined only in dropped files (the carved tree will not link):");
+                @out.WriteLine($"  verify  : FAILED — emitted code uses {hard.Count} function(s) or variable(s) defined only in dropped files (the carved tree will not link):");
                 foreach (var v in hard.Take(20)) @out.WriteLine($"            {v.Name}  used {v.ReferencedIn}:{v.Line}, defined only in dropped {v.DefinedIn}");
                 if (hard.Count > 20) @out.WriteLine($"            (+{hard.Count - 20} more in verify.txt)");
                 @out.WriteLine("            causes: " + string.Join(", ", causes.Select(c => $"{c.Key} {c.Value}")));

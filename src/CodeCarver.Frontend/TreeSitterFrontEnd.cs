@@ -1113,6 +1113,39 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         return clean;
     }
 
+    /// <summary>
+    /// The name node of a file-scope variable definition that becomes a graph node, or null. Another file can link
+    /// only to a non-static variable of a translation unit: that is what must keep its file. Arrays (tables) are nodes
+    /// everywhere, so an unused one can be pruned. A static or header scalar stays text kept with its file: a product
+    /// tree has millions (padding, constants), and as nodes they would only cost graph size. An <c>extern</c> without
+    /// initializer only declares. A declaration with a parse error is often not one at all (comment words after a
+    /// spliced <c>*\</c>+<c>/</c> read as <c>this comment ends at ...</c>): it mints nothing.
+    /// </summary>
+    private TsNode? MintedGlobal(TsNode decl, string path, out bool isStatic)
+    {
+        isStatic = false;
+        if (decl.Parent is not { Type: "declaration" } declaration || declaration.HasError) return null;
+        var storage = declaration.Children.Where(c => c.Type == "storage_class_specifier").Select(c => c.Text).ToList();
+        if (storage.Contains("extern") && decl.Type != "init_declarator") return null;
+        isStatic = storage.Contains("static");
+        if (!HasArrayDeclarator(decl) && (isStatic || !IsTranslationUnit(path))) return null;
+        return GlobalName(decl) is { IsMissing: false, Text.Length: > 0 } node ? node : null;
+    }
+
+    /// <summary>Does the declarator declare an array (<c>int t[4]</c>, <c>const char *names[] = {...}</c>)?</summary>
+    private static bool HasArrayDeclarator(TsNode declarator)
+    {
+        var d = declarator;
+        for (var i = 0; i < 12 && d is not null; i++)
+        {
+            if (d.Type == "array_declarator") return true;
+            if (d.Type is "identifier" or "function_declarator") return false;
+            d = d.Type == "parenthesized_declarator" ? d.NamedChildren.FirstOrDefault(c => c.Type != "comment")
+                : d.GetChildForField("declarator") ?? d.NamedChildren.LastOrDefault();
+        }
+        return false;
+    }
+
     /// <summary>The name a declaration's declarator defines when it is a variable (through initializers, pointers,
     /// arrays, parentheses and function-pointer declarators), or null for a prototype or anything unnamed.</summary>
     private static TsNode? GlobalName(TsNode declarator)
@@ -1365,7 +1398,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // counted (a captured symbol needs >=2 bytes), so the overwhelming majority of small files pay nothing.
         if (PerFileSymbolBudget > 0 && text.Length >= (long)PerFileSymbolBudget * 2)
         {
-            var symbols = CountCaptures(_defs, root) + _globals.Execute(root).Captures.Count(c => GlobalName(c.Node) is not null);
+            var symbols = CountCaptures(_defs, root) + _globals.Execute(root).Captures.Count(c => MintedGlobal(c.Node, path, out _) is not null);
             if (symbols > PerFileSymbolBudget)
             {
                 _symbolBudgetKeptWhole.Add((path, symbols));
@@ -1493,7 +1526,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
         if (root.HasError) _errorFiles++;
         if (root.HasError)
-            foreach (var d in CodeCarver.Core.Reachability.EmittedLinkCheck.Scan(text, header: !IsTranslationUnit(path)).Definitions)
+            foreach (var d in CodeCarver.Core.Reachability.EmittedLinkCheck.Scan(text, header: !IsTranslationUnit(path)).Definitions.Where(d => !d.Data))
             {
                 if (Keywords.Contains(d.Name) || _funcLikeMacroNames.Contains(d.Name)) continue;
                 if (dead is not null && d.Line < dead.Length && dead[d.Line]) continue;
@@ -1547,18 +1580,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var decl = cap.Node;
             if (IsDead(decl)) continue;
             if (scopes.InBody(decl.StartIndex)) continue; // a LOCAL variable, not a file-scope global
-            // A declaration with a parse error is often not one at all (comment words after a spliced `*\`+`/`
-            // read as `this comment ends at ...`): it mints no names.
-            if (decl.Parent is not { Type: "declaration" } declaration || declaration.HasError) continue;
-            var storage = declaration.Children.Where(c => c.Type == "storage_class_specifier").Select(c => c.Text).ToList();
-            if (storage.Contains("extern") && decl.Type != "init_declarator") continue;
-            if (GlobalName(decl) is not { IsMissing: false } node || node.Text is not { Length: > 0 } gname) continue;
+            if (MintedGlobal(decl, path, out var isStatic) is not { } node) continue;
+            var gname = node.Text;
             var span = GlobalDeclarationSpan(node);
             if (span is null) continue;
             var gid = graph.GetOrAddNode(NodeKind.Global, gname, path, new SourceSpan(span.Value.Start, span.Value.End));
             graph.AddEdge(gid, fileNode, EdgeKind.DefinedIn);
             Add(globalsByName, gname, gid);
-            if (storage.Contains("static") && IsTranslationUnit(path)) { _fileLocal.Add(gid); graph.AddFlag(gid, NodeFlags.FileLocal); }
+            if (isStatic && IsTranslationUnit(path)) { _fileLocal.Add(gid); graph.AddFlag(gid, NodeFlags.FileLocal); }
             // What its initializer names, read from the text after the name: a section-placed entry
             // (`const fn_t e __attribute__((section("x"))) = handler;`) doesn't parse as an initializer at all, and
             // the entry is kept by itself (a linker KEEP root) while the file around it may be pruned.
