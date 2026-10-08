@@ -140,4 +140,73 @@ public class HeaderCarverTests
             TempDir.Delete(dir);
         }
     }
+
+    static string CarveOne(string appC, string chipH, IEnumerable<string>? extraNames = null)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdr-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "app.c"), appC);
+            File.WriteAllText(Path.Combine(dir, "chip.h"), chipH);
+            HeaderCarver.Carve(dir, new[] { "chip.h" }, extraNames);
+            return File.ReadAllText(Path.Combine(dir, "chip.h")).Replace("\r\n", "\n");
+        }
+        finally { TempDir.Delete(dir); }
+    }
+
+    /// <summary>A generic paste macro builds the name from its call's arguments, not from text next to the ##,
+    /// and the call can go through a forwarding macro.</summary>
+    [Fact]
+    public void Carve_KeepsNamesAGenericPasteBuildsFromItsArguments()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define CAT(a, b) a##b
+            #define XCAT(a, b) CAT(a, b)
+            #define PIN(n) P##n
+            int u(void){ return XCAT(UART, 2) + PIN(5); }
+            """, """
+            #define UART2 40
+            #define P5 2
+            #define SPI3 7
+            #define Q5 3
+            """);
+        Assert.Contains("#define UART2 40", carved);
+        Assert.Contains("#define P5 2", carved);        // a one-letter literal next to ## is a real prefix
+        Assert.DoesNotContain("SPI3", carved);
+        Assert.DoesNotContain("Q5", carved);
+    }
+
+    /// <summary>A dropped #define must not take half a comment with it, and a #define inside a comment is text.</summary>
+    [Fact]
+    public void Carve_RespectsBlockComments()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            int u(void){ return KEEP_ME; }
+            """, """
+            #define REG_A 0x10 /* desc
+               continues */
+            /* legacy:
+            #define OLD_REG 1 */
+            #define REG_B 0x20 // fine
+            #define KEEP_ME 1
+            #endif
+            """);
+        Assert.Contains("#define REG_A 0x10 /* desc\n   continues */", carved);
+        Assert.Contains("/* legacy:\n#define OLD_REG 1 */", carved);
+        Assert.DoesNotContain("REG_B", carved);
+        Assert.Contains("#define KEEP_ME 1", carved);
+    }
+
+    /// <summary>Names the carved tree can't show: tested by an SDK header outside it, or named on the build's
+    /// command line.</summary>
+    [Fact]
+    public void Carve_KeepsNamesTheCallerSaysAreUsedElsewhere()
+    {
+        var carved = CarveOne("int u(void){ return 0; }\n", "#define CFG_HAS_FPU 1\n#define CFG_OTHER 2\n", new[] { "CFG_HAS_FPU" });
+        Assert.Contains("CFG_HAS_FPU", carved);
+        Assert.DoesNotContain("CFG_OTHER", carved);
+    }
 }

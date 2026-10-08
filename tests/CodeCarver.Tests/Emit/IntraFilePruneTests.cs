@@ -104,6 +104,118 @@ public class IntraFilePruneTests
         }
     }
 
+    static string Prune(string src)
+    {
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-safe-" + Guid.NewGuid().ToString("N"));
+        var srcDir = Path.Combine(work, "src");
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(srcDir);
+        try
+        {
+            File.WriteAllText(Path.Combine(srcDir, "t.c"), src);
+            using var fe = new CFrontEnd();
+            var graph = fe.BuildGraph(new[] { ("t.c", src) });
+            var reader = graph.Nodes.First(n => n.Name == "reader").Id;
+            var plan = ReachabilityEngine.Compute(graph, new[] { new Root(reader, RootKind.ExplicitSymbol) });
+            FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
+            return File.ReadAllText(Path.Combine(outDir, "t.c")).Replace("\r\n", "\n");
+        }
+        finally { TempDir.Delete(work); }
+    }
+
+    /// <summary>Directives inside a removed span stay behind; anything but #if structure must not, so such a span
+    /// is kept: an X-macro table's rows, an #include in a body, a directive-looking line inside a comment.</summary>
+    [Fact]
+    public void EmitPruned_SpanHoldingAnIncludeOrACommentedDirective_IsKeptWhole()
+    {
+        var result = Prune("""
+            const int dead_tbl[] = {
+            #include "vals.inc"
+            };
+            int dead_body(int x) {
+            #include "body.inc"
+                return x;
+            }
+            void dead_old(void) {
+                /* old code:
+            #include "gone.h"
+                */
+            }
+            void dead_plain(void) {
+            #if 1
+                (void)0;
+            #endif
+            }
+            int reader(void) { return 0; }
+            """);
+        Assert.Contains("const int dead_tbl[] = {\n#include \"vals.inc\"\n};", result);
+        Assert.Contains("int dead_body(int x) {\n#include \"body.inc\"", result);
+        Assert.Contains("/* old code:\n#include \"gone.h\"\n    */", result);
+        Assert.DoesNotContain("dead_plain", result);                         // #if structure alone: removed
+    }
+
+    [Fact]
+    public void EmitPruned_CommentOrDeclarationSharingALine_IsNotCut()
+    {
+        var result = Prune("""
+            void dead_tail(void) { } /* note that
+               continues */
+            void later(void); void dead_share(void) { }
+            int reader(void) { return 0; }
+            """);
+        Assert.Contains("void dead_tail(void) { } /* note that\n   continues */", result);
+        Assert.Contains("void later(void);", result);
+    }
+
+    [Fact]
+    public void EmitPruned_RemovedStaticFunction_TakesItsPrototypeAlong()
+    {
+        var result = Prune("""
+            static void helper(void);
+            static int other(int a);   /* still used */
+            void dead_outer(void) { helper(); }
+            static void helper(void) { }
+            static int other(int a) { return a; }
+            int reader(void) { return other(1); }
+            """);
+        Assert.DoesNotContain("helper", result);
+        Assert.Contains("static int other(int a);", result);
+    }
+
+    /// <summary>What the line above a definition attaches to it, through #if blocks and comments.</summary>
+    [Fact]
+    public void EmitPruned_AttributeUnderIfdef_CommentPrefixed_OrPragma_StaysWithItsFunction()
+    {
+        var result = Prune("""
+            int k1;
+            #ifdef USE_RAM
+            RAMFUNC
+            #endif
+            void dead_ram(void) { }
+            /* doc */ WEAK
+            void dead_weak(void) { }
+            #pragma location = ".noinit"
+            void dead_placed(void) { }
+            #pragma GCC diagnostic ignored "-Wunused"
+            void dead_after_mode(void) { }
+            #ifdef FEATURE
+            int feature_fn(int a,
+                           int b) {
+                if (a)
+                    return b;
+                return a;
+            }
+            #endif
+            void dead_after_block(void) { }
+            int reader(void) { return k1; }
+            """);
+        Assert.Contains("RAMFUNC\n#endif\nvoid dead_ram(void)", result);
+        Assert.Contains("/* doc */ WEAK\nvoid dead_weak(void)", result);
+        Assert.Contains("#pragma location = \".noinit\"\nvoid dead_placed(void)", result);
+        Assert.DoesNotContain("dead_after_mode", result);
+        Assert.DoesNotContain("dead_after_block", result);   // a complete function in the #if block above isn't an attribute
+    }
+
     [Fact]
     public void EmitPruned_RemovesUnreachedFunction_KeepsReachedOnes()
     {

@@ -116,7 +116,10 @@ public static class FileTreeEmitter
                 {
                     // Bytes in, bytes out: ReadAllText would honour (and strip) a UTF-8 BOM even when told Latin-1.
                     var original = File.ReadAllBytes(src);
-                    var pruned = Encoding.Latin1.GetBytes(RemoveLineRanges(Encoding.Latin1.GetString(original), ranges));
+                    var statics = defsByFile[rel].Where(n => n.Kind == NodeKind.Function && (n.Flags & NodeFlags.FileLocal) != 0
+                                                           && n.Span.IsKnown && !plan.IsKept(n.Id))
+                                                 .Select(n => (n.Span.StartLine, n.Name)).ToList();
+                    var pruned = Encoding.Latin1.GetBytes(RemoveLineRanges(Encoding.Latin1.GetString(original), ranges, statics));
                     File.WriteAllBytes(dst, pruned);
                     if (pruned.Length < original.Length) { prunedFiles++; prunedBytes += original.Length - pruned.Length; }
                 }
@@ -356,15 +359,17 @@ public static class FileTreeEmitter
     }
 
     /// <summary>Does the span's first line hold code before the definition, or its last line code after it?
-    /// Before: a <c>;</c> or <c>}</c> ahead of the definition's first <c>(</c>, <c>=</c> or <c>{</c> ends some
-    /// other declaration. After: anything but <c>;</c>, whitespace and comments past the final <c>}</c>.</summary>
+    /// Before: a <c>;</c> or <c>}</c> ahead of the first <c>{</c> with more code after it ends some other
+    /// declaration (`void later(void); void dead(void) {`). After: anything but <c>;</c>, whitespace and
+    /// comments past the final <c>}</c>.</summary>
     private static bool SharesLine(string[] lines, int s, int e)
     {
         if (s < 1 || e > lines.Length) return false;
-        foreach (var ch in CodeOnly(lines[s - 1]))
+        var first = CodeOnly(lines[s - 1]);
+        for (var c = 0; c < first.Length; c++)
         {
-            if (ch is '(' or '=' or '{') break;
-            if (ch is ';' or '}') return true;
+            if (first[c] == '{') break;
+            if (first[c] is ';' or '}' && first.AsSpan(c + 1).Trim().Length > 0) return true;
         }
         var last = CodeOnly(lines[e - 1]);
         var close = last.LastIndexOf('}');
@@ -409,9 +414,13 @@ public static class FileTreeEmitter
     /// </summary>
     private static bool UnterminatedAbove(string[] lines, int start)
     {
+        var depth = 0;          // inside how many #if blocks that end above the definition (scanning upward)
+        var branchEnd = false;  // the next code line is the last of an #if branch: it may be an attribute
         for (var k = start - 1; k >= 1; k--)
         {
             var t = lines[k - 1].Trim();
+            if (t.StartsWith("/*", StringComparison.Ordinal) && t.IndexOf("*/", 2, StringComparison.Ordinal) is var close and >= 0)
+                t = t[(close + 2)..].Trim();                               // `/* doc */ WEAK`: the code after it
             if (t.Length == 0 || t.StartsWith("//", StringComparison.Ordinal) || t.StartsWith("/*", StringComparison.Ordinal)
                 || t.StartsWith('*')) continue;
             if (t.EndsWith("*/", StringComparison.Ordinal) && !t.Contains("/*", StringComparison.Ordinal))
@@ -426,20 +435,93 @@ public static class FileTreeEmitter
             // The last line of a multi-line #define doesn't start with '#'.
             var head = k;
             while (head > 1 && lines[head - 2].TrimEnd().EndsWith('\\')) head--;
-            if (lines[head - 1].TrimStart().StartsWith('#')) return false;
+            var ht = lines[head - 1].TrimStart();
+            if (ht.StartsWith('#'))
+            {
+                var word = new string(ht[1..].TrimStart().TakeWhile(char.IsAsciiLetter).ToArray());
+                // `#ifdef USE_RAM / RAMFUNC / #endif` above a head: what the #if block holds is attached too, and so
+                // is what stands above the #if. Look through the block.
+                if (word == "endif") { depth++; branchEnd = true; k = head; continue; }
+                if (word is "else" or "elif" or "elifdef" or "elifndef")
+                { if (depth > 0) { branchEnd = true; k = head; continue; } return false; }
+                if (word is "if" or "ifdef" or "ifndef")
+                { if (depth > 0) { depth--; branchEnd = depth > 0; k = head; continue; } return false; }
+                // A pragma that applies to the next declaration (`#pragma location=`, `vector=`, `inline=forced`,
+                // DATA_SECTION) belongs to the definition; the ones that set a mode for what follows don't.
+                if (word == "pragma" && (depth == 0 || branchEnd) && !ModePragma(ht)) return true;
+                if (depth > 0) { branchEnd = false; k = head; continue; }
+                return false;
+            }
+            if (depth > 0 && !branchEnd) continue;   // earlier lines of an #if branch: not next to the definition
             // A trailing comment isn't what ends the line.
             if (t.EndsWith("*/", StringComparison.Ordinal) && t.LastIndexOf("/*", StringComparison.Ordinal) is > 0 and var bc) t = t[..bc].TrimEnd();
             if (t.IndexOf("//", StringComparison.Ordinal) is > 0 and var lc) t = t[..lc].TrimEnd();
-            return t.Length > 0 && t[^1] is not (';' or '{' or '}' or ':');
+            if (t.Length > 0 && t[^1] is not (';' or '{' or '}' or ':')) return true;
+            if (depth == 0) return false;
+            branchEnd = false;
         }
         return false;
     }
 
+    /// <summary>A <c>#pragma</c> that sets a mode for everything after it rather than naming the next declaration.</summary>
+    private static bool ModePragma(string directive)
+    {
+        var rest = directive[1..].TrimStart()["pragma".Length..].TrimStart();
+        var word = new string(rest.TakeWhile(ch => char.IsAsciiLetterOrDigit(ch) || ch == '_').ToArray());
+        return word is "once" or "pack" or "GCC" or "clang" or "warning" or "message" or "region" or "endregion"
+            or "push_macro" or "pop_macro" or "diag_suppress" or "diag_default" or "diag_warning" or "diag_error"
+            or "diag_remark" or "optimize" or "STDC" or "comment" or "mark" or "ident";
+    }
+
+    /// <summary>For each 1-based line (and one past the last): does it begin inside a block comment? Strings,
+    /// character literals and line comments are skipped, so a <c>/*</c> inside them opens nothing.</summary>
+    private static bool[] CommentStateAtLineStart(string[] lines)
+    {
+        var at = new bool[lines.Length + 2];
+        var inBlock = false;
+        for (var i = 1; i <= lines.Length; i++)
+        {
+            at[i] = inBlock;
+            var line = lines[i - 1];
+            var quote = '\0';
+            for (var c = 0; c < line.Length; c++)
+            {
+                var ch = line[c];
+                if (inBlock) { if (ch == '*' && c + 1 < line.Length && line[c + 1] == '/') { inBlock = false; c++; } }
+                else if (quote != '\0') { if (ch == '\\') c++; else if (ch == quote) quote = '\0'; }
+                else if (ch is '"' or '\'') quote = ch;
+                else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '/') break;
+                else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '*') { inBlock = true; c++; }
+            }
+        }
+        at[lines.Length + 1] = inBlock;
+        return at;
+    }
+
+    /// <summary>True when every directive line in lines <paramref name="s"/>..<paramref name="e"/> is real (not inside a
+    /// comment) and part of #if structure.</summary>
+    private static bool OnlyConditionalDirectives(string[] lines, bool[] inComment, int s, int e)
+    {
+        for (var i = s; i <= e; i++)
+        {
+            var t = lines[i - 1].TrimStart();
+            if (t.Length == 0 || t[0] != '#') continue;
+            if (inComment[i]) return false;
+            var d = t[1..].TrimStart();
+            var word = new string(d.TakeWhile(char.IsAsciiLetter).ToArray());
+            if (word is not ("if" or "ifdef" or "ifndef" or "elif" or "elifdef" or "elifndef" or "else" or "endif")) return false;
+            while (lines[i - 1].TrimEnd().EndsWith('\\') && i < e) i++;   // its continuation lines
+        }
+        return true;
+    }
+
     /// <summary>Remove the given 1-based inclusive line ranges from text, preserving the rest verbatim.</summary>
-    private static string RemoveLineRanges(string text, List<(int Start, int End)> ranges)
+    private static string RemoveLineRanges(string text, List<(int Start, int End)> ranges,
+                                           IReadOnlyList<(int Start, string Name)>? droppedStatics = null)
     {
         var lines = text.Split('\n');
         var drop = DropLines(lines, ranges, null);
+        if (droppedStatics is { Count: > 0 }) DropStaticPrototypes(lines, drop, droppedStatics);
         var sb = new StringBuilder(text.Length);
         for (var i = 1; i <= lines.Length; i++)
         {
@@ -449,6 +531,36 @@ public static class FileTreeEmitter
         }
         return sb.ToString();
     }
+
+    /// <summary>
+    /// A removed static function's forward declaration (`static void helper(void);`) would be left declaring a
+    /// function never defined: "declared 'static' but never defined", an error under -Werror. Remove the one-line
+    /// file-scope prototypes of each static whose definition was removed. Anything less plain stays (a warning
+    /// at worst).
+    /// </summary>
+    private static void DropStaticPrototypes(string[] lines, bool[] drop, IReadOnlyList<(int Start, string Name)> statics)
+    {
+        var names = statics.Where(s => s.Start >= 1 && s.Start <= lines.Length && drop[s.Start]).Select(s => s.Name)
+                           .ToHashSet(StringComparer.Ordinal);
+        if (names.Count == 0) return;
+        var inComment = CommentStateAtLineStart(lines);
+        var depth = 0;
+        for (var i = 1; i <= lines.Length; i++)
+        {
+            var atFileScope = depth == 0;
+            depth += NetBraces(lines, i, i);
+            if (drop[i] || !atFileScope || inComment[i] || inComment[i + 1]) continue;
+            var code = CodeOnly(lines[i - 1]).Trim();
+            if (!code.StartsWith("static", StringComparison.Ordinal) || !code.EndsWith(';') || code.IndexOfAny(NotInPrototype) >= 0
+                || code.IndexOf(';') != code.Length - 1) continue;
+            var m = PrototypeName.Match(code);
+            if (m.Success && names.Contains(m.Groups[1].Value)) drop[i] = true;
+        }
+    }
+
+    private static readonly char[] NotInPrototype = { '{', '}', '=', '#' };
+    // The declared name: the identifier right before the parameter list's '('.
+    private static readonly Regex PrototypeName = new(@"([A-Za-z_]\w*)\s*\([^()]*(?:\([^()]*\)[^()]*)*\)\s*(?:__attribute__\s*\(\(.*\)\)\s*)?;$", RegexOptions.Compiled);
 
     /// <summary>The requested ranges that <see cref="RemoveLineRanges"/> actually removes.</summary>
     private static HashSet<(int, int)> AppliedRanges(string[] lines, List<(int Start, int End)> ranges)
@@ -461,6 +573,7 @@ public static class FileTreeEmitter
     private static bool[] DropLines(string[] lines, List<(int Start, int End)> ranges, HashSet<(int, int)>? applied)
     {
         var drop = new bool[lines.Length + 2];
+        var inComment = CommentStateAtLineStart(lines);
         foreach (var (s, e) in ranges)
         {
             // A whole definition has balanced braces. If a span's braces don't balance, tree-sitter
@@ -472,6 +585,16 @@ public static class FileTreeEmitter
             // (`int g; int dead(void){...}`, `} int dead(...)`, `...} int h;`) would take that code with it
             // (review RB9b). Keep such a span whole — sound, and EmitClosure then treats it as written.
             if (SharesLine(lines, s, e)) continue;
+
+            // A comment the span starts inside, or one its last line opens and a later line closes: removing the
+            // lines would cut it in half.
+            if (s < 1 || e > lines.Length || inComment[s] || inComment[e + 1]) continue;
+
+            // Directives inside the span stay (below), so only #if structure may be there: an #include inside a
+            // table or body (X-macro rows) left at file scope breaks the build, and so would a #define, #undef or
+            // #pragma moved out of its context. A directive-looking line inside a comment isn't one at all, and
+            // keeping it would make it one.
+            if (!OnlyConditionalDirectives(lines, inComment, s, e)) continue;
 
             // A net-open brace in the lines just above the span can mean two very different things:
             //  (a) an `#if X / TYPE foo(...){ / #else / TYPE bar(...){ / #endif` dual-signature construct —

@@ -1547,7 +1547,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var decl = cap.Node;
             if (IsDead(decl)) continue;
             if (scopes.InBody(decl.StartIndex)) continue; // a LOCAL variable, not a file-scope global
-            if (decl.Parent is not { Type: "declaration" } declaration) continue;
+            // A declaration with a parse error is often not one at all (comment words after a spliced `*\`+`/`
+            // read as `this comment ends at ...`): it mints no names.
+            if (decl.Parent is not { Type: "declaration" } declaration || declaration.HasError) continue;
             var storage = declaration.Children.Where(c => c.Type == "storage_class_specifier").Select(c => c.Text).ToList();
             if (storage.Contains("extern") && decl.Type != "init_declarator") continue;
             if (GlobalName(decl) is not { IsMissing: false } node || node.Text is not { Length: > 0 } gname) continue;

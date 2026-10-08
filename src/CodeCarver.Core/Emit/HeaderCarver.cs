@@ -30,7 +30,9 @@ public static class HeaderCarver
     /// Carve the given big headers (relative paths) in place under <paramref name="outDir"/>, dropping
     /// #defines not transitively needed by the other kept files there. Returns aggregate size/keep stats.
     /// </summary>
-    public static HeaderCarveResult Carve(string outDir, IReadOnlyCollection<string> bigHeaderRels)
+    /// <param name="extraNames">Names used where the carved tree can't show them: an SDK header outside it that
+    /// tests a macro, the build's command line (<c>-DBAUD=UART_DIV_115200</c>).</param>
+    public static HeaderCarveResult Carve(string outDir, IReadOnlyCollection<string> bigHeaderRels, IEnumerable<string>? extraNames = null)
     {
         var bigSet = new HashSet<string>(bigHeaderRels, StringComparer.OrdinalIgnoreCase);
         var bigFull = bigHeaderRels.Select(r => Path.Combine(outDir, r)).ToList();
@@ -43,25 +45,43 @@ public static class HeaderCarver
         //    Every TEXT file in the output counts — assembly, linker scripts, .inc tables, scripts — not only C:
         //    a define used only by startup.S or a linker script is still needed (review H1). The caller runs this
         //    after the infrastructure copy so those files are present. Binary files are skipped.
-        var needed = new HashSet<string>(StringComparer.Ordinal);
+        var needed = new HashSet<string>(extraNames ?? Array.Empty<string>(), StringComparer.Ordinal);
         var fragments = new HashSet<string>(StringComparer.Ordinal);
-        var walk = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
+        var pastes = new Pastes();
+        // Hidden files count (a .config, a dot-named generated header): only the system ones are skipped.
+        var walk = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.System };
+        var seedFiles = new List<string>();
         foreach (var f in Directory.EnumerateFiles(outDir, "*", walk))
         {
             var rel = Path.GetRelativePath(outDir, f).Replace('\\', '/');
             if (bigSet.Contains(rel) || LooksBinary(f)) continue;
-            foreach (var line in File.ReadLines(f, Encoding.Latin1))
+            seedFiles.Add(f);
+            foreach (var line in LogicalLines(f))
             {
                 AddIdentifiers(needed, line);
-                if (line.Contains("##", StringComparison.Ordinal)) AddPasteFragments(fragments, line);
+                pastes.Learn(line, fragments);
             }
         }
+        // A paste macro's own call sites name the pieces (`CAT(UART, 2)` builds UART2): learned macros first,
+        // in the big headers too, then the calls.
+        foreach (var path in bigFull)
+            foreach (var (_, text, kind) in EnumerateLogicalLines(path))
+                if (kind == LineKind.Define) pastes.Learn(text, literals: null);   // its literal pieces count once it's wanted
+        if (pastes.Any)
+            foreach (var f in seedFiles)
+                foreach (var line in LogicalLines(f))
+                    pastes.AddCallArguments(line, fragments);
 
         // A define is wanted if the code references its name, OR a paste fragment could build that name.
-        bool Wanted(string name) =>
-            needed.Contains(name) ||
-            fragments.Any(fr => name.StartsWith(fr, StringComparison.Ordinal)
-                             || name.EndsWith(fr, StringComparison.Ordinal));
+        bool Wanted(string name)
+        {
+            if (needed.Contains(name)) return true;
+            if (fragments.Count <= 64)
+                return fragments.Any(fr => name.StartsWith(fr, StringComparison.Ordinal) || name.EndsWith(fr, StringComparison.Ordinal));
+            for (var k = 1; k <= name.Length; k++)
+                if (fragments.Contains(name[..k]) || fragments.Contains(name[^k..])) return true;
+            return false;
+        }
 
         // 2. Fixpoint: grow `needed` with the bodies of wanted defines and all #if-condition identifiers,
         //    streaming each header per pass. Terminates because `needed` only grows and is finite. Passes
@@ -75,17 +95,14 @@ public static class HeaderCarver
             foreach (var path in bigFull)
                 foreach (var (name, text, kind) in EnumerateLogicalLines(path))
                 {
-                    if (kind != LineKind.Define) { grew |= AddIdentifiers(needed, text); continue; }
-                    if (name is not null && Wanted(name))
-                    {
-                        grew |= AddIdentifiers(needed, text); // keep it -> its body's names are needed too
-                        if (text.Contains("##", StringComparison.Ordinal))
-                        {
-                            var n = fragments.Count;
-                            AddPasteFragments(fragments, text);
-                            grew |= fragments.Count != n;
-                        }
-                    }
+                    if (kind == LineKind.Define && (name is null || !Wanted(name))) continue;
+                    // Kept verbatim (not a define) or kept as wanted: what it names is needed, and what its pastes
+                    // and paste-macro calls can build.
+                    grew |= AddIdentifiers(needed, text);
+                    var n = fragments.Count;
+                    if (kind == LineKind.Define) pastes.Learn(text, fragments);
+                    pastes.AddCallArguments(text, fragments);
+                    grew |= fragments.Count != n;
                 }
         }
 
@@ -119,47 +136,95 @@ public static class HeaderCarver
     {
         using var r = new StreamReader(path, Encoding.Latin1);
         string? line;
+        var inComment = false;
         while ((line = r.ReadLine()) is not null)
         {
             var t = line.TrimStart();
-            var isDefine = IsDefineDirective(t);
-            var isCond = !isDefine && IsConditionalDirective(t);
+            var commented = inComment;   // a #define inside a block comment is comment text
+            var isDefine = !commented && IsDefineDirective(t);
+            var isCond = !commented && !isDefine && IsConditionalDirective(t);
+            inComment = CommentOpenAfter(line, inComment);
             var sb = new StringBuilder(line);
             if (isDefine || isCond)
                 while (EndsWithContinuation(line) && (line = r.ReadLine()) is not null)
+                {
                     sb.Append('\n').Append(line);
+                    inComment = CommentOpenAfter(line, inComment);
+                }
             var full = sb.ToString();
-            yield return isDefine ? (DefineName(full), full, LineKind.Define)
+            // A define that leaves a comment open is kept whatever it names (the rewrite can't cut the comment):
+            // read it as plain text, so what it names counts.
+            yield return isDefine && !inComment ? (DefineName(full), full, LineKind.Define)
                  : isCond ? (null, full, LineKind.Conditional)
                  : (null, full, LineKind.Other);
         }
     }
 
+    /// <summary>A file's lines with backslash-continuations joined, streamed.</summary>
+    private static IEnumerable<string> LogicalLines(string path)
+    {
+        var sb = new StringBuilder();
+        foreach (var line in File.ReadLines(path, Encoding.Latin1))
+        {
+            if (EndsWithContinuation(line)) { sb.Append(line).Append('\n'); continue; }
+            if (sb.Length == 0) { yield return line; continue; }
+            sb.Append(line);
+            yield return sb.ToString();
+            sb.Clear();
+        }
+        if (sb.Length > 0) yield return sb.ToString();
+    }
+
+    /// <summary>Is a block comment open after <paramref name="line"/>, given whether one was open before it?
+    /// String and character literals and line comments open nothing.</summary>
+    private static bool CommentOpenAfter(string line, bool inBlock)
+    {
+        var quote = '\0';
+        for (var c = 0; c < line.Length; c++)
+        {
+            var ch = line[c];
+            if (inBlock) { if (ch == '*' && c + 1 < line.Length && line[c + 1] == '/') { inBlock = false; c++; } }
+            else if (quote != '\0') { if (ch == '\\') c++; else if (ch == quote) quote = '\0'; }
+            else if (ch is '"' or '\'') quote = ch;
+            else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '/') break;
+            else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '*') { inBlock = true; c++; }
+        }
+        return inBlock;
+    }
+
     /// <summary>Copy <paramref name="src"/> to <paramref name="dst"/>, omitting #defines the predicate rejects.
-    /// Byte-transparent (Latin-1) and every kept line keeps its own line ending (review E1).</summary>
+    /// Byte-transparent (Latin-1) and every kept line keeps its own line ending (review E1). A line inside a block
+    /// comment is text, and a define that leaves a comment open is kept: dropping it would cut the comment.</summary>
     private static void RewriteDroppingUnneeded(string src, string dst, Func<string, bool> wanted, ref int kept, ref int dropped)
     {
         using var w = new StreamWriter(dst, false, Encoding.Latin1);
         using var e = ReadLinesWithEol(src).GetEnumerator();
+        var inComment = false;
+        var define = new List<(string Line, string Eol)>();
         while (e.MoveNext())
         {
             var (line, eol) = e.Current;
-            if (IsDefineDirective(line.TrimStart()))
+            if (!inComment && IsDefineDirective(line.TrimStart()))
             {
-                var name = DefineName(line);
-                var drop = name is not null && !wanted(name);
-                if (drop) dropped++; else kept++;
-
-                // Consume the whole (possibly multi-line) define; write it only if kept.
-                if (!drop) { w.Write(line); w.Write(eol); }
+                // Read the whole (possibly multi-line) define, then decide.
+                define.Clear();
+                define.Add((line, eol));
+                inComment = CommentOpenAfter(line, inComment);
                 var cont = line;
                 while (EndsWithContinuation(cont) && e.MoveNext())
                 {
                     (cont, eol) = e.Current;
-                    if (!drop) { w.Write(cont); w.Write(eol); }
+                    define.Add((cont, eol));
+                    inComment = CommentOpenAfter(cont, inComment);
                 }
+                var name = DefineName(line);
+                var drop = name is not null && !inComment && !wanted(name);
+                if (drop) { dropped++; continue; }
+                kept++;
+                foreach (var (l, el) in define) { w.Write(l); w.Write(el); }
                 continue;
             }
+            inComment = CommentOpenAfter(line, inComment);
             w.Write(line);
             w.Write(eol);
         }
@@ -239,25 +304,125 @@ public static class HeaderCarver
     }
 
     /// <summary>
-    /// Collect the literal identifier fragments adjacent to a <c>##</c> paste (<c>REG_ ## n ## _BASE</c>
-    /// → "REG_", "_BASE"). A define whose name starts or ends with such a fragment could be the concrete
-    /// paste result, so it must be kept. Single-char fragments (usually the pasted parameter) are ignored.
+    /// The identifier pieces next to each <c>##</c> paste (<c>REG_ ## n ## _BASE</c> → "REG_", "n", "_BASE"),
+    /// spaces around the <c>##</c> allowed.
     /// </summary>
-    private static void AddPasteFragments(HashSet<string> set, string line)
+    private static IEnumerable<(string Piece, bool Pasted)> PastePieces(string text)
     {
-        var i = line.IndexOf("##", StringComparison.Ordinal);
+        var i = text.IndexOf("##", StringComparison.Ordinal);
         while (i >= 0)
         {
-            // fragment immediately before the ##
             var e = i;
-            while (e > 0 && (char.IsAsciiLetterOrDigit(line[e - 1]) || line[e - 1] == '_')) e--;
-            if (i - e > 1) set.Add(line[e..i]);
-            // fragment immediately after the ##
+            while (e > 0 && text[e - 1] is ' ' or '\t') e--;
+            var b = e;
+            while (b > 0 && IsIdentChar(text[b - 1])) b--;
+            if (e > b && IsIdentStart(text[b])) yield return (text[b..e], true);
             var s = i + 2;
+            while (s < text.Length && text[s] is ' ' or '\t') s++;
             var j = s;
-            while (j < line.Length && (char.IsAsciiLetterOrDigit(line[j]) || line[j] == '_')) j++;
-            if (j - s > 1) set.Add(line[s..j]);
-            i = line.IndexOf("##", i + 2, StringComparison.Ordinal);
+            while (j < text.Length && IsIdentChar(text[j])) j++;
+            if (j > s) yield return (text[s..j], true);
+            i = text.IndexOf("##", i + 2, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>
+    /// What token pasting can build. A define whose name starts or ends with a fragment could be a paste result,
+    /// so it is kept. Fragments come from the literal text next to a <c>##</c> (<c>REG_##n##_BASE</c>: "REG_",
+    /// "_BASE"; <c>P##n</c>: "P") and, for a macro that pastes its parameters (<c>CAT(a, b) a##b</c>, or one that
+    /// passes its parameters on to such a macro), from the identifiers its calls pass (<c>CAT(UART, 2)</c>: "UART").
+    /// </summary>
+    private sealed class Pastes
+    {
+        private readonly Dictionary<string, string> callers = new(StringComparer.Ordinal);   // name -> body, may forward
+        private readonly HashSet<string> pasters = new(StringComparer.Ordinal);
+        public bool Any => pasters.Count > 0;
+
+        /// <summary>Learn a logical line: a function-like #define that pastes a parameter becomes a paster; its literal
+        /// paste pieces go to <paramref name="literals"/> (null: not yet, the define isn't known to be wanted).</summary>
+        public void Learn(string text, HashSet<string>? literals)
+        {
+            if (!text.Contains('#')) return;
+            var (name, parms, body) = FunctionLike(text);
+            if (name is null)
+            {
+                if (literals is not null && text.Contains("##", StringComparison.Ordinal))
+                    foreach (var (piece, _) in PastePieces(text)) if (piece.Length > 1) literals.Add(piece);   // unknown context
+                return;
+            }
+            var pastesParam = false;
+            foreach (var (piece, _) in PastePieces(body))
+                if (parms.Contains(piece)) pastesParam = true;
+                else literals?.Add(piece);
+            if (pastesParam) { if (pasters.Add(name)) Propagate(); return; }
+            if (parms.Count > 0 && body.Contains('('))
+            {
+                callers[name] = body;
+                if (CallsPaster(body)) { pasters.Add(name); Propagate(); }
+            }
+        }
+
+        /// <summary>Every identifier passed to a paster called in <paramref name="text"/> (a #define's own parameters
+        /// excepted: they are placeholders, not names).</summary>
+        public void AddCallArguments(string text, HashSet<string> fragments)
+        {
+            if (pasters.Count == 0) return;
+            var (_, parms, _) = FunctionLike(text);
+            var i = 0;
+            while (i < text.Length)
+            {
+                if (!IsIdentStart(text[i]) || (i > 0 && IsIdentChar(text[i - 1]))) { i++; continue; }
+                var s = i;
+                while (i < text.Length && IsIdentChar(text[i])) i++;
+                if (!pasters.Contains(text[s..i])) continue;
+                var p = i;
+                while (p < text.Length && text[p] is ' ' or '\t') p++;
+                if (p >= text.Length || text[p] != '(') continue;
+                var depth = 0;
+                var a = p;
+                for (; a < text.Length; a++)
+                {
+                    if (text[a] == '(') depth++;
+                    else if (text[a] == ')' && --depth == 0) break;
+                }
+                var args = new HashSet<string>(StringComparer.Ordinal);
+                AddIdentifiers(args, text[(p + 1)..Math.Min(a, text.Length)]);
+                foreach (var id in args) if (!parms.Contains(id)) fragments.Add(id);
+            }
+        }
+
+        private bool CallsPaster(string body)
+        {
+            var ids = new HashSet<string>(StringComparer.Ordinal);
+            AddIdentifiers(ids, body);
+            return ids.Overlaps(pasters);
+        }
+
+        private void Propagate()
+        {
+            for (var grew = true; grew;)
+            {
+                grew = false;
+                foreach (var (name, body) in callers)
+                    if (!pasters.Contains(name) && CallsPaster(body)) { pasters.Add(name); grew = true; }
+            }
+        }
+
+        /// <summary>Name, parameters and body of a function-like <c>#define NAME(params) body</c>, or a null name.</summary>
+        private static (string? Name, HashSet<string> Params, string Body) FunctionLike(string text)
+        {
+            var none = (default(string), new HashSet<string>(), "");
+            if (!IsDefineDirective(text.TrimStart())) return none;
+            var name = DefineName(text);
+            if (name is null) return none;
+            var at = text.IndexOf(name, text.IndexOf("define", StringComparison.Ordinal) + 6, StringComparison.Ordinal) + name.Length;
+            if (at >= text.Length || text[at] != '(') return none;   // object-like
+            var close = text.IndexOf(')', at);
+            if (close < 0) return none;
+            var parms = text[(at + 1)..close].Split(',').Select(p => p.Trim()).Where(p => p.Length > 0)
+                            .Select(p => p == "..." ? "__VA_ARGS__" : p.TrimEnd('.').Trim()).ToHashSet(StringComparer.Ordinal);
+            parms.Add("__VA_ARGS__");
+            return (name, parms, text[(close + 1)..]);
         }
     }
 

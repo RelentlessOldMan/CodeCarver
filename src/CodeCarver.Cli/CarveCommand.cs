@@ -1043,6 +1043,7 @@ public static class CarveCommand
                     + (etaSec < 0 ? "estimating..." : FormatEta(etaSec)));
             };
         }
+        var outsideNames = new HashSet<string>(StringComparer.Ordinal);   // identifiers in headers read outside the root
         if (defines is not null && closedWorld && closureLang)
         {
             // pre-parse is often the longest phase on a product tree: say which part.
@@ -1109,6 +1110,9 @@ public static class CarveCommand
                     if (Path.GetExtension(full).Length == 0 && new FileInfo(full).Length > 4_000_000) return;  // not a header
                     var text = File.ReadAllText(full);
                     outsideScanned++;
+                    // What it names may be a macro a carved big header defines (an SDK header testing a config
+                    // macro): header carving must keep those.
+                    foreach (var m in Identifier.EnumerateMatches(text)) outsideNames.Add(text.Substring(m.Index, m.Length));
                     foreach (System.Text.RegularExpressions.Match m in defRe.Matches(text))
                         if (condIdents.Contains(m.Groups[1].Value)) ambientMacros.Add(m.Groups[1].Value);
                     Includes(Path.GetDirectoryName(full) ?? dir, text);
@@ -2339,7 +2343,11 @@ public static class CarveCommand
                 summary[$"{summaryStage}.headerCarve.wholeIncludedFromOutside"] = keptBigAll.Count - keptBig.Count;
                 if (keptBig.Count > 0)
                 {
-                    var hc = HeaderCarver.Carve(stageDir, keptBig);
+                    // Names the carved tree can't show: what headers outside it name, and the build's -D values.
+                    var elsewhere = new HashSet<string>(outsideNames, StringComparer.Ordinal);
+                    foreach (var spec in buildCmds.SelectMany(c => c.Defines).Concat(defineSpecs))
+                        foreach (var m in Identifier.EnumerateMatches(spec)) elsewhere.Add(spec.Substring(m.Index, m.Length));
+                    var hc = HeaderCarver.Carve(stageDir, keptBig, elsewhere);
                     summary[$"{summaryStage}.headerCarve.bytesBefore"] = hc.BytesBefore;
                     summary[$"{summaryStage}.headerCarve.bytesAfter"] = hc.BytesAfter;
                     summary[$"{summaryStage}.headerCarve.definesDropped"] = hc.DefinesDropped;
