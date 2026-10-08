@@ -152,6 +152,7 @@ public static class BuildLogScraper
             {
                 File = src,
                 Directory = dir,
+                Driver = driver,
                 Arguments = args,
                 Defines = defines,
                 Includes = includes,

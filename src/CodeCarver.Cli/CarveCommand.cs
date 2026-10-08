@@ -489,7 +489,45 @@ public static class CarveCommand
                 foreach (var n in MacroProbe.FlagDependentNames(probeBase)) probeBase.ForceUnknown(n);
             probeBase.Ambient = ambientMacros;
         }
-        Mark("defines");   // per-file define sets, compiler probe
+        // With a compiler to run and the build's commands, its own preprocessor decides the #if branches (see
+        // CompilerPreprocess): config-header macros, #undef and include order included. A command whose driver is the
+        // configured compiler (same name) runs with it; any other runs as logged when that path exists here.
+        CompilerPreprocess? exactPre = null;
+        if (probeCompiler is not null && buildCmds.Count > 0 && lang is "c" or "cpp")
+        {
+            static string DriverName(string d) => Path.GetFileNameWithoutExtension(d.Replace('\\', '/').Split('/')[^1]).ToLowerInvariant();
+            string? Resolve(string c)
+            {
+                if (File.Exists(c)) return Path.GetFullPath(c);
+                foreach (var d in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+                    foreach (var ext in OperatingSystem.IsWindows() ? new[] { ".exe", "" } : new[] { "" })
+                    {
+                        try { var p = Path.Combine(d, c + ext); if (File.Exists(p)) return p; } catch (ArgumentException) { }
+                    }
+                return null;
+            }
+            var configured = cv.Compilers.Select(c => (Name: DriverName(c), Exe: Resolve(c))).Where(c => c.Exe is not null).ToList();
+            var exeFor = new System.Collections.Concurrent.ConcurrentDictionary<string, string?>(StringComparer.Ordinal);
+            string? DriverFor(CompileCommand c)
+            {
+                if (c.Driver is not { } d) return configured.Count == 1 ? configured[0].Exe : null;
+                return exeFor.GetOrAdd(d, d2 =>
+                {
+                    var name = DriverName(d2);
+                    if (name is "cl" or "clang-cl") return null;   // MSVC-style -E prints #line, not GCC markers
+                    return configured.FirstOrDefault(c2 => c2.Name == name).Exe ?? (Path.IsPathFullyQualified(d2) ? Resolve(d2) : null);
+                });
+            }
+            var absCmds = buildCmds.Select(c => c with { Directory = Path.IsPathFullyQualified(c.Directory) ? c.Directory : Path.GetFullPath(Path.Combine(dir, c.Directory)) }).ToList();
+            exactPre = CompilerPreprocess.Run(absCmds, dir, DriverFor, CmdRel);
+            summary["world.preprocessed.commands"] = exactPre.Commands;
+            summary["world.preprocessed.failed"] = exactPre.Failed;
+            summary["world.preprocessed.filesDecided"] = exactPre.FilesDecided;
+            err.WriteLine($"  config  : preprocessed {exactPre.Succeeded:N0} of {exactPre.Commands:N0} compile command(s) with the build's compiler -> "
+                + $"#if branches of {exactPre.FilesDecided:N0} file(s) decided exactly"
+                + (exactPre.Failed > 0 ? $"; {exactPre.Failed:N0} could not be run here, so headers keep the scanner's answer" : ""));
+        }
+        Mark("defines");   // per-file define sets, compiler probe, preprocessing
         // Closed-world only when inputs that tell us the define set actually loaded (review PP4/BL3).
         closedWorld = probeBase is not null || buildCmds.Count > 0;
         var worldReason = closedWorld
@@ -977,6 +1015,7 @@ public static class CarveCommand
             if (maxSymbolsPerFile is not null) tsfe.PerFileSymbolBudget = maxSymbolsPerFile.Value;
             if (refIncludes.Count > 0) tsfe.ReferenceOnlyIncludes = refIncludes;
             if (perFileDefines is not null) tsfe.PerFileDefines = perFileDefines; // per-TU #ifdef config from the build log
+            if (exactPre is not null) tsfe.ExactDeadLines = exactPre.DeadLines;
             // P1: each logged file's own -I search path (exact), and the union of all of them for headers and
             // unlogged files. Directories outside the carve root are left out (nothing there is a graph file).
             if (buildCmds.Count > 0)
@@ -1252,8 +1291,9 @@ public static class CarveCommand
                         if (text.Length == 0 || !re.IsMatch(text)) continue;
                         var def = EmittedLinkCheck.Scan(text, EmittedLinkCheck.IsHeader(rel)).Definitions.FirstOrDefault(d => d.Name == name);
                         if (def.Name is null) continue;
-                        if (checkDead && (perFileDefines?.Invoke(rel) ?? defines) is { } t
-                            && PreprocessorScanner.DeadLineMap(text, t, closedWorld) is var dl && def.Line < dl.Length && dl[def.Line])
+                        if (checkDead && (exactPre?.DeadLines(rel, text) ?? ((perFileDefines?.Invoke(rel) ?? defines) is { } t
+                                ? PreprocessorScanner.DeadLineMap(text, t, closedWorld) : null)) is { } dl
+                            && def.Line < dl.Length && dl[def.Line])
                             dead = true;
                         return (rel, def.Line);
                     }
@@ -1866,7 +1906,12 @@ public static class CarveCommand
             @out.WriteLine($"  verify  : (emitted-tree link check is C/C++ only; skipped for language '{lang}')");
         // Dead-line classification for the link check: the same #ifdef model the front-end used per file.
         Func<string, string, bool[]?>? deadLinesFor = defines is null && perFileDefines is null ? null
-            : (rel, text) => (perFileDefines?.Invoke(rel) ?? defines) is { } t ? PreprocessorScanner.DeadLineMap(text, t, closedWorld) : null;
+            : (rel, text) => exactPre?.DeadLines(rel, text)
+                             ?? ((perFileDefines?.Invoke(rel) ?? defines) is { } t ? PreprocessorScanner.DeadLineMap(text, t, closedWorld) : null);
+        // Lines live in only some configurations: none, where the compiles decided the file.
+        bool[] UncertainLines(string rel, string text)
+            => exactPre is not null && exactPre.Decides(rel) ? new bool[text.Count(c => c == '\n') + 2]
+               : PreprocessorScanner.UncertainLineMap(text, (perFileDefines?.Invoke(rel) ?? defines) ?? new MacroTable(), closedWorld);
         // Runs the emitted-tree check, prints the verdict, writes codecarver/verify.txt; true when it failed.
         string summaryStage = "run";   // key prefix for the stage being verified ("run" in analysis-only mode)
         // What the failure write-ups (FailureCases) need from this run.
@@ -1880,11 +1925,7 @@ public static class CarveCommand
             LinkNames = linkUses.Select(u => u.Name).Distinct(StringComparer.Ordinal).ToList(),
             Wrapped = wrapped.ToList(),
             NotBuilt = notBuilt, Unparsed = unparsedFiles,
-            LineMaps = (rel, text) =>
-            {
-                var t = (perFileDefines?.Invoke(rel) ?? defines) ?? new MacroTable();
-                return (deadLinesFor?.Invoke(rel, text), PreprocessorScanner.UncertainLineMap(text, t, closedWorld));
-            },
+            LineMaps = (rel, text) => (deadLinesFor?.Invoke(rel, text), UncertainLines(rel, text)),
             Languages = cv.Languages, ManualDefines = cv.Defines,
             CarveSource = pruned, CarveHeaders = pruned && pruneHeaders,
             Advanced = new[] { $"maxParseBytes = {maxParseBytes}", $"skipFilesNotBuilt = {(cv.SkipFilesNotBuilt ? "true" : "false")}",
@@ -1938,7 +1979,7 @@ public static class CarveCommand
             {
                 if (buildCmds.Count > 0 || !emittedByRel.TryGetValue(v.ReferencedIn, out var path)) return false;
                 var text = SafeRead(path);
-                var map = PreprocessorScanner.UncertainLineMap(text, (perFileDefines?.Invoke(v.ReferencedIn) ?? defines) ?? new MacroTable(), closedWorld);
+                var map = UncertainLines(v.ReferencedIn, text);
                 return v.Line > 0 && v.Line < map.Length && map[v.Line];
             }
             var notBuiltOnly = hard.Where(v => (traceMissedCompiled == 0 || v.Weak || UseUncertain(v))

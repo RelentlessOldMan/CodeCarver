@@ -142,7 +142,7 @@ use only letters, digits, `_` and `-`.
 | Key | Effect |
 |---|---|
 | `buildLogs = ["make-n.log","build.console.txt"]` | scrape real per-file `-D`/`-I` from a `make -n` log, console capture, or `compile_commands.json`. **The** way to pin `#ifdef`s. A log with no recognised compile command, or none naming a file under the carve root, is exit 2. |
-| `compiler = "arm-none-eabi-gcc"` | probe the compiler (`-dM -E`) for its built-in macros. A compiler that can't be probed is exit 2. |
+| `compiler = "arm-none-eabi-gcc"` | probe the compiler (`-dM -E`) for its built-in macros, and with `buildLogs` preprocess every compile command so the build's own preprocessor decides each `#if` (see **Exact** below). A compiler that can't be probed is exit 2. |
 | `compilerNames = ["armcc","iccarm"]` | extra compiler driver names to recognise in a **text** build log (gcc/clang/cl and cross drivers are known) |
 | `defines = ["CHIP=F4"]` | manual defines, applied to every file. They do **not** by themselves make the world closed (see below). |
 | `buildTraceFiles = ["build.trace"]` | files opened while **building** (capture with [`tools/capture`](../tools/capture/README.md)) |
@@ -388,6 +388,16 @@ CodeCarver **derives this automatically**; the `world:` line says which and why.
 
   A translation unit that no compile command covers, or whose command was incomplete (unreadable response
   file or forced include), is resolved open-world; the `build:` lines report how many.
+- **Exact** (a `buildLogs` **and** a `compiler`): the build's own preprocessor decides. Every compile command is
+  run again in its directory with `-E -dD` in place of `-c`/`-o`/dependency flags, and its line markers say which
+  lines of the source and of every header came through. A conditional block is live when any of its lines came
+  through in any compile, and dead otherwise, so macros a config header defines, `#undef`s and include order all
+  count. A command whose driver has the same name as the `compiler` runs with it; another runs as logged when that
+  path exists here; MSVC-style drivers are not run. A header is decided this way only when **every** command ran
+  (one that couldn't might have taken a block the others skipped), a source file when every command compiling it
+  ran; anything else, and files with `#line` directives, keeps the rules above. The `config :` line and
+  `world.preprocessed.commands` / `.failed` / `.filesDecided` say how it went. It costs one preprocess per command,
+  in parallel.
 
 **Resolution affects reachability only.** It decides which calls count; the emitted text still contains both
 branches of every `#if`. So feed a build log (or set a build's `compiler`) to carve tighter; give neither to

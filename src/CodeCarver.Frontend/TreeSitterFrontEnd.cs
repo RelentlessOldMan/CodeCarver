@@ -332,6 +332,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// </summary>
     public Func<string, MacroTable?>? PerFileDefines { get; set; }
 
+    /// <summary>Dead lines the build's own preprocessor decided for a file (see CompilerPreprocess), or null to use
+    /// the conditional scanner. Takes precedence over <see cref="PerFileDefines"/>.</summary>
+    public Func<string, string, bool[]?>? ExactDeadLines { get; set; }
+
     /// <summary>
     /// Optional parse-progress callback, invoked once per parsed file with (filesDone, filesTotal, bytesDone,
     /// bytesTotal). Parsing is the dominant, roughly byte-linear phase, so a caller can turn measured
@@ -1540,7 +1544,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var srcLines = text.Split('\n');
 
         // When configured, code in dead #ifdef branches is skipped (config-specific carve).
-        var dead = defines is null ? null : PreprocessorScanner.DeadLineMap(text, defines, closedWorldDefines);
+        var dead = ExactDeadLines?.Invoke(path, text)
+                   ?? (defines is null ? null : PreprocessorScanner.DeadLineMap(text, defines, closedWorldDefines));
         bool IsDead(TsNode n) => dead is not null && n.StartPosition.Row + 1 is var ln && ln < dead.Length && dead[ln];
 
         var funcSpans = new List<(int Start, int End, NodeId Id)>();

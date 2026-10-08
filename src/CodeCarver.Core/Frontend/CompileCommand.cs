@@ -9,6 +9,9 @@ public sealed record CompileCommand
     public string Directory { get; init; } = ".";
     public IReadOnlyList<string> Arguments { get; init; } = Array.Empty<string>();
 
+    /// <summary>The compiler driver as the log spelled it (path or name); its arguments are <see cref="Arguments"/>.</summary>
+    public string? Driver { get; init; }
+
     /// <summary>Macro definitions, without the <c>-D</c> (e.g. "LUA_USE_LINUX", "FOO=1").</summary>
     public IReadOnlyList<string> Defines { get; init; } = Array.Empty<string>();
 
