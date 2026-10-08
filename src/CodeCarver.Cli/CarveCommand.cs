@@ -1369,27 +1369,32 @@ public static class CarveCommand
         var buildObservedRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // opened by a BUILD (what it compiled)
         var fileTraceRoots = new List<Root>();
         int externalTu = 0, externalHeaders = 0;   // source files that EXIST outside the carve root (missing dependency?)
+        // Compiler/system include trees are never "missing dependencies" (review T4), nor code that uses the module.
+        var systemDirs = new List<string> { "/usr/", "/opt/", "/lib/", "/etc/", "/proc/", "/sys/", "/dev/" };
+        foreach (var sf in new[] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86,
+                                   Environment.SpecialFolder.Windows, Environment.SpecialFolder.CommonApplicationData })
+            try { var f = Environment.GetFolderPath(sf); if (f.Length > 0) systemDirs.Add(Path.TrimEndingDirectorySeparator(f) + Path.DirectorySeparatorChar); } catch { }
+        if (probeCompiler is not null)
+            try
+            {
+                var exe = File.Exists(probeCompiler) ? Path.GetFullPath(probeCompiler)
+                    : (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator)
+                        .Select(d => { try { return Path.Combine(d, probeCompiler); } catch { return ""; } })
+                        .FirstOrDefault(c => File.Exists(c) || File.Exists(c + ".exe"));
+                // <toolchain>/bin/gcc -> <toolchain>/
+                if (!string.IsNullOrEmpty(exe) && Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(exe))) is { } tc)
+                    systemDirs.Add(Path.TrimEndingDirectorySeparator(tc) + Path.DirectorySeparatorChar);
+            }
+            catch { /* best effort */ }
+        bool IsSystemPath(string full)
+        {
+            var fwd = full.Replace('\\', '/');
+            return systemDirs.Any(sd => fwd.StartsWith(sd.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase));
+        }
         if (buildFileTraces.Count + runFileTraces.Count > 0)
         {
             var rootFull = Path.GetFullPath(dir);
             var rootPrefix = Path.TrimEndingDirectorySeparator(rootFull) + Path.DirectorySeparatorChar;
-            // Compiler/system include trees are never "missing dependencies" (review T4).
-            var systemDirs = new List<string> { "/usr/", "/opt/", "/lib/", "/etc/", "/proc/", "/sys/", "/dev/" };
-            foreach (var sf in new[] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86,
-                                       Environment.SpecialFolder.Windows, Environment.SpecialFolder.CommonApplicationData })
-                try { var f = Environment.GetFolderPath(sf); if (f.Length > 0) systemDirs.Add(Path.TrimEndingDirectorySeparator(f) + Path.DirectorySeparatorChar); } catch { }
-            if (probeCompiler is not null)
-                try
-                {
-                    var exe = File.Exists(probeCompiler) ? Path.GetFullPath(probeCompiler)
-                        : (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator)
-                            .Select(d => { try { return Path.Combine(d, probeCompiler); } catch { return ""; } })
-                            .FirstOrDefault(c => File.Exists(c) || File.Exists(c + ".exe"));
-                    // <toolchain>/bin/gcc -> <toolchain>/
-                    if (!string.IsNullOrEmpty(exe) && Path.GetDirectoryName(Path.GetDirectoryName(Path.GetFullPath(exe))) is { } tc)
-                        systemDirs.Add(Path.TrimEndingDirectorySeparator(tc) + Path.DirectorySeparatorChar);
-                }
-                catch { /* best effort */ }
             var tuExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".s", ".asm" };
 
             // Returns false (after printing why) when a trace can't be used: unreadable, or nothing in it maps here.
@@ -1422,8 +1427,7 @@ public static class CarveCommand
                         if (Path.IsPathRooted(cand) && absoluteMisses.Count < 400) absoluteMisses.Add(cand);
                         if (!exts.Concat(tuExts).Any(e => cand.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue;
                         if (full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) || !File.Exists(full)) continue;
-                        var fwd = full.Replace('\\', '/');
-                        if (systemDirs.Any(sd => fwd.StartsWith(sd.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase))) continue;
+                        if (IsSystemPath(full)) continue;
                         if (tuExts.Any(e => full.EndsWith(e, StringComparison.OrdinalIgnoreCase))) externalTu++; else externalHeaders++;
                     }
                     if (cands.Count > 0 && inTree == 0)
@@ -1466,6 +1470,48 @@ public static class CarveCommand
             summary["traces.outsideRootTranslationUnits"] = externalTu;
             summary["traces.outsideRootHeaders"] = externalHeaders;
         }
+
+        // Headers in the root that code OUTSIDE it includes (shared glue using the module's API): the rest of the
+        // build compiles against them, so they are kept whole in every stage. Evidence: outside sources the build log
+        // compiles and outside files the build trace opened. With a complete trace, only headers the build opened.
+        var includedFromOutside = new HashSet<string>(StringComparer.Ordinal);
+        if (lang is "c" or "cpp")
+        {
+            var rootFullX = Path.GetFullPath(dir);
+            var outsideCode = new List<string>();
+            var logIncDirs = new List<string>();
+            foreach (var cc in buildCmds)
+            {
+                var bd = Path.IsPathFullyQualified(cc.Directory) ? cc.Directory : Path.Combine(dir, cc.Directory);
+                foreach (var inc in cc.Includes)
+                    try { logIncDirs.Add(Path.GetFullPath(Path.IsPathFullyQualified(inc) ? inc : Path.Combine(bd, inc))); }
+                    catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { }
+                if (CmdRel(cc) is not null) continue;
+                try
+                {
+                    outsideCode.Add(Path.GetFullPath(Path.IsPathFullyQualified(cc.File) ? cc.File : Path.Combine(bd, cc.File)));
+                    foreach (var fi in cc.ForcedIncludes)
+                        outsideCode.Add(Path.GetFullPath(Path.IsPathFullyQualified(fi) ? fi : Path.Combine(bd, fi)));
+                }
+                catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { }
+            }
+            outsideCode.AddRange(buildTraceFull);
+            if (outsideCode.Count > 0)
+            {
+                var ext = ExternalIncluders.Find(outsideCode, logIncDirs, rootFullX, fullByRel.Keys, IsSystemPath, SafeRead);
+                var traced = cv.EveryBuildTraced && buildFileTraces.Count > 0;
+                foreach (var h in ext.Headers)
+                    if (fullByRel.ContainsKey(h) && !Excluded(fullByRel[h]) && (!traced || buildObservedRel.Contains(h)))
+                        includedFromOutside.Add(h);
+                summary["roots.includedFromOutside"] = includedFromOutside.Count;
+                if (includedFromOutside.Count > 0)
+                    err.WriteLine($"  outside : {includedFromOutside.Count} header(s) here are #included by code outside the carve root "
+                        + $"({ext.FilesScanned:N0} outside file(s) read) — kept whole: the rest of the build compiles against them");
+            }
+        }
+        var outsideRoots = includedFromOutside.Count == 0 ? new List<Root>()
+            : graph.Nodes.Where(n => n.FilePath is { } fp && includedFromOutside.Contains(fp))
+                   .Select(n => new Root(n.Id, RootKind.Exported, "included from outside the carve root")).ToList();
 
         // Assembly startup (.s/.S) references C handlers by name (vector table `.word Handler`) — root them.
         var asmRoots = new List<Root>();
@@ -1562,7 +1608,7 @@ public static class CarveCommand
         linkUses.AddRange(genUses.Where(u => definedFns.Contains(u.Name)));
 
         var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots).Concat(linkRoots)
-                                   .Concat(forceKeepRoots).Concat(forcedRoots).Concat(traceRoots).Concat(fileTraceRoots).ToList();
+                                   .Concat(forceKeepRoots).Concat(forcedRoots).Concat(traceRoots).Concat(fileTraceRoots).Concat(outsideRoots).ToList();
         if (rootSet.Count == 0)
         {
             err.WriteLine("no roots to carve from: list the entry symbols in [common] entryPoints");
@@ -2224,7 +2270,8 @@ public static class CarveCommand
             // carve must keep (review H1).
             if (pruneHeaders && lang is "c" or "cpp")
             {
-                var keptBig = bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)).Where(splan.KeptFiles.Contains).ToList();
+                var keptBig = bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)).Where(splan.KeptFiles.Contains)
+                    .Where(r => !includedFromOutside.Contains(r)).ToList();   // outside code uses their macros: whole
                 if (keptBig.Count > 0)
                 {
                     var hc = HeaderCarver.Carve(stageDir, keptBig);

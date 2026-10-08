@@ -18,6 +18,9 @@ On a successful carve it also says where the carve could get tighter and where t
 `indirectOnly`: kept only because its address is taken, a vtable or inline asm names it, the price of soundness;
 `header`: included by kept code; `reached`: called or referenced from a root), `keep.bytes.largest10Percent` is the
 share of kept bytes in the ten largest kept files, and `time.<phase>.ms` is each phase's time.
+`roots.includedFromOutside` counts headers in the carve root that code outside it `#include`s (found through the
+build log's outside compiles and the build trace's outside files); they are kept whole in every stage, since the
+rest of the build compiles against them.
 
 ## When `verify` fails: `codecarver/debug/`
 
