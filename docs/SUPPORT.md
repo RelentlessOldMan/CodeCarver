@@ -18,6 +18,13 @@ On a successful carve it also says where the carve could get tighter and where t
 `indirectOnly`: kept only because its address is taken, a vtable or inline asm names it, the price of soundness;
 `header`: included by kept code; `reached`: called or referenced from a root), `keep.bytes.largest10Percent` is the
 share of kept bytes in the ten largest kept files, and `time.<phase>.ms` is each phase's time.
+`time.pre-parse.<part>.ms` splits the macro scan before parsing: `treeMacros` (the tree's own files),
+`outsideHeaders` (headers the build reads outside the root), `quotedIncludes` (following `#include "..."` out of the
+tree) and `unparsedHeaders` (big and dense headers, streamed).
+What content carving did, per stage: `stageN.sourceCarve.filesPruned` / `.bytesRemoved` (unreached definitions cut
+from kept source files; headers are never pruned) and `stageN.headerCarve.*` (unused `#define`s cut from big
+generated headers: `bigHeadersKept`, `wholeIncludedFromOutside` (left whole, see below), `bytesBefore`, `bytesAfter`,
+`definesDropped`). Two stages that differ little in size usually show why here.
 `roots.includedFromOutside` counts headers in the carve root that code outside it `#include`s (found through the
 build log's outside compiles and the build trace's outside files); they are kept whole in every stage, since the
 rest of the build compiles against them.

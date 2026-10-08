@@ -1032,8 +1032,13 @@ public static class CarveCommand
                     + (etaSec < 0 ? "estimating..." : FormatEta(etaSec)));
             };
         }
+        // Directory listings shared by everything below that follows #includes (FileLookup).
+        var fileLookup = new CodeCarver.Core.Util.FileLookup();
         if (defines is not null && closedWorld && closureLang)
         {
+            // pre-parse is often the longest phase on a product tree: say which part.
+            var ppSw = System.Diagnostics.Stopwatch.StartNew();
+            void PreParsePart(string part) { summary[$"time.pre-parse.{part}.ms"] = ppSw.ElapsedMilliseconds; ppSw.Restart(); }
             // PP1: every macro name #defined/#undef'd anywhere in the tree. Parsed files are read in full; the
             // big/dense headers the parser skips are streamed, keeping only names some #if actually tests.
             // Any directive spelling: #, the digraph %:, the trigraph ??=.
@@ -1070,6 +1075,7 @@ public static class CarveCommand
                 Includes(Path.GetDirectoryName(fullByRel[rel]) ?? dir, text);
             }
             foreach (var (_, text) in refIncludes) ScanText(text);
+            PreParsePart("treeMacros");
 
             // Headers the build reads that the walk didn't: outside the root (an SDK, generated config) or in an
             // excluded directory. A trace of every build says exactly which; otherwise every header under the build
@@ -1089,7 +1095,7 @@ public static class CarveCommand
                     // tools/capture records successful opens only, so a missing one is a path from another machine
                     // (a WSL or CI path with no pathMap): its macros can't be seen. Extensionless paths are mostly
                     // programs, not headers.
-                    if (!File.Exists(full)) { if (Path.GetExtension(full).Length > 0) notHere++; return; }
+                    if (!fileLookup.Exists(full)) { if (Path.GetExtension(full).Length > 0) notHere++; return; }
                     if (Path.GetExtension(full).Length == 0 && new FileInfo(full).Length > 4_000_000) return;  // not a header
                     var text = File.ReadAllText(full);
                     outsideScanned++;
@@ -1127,27 +1133,24 @@ public static class CarveCommand
                 }
                 if (missingDirs > 0) unseen.Add($"{missingDirs} include dir(s) from the build log don't exist here");
             }
+            PreParsePart("outsideHeaders");
             // Quoted includes: follow the ones that leave the tree; one that resolves nowhere hides its macros.
             var basenames = new HashSet<string>(fullByRel.Keys.Select(r => Path.GetFileName(r)), StringComparer.OrdinalIgnoreCase);
             var unresolved = 0;
             // Each (dir, name) once, and each name's -I search once: thousands of files x hundreds of -I dirs.
             var seenQuoted = new HashSet<(string, string)>();
             var viaIncDirs = new Dictionary<string, string?>(StringComparer.Ordinal);
-            string? Probe(string cand, string raw)
-            {
-                try { var full = Path.GetFullPath(Path.Combine(cand, raw)); return File.Exists(full) ? full : null; }
-                catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return null; }
-            }
             for (var qi = 0; qi < quoted.Count; qi++)
             {
                 var (fromDir, raw) = quoted[qi];
                 if (!seenQuoted.Add((fromDir, raw))) continue;
-                var hit = Probe(fromDir, raw);
+                var hit = fileLookup.Probe(fromDir, raw);
                 if (hit is null && !viaIncDirs.TryGetValue(raw, out hit))
-                    viaIncDirs[raw] = hit = incDirs.Select(d => Probe(d, raw)).FirstOrDefault(p => p is not null);
+                    viaIncDirs[raw] = hit = incDirs.Select(d => fileLookup.Probe(d, raw)).FirstOrDefault(p => p is not null);
                 if (hit is not null) { ScanFile(hit); continue; }
                 if (!basenames.Contains(Path.GetFileName(raw))) unresolved++;
             }
+            PreParsePart("quotedIncludes");
             if (buildOpenedOutside is null)
             {
                 if (unresolved > 0) unseen.Add($"{unresolved} #include \"...\"(s) resolve to no file here");
@@ -1183,6 +1186,7 @@ public static class CarveCommand
                     ambientMacros.UnionWith(condIdents);
                 }
             }
+            PreParsePart("unparsedHeaders");
             err.WriteLine($"  config  : {ambientMacros.Count:N0} macro name(s) #defined in the tree stay unknown unless the build defines them");
             summary["world.ambientMacros"] = ambientMacros.Count;
         }
@@ -1499,7 +1503,7 @@ public static class CarveCommand
             if (outsideCode.Count > 0)
             {
                 var extSw = System.Diagnostics.Stopwatch.StartNew();
-                var ext = ExternalIncluders.Find(outsideCode, logIncDirs, rootFullX, fullByRel.Keys, IsSystemPath, SafeRead);
+                var ext = ExternalIncluders.Find(outsideCode, logIncDirs, rootFullX, fullByRel.Keys, IsSystemPath, SafeRead, fileLookup);
                 summary["time.outsideIncludes.ms"] = extSw.ElapsedMilliseconds;
                 summary["outsideIncludes.filesRead"] = ext.FilesScanned;
                 var traced = cv.EveryBuildTraced && buildFileTraces.Count > 0;
@@ -2236,6 +2240,12 @@ public static class CarveCommand
             if (splan.KeptFiles.Count > plan.KeptFiles.Count)
                 @out.WriteLine($"  closure : +{splan.KeptFiles.Count - plan.KeptFiles.Count} file(s) kept because code this stage writes uses them (the output must link)");
             var res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir) : FileTreeEmitter.Emit(splan, dir, stageDir);
+            if (prune)
+            {
+                // Source carving cuts unreached definitions out of kept .c files only; headers are never pruned.
+                summary[$"{summaryStage}.sourceCarve.filesPruned"] = res.PrunedFiles;
+                summary[$"{summaryStage}.sourceCarve.bytesRemoved"] = res.PrunedBytes;
+            }
             var carvedBytes = res.BytesWritten;
             var buildRequiredFiles = res.Written;
             @out.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{(prune ? "intra-file (unused functions removed)" : "file-level (whole kept files)")}]");
@@ -2273,11 +2283,17 @@ public static class CarveCommand
             // carve must keep (review H1).
             if (pruneHeaders && lang is "c" or "cpp")
             {
-                var keptBig = bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)).Where(splan.KeptFiles.Contains)
-                    .Where(r => !includedFromOutside.Contains(r)).ToList();   // outside code uses their macros: whole
+                var keptBigAll = bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)).Where(splan.KeptFiles.Contains).ToList();
+                var keptBig = keptBigAll.Where(r => !includedFromOutside.Contains(r)).ToList();   // outside code uses their macros: whole
+                // Why header carving moved the size or didn't: how many big headers it could touch, and what it cut.
+                summary[$"{summaryStage}.headerCarve.bigHeadersKept"] = keptBigAll.Count;
+                summary[$"{summaryStage}.headerCarve.wholeIncludedFromOutside"] = keptBigAll.Count - keptBig.Count;
                 if (keptBig.Count > 0)
                 {
                     var hc = HeaderCarver.Carve(stageDir, keptBig);
+                    summary[$"{summaryStage}.headerCarve.bytesBefore"] = hc.BytesBefore;
+                    summary[$"{summaryStage}.headerCarve.bytesAfter"] = hc.BytesAfter;
+                    summary[$"{summaryStage}.headerCarve.definesDropped"] = hc.DefinesDropped;
                     carvedBytes -= hc.BytesBefore - hc.BytesAfter;
                     var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
                     @out.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} kept, {hc.DefinesDropped:N0} dropped; "

@@ -6,7 +6,9 @@ using CodeCarver.Core.Reachability;
 namespace CodeCarver.Core.Emit;
 
 /// <summary>Outcome of writing a carved tree: how many files (and bytes) were emitted, and which.</summary>
-public sealed record EmitResult(int FilesWritten, long BytesWritten, IReadOnlyList<string> Written);
+/// <param name="PrunedFiles">Files the pruned emitter rewrote with unreached definitions removed.</param>
+/// <param name="PrunedBytes">Bytes those removals took out.</param>
+public sealed record EmitResult(int FilesWritten, long BytesWritten, IReadOnlyList<string> Written, int PrunedFiles = 0, long PrunedBytes = 0);
 
 /// <summary>
 /// The simplest emitter: file-level carve. It copies the plan's kept files (preserving their relative
@@ -85,7 +87,8 @@ public static class FileTreeEmitter
         var defsByFile = EmitClosure.DefinitionsByFile(graph);
 
         var written = new List<string>();
-        long bytes = 0;
+        long bytes = 0, prunedBytes = 0;
+        var prunedFiles = 0;
         foreach (var rel in plan.KeptFiles)
         {
             var src = Path.Combine(sourceRoot, rel);
@@ -110,8 +113,13 @@ public static class FileTreeEmitter
             try
             {
                 if (ranges is { Count: > 0 } && !IsUtf16(src))
+                {
                     // Bytes in, bytes out: ReadAllText would honour (and strip) a UTF-8 BOM even when told Latin-1.
-                    File.WriteAllBytes(dst, Encoding.Latin1.GetBytes(RemoveLineRanges(Encoding.Latin1.GetString(File.ReadAllBytes(src)), ranges)));
+                    var original = File.ReadAllBytes(src);
+                    var pruned = Encoding.Latin1.GetBytes(RemoveLineRanges(Encoding.Latin1.GetString(original), ranges));
+                    File.WriteAllBytes(dst, pruned);
+                    if (pruned.Length < original.Length) { prunedFiles++; prunedBytes += original.Length - pruned.Length; }
+                }
                 else
                     File.Copy(src, dst, overwrite: true);
             }
@@ -122,7 +130,7 @@ public static class FileTreeEmitter
         }
 
         CopyUnscannedIncludes(plan.KeptFiles, plan.DroppedFiles, sourceRoot, outDir, written, ref bytes);
-        return new EmitResult(written.Count, bytes, written);
+        return new EmitResult(written.Count, bytes, written, prunedFiles, prunedBytes);
     }
 
     /// <summary>
@@ -392,6 +400,39 @@ public static class FileTreeEmitter
         return sb.ToString();
     }
 
+    /// <summary>
+    /// True when the nearest code line above 1-based line <paramref name="start"/> (past blank and comment lines)
+    /// leaves a declaration open: not part of a directive, and not ending in <c>;</c> <c>{</c> <c>}</c> or a label's
+    /// <c>:</c>. Comments are recognized by line shape; a miss reads as code and keeps more (sound).
+    /// </summary>
+    private static bool UnterminatedAbove(string[] lines, int start)
+    {
+        for (var k = start - 1; k >= 1; k--)
+        {
+            var t = lines[k - 1].Trim();
+            if (t.Length == 0 || t.StartsWith("//", StringComparison.Ordinal) || t.StartsWith("/*", StringComparison.Ordinal)
+                || t.StartsWith('*')) continue;
+            if (t.EndsWith("*/", StringComparison.Ordinal) && !t.Contains("/*", StringComparison.Ordinal))
+            {
+                // The last line of a block comment: resume above the line that opens it.
+                while (k > 1 && !lines[k - 1].Contains("/*", StringComparison.Ordinal)) k--;
+                var at = lines[k - 1].IndexOf("/*", StringComparison.Ordinal);
+                if (at < 0) return true;                                   // no opener: unsure, keep
+                t = lines[k - 1][..at].Trim();                             // code before the comment
+                if (t.Length == 0) continue;
+            }
+            // The last line of a multi-line #define doesn't start with '#'.
+            var head = k;
+            while (head > 1 && lines[head - 2].TrimEnd().EndsWith('\\')) head--;
+            if (lines[head - 1].TrimStart().StartsWith('#')) return false;
+            // A trailing comment isn't what ends the line.
+            if (t.EndsWith("*/", StringComparison.Ordinal) && t.LastIndexOf("/*", StringComparison.Ordinal) is > 0 and var bc) t = t[..bc].TrimEnd();
+            if (t.IndexOf("//", StringComparison.Ordinal) is > 0 and var lc) t = t[..lc].TrimEnd();
+            return t.Length > 0 && t[^1] is not (';' or '{' or '}' or ':');
+        }
+        return false;
+    }
+
     /// <summary>Remove the given 1-based inclusive line ranges from text, preserving the rest verbatim.</summary>
     private static string RemoveLineRanges(string text, List<(int Start, int End)> ranges)
     {
@@ -463,6 +504,12 @@ public static class FileTreeEmitter
                 if (sharedUnderPreproc && candidateIsSignature) start = candidate; // (a) dual-signature — extend up
                 // else (b): enclosing scope, leave start = s; remove the balanced span alone.
             }
+
+            // A code line above the span that doesn't end a declaration belongs to this one: an attribute macro
+            // on its own line (`WEAK` / `NORET` / `SECTION(".x")` above the head) that the parse left outside the
+            // span. Removing the span alone strands it on whatever follows (a compile error, or the next
+            // definition silently weak). Keep the definition whole (sound; EmitClosure sees it written).
+            if (UnterminatedAbove(lines, start)) continue;
             for (var i = Math.Max(1, start); i <= e && i <= lines.Length; i++)
                 drop[i] = true;
             applied?.Add((s, e));
