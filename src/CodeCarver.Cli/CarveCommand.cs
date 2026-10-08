@@ -1498,7 +1498,10 @@ public static class CarveCommand
             outsideCode.AddRange(buildTraceFull);
             if (outsideCode.Count > 0)
             {
+                var extSw = System.Diagnostics.Stopwatch.StartNew();
                 var ext = ExternalIncluders.Find(outsideCode, logIncDirs, rootFullX, fullByRel.Keys, IsSystemPath, SafeRead);
+                summary["time.outsideIncludes.ms"] = extSw.ElapsedMilliseconds;
+                summary["outsideIncludes.filesRead"] = ext.FilesScanned;
                 var traced = cv.EveryBuildTraced && buildFileTraces.Count > 0;
                 foreach (var h in ext.Headers)
                     if (fullByRel.ContainsKey(h) && !Excluded(fullByRel[h]) && (!traced || buildObservedRel.Contains(h)))

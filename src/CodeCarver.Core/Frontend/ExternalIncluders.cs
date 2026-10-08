@@ -48,6 +48,11 @@ public static class ExternalIncluders
             try { var full = Path.GetFullPath(f); if (!full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase)) Enqueue(full); }
             catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { }
 
+        // Thousands of files x hundreds of -I dirs: each (dir, name) is probed once, each name's -I search once,
+        // and each unresolved name's root match once.
+        var local = new Dictionary<(string, string), string?>();
+        var viaDirs = new Dictionary<string, string?>(StringComparer.Ordinal);
+        var byTail = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         var scanned = 0;
         while (queue.Count > 0)
         {
@@ -62,7 +67,11 @@ public static class ExternalIncluders
             {
                 var raw = (m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value).Trim().Replace('\\', '/');
                 if (raw.Length == 0) continue;
-                var hit = (m.Groups[1].Success ? Probe(fromDir, raw) : null) ?? dirs.Select(d => Probe(d, raw)).FirstOrDefault(p => p is not null);
+                string? hit = null;
+                if (m.Groups[1].Success && !local.TryGetValue((fromDir, raw), out hit))
+                    local[(fromDir, raw)] = hit = Probe(fromDir, raw);
+                if (hit is null && !viaDirs.TryGetValue(raw, out hit))
+                    viaDirs[raw] = hit = dirs.Select(d => Probe(d, raw)).FirstOrDefault(p => p is not null);
                 if (hit is not null)
                 {
                     if (hit.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
@@ -71,11 +80,15 @@ public static class ExternalIncluders
                     continue;
                 }
                 // Resolves nowhere we know: every root file the include could name.
-                var tail = string.Join('/', raw.Split('/').SkipWhile(s => s is "." or ".." or ""));
-                if (tail.Length == 0 || !byName.TryGetValue(tail[(tail.LastIndexOf('/') + 1)..], out var cands)) continue;
-                foreach (var c in cands)
-                    if (c.Equals(tail, StringComparison.OrdinalIgnoreCase) || c.EndsWith("/" + tail, StringComparison.OrdinalIgnoreCase))
-                        found.Add(c);
+                if (!byTail.TryGetValue(raw, out var matches))
+                {
+                    byTail[raw] = matches = new List<string>();
+                    var tail = string.Join('/', raw.Split('/').SkipWhile(s => s is "." or ".." or ""));
+                    if (tail.Length > 0 && byName.TryGetValue(tail[(tail.LastIndexOf('/') + 1)..], out var cands))
+                        matches.AddRange(cands.Where(c => c.Equals(tail, StringComparison.OrdinalIgnoreCase)
+                                                       || c.EndsWith("/" + tail, StringComparison.OrdinalIgnoreCase)));
+                }
+                found.UnionWith(matches);
             }
         }
         return new Result(found.OrderBy(r => r, StringComparer.Ordinal).ToList(), scanned);
