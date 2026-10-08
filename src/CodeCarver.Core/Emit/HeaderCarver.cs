@@ -409,15 +409,22 @@ public static class HeaderCarver
             }
         }
 
-        // Object-like defines of the kept files (name -> body), and the argument names whose expansion counts.
-        private readonly Dictionary<string, string> objects = new(StringComparer.Ordinal);
+        // Object-like defines of the kept files (name -> every body: `#if BOARD == 1 / #define P USART / #else /
+        // #define P LPUART` builds either), and the argument names whose expansion counts.
+        private readonly Dictionary<string, List<string>> objects = new(StringComparer.Ordinal);
         private readonly HashSet<string> expanded = new(StringComparer.Ordinal);
+        private const int MaxBodiesPerName = 16;
+        // In a body of several names, ones shorter than this name too many defines to be worth a fragment (a
+        // one-letter operand beside a cast): the longer names around them carry the paste.
+        private const int MinExpandedFragment = 3;
 
         /// <summary>Remember an object-like define of a kept file: a paste argument naming it may expand to it.</summary>
         public void LearnObject(string text)
         {
             if (!text.Contains("define", StringComparison.Ordinal)) return;
-            if (ObjectBody(text, out var name) is { } body && name is not null && body.Length <= 512) objects[name] = body;
+            if (ObjectBody(text, out var name) is not { } body || name is null || body.Length > 512) return;
+            if (!objects.TryGetValue(name, out var bodies)) objects[name] = bodies = new List<string>();
+            if (bodies.Count < MaxBodiesPerName && !bodies.Contains(body)) bodies.Add(body);
         }
 
         /// <summary>
@@ -428,19 +435,27 @@ public static class HeaderCarver
         /// </summary>
         private void Expand(string id, HashSet<string> fragments)
         {
-            if (!expanded.Add(id) || !objects.TryGetValue(id, out var body)) return;
-            var ids = new HashSet<string>(StringComparer.Ordinal);
-            AddIdentifiers(ids, body);
-            foreach (var b in ids) { fragments.Add(b); Expand(b, fragments); }
+            if (!expanded.Add(id) || !objects.TryGetValue(id, out var bodies)) return;
+            foreach (var body in bodies) AddExpansion(body, fragments);
         }
 
         /// <summary>A carved header's define for an argument name passed to a paster: its expansion is a fragment.</summary>
         public void ExpandDefine(string name, string text, HashSet<string> fragments)
         {
             if (!expanded.Contains(name) || ObjectBody(text, out _) is not { } body) return;
+            AddExpansion(body, fragments);
+        }
+
+        private void AddExpansion(string body, HashSet<string> fragments)
+        {
             var ids = new HashSet<string>(StringComparer.Ordinal);
             AddIdentifiers(ids, body);
-            foreach (var b in ids) { fragments.Add(b); Expand(b, fragments); }
+            // A body that is one name is a plain rename (`#define PORT U`): that name is the piece, however short.
+            foreach (var b in ids)
+            {
+                if (ids.Count == 1 || b.Length >= MinExpandedFragment) fragments.Add(b);
+                Expand(b, fragments);
+            }
         }
 
         private bool CallsPaster(string body)

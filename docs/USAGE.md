@@ -142,7 +142,7 @@ use only letters, digits, `_` and `-`.
 | Key | Effect |
 |---|---|
 | `buildLogs = ["make-n.log","build.console.txt"]` | scrape real per-file `-D`/`-I` from a `make -n` log, console capture, or `compile_commands.json`. **The** way to pin `#ifdef`s. A log with no recognised compile command, or none naming a file under the carve root, is exit 2. |
-| `compiler = "arm-none-eabi-gcc"` | probe the compiler (`-dM -E`) for its built-in macros, and with `buildLogs` preprocess every compile command so the build's own preprocessor decides each `#if` (see **Exact** below). A compiler that can't be probed is exit 2. |
+| `compiler = "arm-none-eabi-gcc"` | probe the compiler (`-dM -E`) for its built-in macros, and with `buildLogs` **run** every GCC/Clang compile command again with `-E` so the build's own preprocessor decides each `#if` (see **Exact** below; uses most cores). A compiler that can't be probed is exit 2. |
 | `compilerNames = ["armcc","iccarm"]` | extra compiler driver names to recognise in a **text** build log (gcc/clang/cl and cross drivers are known) |
 | `defines = ["CHIP=F4"]` | manual defines, applied to every file. They do **not** by themselves make the world closed (see below). |
 | `buildTraceFiles = ["build.trace"]` | files opened while **building** (capture with [`tools/capture`](../tools/capture/README.md)) |
@@ -388,16 +388,27 @@ CodeCarver **derives this automatically**; the `world:` line says which and why.
 
   A translation unit that no compile command covers, or whose command was incomplete (unreadable response
   file or forced include), is resolved open-world; the `build:` lines report how many.
-- **Exact** (a `buildLogs` **and** a `compiler`): the build's own preprocessor decides. Every compile command is
-  run again in its directory with `-E -dD` in place of `-c`/`-o`/dependency flags, and its line markers say which
-  lines of the source and of every header came through. A conditional block is live when any of its lines came
-  through in any compile, and dead otherwise, so macros a config header defines, `#undef`s and include order all
-  count. A command whose driver has the same name as the `compiler` runs with it; another runs as logged when that
-  path exists here; MSVC-style drivers are not run. A header is decided this way only when **every** command ran
-  (one that couldn't might have taken a block the others skipped), a source file when every command compiling it
-  ran; anything else, and files with `#line` directives, keeps the rules above. The `config :` line and
-  `world.preprocessed.commands` / `.failed` / `.filesDecided` say how it went. It costs one preprocess per command,
-  in parallel.
+- **Exact** (a `buildLogs` **and** a `compiler`): the build's own preprocessor decides. **The carve runs the build's
+  compile commands**: each is run again in its directory with `-E -dD` in place of `-c`, `-o`, dependency-file and
+  `-save-temps` flags, and its line markers say which lines of the source and of every header came through. A
+  conditional block is live when any of its lines came through in any compile, and dead otherwise, so macros a config
+  header defines, `#undef`s and include order all count.
+  - **What runs.** Only GCC/Clang-style drivers (`gcc`, `g++`, `cc`, `c++`, `clang`, `clang++`, cross-prefixed or
+    versioned like `arm-none-eabi-gcc`, `clang-17`): one named like the `compiler` runs as it, another only from the
+    full path the log gives. MSVC-style and other tools never run, nor does a command carrying `-wrapper`, `-specs`,
+    `-fplugin`, `-fpass-plugin`, `-iplugindir`, `-load` or `-B` (they load or run other code). A command whose
+    response file was unreadable (or whose directory had to be guessed), or that names an include directory, forced
+    include or source missing here (gcc would skip a missing `-I` and find the same name elsewhere), doesn't run
+    either. `pathMap` rewrites the paths in the arguments too. A long command goes through a temporary response file.
+  - **What is decided.** Headers only when every command ran **and** every translation unit the build compiles (all
+    the tree's, or with a build trace the ones it opened) has a command that ran: a compile the carve didn't see
+    could take a block the others skipped. Short of that, a source file whose own commands all ran and that no other
+    file includes. Never decided dead: a block inside an unclosed parenthesis (the arguments of a multi-line macro
+    call print blank, the whole expansion on the call's first line) or one holding an `#include`. Files with `#line`
+    directives, and everything not decided, keep the rules above; so does verify's view of a source file whose
+    content carving removed lines.
+  - **Cost.** One preprocess per command, on all cores but one, up to 5 minutes each. The `config :` line and
+    `world.preprocessed.commands` / `.failed` / `.failedMissingPaths` / `.refused` / `.filesDecided` say how it went.
 
 **Resolution affects reachability only.** It decides which calls count; the emitted text still contains both
 branches of every `#if`. So feed a build log (or set a build's `compiler`) to carve tighter; give neither to
@@ -473,9 +484,12 @@ Variables are checked where they are defined in a `.c`/`.cpp` file; a definition
 
 **Before** it reports, each stage closes over what verify finds: a definition the emitted code uses but the plan
 left out (the graph missed that use) is kept, and the stage is emitted again from the larger plan, until nothing is
-missing (at most 8 rounds). What that added is counted by cause as `<stage>.verify.keptByCheck.<cause>` and listed
-as `KEPT` lines in `verify.txt`, so the gap stays visible while the carved tree links. Not kept this way: a name
-defined only in a header (a header compiles only where it is included) or only in files the build never compiled.
+missing (at most 8 rounds). Each name it kept is counted by cause as `<stage>.verify.keptByCheck.<cause>` (an
+unrecognised definition also by shape, `...definitionNotRecognized.<shape>`) and listed as a `KEPT` line in
+`verify.txt`, so the gap stays visible while the carved tree links; a later stage of the same kind starts from those
+and reports them too. Every file defining the name is kept, except a header (it compiles only where it is included)
+and a file the build never compiled; a name defined only there stays a failure. The infrastructure is copied once,
+after the plan settles.
 Whatever is still missing after that fails as below.
 
 Each failure also gets a **cause**, counted in `summary.txt` as `verify.failed.<cause>` (numbers only, safe to

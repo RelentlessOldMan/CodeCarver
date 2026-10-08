@@ -330,6 +330,7 @@ public static class CarveCommand
             {
                 Directory = MapPath(c.Directory),
                 File = MapPath(c.File),
+                Arguments = CompilerPreprocess.MapArguments(c.Arguments, MapPath),   // what a preprocess run passes
                 Includes = c.Includes.Select(MapPath).ToList(),
                 ForcedIncludes = c.ForcedIncludes.Select(MapPath).ToList(),
                 AlternativeDirectories = c.AlternativeDirectories.Select(MapPath).ToList(),
@@ -489,45 +490,8 @@ public static class CarveCommand
                 foreach (var n in MacroProbe.FlagDependentNames(probeBase)) probeBase.ForceUnknown(n);
             probeBase.Ambient = ambientMacros;
         }
-        // With a compiler to run and the build's commands, its own preprocessor decides the #if branches (see
-        // CompilerPreprocess): config-header macros, #undef and include order included. A command whose driver is the
-        // configured compiler (same name) runs with it; any other runs as logged when that path exists here.
-        CompilerPreprocess? exactPre = null;
-        if (probeCompiler is not null && buildCmds.Count > 0 && lang is "c" or "cpp")
-        {
-            static string DriverName(string d) => Path.GetFileNameWithoutExtension(d.Replace('\\', '/').Split('/')[^1]).ToLowerInvariant();
-            string? Resolve(string c)
-            {
-                if (File.Exists(c)) return Path.GetFullPath(c);
-                foreach (var d in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
-                    foreach (var ext in OperatingSystem.IsWindows() ? new[] { ".exe", "" } : new[] { "" })
-                    {
-                        try { var p = Path.Combine(d, c + ext); if (File.Exists(p)) return p; } catch (ArgumentException) { }
-                    }
-                return null;
-            }
-            var configured = cv.Compilers.Select(c => (Name: DriverName(c), Exe: Resolve(c))).Where(c => c.Exe is not null).ToList();
-            var exeFor = new System.Collections.Concurrent.ConcurrentDictionary<string, string?>(StringComparer.Ordinal);
-            string? DriverFor(CompileCommand c)
-            {
-                if (c.Driver is not { } d) return configured.Count == 1 ? configured[0].Exe : null;
-                return exeFor.GetOrAdd(d, d2 =>
-                {
-                    var name = DriverName(d2);
-                    if (name is "cl" or "clang-cl") return null;   // MSVC-style -E prints #line, not GCC markers
-                    return configured.FirstOrDefault(c2 => c2.Name == name).Exe ?? (Path.IsPathFullyQualified(d2) ? Resolve(d2) : null);
-                });
-            }
-            var absCmds = buildCmds.Select(c => c with { Directory = Path.IsPathFullyQualified(c.Directory) ? c.Directory : Path.GetFullPath(Path.Combine(dir, c.Directory)) }).ToList();
-            exactPre = CompilerPreprocess.Run(absCmds, dir, DriverFor, CmdRel);
-            summary["world.preprocessed.commands"] = exactPre.Commands;
-            summary["world.preprocessed.failed"] = exactPre.Failed;
-            summary["world.preprocessed.filesDecided"] = exactPre.FilesDecided;
-            err.WriteLine($"  config  : preprocessed {exactPre.Succeeded:N0} of {exactPre.Commands:N0} compile command(s) with the build's compiler -> "
-                + $"#if branches of {exactPre.FilesDecided:N0} file(s) decided exactly"
-                + (exactPre.Failed > 0 ? $"; {exactPre.Failed:N0} could not be run here, so headers keep the scanner's answer" : ""));
-        }
-        Mark("defines");   // per-file define sets, compiler probe, preprocessing
+        CompilerPreprocess? exactPre = null;   // run after the build traces (see "preprocess" below)
+        Mark("defines");   // per-file define sets, compiler probe
         // Closed-world only when inputs that tell us the define set actually loaded (review PP4/BL3).
         closedWorld = probeBase is not null || buildCmds.Count > 0;
         var worldReason = closedWorld
@@ -764,6 +728,52 @@ public static class CarveCommand
             if (cv.SkipFilesNotBuilt) summary["parse.filesNotBuiltSkipped"] = notBuilt.Count;
         }
         Mark("buildTraces");
+        // With a compiler to run and the build's commands, its own preprocessor decides the #if branches (see
+        // CompilerPreprocess): config-header macros, #undef and include order included. Only GCC/Clang-style drivers run:
+        // one named like a configured compiler runs as that compiler, another only from the full path the log gives.
+        if (probeCompiler is not null && buildCmds.Count > 0 && lang is "c" or "cpp")
+        {
+            static string DriverName(string d) => Path.GetFileNameWithoutExtension(d.Replace('\\', '/').Split('/')[^1]).ToLowerInvariant();
+            string? Resolve(string c)
+            {
+                if (File.Exists(c)) return Path.GetFullPath(c);
+                foreach (var d in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+                    foreach (var ext in OperatingSystem.IsWindows() ? new[] { ".exe", "" } : new[] { "" })
+                    {
+                        try { var p = Path.Combine(d, c + ext); if (File.Exists(p)) return p; } catch (ArgumentException) { }
+                    }
+                return null;
+            }
+            var configured = cv.Compilers.Where(CompilerPreprocess.IsGccFamily)
+                                         .Select(c => (Name: DriverName(c), Exe: Resolve(c))).Where(c => c.Exe is not null).ToList();
+            var exeFor = new System.Collections.Concurrent.ConcurrentDictionary<string, string?>(StringComparer.Ordinal);
+            string? DriverFor(CompileCommand c)
+            {
+                if (c.Driver is not { } d) return configured.Count == 1 ? configured[0].Exe : null;
+                return exeFor.GetOrAdd(d, d2 =>
+                {
+                    if (!CompilerPreprocess.IsGccFamily(d2)) return null;   // MSVC-style -E prints #line; other tools may do anything
+                    var name = DriverName(d2);
+                    return configured.FirstOrDefault(c2 => c2.Name == name).Exe ?? (Path.IsPathFullyQualified(d2) ? Resolve(d2) : null);
+                });
+            }
+            var absCmds = buildCmds.Select(c => c with { Directory = Path.IsPathFullyQualified(c.Directory) ? c.Directory : Path.GetFullPath(Path.Combine(dir, c.Directory)) }).ToList();
+            // Headers are decided only when every translation unit the build compiles has a command that ran.
+            var tuExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
+            var units = parseRels.Where(r => !notBuilt.Contains(r) && tuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)));
+            exactPre = CompilerPreprocess.Run(absCmds, dir, DriverFor, CmdRel, units);
+            exactPre.IncludedByAnother = includedCFiles.Contains;   // filled by the file scan below
+            summary["world.preprocessed.commands"] = exactPre.Commands;
+            summary["world.preprocessed.failed"] = exactPre.Failed;
+            summary["world.preprocessed.failedMissingPaths"] = exactPre.MissingPaths;
+            summary["world.preprocessed.refused"] = exactPre.Refused;
+            summary["world.preprocessed.filesDecided"] = exactPre.FilesDecided;
+            err.WriteLine($"  config  : preprocessed {exactPre.Succeeded:N0} of {exactPre.Commands:N0} compile command(s) with the build's compiler -> "
+                + $"#if branches of {exactPre.FilesDecided:N0} file(s) decided exactly"
+                + (exactPre.Failed > 0 ? $"; {exactPre.Failed:N0} not run ({exactPre.MissingPaths:N0} name a path missing here, "
+                                         + $"{exactPre.Refused:N0} refused), so headers keep the scanner's answer" : ""));
+        }
+        Mark("preprocess");
         if (perFileSpecs.Count > 0)
         {
             // D-B: translation units no compile command covers are resolved open-world; say how many.
@@ -1773,6 +1783,9 @@ public static class CarveCommand
         // Definitions the link check found emitted code using after a stage's plan left them out (see the stage loop):
         // rooted in every later plan of the same kind, so the next stage of that kind starts from them.
         var checkRoots = new Dictionary<bool, List<Root>> { [false] = new(), [true] = new() };
+        // What those roots were for: counts by cause (and shape) and the KEPT lines, per kind of stage.
+        var checkCauses = new Dictionary<bool, Dictionary<string, int>> { [false] = new(StringComparer.Ordinal), [true] = new(StringComparer.Ordinal) };
+        var checkLog = new Dictionary<bool, List<string>> { [false] = new(), [true] = new() };
         CarvePlan PlanFor(bool pruned)
         {
             if (!closeOverEmit) return plan;
@@ -1905,12 +1918,25 @@ public static class CarveCommand
         if (!linkCheck)
             @out.WriteLine($"  verify  : (emitted-tree link check is C/C++ only; skipped for language '{lang}')");
         // Dead-line classification for the link check: the same #ifdef model the front-end used per file.
+        var originalHash = new System.Collections.Concurrent.ConcurrentDictionary<string, (int Length, int Hash)?>(StringComparer.Ordinal);
         Func<string, string, bool[]?>? deadLinesFor = defines is null && perFileDefines is null ? null
-            : (rel, text) => exactPre?.DeadLines(rel, text)
+            : (rel, text) => (IsOriginal(rel, text) ? exactPre!.DeadLines(rel, text) : null)
                              ?? ((perFileDefines?.Invoke(rel) ?? defines) is { } t ? PreprocessorScanner.DeadLineMap(text, t, closedWorld) : null);
+        // The compiles' line numbers are the original file's: a pruned emitted file has lines removed, so it takes the
+        // scanner's answer. Original = the same text as the source file read the way verify reads it (Latin-1).
+        bool IsOriginal(string rel, string text)
+        {
+            if (exactPre is null || !exactPre.Decides(rel) || !fullByRel.TryGetValue(rel, out var src)) return false;
+            var o = originalHash.GetOrAdd(rel, _ =>
+            {
+                try { var s = File.ReadAllText(src, System.Text.Encoding.Latin1); return (s.Length, s.GetHashCode()); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
+            });
+            return o is { } h && h.Length == text.Length && h.Hash == text.GetHashCode();
+        }
         // Lines live in only some configurations: none, where the compiles decided the file.
         bool[] UncertainLines(string rel, string text)
-            => exactPre is not null && exactPre.Decides(rel) ? new bool[text.Count(c => c == '\n') + 2]
+            => IsOriginal(rel, text) ? new bool[text.Count(c => c == '\n') + 2]
                : PreprocessorScanner.UncertainLineMap(text, (perFileDefines?.Invoke(rel) ?? defines) ?? new MacroTable(), closedWorld);
         // Runs the emitted-tree check, prints the verdict, writes codecarver/verify.txt; true when it failed.
         string summaryStage = "run";   // key prefix for the stage being verified ("run" in analysis-only mode)
@@ -1941,7 +1967,16 @@ public static class CarveCommand
             if (FailureCases.Replaying || !File.Exists(path) || lang is not ("c" or "cpp")) return;
             try
             {
-                var fc = FailureCases.WriteBuildErrors(CasesContext(p, pruned), File.ReadAllText(path), carvedDir, ccDir);
+                var buildLog = File.ReadAllText(path);
+                // What kind of errors, as counts (and the -Werror warning names, compiler flags): enough to tell from a
+                // summary alone whether a cut broke the text, left a declaration behind, or dropped a definition.
+                foreach (var g in CodeCarver.Core.Diagnostics.BuildErrors.Parse(buildLog).GroupBy(e => e.Kind))
+                {
+                    summary[$"{summaryStage}.buildErrors.{g.Key}"] = g.Count();
+                    foreach (var w in g.Select(CodeCarver.Core.Diagnostics.BuildErrors.WerrorFlagOf).Where(f => f is not null).GroupBy(f => f!))
+                        summary[$"{summaryStage}.buildErrors.{g.Key}.{w.Key}"] = w.Count();
+                }
+                var fc = FailureCases.WriteBuildErrors(CasesContext(p, pruned), buildLog, carvedDir, ccDir);
                 @out.WriteLine($"  build   : {BuildOutputFile}: {fc.Cases} error(s) written up, {fc.Reproduced} reproduce in their anonymized bundle");
                 if (fc.AnonZip is { } z) @out.WriteLine($"            send: {z}  (anonymized, safe to share)");
                 @out.WriteLine($"            keep: {Path.Combine(ccDir, "debug-build", "raw")}  (real names: stays on this machine)");
@@ -1990,38 +2025,56 @@ public static class CarveCommand
         // Definitions the emitted code uses that this stage left out (the graph missed the use): what to root so the
         // next plan keeps them. A node defined in that file, or the file itself when its definition is no node. Never
         // for a file the build didn't compile (keeping it can't be what the real build linked). Counted by cause.
-        List<Root> RootsForMissing(CarvePlan p, List<LinkViolation> hard, Dictionary<string, int> byCause)
+        Dictionary<string, NodeId>? fileNodeOf = null;
+        (List<Root> Roots, List<LinkViolation> Kept) RootsForMissing(CarvePlan p, List<LinkViolation> hard, Dictionary<string, int> byCause)
         {
-            // A header is compiled only where it is included: keeping one that defines the name links nothing.
-            var missing = hard.Where(v => !notBuilt.Contains(v.DefinedIn) && !EmittedLinkCheck.IsHeader(v.DefinedIn)).ToList();
-            if (missing.Count == 0) return new List<Root>();
+            // Every file that defines the name, not just the one reported: with several build variants the reported one
+            // may be a variant the build doesn't use. Never a header (compiled only where it is included: keeping one
+            // links nothing) or a file the build never compiled.
+            List<string> Defining(LinkViolation v) => (v.DefinedInAll.Count > 0 ? v.DefinedInAll : new[] { v.DefinedIn })
+                .Where(f => !notBuilt.Contains(f) && !EmittedLinkCheck.IsHeader(f)).Distinct(StringComparer.Ordinal).ToList();
+            var missing = hard.Where(v => Defining(v).Count > 0).ToList();
+            if (missing.Count == 0) return (new List<Root>(), new List<LinkViolation>());
             var why = ClassifyViolations(graph, p, missing, unparsedFiles);
             var keptSet = p.KeptFiles.ToHashSet(StringComparer.Ordinal);
-            var wanted = missing.Select(v => (v.Name, v.DefinedIn)).ToHashSet();
-            var files = missing.Select(v => v.DefinedIn).ToHashSet(StringComparer.Ordinal);
-            var add = new List<Root>();
-            var covered = new HashSet<(string, string)>();
+            var files = missing.SelectMany(Defining).ToHashSet(StringComparer.Ordinal);
+            var names = missing.Select(v => v.Name).ToHashSet(StringComparer.Ordinal);
+            var defNodes = new Dictionary<(string, string), List<Node>>();
             foreach (var n in graph.Nodes)
-            {
-                if (n.FilePath is not { } f || !files.Contains(f)) continue;
-                if (n.Kind is NodeKind.Function or NodeKind.Global && wanted.Contains((n.Name, f)))
+                if (n.Kind is NodeKind.Function or NodeKind.Global && n.FilePath is { } f && files.Contains(f) && names.Contains(n.Name))
                 {
-                    covered.Add((n.Name, f));
-                    if (!p.IsKept(n.Id)) add.Add(new Root(n.Id, RootKind.EmittedWhole, "used by emitted code"));
+                    if (!defNodes.TryGetValue((n.Name, f), out var l)) defNodes[(n.Name, f)] = l = new List<Node>();
+                    l.Add(n);
                 }
-            }
+            fileNodeOf ??= graph.Nodes.Where(n => n.Kind == NodeKind.File).GroupBy(n => n.Name, StringComparer.Ordinal)
+                                      .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.Ordinal);
+            var add = new List<Root>();
+            var kept = new List<LinkViolation>();
             foreach (var v in missing)
             {
-                if (covered.Contains((v.Name, v.DefinedIn))) continue;
-                var fileNode = graph.Nodes.FirstOrDefault(n => n.Kind == NodeKind.File && n.Name == v.DefinedIn);
-                if (fileNode is not null && !p.IsKept(fileNode.Id)) add.Add(new Root(fileNode.Id, RootKind.EmittedWhole, "used by emitted code"));
-            }
-            foreach (var v in missing)
-            {
+                var before = add.Count;
+                foreach (var f in Defining(v))
+                {
+                    if (defNodes.TryGetValue((v.Name, f), out var ns))
+                        add.AddRange(ns.Where(n => !p.IsKept(n.Id)).Select(n => new Root(n.Id, RootKind.EmittedWhole, "used by emitted code")));
+                    else if (fileNodeOf.TryGetValue(f, out var fid) && !p.IsKept(fid))
+                        add.Add(new Root(fid, RootKind.EmittedWhole, "used by emitted code"));
+                }
+                if (add.Count == before) continue;   // nothing new to keep: it stays a failure
+                kept.Add(v);
                 var cause = keptSet.Contains(v.DefinedIn) ? "prunedFromKeptFile" : why[v];
                 byCause[cause] = byCause.GetValueOrDefault(cause) + 1;
+                // What an unrecognised definition looks like, as for a failure (the parser gap stays visible).
+                if (cause == "definitionNotRecognized" && fe is TreeSitterFrontEnd ts && v.DefinedLine > 0 && ReadRel(v.DefinedIn) is { Length: > 0 } defText)
+                {
+                    IEnumerable<string> shapes;
+                    try { shapes = ts.DiagnoseDefinition(v.DefinedIn, defText, v.DefinedLine, v.Name); }
+                    catch (Exception ex) when (ex is not OutOfMemoryException) { shapes = new[] { "diagnosisFailed" }; }
+                    foreach (var s in shapes.DefaultIfEmpty("noKnownShape").Distinct())
+                        byCause[$"{cause}.{s}"] = byCause.GetValueOrDefault($"{cause}.{s}") + 1;
+                }
             }
-            return add.DistinctBy(r => r.Node).ToList();
+            return (add.DistinctBy(r => r.Node).ToList(), kept);
         }
         bool VerifyEmitted(CarvePlan p, IReadOnlyList<(string Rel, string Path)> emittedFiles, string ccDir, bool pruned = false,
                            (LinkCheckResult R, List<LinkViolation> Hard, List<LinkViolation> NotBuiltOnly)? checkedAlready = null)
@@ -2379,29 +2432,28 @@ public static class CarveCommand
             // never ships a tree that fails to link over a use the check can see; what it had to add is counted by
             // cause (stageN.verify.keptByCheck.*), so the parser gap stays visible.
             EmitResult res;
-            InfraEmitResult infra;
             List<(string Rel, string Path)> verifyFiles;
             (LinkCheckResult R, List<LinkViolation> Hard, List<LinkViolation> NotBuiltOnly)? checkedAlready = null;
-            var keptByCheck = new Dictionary<string, int>(StringComparer.Ordinal);
-            var addedByCheck = 0;
-            keptByCheckLog.Clear();
+            // Cumulative per kind of stage: a later stage of the same kind starts from these roots, so it reports them too.
+            var keptByCheck = checkCauses[prune];
             for (var round = 0; ; round++)
             {
                 res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir) : FileTreeEmitter.Emit(splan, dir, stageDir);
-                // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
-                // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
-                infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel);
-                // Verify the code plus the assembly files copied with it: those define symbols C calls (fast_copy in a .S).
-                verifyFiles = res.Written.Concat(infra.Files.Where(EmittedLinkCheck.IsAssembly)).Distinct(StringComparer.Ordinal)
-                                 .Select(r => (r, Path.Combine(stageDir, r))).ToList();
+                // The code plus the assembly files the infrastructure copy will carry (they define symbols C calls:
+                // fast_copy in a .S), read from the tree: the infrastructure is copied once, after the plan settles.
+                var droppedInfra = new HashSet<string>(InfraDropped(splan), StringComparer.Ordinal);
+                var written = new HashSet<string>(res.Written, StringComparer.Ordinal);
+                verifyFiles = res.Written.Select(r => (r, Path.Combine(stageDir, r)))
+                    .Concat(asmFilesInTree.Select(f => (Rel: Path.GetRelativePath(dir, f).Replace('\\', '/'), Path: f))
+                                          .Where(a => !droppedInfra.Contains(a.Rel) && !written.Contains(a.Rel)))
+                    .ToList();
                 if (!linkCheck || !closeOverEmit) break;
                 checkedAlready = CheckEmitted(splan, verifyFiles, prune);
                 if (round >= MaxCheckRounds || checkedAlready.Value.Hard.Count == 0) break;
-                var add = RootsForMissing(splan, checkedAlready.Value.Hard, keptByCheck);
+                var (add, kept) = RootsForMissing(splan, checkedAlready.Value.Hard, keptByCheck);
                 if (add.Count == 0) break;
-                foreach (var v in checkedAlready.Value.Hard)
-                    keptByCheckLog.Add($"KEPT {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined in {v.DefinedIn}:{v.DefinedLine}");
-                addedByCheck += add.Count;
+                foreach (var v in kept)
+                    checkLog[prune].Add($"KEPT {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined in {v.DefinedIn}:{v.DefinedLine}");
                 checkRoots[prune].AddRange(add);
                 stagePlans.Remove(prune);
                 splan = PlanFor(prune);
@@ -2410,16 +2462,23 @@ public static class CarveCommand
                 try { Directory.Delete(stageDir, recursive: true); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
                 Directory.CreateDirectory(stageDir);
             }
+            keptByCheckLog.Clear();
+            keptByCheckLog.AddRange(checkLog[prune]);
+            // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
+            // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
+            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel);
             summary[$"{summaryStage}.keptFiles"] = splan.KeptFiles.Count;
             summary[$"{summaryStage}.droppedFiles"] = splan.DroppedFiles.Count;
             summary[$"{summaryStage}.closureAddedFiles"] = splan.KeptFiles.Count - plan.KeptFiles.Count;
-            summary[$"{summaryStage}.verify.keptByCheck"] = keptByCheck.Values.Sum();
+            var keptTotal = keptByCheck.Where(k => !k.Key.Contains('.')).Sum(k => k.Value);
+            summary[$"{summaryStage}.verify.keptByCheck"] = keptTotal;
             foreach (var (cause, n) in keptByCheck) summary[$"{summaryStage}.verify.keptByCheck.{cause}"] = n;
             if (splan.KeptFiles.Count > plan.KeptFiles.Count)
                 @out.WriteLine($"  closure : +{splan.KeptFiles.Count - plan.KeptFiles.Count} file(s) kept because code this stage writes uses them (the output must link)");
-            if (addedByCheck > 0)
-                @out.WriteLine($"  closure : {keptByCheck.Values.Sum()} use(s) the graph missed were found in the emitted code and kept ("
-                    + string.Join(", ", keptByCheck.OrderBy(k => k.Key, StringComparer.Ordinal).Select(k => $"{k.Key} {k.Value}")) + "; see verify.txt)");
+            if (keptTotal > 0)
+                @out.WriteLine($"  closure : {keptTotal} use(s) the graph missed were found in the emitted code and kept ("
+                    + string.Join(", ", keptByCheck.Where(k => !k.Key.Contains('.')).OrderBy(k => k.Key, StringComparer.Ordinal)
+                                                   .Select(k => $"{k.Key} {k.Value}")) + "; see verify.txt)");
             if (prune)
             {
                 // Source carving cuts unreached definitions out of kept .c files only; headers are never pruned.

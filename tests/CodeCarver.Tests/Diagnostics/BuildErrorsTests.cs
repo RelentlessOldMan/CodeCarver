@@ -68,7 +68,7 @@ public sealed class BuildErrorsTests
     public void AnErrorWithoutAName_IsStillKept()
     {
         var e = One("src/a.c:5:1: error: expected ';' before '}' token");
-        Assert.Equal(BuildErrorKind.Other, e.Kind);
+        Assert.Equal(BuildErrorKind.Syntax, e.Kind);
         Assert.Equal(5, e.Line);
     }
 }

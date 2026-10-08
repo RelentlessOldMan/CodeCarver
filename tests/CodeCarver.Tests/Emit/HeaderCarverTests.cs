@@ -254,6 +254,30 @@ public class HeaderCarverTests
         Assert.DoesNotContain("I2C1", carved);
     }
 
+    /// <summary>An argument macro defined differently per #if branch builds either name: both stay.</summary>
+    [Fact]
+    public void Carve_KeepsEveryBranchOfAnArgumentMacro()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define _CAT(a, b) a##b
+            #define CAT(a, b) _CAT(a, b)
+            #if BOARD == 1
+            #define UART_PREFIX USART
+            #else
+            #define UART_PREFIX LPUART
+            #endif
+            int u(void){ return CAT(UART_PREFIX, 2); }
+            """, """
+            #define USART2 40
+            #define LPUART2 41
+            #define SPI3 7
+            """);
+        Assert.Contains("#define USART2 40", carved);
+        Assert.Contains("#define LPUART2 41", carved);
+        Assert.DoesNotContain("SPI3", carved);
+    }
+
     /// <summary>GNU's <c>, ##__VA_ARGS__</c> only swallows a comma: a logging macro is not a paste, and the short
     /// names passed to it don't keep every define that starts or ends with them.</summary>
     [Fact]

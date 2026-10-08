@@ -723,28 +723,31 @@ public static class EmittedLinkCheck
         var toks = all.Where(t => !t.InDefine).ToList();
         var match = MatchBraces(toks);
         var stmt = new List<Tok>();
-        // Inside a K&R head (`int f(a, len) int a; int len; {`): its parameter declarations are not file-scope data.
-        var kAndR = false;
+        // Inside a K&R head (`int f(a, len) int a; int len; {`): the parameter names, whose declarations up to the body
+        // are not file-scope data. Null outside one.
+        HashSet<string>? kAndR = null;
         for (var i = 0; i < toks.Count; i++)
         {
             var s = toks[i].Text;
             if (s == "{")
             {
-                if (IsTransparentOpen(toks, i)) { stmt.Clear(); kAndR = false; continue; }   // namespace / extern "C": look inside
+                if (IsTransparentOpen(toks, i)) { stmt.Clear(); kAndR = null; continue; }   // namespace / extern "C": look inside
                 var close = match[i];
                 // An initializer (or a lambda after `=`) belongs to the declaration, and so does a type's body —
                 // `struct cfg {...} board;`, `enum class mode : u8 {...};`, `class D : public Base {...};` — which stands
                 // in for the type, so a base class or an underlying type is never read as a definition. Anything else
-                // (a function body, also one with trailing words: `struct node *next(void) const {`) ends it.
+                // (a function body, also one with trailing words: `struct node *next(void) const {`) ends it. An
+                // attribute in the type's head (`struct __attribute__((packed)) cfg {`, `struct ALIGN(4) cfg {`) is no
+                // parameter list.
                 if (TopLevelAssign(stmt)) { }
-                else if (TypeKeyword(stmt) is var kw && kw >= 0 && !stmt.Skip(kw).Any(t => t.Text is "(" or ")"))
+                else if (TypeKeyword(stmt) is var kw && kw >= 0 && !WithoutTypeAttributes(stmt, kw).Any(t => t.Text is "(" or ")"))
                 {
                     var line = stmt[kw].Line;
                     stmt.RemoveRange(kw, stmt.Count - kw);
                     stmt.Add(new Tok(TypeBody, line, true, false));
                 }
                 else stmt.Clear();
-                kAndR = false;
+                kAndR = null;
                 if (close < 0)
                 {
                     // Braces unbalanced by #if branches (`#if A` / `void f(void) {` / `#else` / `void f(int x) {` /
@@ -758,8 +761,10 @@ public static class EmittedLinkCheck
             if (s == "}") { stmt.Clear(); continue; }
             if (s == ";")
             {
-                if (!kAndR) DataStatement(stmt, result);
-                if (!kAndR && KAndRHead(stmt)) kAndR = true;
+                // Each further declaration of a parameter belongs to the head; anything else ends it.
+                if (kAndR is not null && DeclaresOnly(stmt, kAndR)) { stmt.Clear(); continue; }
+                kAndR = KAndRHead(stmt);
+                if (kAndR is null) DataStatement(stmt, result);
                 stmt.Clear();
                 continue;
             }
@@ -790,28 +795,93 @@ public static class EmittedLinkCheck
     /// <summary>Index of the last struct/union/enum/class keyword of a statement, or -1.</summary>
     static int TypeKeyword(List<Tok> stmt) => stmt.FindLastIndex(t => t.Text is "struct" or "union" or "enum" or "class");
 
-    /// <summary>An `=` outside parentheses: an initializer follows (`void f(int a = 1) {` is a function).</summary>
+    /// <summary>An `=` outside parentheses: an initializer follows (`void f(int a = 1) {` is a function, and so is
+    /// `X& X::operator=(const X&) {` — the tokenizer splits `operator+=` into its symbols).</summary>
     static bool TopLevelAssign(List<Tok> stmt)
     {
         var level = 0;
-        foreach (var t in stmt)
+        for (var i = 0; i < stmt.Count; i++)
         {
+            var t = stmt[i];
             if (t.Text is "(" or "[") level++;
             else if (t.Text is ")" or "]") level--;
-            else if (t.Text == "=" && level == 0) return true;
+            else if (t.Text == "=" && level == 0 && !OperatorName(stmt, i)) return true;
         }
         return false;
     }
 
-    /// <summary>`name(a, b) type a;`: an old-style head — a parameter list of bare names, then a declaration.</summary>
-    static bool KAndRHead(List<Tok> stmt)
+    /// <summary>Is the symbol at <paramref name="at"/> part of an operator function's name (<c>operator</c>, then up to
+    /// three symbols)?</summary>
+    static bool OperatorName(List<Tok> stmt, int at)
+    {
+        for (var k = at - 1; k >= 0 && k >= at - 3; k--)
+        {
+            if (stmt[k].Text == "operator") return true;
+            if (stmt[k].Ident || stmt[k].Text is ")" or "]") return false;
+        }
+        return false;
+    }
+
+    /// <summary>`name(a, b) type a;`: an old-style head — a parameter list of bare names, then a declaration of one of
+    /// them. Its parameter names, or null. (`void f(void) WEAK;` and `MACRO(a, b) int x;` are not heads.)</summary>
+    static HashSet<string>? KAndRHead(List<Tok> stmt)
     {
         var open = stmt.FindIndex(t => t.Text == "(");
-        if (open < 1 || !stmt[open - 1].Ident) return false;
+        if (open < 1 || !stmt[open - 1].Ident) return null;
+        var names = new HashSet<string>(StringComparer.Ordinal);
         var k = open + 1;
-        for (; k < stmt.Count && stmt[k].Text != ")"; k++)
-            if (!(stmt[k].Ident || stmt[k].Text == ",")) return false;
-        return k + 1 < stmt.Count && stmt[k + 1].Ident && !AttributeWords.Contains(stmt[k + 1].Text);
+        for (var wantName = true; k < stmt.Count && stmt[k].Text != ")"; k++, wantName = !wantName)
+        {
+            var t = stmt[k];
+            if (wantName ? !t.Ident || BuiltinTypes.Contains(t.Text) || Qualifiers.Contains(t.Text) : t.Text != ",") return null;
+            if (wantName) names.Add(t.Text);
+        }
+        if (names.Count == 0 || k + 1 >= stmt.Count) return null;
+        return DeclaresOnly(stmt.GetRange(k + 1, stmt.Count - k - 1), names) ? names : null;
+    }
+
+    /// <summary>Does <paramref name="decl"/> (one statement, no ';') declare only names from <paramref name="names"/>:
+    /// a type, then declarators each ending in one of them (<c>int a, len</c>, <c>char *s</c>, <c>int v[4]</c>)?</summary>
+    static bool DeclaresOnly(List<Tok> decl, HashSet<string> names)
+    {
+        if (decl.Count < 2 || !decl[0].Ident) return false;
+        var level = 0;
+        string? last = null;
+        foreach (var t in decl.Append(new Tok(",", 0, false, false)))
+        {
+            if (t.Text is "(" or "[") { level++; continue; }
+            if (t.Text is ")" or "]") { level--; continue; }
+            if (level > 0) continue;
+            if (t.Text == ",")
+            {
+                if (last is null || !names.Contains(last)) return false;
+                last = null;
+            }
+            else if (t.Ident) last = t.Text;
+            else if (t.Text is not ("*" or "&")) return false;
+        }
+        return true;
+    }
+
+    /// <summary>The tokens of a type's head from its keyword on, without the attributes there:
+    /// <c>struct __attribute__((packed)) cfg</c>, <c>struct ALIGN(4) cfg</c> (an attribute-like macro right after the
+    /// keyword), <c>alignas(8)</c>.</summary>
+    static IEnumerable<Tok> WithoutTypeAttributes(List<Tok> stmt, int kw)
+    {
+        for (var k = kw; k < stmt.Count; k++)
+        {
+            var t = stmt[k];
+            if (k + 1 < stmt.Count && stmt[k + 1].Text == "("
+                && (AttributeWords.Contains(t.Text) || (k == kw + 1 && t.Ident && AttributeLike(t.Text))))
+            {
+                var depth = 0;
+                for (k++; k < stmt.Count; k++)
+                    if (stmt[k].Text == "(") depth++;
+                    else if (stmt[k].Text == ")" && --depth == 0) break;
+                continue;
+            }
+            yield return t;
+        }
     }
 
     /// <summary>Spelled like an attribute macro (<c>PROGMEM</c>, <c>SECTION</c>, <c>__ALIGNED</c>): all capitals, or a
@@ -857,7 +927,8 @@ public static class EmittedLinkCheck
         for (var k = 0; k < stmt.Count; k++)
         {
             var attrMacro = k + 2 < stmt.Count && stmt[k + 1].Text == "(" && stmt[k + 2].Text != "(" && stmt[k].Ident
-                && AttributeLike(stmt[k].Text) && k >= 1 && (stmt[k - 1].Text is "]" || DeclaratorName(stmt, k - 1));
+                && AttributeLike(stmt[k].Text) && k >= 1 && (stmt[k - 1].Text is "]" || DeclaratorName(stmt, k - 1))
+                && !ParameterList(stmt, k + 1);   // `int EXPORT INIT_ALL(void);` is a prototype of INIT_ALL
             if ((AttributeWords.Contains(stmt[k].Text) && k + 1 < stmt.Count && stmt[k + 1].Text == "(") || attrMacro)
             {
                 var depth = 0;
@@ -877,8 +948,8 @@ public static class EmittedLinkCheck
             if (t.Text is "(" or "[") level++;
             else if (t.Text is ")" or "]") level--;
             else if (t.Text == "=" && level == 0) seenEq = true;
-            else if (!seenEq && t.Text == "<") angle++;
-            else if (!seenEq && t.Text == ">" && angle > 0) angle--;
+            else if (!seenEq && level == 0 && t.Text == "<") angle++;            // `int a[A<B ? 1 : 2], b;`: no template
+            else if (!seenEq && level == 0 && t.Text == ">" && angle > 0) angle--;
             if (t.Text == "," && level == 0 && angle == 0) { parts.Add(new()); seenEq = false; continue; }
             parts[^1].Add(t);
         }
@@ -906,13 +977,20 @@ public static class EmittedLinkCheck
                 var head = bracket < 0 ? left : left.GetRange(0, bracket);
                 var idx = head.FindLastIndex(t => t.Ident);
                 if (idx < 0) continue;
-                // A trailing attribute macro (`const int v PROGMEM = 1;`) is not the name: the declarator before it is.
-                var at = idx;
-                while (at >= 1 && AttributeLike(head[at].Text) && head[at - 1].Ident && AttributeLike(head[at - 1].Text)) at--;
-                if (at != idx || AttributeLike(head[idx].Text))
+                // The first declarator's name is the word after its type (`U32 COUNTER`, `std::uint32_t REG_C`,
+                // `struct REGS BANK0`), and attribute-like words after that are attributes (`const int v PROGMEM = 1;`).
+                if (p == 0 && NameAfterType(head) is { } named && (named == idx || AllAttributeLike(head, named + 1, idx)))
+                    idx = named;
+                else
                 {
-                    if (DeclaratorName(head, at - 1)) idx = at - 1;
-                    else if (at != idx) { if (p == 0) return; continue; }   // unsure: record nothing
+                    // A trailing attribute macro (`const int v PROGMEM = 1;`) is not the name: the declarator before it is.
+                    var at = idx;
+                    while (at >= 1 && AttributeLike(head[at].Text) && head[at - 1].Ident && AttributeLike(head[at - 1].Text)) at--;
+                    if (at != idx || AttributeLike(head[idx].Text))
+                    {
+                        if (DeclaratorName(head, at - 1)) idx = at - 1;
+                        else if (at != idx) { if (p == 0) return; continue; }   // unsure: record nothing
+                    }
                 }
                 // The first declarator needs a type before its name; `struct tag;` declares a tag, not a variable.
                 if (p == 0 && (idx == 0 || head[idx - 1].Text is "struct" or "union" or "enum" or "class")) return;
@@ -922,6 +1000,75 @@ public static class EmittedLinkCheck
             if (NotNames.Contains(n.Text) || n.Text == TypeBody) continue;
             result.Definitions.Add(new Definition(n.Text, n.Line, isStatic, false, Data: true));
         }
+    }
+
+    // Macros commonly spelled in place of a storage class or qualifier (CMSIS `__IO`, `STATIC`, `CONST`).
+    static readonly HashSet<string> QualifierMacros = new(StringComparer.Ordinal)
+        { "STATIC", "LOCAL", "PRIVATE", "CONST", "VOLATILE", "__IO", "__I", "__O", "__IM", "__OM", "__IOM" };
+
+    /// <summary>Index of the identifier right after a declaration's type — qualifiers, then one type (builtin words,
+    /// a qualified or template name, a struct/union/enum/class and its tag), then pointers — or null when there is
+    /// none (<c>struct tag</c>) or it is a type or qualifier word.</summary>
+    static int? NameAfterType(List<Tok> head)
+    {
+        var t = 0;
+        while (t < head.Count && (Qualifiers.Contains(head[t].Text) || QualifierMacros.Contains(head[t].Text)
+               // `__packed uint32_t REG`: a reserved word before a type and a name qualifies.
+               || (head[t].Text.StartsWith("__", StringComparison.Ordinal) && !BuiltinTypes.Contains(head[t].Text)
+                   && t + 2 < head.Count && head[t + 1].Ident && (head[t + 2].Ident || head[t + 2].Text is "*" or "&"))))
+            t++;
+        if (t >= head.Count) return null;
+        var end = t;
+        var w = head[t].Text;
+        if (w is "struct" or "union" or "enum" or "class")
+            end = t + 1 < head.Count && head[t + 1].Ident ? t + 1 : t;
+        else if (BuiltinTypes.Contains(w))
+            while (end + 1 < head.Count && BuiltinTypes.Contains(head[end + 1].Text)) end++;
+        else if (head[t].Ident)
+        {
+            // `std::uint32_t`, `ns::Type`, `std::array<int, 4>`.
+            while (end + 2 < head.Count && head[end + 1].Text == "::" && head[end + 2].Ident) end += 2;
+            if (end + 1 < head.Count && head[end + 1].Text == "<")
+            {
+                var depth = 0;
+                for (end++; end < head.Count; end++)
+                    if (head[end].Text == "<") depth++;
+                    else if (head[end].Text == ">" && --depth == 0) break;
+                if (end >= head.Count) return null;
+            }
+        }
+        else return null;
+        var c = end + 1;
+        while (c < head.Count && (head[c].Text is "*" or "&" or "&&" || Qualifiers.Contains(head[c].Text))) c++;
+        if (c >= head.Count || !head[c].Ident) return null;
+        var n = head[c].Text;
+        return BuiltinTypes.Contains(n) || Qualifiers.Contains(n) || NotNames.Contains(n) || n == TypeBody ? null : c;
+    }
+
+    static bool AllAttributeLike(List<Tok> head, int from, int to)
+    {
+        for (var k = from; k <= to; k++) if (!head[k].Ident || !AttributeLike(head[k].Text)) return false;
+        return true;
+    }
+
+    /// <summary>Is the parenthesis at <paramref name="open"/> a parameter list — empty, <c>(void)</c>, starting with a
+    /// type or qualifier word, or holding a type and a name (<c>(uint32_t x)</c>) — rather than macro arguments
+    /// (<c>(".noinit")</c>, <c>(4)</c>)?</summary>
+    static bool ParameterList(List<Tok> toks, int open)
+    {
+        if (open + 1 >= toks.Count) return false;
+        var first = toks[open + 1];
+        if (first.Text == ")") return true;
+        if (BuiltinTypes.Contains(first.Text) || Qualifiers.Contains(first.Text) || first.Text is "struct" or "union" or "enum") return true;
+        string At(int k) => k < toks.Count ? toks[k].Text : "";
+        for (var k = open + 1; k + 1 < toks.Count && toks[k].Text != ")"; k++)
+        {
+            if (!toks[k].Ident) continue;
+            if (toks[k + 1].Ident) return true;                                                   // `uint32_t x`
+            if (At(k + 1) == "*" && (At(k + 2) is ")" or "," or "*"                                // `char *`, `T **`
+                                     || (k + 2 < toks.Count && toks[k + 2].Ident && At(k + 3) is ")" or ","))) return true;   // `T *p`
+        }
+        return false;
     }
 
     /// <summary>Each '{' paired with its '}' by a stack (-1 when it has none): an extra '{' from an #if branch stays

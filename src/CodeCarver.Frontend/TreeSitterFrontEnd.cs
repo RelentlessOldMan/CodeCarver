@@ -36,8 +36,6 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// catches includes tree-sitter misses — e.g. inside an array initializer (the data-fragment case).</summary>
     private static readonly Regex IncludeLine = new(
         """^\s*#\s*include\s+(?:"([^"]+)"|<([^>]+)>)""", RegexOptions.Compiled);
-    private static readonly Regex DefineLine = new(@"^\s*#\s*define\s+[A-Za-z_]", RegexOptions.Compiled);
-
     /// <summary><c>void h(void) __attribute__((weak, alias("target")))</c> — a GCC symbol alias. The
     /// aliasing name IS the target function, so without an edge to the target, dropping the target breaks
     /// the link. Ubiquitous in embedded startup, where every unused handler aliases a Default_Handler.</summary>
@@ -78,10 +76,46 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private static readonly Regex CommentOrSpace = new(@"/\*.*?\*/|//.*|\s+", RegexOptions.Compiled | RegexOptions.Singleline);
     // Object-like macros defined as `extern` in one place and as nothing in another (the EXTERN-header idiom).
     private readonly HashSet<string> _condExternMacros = new(StringComparer.Ordinal);
+    // Function-like macros whose bodies call nothing.
+    private readonly HashSet<string> _callFreeMacros = new(StringComparer.Ordinal);
+    private static readonly Regex CallInBody = new(@"[A-Za-z_]\w*\s*\(", RegexOptions.Compiled);
     // Variables a header defines (not just declares): defined in each translation unit that includes it.
     private readonly List<(NodeId Id, string Header, bool CondExtern)> _headerData = new();
-    // Translation units with a #define before their first #include (the unit that turns EXTERN off).
-    private readonly HashSet<string> _definesBeforeInclude = new(StringComparer.Ordinal);
+    // Per object-like macro defined EMPTY, the names the #if conditions around that definition test; and, for the
+    // EXTERN-style macros, all of them: the flags a unit #defines (or gets by -D) to turn EXTERN off.
+    private readonly Dictionary<string, HashSet<string>> _emptyDefineConditions = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _condExternFlags = new(StringComparer.Ordinal);
+    // Translation units that #define one of those flags themselves, or get it from their compile command.
+    private readonly HashSet<string> _definesExternFlag = new(StringComparer.Ordinal);
+    private static readonly Regex ConditionalLine = new(@"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$", RegexOptions.Compiled);
+    private static readonly Regex EmptyDefineLine = new(@"^\s*#\s*define\s+([A-Za-z_]\w*)\s*(?:/[*/].*)?$", RegexOptions.Compiled);
+    private static readonly Regex DefineName = new(@"^\s*#\s*define\s+([A-Za-z_]\w*)", RegexOptions.Compiled);
+
+    /// <summary>For each macro this text #defines as nothing, the identifiers of the #if conditions enclosing it
+    /// (<c>#ifdef DEFINE_GLOBALS / #define EXTERN</c>: DEFINE_GLOBALS).</summary>
+    private void EmptyDefineConditions(string text)
+    {
+        var stack = new List<List<string>>();
+        foreach (var line in text.Split('\n'))
+        {
+            if (line.IndexOf('#') < 0) continue;
+            if (ConditionalLine.Match(line) is { Success: true } c)
+            {
+                var ids = Identifier.Matches(c.Groups[2].Value).Select(m => m.Value).Where(v => v != "defined").ToList();
+                switch (c.Groups[1].Value)
+                {
+                    case "if" or "ifdef" or "ifndef": stack.Add(ids); break;
+                    case "elif" when stack.Count > 0: stack[^1].AddRange(ids); break;
+                    case "endif" when stack.Count > 0: stack.RemoveAt(stack.Count - 1); break;
+                }
+                continue;
+            }
+            if (stack.Count == 0 || EmptyDefineLine.Match(line) is not { Success: true } d) continue;
+            if (!_emptyDefineConditions.TryGetValue(d.Groups[1].Value, out var set))
+                _emptyDefineConditions[d.Groups[1].Value] = set = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var frame in stack) set.UnionWith(frame);
+        }
+    }
     private static readonly Regex NameBeforeAttr = new( // trailing:  name / name(...) / name[...]  __attribute__
         @"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]|\([^()]*\))?\s*$", RegexOptions.Compiled);
     private static readonly Regex NameAfterAttr = new(  // leading:   __attribute__ ... name( / name[ / name =
@@ -401,8 +435,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _c99InlineFns.Clear();
         _fileLocal.Clear();
         _condExternMacros.Clear();
+        _callFreeMacros.Clear();
         _headerData.Clear();
-        _definesBeforeInclude.Clear();
+        _emptyDefineConditions.Clear();
+        _condExternFlags.Clear();
+        _definesExternFlag.Clear();
         _unparsed.Clear();
         _symbolBudgetKeptWhole.Clear();
         var graph = new CodeGraph();
@@ -728,12 +765,15 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             }
             foreach (Match m in FuncLikeDefine.Matches(text)) fnLike.Add(m.Groups[1].Value);
             if (text.Contains("define", StringComparison.Ordinal))
+            {
                 foreach (Match m in AnyDefine.Matches(text))
                 {
                     var name = m.Groups[1].Value;
                     if (!bodies.TryGetValue(name, out var b)) bodies[name] = b = (m.Groups[2].Success, new List<string>());
                     if (b.Bodies.Count < 8) b.Bodies.Add(m.Groups[3].Value);
                 }
+                if (text.Contains("extern", StringComparison.Ordinal)) EmptyDefineConditions(text);
+            }
         }
 
         // Keep macros: a keep construct in the body, or (transitively) a use of another keep macro.
@@ -761,9 +801,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // definition in the unit that turns it off (see HeaderData).
         foreach (var kv in bodies)
         {
-            if (kv.Value.FnLike) continue;
+            if (kv.Value.FnLike)
+            {
+                // `#define BIT(n) (1u << (n))`: using it calls nothing (see HasCall).
+                if (kv.Value.Bodies.All(b => !CallInBody.IsMatch(b))) _callFreeMacros.Add(kv.Key);
+                continue;
+            }
             var forms = kv.Value.Bodies.Select(b => CommentOrSpace.Replace(b, "")).ToList();
-            if (forms.Contains("extern") && forms.Contains("")) _condExternMacros.Add(kv.Key);
+            if (!forms.Contains("extern") || !forms.Contains("")) continue;
+            _condExternMacros.Add(kv.Key);
+            if (_emptyDefineConditions.TryGetValue(kv.Key, out var flags)) _condExternFlags.UnionWith(flags);
         }
         _keepMacrosFnLike = new HashSet<string>(keep.Where(k => bodies[k].FnLike), StringComparer.Ordinal);
         _keepMacroUse = keep.Count == 0 ? null
@@ -1152,15 +1199,18 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// initializer only declares. A declaration with a parse error is often not one at all (comment words after a
     /// spliced <c>*\</c>+<c>/</c> read as <c>this comment ends at ...</c>): it mints nothing.
     /// </summary>
-    private TsNode? MintedGlobal(TsNode decl, string path, string[] lines, out bool isStatic, out bool condExtern)
+    /// <param name="headerDefinition">A header variable every including unit defines (see <see cref="HeaderData"/>).</param>
+    private TsNode? MintedGlobal(TsNode decl, string path, string[] lines, out bool isStatic, out bool condExtern, out bool headerDefinition)
     {
         isStatic = false;
         condExtern = false;
+        headerDefinition = false;
         if (decl.Parent is not { Type: "declaration" } declaration || declaration.HasError) return null;
         var storage = declaration.Children.Where(c => c.Type == "storage_class_specifier").Select(c => c.Text).ToList();
         if (storage.Contains("extern") && decl.Type != "init_declarator") return null;
         isStatic = storage.Contains("static");
-        if (!HasArrayDeclarator(decl) && (isStatic || (!IsTranslationUnit(path) && !HeaderDefines(declaration, decl, storage, lines, out condExtern))))
+        headerDefinition = !isStatic && !IsTranslationUnit(path) && HeaderDefines(declaration, decl, storage, lines, out condExtern);
+        if (!HasArrayDeclarator(decl) && (isStatic || (!IsTranslationUnit(path) && !headerDefinition)))
             return null;
         return GlobalName(decl) is { IsMissing: false, Text.Length: > 0 } node ? node : null;
     }
@@ -1186,8 +1236,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// A variable a header DEFINES (<c>int g = 1;</c>, or <c>EXTERN int g;</c> with EXTERN empty in one unit) is defined
     /// in the translation units that include it, not in the header: keeping the header alone links nothing. Each such
     /// node references those units, so a use keeps one that compiles it. For the EXTERN idiom only the units that
-    /// #define something before their first #include (the one that turns EXTERN off) are linked; when none does, all
-    /// are (sound). Skipped when a translation unit defines the name itself.
+    /// define a flag the #if around the empty EXTERN tests (by #define or -D) are linked; when none does, all are
+    /// (sound). Skipped when a translation unit defines the name itself with external linkage.
     /// </summary>
     private void HeaderData(CodeGraph graph, Dictionary<string, NodeId> fileNodeByPath,
                             Dictionary<string, List<NodeId>> globalsByName)
@@ -1224,36 +1274,56 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         foreach (var (id, header, condExtern) in _headerData)
         {
             var name = graph.GetNode(id).Name;
-            if (globalsByName.TryGetValue(name, out var defs) && defs.Any(d => graph.GetNode(d).FilePath is { } p && IsTranslationUnit(p)))
+            // A unit that defines it itself, with external linkage (a same-named static elsewhere is another variable).
+            if (globalsByName.TryGetValue(name, out var defs)
+                && defs.Any(d => graph.GetNode(d) is { FilePath: { } p } dn && IsTranslationUnit(p) && (dn.Flags & NodeFlags.FileLocal) == 0))
                 continue;
             var units = Units(header);
-            if (condExtern && units.Where(_definesBeforeInclude.Contains).ToList() is { Count: > 0 } off) units = off;
+            if (condExtern && units.Where(_definesExternFlag.Contains).ToList() is { Count: > 0 } off) units = off;
             foreach (var u in units)
                 if (fileNodeByPath.TryGetValue(u, out var un)) graph.AddEdge(id, un, EdgeKind.References);
         }
     }
 
-    /// <summary>A declaration whose type specifier has a body: <c>struct cfg { int a; } g;</c>, <c>enum m {A} g;</c>.</summary>
+    /// <summary>A declaration whose type specifier has a body and a tag other code can name: <c>struct cfg { int a; } g;</c>,
+    /// <c>enum m {A} g;</c>. An anonymous one (<c>static const struct { ... } cmds[]</c>) is nameable nowhere else.</summary>
     private static bool DefinesType(TsNode declaration)
         => declaration.GetChildForField("type") is { Type: "struct_specifier" or "union_specifier" or "enum_specifier" or "class_specifier" } t
-           && t.GetChildForField("body") is not null;
+           && t.GetChildForField("body") is not null && t.GetChildForField("name") is not null;
 
-    /// <summary>A C++ variable whose construction can run code: an object of a non-builtin type (not through a
-    /// pointer), or one whose initializer calls something (<c>int reg = do_register();</c>).</summary>
+    /// <summary>A C++ variable whose construction can run code: one whose initializer calls a function (not a macro),
+    /// or an object of a non-builtin type (not through a pointer) that isn't brace-initialized — a table of aggregates
+    /// (<c>Entry t[] = {{...}}</c>) runs nothing.</summary>
     private bool CppObject(TsNode declaration, TsNode decl, string path)
     {
         if (_cGrammar || path.EndsWith(".c", StringComparison.OrdinalIgnoreCase)) return false;
-        if (decl.Type == "init_declarator" && decl.GetChildForField("value") is { } value && HasCall(value)) return true;
+        var value = decl.Type == "init_declarator" ? decl.GetChildForField("value") : null;
+        if (value is not null && HasCall(value)) return true;
         if (declaration.GetChildForField("type")?.Type is "primitive_type" or "sized_type_specifier" or "enum_specifier") return false;
+        if (value?.Type == "initializer_list") return false;
         for (var d = decl; d is not null; d = d.GetChildForField("declarator"))
             if (d.Type is "pointer_declarator" or "reference_declarator" or "function_declarator") return false;
         return true;
     }
 
-    private static bool HasCall(TsNode n)
+    /// <summary>A call, <c>new</c> or lambda anywhere in an initializer; a function-like macro whose body calls nothing
+    /// (<c>BIT(1)</c>) isn't one.
+    /// Iterative and bounded: a generated initializer can nest tens of thousands of levels deep, and past the budget
+    /// the answer is yes (keep).</summary>
+    private bool HasCall(TsNode n)
     {
-        if (n.Type is "call_expression" or "new_expression" or "lambda_expression") return true;
-        foreach (var c in n.NamedChildren) if (HasCall(c)) return true;
+        var stack = new Stack<TsNode>();
+        stack.Push(n);
+        for (var budget = 200_000; stack.Count > 0; budget--)
+        {
+            if (budget == 0) return true;
+            var c = stack.Pop();
+            if (c.Type is "new_expression" or "lambda_expression") return true;
+            if (c.Type == "call_expression"
+                && !(c.GetChildForField("function") is { Type: "identifier" } f && _callFreeMacros.Contains(f.Text)))
+                return true;
+            foreach (var k in c.NamedChildren) stack.Push(k);
+        }
         return false;
     }
 
@@ -1524,7 +1594,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         if (PerFileSymbolBudget > 0 && text.Length >= (long)PerFileSymbolBudget * 2)
         {
             var lines = text.Split('\n');
-            var symbols = CountCaptures(_defs, root) + _globals.Execute(root).Captures.Count(c => MintedGlobal(c.Node, path, lines, out _, out _) is not null);
+            var symbols = CountCaptures(_defs, root) + _globals.Execute(root).Captures.Count(c => MintedGlobal(c.Node, path, lines, out _, out _, out _) is not null);
             if (symbols > PerFileSymbolBudget)
             {
                 _symbolBudgetKeptWhole.Add((path, symbols));
@@ -1709,7 +1779,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var decl = cap.Node;
             if (IsDead(decl)) continue;
             if (scopes.InBody(decl.StartIndex)) continue; // a LOCAL variable, not a file-scope global
-            if (MintedGlobal(decl, path, srcLines, out var isStatic, out var condExtern) is not { } node) continue;
+            if (MintedGlobal(decl, path, srcLines, out var isStatic, out var condExtern, out var headerDefinition) is not { } node) continue;
             var gname = node.Text;
             var span = GlobalDeclarationSpan(node);
             if (span is null) continue;
@@ -1717,10 +1787,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             graph.AddEdge(gid, fileNode, EdgeKind.DefinedIn);
             Add(globalsByName, gname, gid);
             if (isStatic && IsTranslationUnit(path)) { _fileLocal.Add(gid); graph.AddFlag(gid, NodeFlags.FileLocal); }
-            if (!isStatic && !IsTranslationUnit(path)) _headerData.Add((gid, path, condExtern));
-            // Not removable on its own: a declaration that also defines its type (`struct cfg {...} dead_cfg;` — the
-            // type goes with it), or a C++ object of class type, whose constructor can register something at start-up.
-            if (decl.Parent is { } owner && (DefinesType(owner) || CppObject(owner, decl, path)))
+            if (headerDefinition) _headerData.Add((gid, path, condExtern));
+            // Not removable on its own: a declaration that also defines a named type (`struct cfg {...} dead_cfg;` — the
+            // type goes with it), or a C++ object whose constructor can register something at start-up. Only in a unit:
+            // a header is never cut, and such an edge there would pull in every unit including it.
+            if (IsTranslationUnit(path) && decl.Parent is { } owner && (DefinesType(owner) || CppObject(owner, decl, path)))
                 graph.AddEdge(fileNode, gid, EdgeKind.References);
             // What its initializer names, read from the text after the name: a section-placed entry
             // (`const fn_t e __attribute__((section("x"))) = handler;`) doesn't parse as an initializer at all, and
@@ -1751,12 +1822,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(fileNode, gid, EdgeKind.References);
                 Add(globalsByName, d.Name, gid);
             }
-        if (IsTranslationUnit(path))
-            for (var li = 0; li < srcLines.Length; li++)
-            {
-                if (IncludeLine.IsMatch(srcLines[li])) break;
-                if (DefineLine.IsMatch(srcLines[li])) { _definesBeforeInclude.Add(path); break; }
-            }
+        if (_condExternFlags.Count > 0 && IsTranslationUnit(path))
+        {
+            if (defines is not null && _condExternFlags.Any(defines.IsDefined)) _definesExternFlag.Add(path);
+            else
+                foreach (var l in srcLines)
+                    if (l.IndexOf('#') >= 0 && DefineName.Match(l) is { Success: true } dm && _condExternFlags.Contains(dm.Groups[1].Value))
+                    { _definesExternFlag.Add(path); break; }
+        }
 
         // Pass 2: #includes → file/header edges. Scanned from TEXT, not the parse tree: #include is a
         // line-oriented preprocessor directive, and tree-sitter misses ones in odd positions — notably

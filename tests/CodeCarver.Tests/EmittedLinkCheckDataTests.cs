@@ -26,6 +26,47 @@ public sealed class EmittedLinkCheckDataTests
         Assert.DoesNotContain(notData, Data(text));
     }
 
+    /// <summary>A prototype with a trailing attribute macro, or a macro call with no ';', is no K&amp;R head: the data
+    /// after it is still read.</summary>
+    [Theory]
+    [InlineData("static void modd_loop(void) __NO_RETURN;\nvoid Modd_Handler(void) WEAK;\nunsigned modd_clock = 16;\n"
+              + "volatile unsigned modd_ticks;\nstatic unsigned char modd_rx[64];\n", "modd_clock,modd_ticks,modd_rx")]
+    [InlineData("SOME_MACRO(a, b) int x; int modd_y; int modd_z;\n", "modd_y,modd_z")]
+    [InlineData("int f(a, len) int a; char *len; { return a; }\nint modd_after;\n", "modd_after")]
+    public void DataAfterAttributedPrototypes_IsRead(string text, string names)
+    {
+        Assert.Equal(names.Split(','), Data(text));
+    }
+
+    [Theory]
+    [InlineData("U32 MODD_COUNTER;\n", "MODD_COUNTER")]
+    [InlineData("static U32 MODD_TICKS = 0;\n", "MODD_TICKS")]
+    [InlineData("const UINT8 MODD_CRC[4] = { 1, 2, 3, 4 };\n", "MODD_CRC")]
+    [InlineData("__IO uint32_t MODD_REG;\n", "MODD_REG")]
+    [InlineData("struct REGS MODD_BANK;\n", "MODD_BANK")]
+    [InlineData("std::uint32_t MODD_REG_C;\n", "MODD_REG_C")]
+    [InlineData("ns::Type MODD_OBJ;\n", "MODD_OBJ")]
+    [InlineData("uint32_t MODD_REG_A;\n", "MODD_REG_A")]
+    [InlineData("const int modd_v PROGMEM = 1;\n", "modd_v")]
+    [InlineData("struct __attribute__((packed)) modd_cfg { int a; } modd_g_cfg;\n", "modd_g_cfg")]
+    [InlineData("struct ALIGN(4) modd_cfg2 { int a; } modd_g_cfg2;\n", "modd_g_cfg2")]
+    [InlineData("X& X::operator=(const X& o) { return *this; }\nint modd_after_assign;\n", "modd_after_assign")]
+    [InlineData("X& X::operator+=(const X& o) { return *this; }\nint modd_after_add;\n", "modd_after_add")]
+    [InlineData("int modd_arr[A<B ? 1 : 2], modd_tail;\n", "modd_arr,modd_tail")]
+    public void CapitalisedAndQualifiedNames_AreRead(string text, string names)
+    {
+        Assert.Equal(names.Split(','), Data(text));
+    }
+
+    [Theory]
+    [InlineData("int EXPORT MODD_INIT_ALL(void);\n")]
+    [InlineData("void __stdcall MODD_FOO_INIT(int);\n")]
+    [InlineData("int EXPORT MODD_SET(uint32_t value);\n")]
+    public void PrototypesWithCallConventionMacros_DefineNoData(string text)
+    {
+        Assert.Empty(Data(text));
+    }
+
     [Theory]
     [InlineData("std::pair<Alpha, Beta> p;\n", "p")]
     [InlineData("std::map<Key,Val> m = {};\n", "m")]

@@ -19,7 +19,8 @@ On a successful carve it also says where the carve could get tighter and where t
 `header`: included by kept code; `reached`: called or referenced from a root), `keep.bytes.largest10Percent` is the
 share of kept bytes in the ten largest kept files, and `time.<phase>.ms` is each phase's time, in run order from
 the start: `buildLogs`, `defines` (per-file define sets, compiler probe), `walk` (the tree walk and file sizes),
-`buildTraces`, `input+refscan`, `pre-parse`, `build-graph`, `roots`, `reachability`, `precision`, then `emit` (a
+`buildTraces`, `preprocess` (rerunning the build's compile commands with `-E`, when a build has a `compiler`; see
+`world.preprocessed.*`), `input+refscan`, `pre-parse`, `build-graph`, `roots`, `reachability`, `precision`, then `emit` (a
 carve) or `analyze` (an analysis-only run, which writes no tree). Those add up to the run. A key with a further dot inside (`time.pre-parse.<part>.ms`, `time.build-graph.<part>.ms`,
 `time.outsideIncludes.ms`, which is part of `roots`) is part of a phase, not added to it.
 `time.pre-parse.<part>.ms` splits the macro scan before parsing: `treeMacros` (the tree's own files),
@@ -84,6 +85,11 @@ like verify failures, in `codecarver/debug-build/`: for each name the build miss
 and why the carve dropped it, raw (`raw/`, keep local) and anonymized (`anon.zip`, to send). The compiler's own words
 stay in the anonymized error lines; every name and path in them is rewritten. A replay counts as reproduced when the
 anonymized copy's carve drops every file that defines the name (or the missing header) too.
+
+`summary.txt` counts the errors by kind, numbers only: `<stage>.buildErrors.<kind>` for `UndefinedReference`,
+`Undeclared`, `UnknownType`, `MissingHeader`, `WarningAsError` (also per warning, e.g.
+`.WarningAsError.unused-function`), `Redefinition`, `Syntax` (the text no longer parses: a cut in the wrong place) and
+`Other`, beside `<stage>.buildErrors.cases` / `.reproduced`.
 
 ## Checking a fix: `tools\selfcheck\selfcheck.ps1`
 

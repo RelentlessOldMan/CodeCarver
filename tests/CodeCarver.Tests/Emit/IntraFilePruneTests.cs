@@ -214,6 +214,25 @@ public class IntraFilePruneTests
         AssertCompiles(result, werror: false);   // -Wall's -Wcomment flags the splice itself, in the original too
     }
 
+    /// <summary>A line that is a whole call already (a macro supplying its own `;`) is not the start of the prototype
+    /// after it: only the prototype goes.</summary>
+    [Fact]
+    public void EmitPruned_PrototypeAfterAMacroCall_LeavesTheCall()
+    {
+        const string src = """
+            #define DECLARE_COUNTER(n) int n = 0;
+            DECLARE_COUNTER(hits)
+            static void helper(void);
+            static void helper(void) { }
+            void b_dead(void) { helper(); }
+            int reader(void) { return hits; }
+            """;
+        var result = Prune(src);
+        Assert.Contains("DECLARE_COUNTER(hits)", result);
+        Assert.DoesNotContain("helper", result);
+        AssertCompiles(result);
+    }
+
     [Fact]
     public void EmitPruned_RemovedFunction_TakesMultiLineAndMacroSpelledPrototypesAlong()
     {

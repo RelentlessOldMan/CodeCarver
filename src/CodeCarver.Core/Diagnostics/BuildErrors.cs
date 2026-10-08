@@ -12,6 +12,14 @@ public enum BuildErrorKind
     UnknownType,
     /// <summary>An #include the compiler can't find: a dropped header.</summary>
     MissingHeader,
+    /// <summary>A warning the build turns into an error (<c>[-Werror=unused-function]</c>): often a prototype or static
+    /// the carve left without its definition, or a definition left unused.</summary>
+    WarningAsError,
+    /// <summary>Defined twice or with conflicting types: text the carve kept twice.</summary>
+    Redefinition,
+    /// <summary>The text no longer parses (<c>expected ';'</c>, an unterminated comment, <c>#endif</c> without <c>#if</c>):
+    /// a cut in the wrong place.</summary>
+    Syntax,
     Other,
 }
 
@@ -40,7 +48,13 @@ public static class BuildErrors
     static readonly Regex Armlink = new(@"L6218E:\s*Undefined symbol\s+(?<name>[^\s(]+)", RegexOptions.Compiled);
     static readonly Regex IarLink = new(@"Error\[Li005\]:\s*no definition for\s+""(?<name>[^""]+)""", RegexOptions.Compiled);
 
-    static readonly Regex Quoted = new(@"[`'‘""](?<q>[^`'’""]+)[`'’""]", RegexOptions.Compiled);
+    static readonly Regex WerrorFlag = new(@"\[-Werror=(?<flag>[\w+-]+)\]", RegexOptions.Compiled);
+
+    /// <summary>The warning a <see cref="BuildErrorKind.WarningAsError"/> error was (<c>unused-function</c>): a compiler
+    /// flag name, safe to count.</summary>
+    public static string? WerrorFlagOf(BuildError e) => WerrorFlag.Match(e.Message) is { Success: true } m ? m.Groups["flag"].Value : null;
+
+    static readonly Regex Quoted =new(@"[`'‘""](?<q>[^`'’""]+)[`'’""]", RegexOptions.Compiled);
     static readonly Regex Identifier = new(@"^[A-Za-z_$][\w$]*$", RegexOptions.Compiled);
 
     public static List<BuildError> Parse(string log)
@@ -96,11 +110,17 @@ public static class BuildErrors
             var colon = msg.IndexOf(':');
             return (BuildErrorKind.MissingHeader, colon > 0 ? msg[..colon].Trim() : null);
         }
-        var kind = lower.Contains("undefined reference") ? BuildErrorKind.UndefinedReference
+        var kind = lower.Contains("[-werror") ? BuildErrorKind.WarningAsError
+            : lower.Contains("undefined reference") ? BuildErrorKind.UndefinedReference
             : lower.Contains("unknown type name") || lower.Contains("is not a type") || lower.Contains("does not name a type")
               ? BuildErrorKind.UnknownType
             : lower.Contains("undeclared") || lower.Contains("implicit declaration") || lower.Contains("is undefined")
               || lower.Contains("was not declared") || lower.Contains("not declared in this scope") ? BuildErrorKind.Undeclared
+            : lower.Contains("redefinition") || lower.Contains("conflicting types") || lower.Contains("multiple definition")
+              || lower.Contains("redeclared") ? BuildErrorKind.Redefinition
+            : lower.StartsWith("expected", StringComparison.Ordinal) || lower.Contains(" expected ") || lower.Contains("stray ")
+              || lower.Contains("unterminated") || lower.Contains("without #if") || lower.Contains("missing terminating")
+              || lower.Contains("unbalanced") || lower.Contains("syntax error") ? BuildErrorKind.Syntax
             : BuildErrorKind.Other;
         string? name = null;
         foreach (Match q in Quoted.Matches(msg))

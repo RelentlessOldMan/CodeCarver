@@ -109,6 +109,72 @@ public sealed class GlobalDataTests
         Assert.False(t.Kept("other.c"), o + e);
     }
 
+    /// <summary>The EXTERN idiom picks the unit that defines the flag, not one that merely #defines something first; a
+    /// same-named static elsewhere is another variable.</summary>
+    [Fact]
+    public void ExternMacroHeader_FollowsTheFlag_NotAnyEarlyDefine()
+    {
+        using var t = new TreeCarve();
+        t.W("modd_globals.h", "#ifdef MODD_DEFINE_GLOBALS\n#define MODD_EXTERN\n#else\n#define MODD_EXTERN extern\n#endif\nMODD_EXTERN int modd_g;\n")
+         .W("globals.c", "#include <stddef.h>\n#define MODD_DEFINE_GLOBALS\n#include \"modd_globals.h\"\n")
+         .W("util.c", "#define _GNU_SOURCE\n#include \"modd_globals.h\"\nint modd_util(void){ return 1; }\n")
+         .W("other.c", "static int modd_g[2];\nint modd_other(void){ return modd_g[0]; }\n")
+         .W("main.c", "#include \"modd_globals.h\"\nint main(void){ return modd_g; }\n");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.True(t.Kept("globals.c"), o + e);
+        Assert.False(t.Kept("util.c"), o + e);
+    }
+
+    /// <summary>A header's tentative array, or a header table that defines its type, doesn't pull in every unit that
+    /// includes the header.</summary>
+    [Fact]
+    public void HeaderData_DoesNotFanOutToEveryIncluder()
+    {
+        using var t = new TreeCarve();
+        t.W("modd_common.h", "int modd_buf[8];\nstruct modd_s { int a; } modd_tab[4];\n")
+         .W("feat1.c", "#include \"modd_common.h\"\nint modd_f1(void){ return 1; }\n")
+         .W("feat2.c", "#include \"modd_common.h\"\nint modd_f2(void){ return 2; }\n")
+         .W("main.c", "#include \"modd_common.h\"\nint main(void){ return modd_buf[0]; }\n");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        Assert.False(t.Kept("feat1.c"), o + e);
+        Assert.False(t.Kept("feat2.c"), o + e);
+    }
+
+    /// <summary>Tables are still carved: an anonymous-struct table in C, and C++ aggregate tables and BIT()-style
+    /// macro initializers, run no code and name no type anyone else can use.</summary>
+    [Fact]
+    public void Prune_StillCutsUnusedTables()
+    {
+        using var t = new TreeCarve();
+        t.W("main.c", "static const struct { const char *n; int v; } modd_cmds[] = { { \"a\", 1 } };\nint main(void){ return 0; }\n");
+        var (code, o, e) = t.Carve(extraToml: Pruned);
+        Assert.True(code == 0, o + e);
+        Assert.DoesNotContain("modd_cmds", File.ReadAllText(Stage(t, "main.c")));
+
+        using var c = new TreeCarve();
+        c.W("main.cpp", "#define MODD_BIT(n) (1u << (n))\ntypedef unsigned char u8;\nstruct Entry { int a; int b; };\n"
+                      + "static const u8 modd_lut[] = { 1, 2 };\nEntry modd_table[] = { { 1, 2 } };\n"
+                      + "static const unsigned modd_masks[] = { MODD_BIT(1), MODD_BIT(2) };\nint main(void){ return 0; }\n");
+        (code, o, e) = c.Carve(extraToml: Pruned, languages: "\"cpp\"");
+        Assert.True(code == 0, o + e);
+        var text = File.ReadAllText(Stage(c, "main.cpp"));
+        Assert.DoesNotContain("modd_lut", text);
+        Assert.DoesNotContain("modd_table", text);
+        Assert.DoesNotContain("modd_masks", text);
+    }
+
+    /// <summary>A generated initializer nested tens of thousands deep doesn't overflow the stack.</summary>
+    [Fact]
+    public void DeepCppInitializer_DoesNotCrash()
+    {
+        using var t = new TreeCarve();
+        t.W("main.cpp", "int modd_x = 0" + string.Concat(Enumerable.Range(1, 20_000).Select(i => " + " + i)) + ";\nint main(void){ return 0; }\n");
+        var (code, o, e) = t.Carve(languages: "\"cpp\"");
+        Assert.True(code == 0, o + e);
+    }
+
     /// <summary>A header that defines a variable defines it in the unit including it: that unit is kept.</summary>
     [Fact]
     public void HeaderDefinition_KeepsTheIncludingUnit()

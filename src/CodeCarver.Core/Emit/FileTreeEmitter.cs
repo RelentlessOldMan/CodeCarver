@@ -631,7 +631,9 @@ public static class FileTreeEmitter
             var code = LineCode(lines, inComment, inLineComment, i).Trim();
             if (code.Length == 0) continue;
             var startsHere = statementStart && depth[i] == 0 && !inComment[i];
-            statementStart = code[^1] is ';' or '{' or '}';
+            // A file-scope line ending in `)` is a whole macro call (`DECLARE_COUNTER(hits)`) or a head whose `{` is
+            // next: either way a prototype can start on the line after it.
+            statementStart = code[^1] is ';' or '{' or '}' || (code[^1] == ')' && depth[i] == 0);
             if (!startsHere || code[^1] == '{') continue;
 
             // Collect the statement to its `;` — every line plain code at file scope, none removed or a directive.
@@ -639,6 +641,9 @@ public static class FileTreeEmitter
             var stmt = new StringBuilder(code);
             while (stmt.ToString().IndexOfAny(StatementEnd) < 0 && j < lines.Length && j - i < 32)
             {
+                // A line ending in `)` is a whole head or call already (`DECLARE_COUNTER(hits)`, a macro that supplies
+                // its own `;`): a prototype broken over lines breaks inside its parameters or before its name.
+                if (stmt.ToString().TrimEnd().EndsWith(')')) { j = -1; break; }
                 j++;
                 if (drop[j] || inComment[j] || depth[j] != 0 || DirectiveBody(lines[j - 1]) is not null) { j = -1; break; }
                 stmt.Append(' ').Append(LineCode(lines, inComment, inLineComment, j).Trim());
@@ -701,8 +706,12 @@ public static class FileTreeEmitter
     }
 
     private static readonly char[] NotInPrototype = { '{', '}', '=', '#' };
-    // The declared name: the identifier right before the parameter list's '('.
-    private static readonly Regex PrototypeName = new(@"([A-Za-z_]\w*)\s*\([^()]*(?:\([^()]*\)[^()]*)*\)\s*(?:__attribute__\s*\(\(.*\)\)\s*)?;$", RegexOptions.Compiled);
+    // The declared name: the identifier right before the parameter list's '('. Anchored: before it only declaration
+    // words (storage, qualifiers, types, attribute macros), pointers and attributes, so a statement that holds
+    // anything else (a macro call before it) is no prototype.
+    private static readonly Regex PrototypeName = new(
+        @"^(?:(?:__attribute__\s*\(\((?:[^()]|\([^()]*\))*\)\)|__declspec\s*\([^()]*\)|\[\[[^\]]*\]\]|[A-Za-z_]\w*\b|[*&])\s*)*?"
+        + @"([A-Za-z_]\w*)\s*\([^()]*(?:\([^()]*\)[^()]*)*\)\s*(?:__attribute__\s*\(\(.*\)\)\s*)?;$", RegexOptions.Compiled);
 
     /// <summary>The requested ranges that <see cref="RemoveLineRanges"/> actually removes.</summary>
     private static HashSet<(int, int)> AppliedRanges(string[] lines, List<(int Start, int End)> ranges)

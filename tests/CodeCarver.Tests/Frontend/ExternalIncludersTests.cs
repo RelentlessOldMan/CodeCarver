@@ -41,9 +41,9 @@ public sealed class ExternalIncludersTests
             Assert.Equal(3000 + 3000 + 1, r.FilesScanned);   // and the root header, followed for what it includes
             // Every directory is listed once, whatever the number of (dir, name) probes: 300 -I dirs and the pub/ each
             // could hold, 30 glue dirs, the root and its pub/. Probing each pair with File.Exists took 13 s here on
-            // Windows; this, under 1 s.
+            // Windows; this takes about 2 s (it reads all 6,000 files). The limit leaves room for a loaded test run.
             Assert.True(lookup.DirectoriesListed <= 2 * 301 + 30 + 2, $"listed {lookup.DirectoriesListed}");
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), $"took {sw.Elapsed}");
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(8), $"took {sw.Elapsed}");
         }
         finally { try { Directory.Delete(work, true); } catch { } }
     }

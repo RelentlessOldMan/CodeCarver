@@ -76,11 +76,28 @@ public sealed class TempDir : IDisposable
     }
 }
 
-/// <summary>Finds the pinned toolchains (fetched into <c>.toolchains/</c>, not committed) and runs them.</summary>
+/// <summary>Finds the pinned toolchains (fetched into <c>.toolchains/</c>, not committed) and runs them. A host
+/// gcc/g++ on PATH stands in when the pinned one isn't there (CI's Linux runners have one), so compile checks run.</summary>
 public static class Toolchain
 {
-    public static string? Gcc() => FindUp(System.IO.Path.Combine(".toolchains", "w64devkit", "bin", "gcc.exe"));
-    public static string? Gxx() => FindUp(System.IO.Path.Combine(".toolchains", "w64devkit", "bin", "g++.exe"));
+    public static string? Gcc() => FindUp(System.IO.Path.Combine(".toolchains", "w64devkit", "bin", "gcc.exe")) ?? OnPath("gcc");
+    public static string? Gxx() => FindUp(System.IO.Path.Combine(".toolchains", "w64devkit", "bin", "g++.exe")) ?? OnPath("g++");
+
+    private static string? OnPath(string name)
+    {
+        var file = OperatingSystem.IsWindows() ? name + ".exe" : name;
+        foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(System.IO.Path.PathSeparator))
+        {
+            if (dir.Length == 0) continue;
+            try
+            {
+                var cand = System.IO.Path.Combine(dir, file);
+                if (File.Exists(cand)) return cand;
+            }
+            catch (ArgumentException) { }   // a malformed PATH entry
+        }
+        return null;
+    }
 
     public static string? ArmGcc()
     {
