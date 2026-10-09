@@ -109,7 +109,7 @@ once, so on a large tree it takes minutes, not seconds. The output is still coun
 The release ships a self-check that carves tiny made-up trees, one for each definition shape a past evaluation
 found missed (out-of-line C++ methods in nested scopes, K&R definitions with and without parameter declarations,
 implicit-int definitions, a function head split across `#ifdef`, `#if/#else` inside a parameter list, a
-macro-defined function, a registration macro verify misread as a function), and checks each carve kept what `main`
+macro-defined function, a registration macro verify misread as a function, a name glued by a macro that pastes its own parameters), and checks each carve kept what `main`
 needs. It uses none of your
 source and takes seconds:
 

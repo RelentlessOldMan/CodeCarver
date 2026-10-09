@@ -470,3 +470,83 @@ public sealed class KeptWholeUsesTests
         finally { TempDir.Delete(root); }
     }
 }
+
+/// <summary>Names built by a macro that pastes its own parameters (see PasteMacros).</summary>
+public sealed class GluePasteTests
+{
+    sealed class Work : IDisposable
+    {
+        public readonly string Root = Path.Combine(Path.GetTempPath(), "cc-glue-" + Guid.NewGuid().ToString("N"));
+        public string Src => Path.Combine(Root, "src");
+        public Work() => Directory.CreateDirectory(Src);
+        public void W(string rel, string text) => File.WriteAllText(Path.Combine(Src, rel), text);
+        public (int Code, string Out) Carve(string extra = "")
+        {
+            var cfg = Path.Combine(Root, "carve.toml");
+            File.WriteAllText(cfg, $"outputDirectory = \"{Path.Combine(Root, "out").Replace('\\', '/')}\"\n"
+                                   + "[common]\nentryPoints = [\"main\"]\nlanguages = [\"c\"]\n" + extra);
+            var so = new StringWriter(); var se = new StringWriter();
+            var code = CarveCommand.Run(new[] { "carve", Src, "--config", cfg }, so, se);
+            return (code, so + "\n" + se);
+        }
+        public bool Kept(string rel, string stage = "") => File.Exists(Path.Combine(Root, "out", stage, "carved", rel));
+        public string Read(string rel, string stage = "") => File.ReadAllText(Path.Combine(Root, "out", stage, "carved", rel));
+        public void Dispose() { try { Directory.Delete(Root, true); } catch { } }
+    }
+
+    // A macro that pastes its own parameters builds names no body scan sees: `CAT(a, b) a##b` reached through a
+    // wrapper that supplies the literal piece, or called with it in code. The carve inside the file removed the
+    // definition and the build said "undeclared" (work eval, 1.0.189).
+    const string Cat = "#define CAT(a, b) a##b\n#define CAT3(a, b, c) a##b##c\n";
+
+    [Fact]
+    public void GluePaste_ThroughAWrapper_KeepsWhatItBuilds()
+    {
+        using var w = new Work();
+        w.W("m.h", Cat + "#define DESC(n) CAT(n, _desc)\n#define CFG(n) CAT3(dev_, n, _cfg)\n");
+        w.W("main.c", "#include \"m.h\"\nint main(void){ return DESC(foo) + CFG(foo); }\n"
+                      + "static const int foo_desc = 1;\nstatic const int dev_foo_cfg = 2;\n"
+                      + "static int unused_fn(void) { return 3; }\n");
+        var (code, o) = w.Carve("[stages.aggressive]\ncarveSourceFileContents = true\n");
+        Assert.True(code == 0, o);
+        var text = w.Read("main.c", "aggressive");
+        Assert.Contains("foo_desc = 1", text);
+        Assert.Contains("dev_foo_cfg = 2", text);
+        Assert.DoesNotContain("unused_fn", text);
+    }
+
+    [Fact]
+    public void GluePaste_CalledInCode_KeepsTheFunctionItNames()
+    {
+        using var w = new Work();
+        w.W("m.h", Cat);
+        w.W("main.c", "#include \"m.h\"\ntypedef int (*fp)(void);\nstatic int foo_isr(void) { return 1; }\n"
+                      + "static int bar_isr(void) { return 2; }\nint main(void){ fp f = CAT(foo, _isr); return f(); }\n");
+        var (code, o) = w.Carve("[stages.aggressive]\ncarveSourceFileContents = true\n");
+        Assert.True(code == 0, o);
+        var text = w.Read("main.c", "aggressive");
+        Assert.Contains("foo_isr(void)", text);
+        Assert.DoesNotContain("bar_isr", text);   // the use names foo_isr exactly
+    }
+
+    [Fact]
+    public void PasteMacros_FollowParametersThroughWrappers()
+    {
+        var bodies = new Dictionary<string, (bool, List<string>)>
+        {
+            ["CAT"] = (true, new() { "a, b) a##b" }),
+            ["MID"] = (true, new() { "x) CAT(x, _mid)" }),
+            ["OUT"] = (true, new() { "y) MID(pre_##y)" }),
+            ["STR"] = (true, new() { "a, b) #a ## b" }),
+            ["ONE"] = (true, new() { "n) n##_one" }),
+        };
+        var t = PasteMacros.Build(bodies);
+        Assert.Empty(PasteMacros.Fragments(t, "CAT"));
+        Assert.Equal(new[] { (PasteMacros.Kind.Suffix, "_mid") }, PasteMacros.Fragments(t, "MID"));
+        Assert.Equal(new[] { (PasteMacros.Kind.Prefix, "pre_"), (PasteMacros.Kind.Suffix, "_mid") }, PasteMacros.Fragments(t, "OUT").OrderBy(f => f.Kind));
+        Assert.False(t.ContainsKey("STR"));
+        Assert.False(t.ContainsKey("ONE"));   // one parameter: the body's own literal already says it
+        Assert.Equal(new[] { (PasteMacros.Kind.Exact, "uart_rx") }, PasteMacros.Fragments(t, "CAT", "uart, _rx"));
+        Assert.Equal(new[] { (PasteMacros.Kind.Prefix, "uart") }, PasteMacros.Fragments(t, "CAT", "uart, (x)"));
+    }
+}

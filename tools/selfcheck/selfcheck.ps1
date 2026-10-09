@@ -46,6 +46,12 @@ $cases = @(
          'reg.h'    = "struct drv { const char *n; int (*i)(void); };`n#define REGISTER_DRIVER(name, init) const struct drv name##_drv = { #name, init };`n"
          'main.c'   = "#include `"reg.h`"`nint b_init(void) { return 0; }`nREGISTER_DRIVER(b, b_init)`nint b_work(void);`nint main(void) { return b_work() + b_init(); }`nint b_work(void) { return 1; }`n"
          'unused.c' = "#include `"reg.h`"`nREGISTER_DRIVER(a, a_init)`nint a_init(void) { return 0; }`n" } }
+    @{ Name = 'name glued by CAT(a, b) a##b through a wrapper'; Lang = 'c'; Expect = @('glue.c')
+       Files = @{
+         'm.h'      = "#define CAT(a, b) a##b`n#define DESC(n) CAT(n, _desc)`nextern const int foo_desc;`n"
+         'main.c'   = "#include `"m.h`"`nint main(void) { return DESC(foo); }`n"
+         'glue.c'   = "const int foo_desc = 1;`n"
+         'unused.c' = "int unused(void) { return 9; }`n" } }
     @{ Name = 'unknown macro between type and name'; Lang = 'c'; Expect = @('win.c')
        Files = @{
          'main.c'   = "int f(void);`nint main(void) { return f(); }`n"

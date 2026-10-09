@@ -332,6 +332,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // Function-like macros that define a symbol named after an argument (see DefinerMacros), and a regex of
     // their names for finding uses.
     private Dictionary<string, List<DefinerMacros.Template>> _definers = new(StringComparer.Ordinal);
+    // What macros that paste their own parameters (`CAT(a, b) a##b`) build, through wrappers (see PasteMacros).
+    private Dictionary<string, List<PasteMacros.Piece[]>> _pasteTemplates = new(StringComparer.Ordinal);
     /// <summary>The tree's definer macros, for the emitted-tree check (null when there are none).</summary>
     public DefinerMacros.Set? DefinerSet { get; private set; }
     private Regex? _definerUse;
@@ -817,6 +819,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             : new Regex(@"\b(?:" + string.Join("|", keep.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
 
         _definers = DefinerMacros.Build(bodies);
+        _pasteTemplates = PasteMacros.Build(bodies);
         DefinerSet = DefinerMacros.MakeSet(_definers);
         _definerUse = _definers.Count == 0 ? null
             : new Regex(@"\b(" + string.Join("|", _definers.Keys.Select(Regex.Escape)) + @")\s*\(", RegexOptions.Compiled);
@@ -1659,6 +1662,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     pendingMacroRefs.Add((mid, id));
                 foreach (var paste in ExtractMacroPastes(defineText))
                     pendingPastes.Add((mid, paste.Kind, paste.Frag));
+                foreach (var (kind, frag) in PasteMacros.Fragments(_pasteTemplates, name))
+                    pendingPastes.Add((mid, ToPasteKind(kind), frag));
             }
             else // class / struct / enum / namespace / type
             {
@@ -1998,6 +2003,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var callee = node.Text;
             pendingCalls.Add((from, callee));
             if (callee.Length > 7 && callee.StartsWith("__real_", StringComparison.Ordinal)) pendingCalls.Add((from, callee[7..]));   // --wrap's original
+            // `CAT(uart, _desc)`: a pasting macro's arguments name what it builds.
+            if (_pasteTemplates.ContainsKey(callee) && node.Parent?.GetChildForField("arguments") is { } pasteArgs)
+            {
+                var argText = pasteArgs.Text;
+                if (argText.Length > 1) argText = argText[1..^1];   // inside the parentheses
+                foreach (var (kind, frag) in PasteMacros.Fragments(_pasteTemplates, callee, argText))
+                    pendingPastes.Add((from, ToPasteKind(kind), frag));
+            }
         }
 
         // Pass 4: non-call references INSIDE functions (address-taken: a callback passed/assigned).
@@ -2188,6 +2201,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     }
 
     private enum PasteKind { Suffix, Prefix, Exact }
+
+    private static PasteKind ToPasteKind(PasteMacros.Kind k)
+        => k switch { PasteMacros.Kind.Prefix => PasteKind.Prefix, PasteMacros.Kind.Suffix => PasteKind.Suffix, _ => PasteKind.Exact };
 
     /// <summary>Token-paste (##) fragments in a macro body: `arg ## Suffix` -> keep functions ending
     /// with Suffix; `Prefix ## arg` -> starting with Prefix; `lit ## lit` -> the exact concatenation.</summary>
