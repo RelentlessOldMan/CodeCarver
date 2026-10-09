@@ -23,6 +23,37 @@ public sealed class CheckClosureTests
         var summary = File.ReadAllText(Path.Combine(t.Root, "out", "p", "codecarver", "summary.txt"));
         Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile = 1", summary);
         Assert.Contains("KEPT modd_helper", File.ReadAllText(Path.Combine(t.Root, "out", "p", "codecarver", "verify.txt")));
+        // What the graph made of the use, and where it sits: counts that name the missed shape.
+        Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile.useNotModelled = 1", summary);
+        Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile.use.atFileScope = 1", summary);
+        Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile.use.reference = 1", summary);
+        Assert.Contains("stage0.verify.keptByCheck = 1", summary);   // the breakdown is not added to the total
+    }
+
+    [Theory]
+    [InlineData("void f(void)\n{\n    tgt(1);\n}\n", 3, "inFunctionBody", "call")]
+    [InlineData("static const struct ops o = {\n    tgt,\n};\n", 2, "inInitializer", "reference")]
+    [InlineData("void (*p)(void) =\n    tgt;\n", 2, "inInitializer", "reference")]
+    [InlineData("#define RUN(x) \\\n    tgt(x)\n", 2, "inMacroDefinition", "call")]
+    [InlineData("struct s {\n    int tgt;\n};\n", 2, "inOtherBlock", "reference")]
+    [InlineData("_Static_assert(sizeof(&tgt) > 0, \"x\");\n", 1, "atFileScope", "reference")]
+    [InlineData("void f(void)\n{\n    other();\n}\n", 3, "inFunctionBody", "nameNotOnLine")]
+    public void UseShape_SaysWhereTheUseSits(string text, int line, string place, string form)
+    {
+        var shapes = CodeCarver.Core.Diagnostics.UseShape.Describe(text, line, "tgt");
+        Assert.Equal(place, shapes[0]);
+        Assert.Equal(form, shapes[1]);
+        Assert.DoesNotContain("inConditional", shapes);
+    }
+
+    [Fact]
+    public void UseShape_CountsAnIfBlock_ButNotTheIncludeGuard()
+    {
+        const string guarded = "#ifndef G_H\n#define G_H\nvoid f(void) { tgt(); }\n#endif\n";
+        Assert.DoesNotContain("inConditional", CodeCarver.Core.Diagnostics.UseShape.Describe(guarded, 3, "tgt"));
+        const string inIf = "#ifndef G_H\n#define G_H\n#if FEATURE\nvoid f(void) { tgt(); }\n#endif\n#endif\n";
+        Assert.Contains("inConditional", CodeCarver.Core.Diagnostics.UseShape.Describe(inIf, 4, "tgt"));
+        Assert.Equal("lineNotFound", CodeCarver.Core.Diagnostics.UseShape.Describe("x\n", 9, "tgt")[0]);
     }
 
     /// <summary>A header compiles only where it is included: keeping one that defines the name links nothing, so the

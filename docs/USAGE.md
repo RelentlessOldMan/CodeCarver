@@ -485,7 +485,8 @@ Variables are checked where they are defined in a `.c`/`.cpp` file; a definition
 **Before** it reports, each stage closes over what verify finds: a definition the emitted code uses but the plan
 left out (the graph missed that use) is kept, and the stage is emitted again from the larger plan, until nothing is
 missing (at most 8 rounds). Each name it kept is counted by cause as `<stage>.verify.keptByCheck.<cause>` (an
-unrecognised definition also by shape, `...definitionNotRecognized.<shape>`) and listed as a `KEPT` line in
+unrecognised definition also by shape, `...definitionNotRecognized.<shape>`; a definition cut from a kept file also by
+what the graph made of the use, `...prunedFromKeptFile.<cause>`, and where the use sits, `...prunedFromKeptFile.use.<shape>`) and listed as a `KEPT` line in
 `verify.txt`, so the gap stays visible while the carved tree links; a later stage of the same kind starts from those
 and reports them too. Every file defining the name is kept, except a header (it compiles only where it is included)
 and a file the build never compiled; a name defined only there stays a failure. The infrastructure is copied once,

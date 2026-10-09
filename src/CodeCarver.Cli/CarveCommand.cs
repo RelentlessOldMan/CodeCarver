@@ -2026,7 +2026,8 @@ public static class CarveCommand
         // next plan keeps them. A node defined in that file, or the file itself when its definition is no node. Never
         // for a file the build didn't compile (keeping it can't be what the real build linked). Counted by cause.
         Dictionary<string, NodeId>? fileNodeOf = null;
-        (List<Root> Roots, List<LinkViolation> Kept) RootsForMissing(CarvePlan p, List<LinkViolation> hard, Dictionary<string, int> byCause)
+        (List<Root> Roots, List<LinkViolation> Kept) RootsForMissing(CarvePlan p, List<LinkViolation> hard, Dictionary<string, int> byCause,
+                                                                     IReadOnlyList<(string Rel, string Path)> emitted)
         {
             // Every file that defines the name, not just the one reported: with several build variants the reported one
             // may be a variant the build doesn't use. Never a header (compiled only where it is included: keeping one
@@ -2064,6 +2065,16 @@ public static class CarveCommand
                 kept.Add(v);
                 var cause = keptSet.Contains(v.DefinedIn) ? "prunedFromKeptFile" : why[v];
                 byCause[cause] = byCause.GetValueOrDefault(cause) + 1;
+                // What the graph made of the use, under the cut: prunedFromKeptFile alone says only where the definition was.
+                if (cause != why[v]) byCause[$"{cause}.{why[v]}"] = byCause.GetValueOrDefault($"{cause}.{why[v]}") + 1;
+                // And where the use sits in the emitted text (work eval, 1.0.195: 8 kept, no clue which use was missed).
+                var usePath = emitted.FirstOrDefault(e => string.Equals(e.Rel, v.ReferencedIn, StringComparison.Ordinal)).Path;
+                string useText;
+                try { useText = usePath is null ? "" : File.ReadAllText(usePath, System.Text.Encoding.Latin1); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { useText = ""; }
+                var useShapes = useText.Length == 0 ? new[] { "fileNotRead" } : CodeCarver.Core.Diagnostics.UseShape.Describe(useText, v.Line, v.Name);
+                if (EmittedLinkCheck.IsHeader(v.ReferencedIn)) useShapes = useShapes.Append("inHeader").ToArray();
+                foreach (var s in useShapes) byCause[$"{cause}.use.{s}"] = byCause.GetValueOrDefault($"{cause}.use.{s}") + 1;
                 // What an unrecognised definition looks like, as for a failure (the parser gap stays visible).
                 if (cause == "definitionNotRecognized" && fe is TreeSitterFrontEnd ts && v.DefinedLine > 0 && ReadRel(v.DefinedIn) is { Length: > 0 } defText)
                 {
@@ -2450,7 +2461,7 @@ public static class CarveCommand
                 if (!linkCheck || !closeOverEmit) break;
                 checkedAlready = CheckEmitted(splan, verifyFiles, prune);
                 if (round >= MaxCheckRounds || checkedAlready.Value.Hard.Count == 0) break;
-                var (add, kept) = RootsForMissing(splan, checkedAlready.Value.Hard, keptByCheck);
+                var (add, kept) = RootsForMissing(splan, checkedAlready.Value.Hard, keptByCheck, verifyFiles);
                 if (add.Count == 0) break;
                 foreach (var v in kept)
                     checkLog[prune].Add($"KEPT {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined in {v.DefinedIn}:{v.DefinedLine}");

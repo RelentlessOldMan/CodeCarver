@@ -171,7 +171,9 @@ line says `FAILED` with the name and where it is used, and the run exits **3** s
 an `#ifdef`-dead line is a note, not a failure. Variables are checked where a `.c`/`.cpp` file defines them, not in
 headers. Before it reports, a stage keeps what the check finds used but left out of a source file and emits again
 (`closure : N use(s) the graph missed ...`); those are counted as `<stage>.verify.keptByCheck.<cause>` and listed as
-`KEPT` lines. They are worth sending: each is a use the carve's graph missed. The full list is in `codecarver/verify.txt`. `verify` cannot see
+`KEPT` lines. Under `prunedFromKeptFile` (cut from a kept file), `...prunedFromKeptFile.<what the graph made of the use>`
+and `...prunedFromKeptFile.use.<shape>` say where each missed use sits: `inFunctionBody`, `inInitializer`,
+`inMacroDefinition`, `inOtherBlock`, `atFileScope`; `call` or `reference`; `inConditional`, `inHeader`. They are worth sending: each is a use the carve's graph missed. The full list is in `codecarver/verify.txt`. `verify` cannot see
 a missing type, macro or header — if a carved tree won't build but `verify` is OK, the compiler's first error is
 the lead.
 
