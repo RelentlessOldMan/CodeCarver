@@ -12,8 +12,9 @@ public sealed class CheckClosureTests
     public void UseTheGraphMissed_IsKept_AndCounted()
     {
         using var t = new TreeCarve();
-        // The graph reads no use at file scope outside an initializer; the check sees modd_helper used.
-        t.W("main.c", "int modd_helper(void){ return 1; }\n_Static_assert(sizeof(&modd_helper) > 0, \"x\");\n"
+        // A macro nothing expands names modd_helper: the graph links the macro, which is unreached; the check reads
+        // every #define body as code, so it keeps modd_helper.
+        t.W("main.c", "int modd_helper(void){ return 1; }\n#define RUN_HELPER() modd_helper()\n"
                     + "int modd_unused(void){ return 2; }\nint main(void){ return 0; }\n");
         var (code, o, e) = t.Carve(extraToml: "[stages.p]\ncarveSourceFileContents = true\n");
         Assert.True(code == 0, o + e);
@@ -24,10 +25,45 @@ public sealed class CheckClosureTests
         Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile = 1", summary);
         Assert.Contains("KEPT modd_helper", File.ReadAllText(Path.Combine(t.Root, "out", "p", "codecarver", "verify.txt")));
         // What the graph made of the use, and where it sits: counts that name the missed shape.
-        Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile.useNotModelled = 1", summary);
-        Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile.use.atFileScope = 1", summary);
-        Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile.use.reference = 1", summary);
+        Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile.useInUnreachedCode = 1", summary);
+        Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile.use.inMacroDefinition = 1", summary);
+        Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile.use.call = 1", summary);
         Assert.Contains("stage0.verify.keptByCheck = 1", summary);   // the breakdown is not added to the total
+    }
+
+    /// <summary>`REGISTER_INIT(on_start);` at file scope, its macro in an SDK header outside the root: the parser reads a
+    /// prototype, but it registers on_start, so the carve keeps it without the check (work eval, 1.0.196: three statics
+    /// kept by the check, used atFileScope as a reference). A K&amp;R head is not such a use.</summary>
+    [Fact]
+    public void FileScopeRegistration_WithAnUnseenMacro_KeepsWhatItRegisters()
+    {
+        using var t = new TreeCarve();
+        t.WOut("sdk/reg.h", "#define REGISTER_INIT(fn) static int (*const init_##fn)(void) __attribute__((used)) = fn\n"
+                   + "#define HOOK(fn) hook_list_add(fn)\n")
+         .W("main.c", "#include <reg.h>\nvoid hook_list_add(int (*f)(void));\n"
+                    + "static int on_start(void) { return 1; }\nREGISTER_INIT(on_start);\n"
+                    + "static int on_tick(void) { return 2; }\n"
+                    + "static int unused_one(void) { return 3; }\nint main(void) { HOOK(on_tick); return 0; }\n")
+         .Compile("main.c", "-I" + t.Outside("sdk"));
+        var (code, o, e) = t.Carve(extraToml: "[stages.p]\ncarveSourceFileContents = true\n");
+        Assert.True(code == 0, o + e);
+        var carved = File.ReadAllText(Path.Combine(t.Root, "out", "p", "carved", "main.c"));
+        Assert.Contains("static int on_start(void)", carved);
+        Assert.Contains("static int on_tick(void)", carved);
+        Assert.DoesNotContain("unused_one", carved);
+        var summary = File.ReadAllText(Path.Combine(t.Root, "out", "p", "codecarver", "summary.txt"));
+        Assert.Contains("stage0.verify.keptByCheck = 0", summary);
+    }
+
+    [Fact]
+    public void FileScopeInvocations_FindRegistrations_NotPrototypesOrKnRHeads()
+    {
+        const string code = "int proto(int a);\nREG(on_a);\nREG2(on_b, 3)\nstatic int f(void) { return 0; }\n"
+                          + "old(a, b)\nint a;\nint b;\n{ return a; }\nstatic int g = 1;\nREG(on_c);\n";
+        var found = CodeCarver.Core.Preprocess.FileScopeInvocations.Find(code).ToList();
+        Assert.Equal(new[] { "REG", "REG2", "REG" }, found.Select(x => x.Macro));
+        Assert.Equal(new[] { 2, 3, 10 }, found.Select(x => x.Line));
+        Assert.Contains("on_b", found[1].Names);
     }
 
     [Theory]
@@ -75,7 +111,7 @@ public sealed class CheckClosureTests
     public void LaterStageOfTheSameKind_ReportsInheritedAdditions()
     {
         using var t = new TreeCarve();
-        t.W("main.c", "int modd_helper(void){ return 1; }\n_Static_assert(sizeof(&modd_helper) > 0, \"x\");\nint main(void){ return 0; }\n");
+        t.W("main.c", "int modd_helper(void){ return 1; }\n#define RUN_HELPER() modd_helper()\nint main(void){ return 0; }\n");
         var (code, o, e) = t.Carve(extraToml: "[stages.a]\ncarveSourceFileContents = true\n[stages.m]\ncarveSourceFileContents = true\ncarveHeaderFileContents = true\n");
         Assert.True(code == 0, o + e);
         foreach (var s in new[] { "a", "m" })

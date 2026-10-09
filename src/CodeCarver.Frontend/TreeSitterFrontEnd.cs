@@ -2020,6 +2020,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     pendingPastes.Add((from, ToPasteKind(kind), frag));
             }
 
+        // Pass 3c: `REGISTER_INIT(on_start);` at file scope with a macro the tree doesn't define (an SDK header outside
+        // the root): the parser reads a prototype, but it registers its arguments (see FileScopeInvocations). A macro
+        // the tree defines is read through its body instead.
+        if (IsTranslationUnit(path))
+            foreach (var (line, macro, names) in FileScopeInvocations.Find(SourceText.CodeOnly(text)))
+            {
+                if (_funcLikeMacroNames.Contains(macro) || (dead is not null && line < dead.Length && dead[line])) continue;
+                foreach (var name in names) pendingRefs.Add((fileNode, name));
+            }
+
         // Pass 4: non-call references INSIDE functions (address-taken: a callback passed/assigned).
         // InsideError only matters when the file actually has a parse error somewhere; checking once
         // avoids a costly ancestor walk per file-scope identifier in the common (clean-parse) case.
