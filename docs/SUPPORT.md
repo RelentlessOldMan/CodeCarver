@@ -93,6 +93,16 @@ anonymized copy's carve drops every file that defines the name (or the missing h
 
 For the counts alone there is no need to carve again: `tools\builderrors\count-build-errors.ps1 -Path
 <out>\<stage>\build-output.txt` prints the same kinds in seconds (Windows PowerShell 5.1 or later, or `pwsh`).
+Point `-Path` at the file that holds the compiler's own `error:` lines: a build wrapper that prints only a summary
+usually writes each module's compiler output to a log of its own.
+
+Add `-Original <the source tree you carved> -Carved <out>\<stage>` and it also says, as `why.*` counts, why each
+named thing is missing: the carve took it out of the same file (`def.lostInUseFile`) or another kept file
+(`def.lostInOtherFile`), it is only in files the carve dropped (`def.inDroppedFile`), every file with it was kept
+unchanged (`def.unchanged`), or it is nowhere in the source (`def.notInOriginal`, e.g. made by `##` pasting); and
+whether the error's line writes the name or gets it from a macro (`use.nameOnLine` / `use.nameNotOnLine`) and sits
+inside an `#if` block (`use.inConditional` / `use.unconditional`). It reads every C and C++ file of the original
+once, so on a large tree it takes minutes, not seconds. The output is still counts only, safe to send.
 
 ## Checking a fix: `tools\selfcheck\selfcheck.ps1`
 
