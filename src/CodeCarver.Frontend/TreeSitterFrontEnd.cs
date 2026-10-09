@@ -333,7 +333,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // their names for finding uses.
     private Dictionary<string, List<DefinerMacros.Template>> _definers = new(StringComparer.Ordinal);
     // What macros that paste their own parameters (`CAT(a, b) a##b`) build, through wrappers (see PasteMacros).
-    private Dictionary<string, List<PasteMacros.Piece[]>> _pasteTemplates = new(StringComparer.Ordinal);
+    private PasteMacros.Table _pasteTable = new();
+    private Regex? _pasteUse;
+    private HashSet<string> _objectMacros = new(StringComparer.Ordinal);
     /// <summary>The tree's definer macros, for the emitted-tree check (null when there are none).</summary>
     public DefinerMacros.Set? DefinerSet { get; private set; }
     private Regex? _definerUse;
@@ -819,7 +821,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             : new Regex(@"\b(?:" + string.Join("|", keep.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
 
         _definers = DefinerMacros.Build(bodies);
-        _pasteTemplates = PasteMacros.Build(bodies);
+        _objectMacros = new HashSet<string>(defs.Keys, StringComparer.Ordinal);
+        _pasteTable = PasteMacros.Build(bodies, _objectMacros.Contains);
+        _pasteUse = PasteMacros.UseRegex(_pasteTable);
         DefinerSet = DefinerMacros.MakeSet(_definers);
         _definerUse = _definers.Count == 0 ? null
             : new Regex(@"\b(" + string.Join("|", _definers.Keys.Select(Regex.Escape)) + @")\s*\(", RegexOptions.Compiled);
@@ -1662,8 +1666,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     pendingMacroRefs.Add((mid, id));
                 foreach (var paste in ExtractMacroPastes(defineText))
                     pendingPastes.Add((mid, paste.Kind, paste.Frag));
-                foreach (var (kind, frag) in PasteMacros.Fragments(_pasteTemplates, name))
-                    pendingPastes.Add((mid, ToPasteKind(kind), frag));
+                foreach (var built in PasteMacros.BodyNames(_pasteTable, name))
+                    pendingPastes.Add((mid, PasteKind.Exact, built));
             }
             else // class / struct / enum / namespace / type
             {
@@ -2003,15 +2007,18 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var callee = node.Text;
             pendingCalls.Add((from, callee));
             if (callee.Length > 7 && callee.StartsWith("__real_", StringComparison.Ordinal)) pendingCalls.Add((from, callee[7..]));   // --wrap's original
-            // `CAT(uart, _desc)`: a pasting macro's arguments name what it builds.
-            if (_pasteTemplates.ContainsKey(callee) && node.Parent?.GetChildForField("arguments") is { } pasteArgs)
+        }
+
+        // Pass 3b: `DESC(uart)` / `CAT(uart, _desc)`: a use of a macro that pastes its own parameters names what it
+        // builds. Found in the text, not the parse, so a use in any position counts (a declarator, a parse error).
+        if (_pasteUse is { } pasteUse && pasteUse.IsMatch(text))
+            foreach (var (line, macro, args) in PasteMacros.Uses(_pasteTable, pasteUse, SourceText.CodeOnly(text)))
             {
-                var argText = pasteArgs.Text;
-                if (argText.Length > 1) argText = argText[1..^1];   // inside the parentheses
-                foreach (var (kind, frag) in PasteMacros.Fragments(_pasteTemplates, callee, argText))
+                if (dead is not null && line < dead.Length && dead[line]) continue;
+                var from = Enclosing(line) ?? fileNode;
+                foreach (var (kind, frag) in PasteMacros.UseFragments(_pasteTable, macro, args, _objectMacros.Contains))
                     pendingPastes.Add((from, ToPasteKind(kind), frag));
             }
-        }
 
         // Pass 4: non-call references INSIDE functions (address-taken: a callback passed/assigned).
         // InsideError only matters when the file actually has a parse error somewhere; checking once

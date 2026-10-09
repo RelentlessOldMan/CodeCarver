@@ -537,16 +537,36 @@ public sealed class GluePasteTests
             ["CAT"] = (true, new() { "a, b) a##b" }),
             ["MID"] = (true, new() { "x) CAT(x, _mid)" }),
             ["OUT"] = (true, new() { "y) MID(pre_##y)" }),
+            ["FIXED"] = (true, new() { ") CAT(fixed, _name)" }),
             ["STR"] = (true, new() { "a, b) #a ## b" }),
             ["ONE"] = (true, new() { "n) n##_one" }),
         };
-        var t = PasteMacros.Build(bodies);
-        Assert.Empty(PasteMacros.Fragments(t, "CAT"));
-        Assert.Equal(new[] { (PasteMacros.Kind.Suffix, "_mid") }, PasteMacros.Fragments(t, "MID"));
-        Assert.Equal(new[] { (PasteMacros.Kind.Prefix, "pre_"), (PasteMacros.Kind.Suffix, "_mid") }, PasteMacros.Fragments(t, "OUT").OrderBy(f => f.Kind));
-        Assert.False(t.ContainsKey("STR"));
-        Assert.False(t.ContainsKey("ONE"));   // one parameter: the body's own literal already says it
-        Assert.Equal(new[] { (PasteMacros.Kind.Exact, "uart_rx") }, PasteMacros.Fragments(t, "CAT", "uart, _rx"));
-        Assert.Equal(new[] { (PasteMacros.Kind.Prefix, "uart") }, PasteMacros.Fragments(t, "CAT", "uart, (x)"));
+        var objectMacros = new HashSet<string> { "DEV" };
+        var t = PasteMacros.Build(bodies, objectMacros.Contains);
+        IEnumerable<(PasteMacros.Kind, string)> Use(string m, string args) => PasteMacros.UseFragments(t, m, args, objectMacros.Contains);
+        Assert.Equal(new[] { (PasteMacros.Kind.Exact, "uart_rx") }, Use("CAT", "uart, _rx"));
+        Assert.Equal(new[] { (PasteMacros.Kind.Exact, "uart_mid") }, Use("MID", "uart"));
+        Assert.Equal(new[] { (PasteMacros.Kind.Exact, "pre_uart_mid") }, Use("OUT", "uart"));
+        Assert.Equal(new[] { "fixed_name" }, PasteMacros.BodyNames(t, "FIXED"));
+        // Not a plain name: only the literal pieces around it, for this use.
+        Assert.Equal(new[] { (PasteMacros.Kind.Prefix, "uart") }, Use("CAT", "uart, (x)"));
+        // An object-like macro may expand before it is pasted.
+        Assert.Equal(new[] { (PasteMacros.Kind.Suffix, "_mid") }, Use("MID", "DEV"));
+        Assert.False(t.Templates.ContainsKey("STR"));
+        Assert.False(t.Templates.ContainsKey("ONE"));   // one parameter: the body's own literal already says it
+    }
+
+    [Fact]
+    public void GluePaste_LinksOnlyWhatEachUseBuilds()
+    {
+        using var w = new Work();
+        w.W("m.h", Cat + "#define DESC(n) CAT(n, _desc)\n");
+        w.W("main.c", "#include \"m.h\"\nstatic int foo_desc(void) { return 1; }\nstatic int bar_desc(void) { return 2; }\n"
+                      + "int main(void){ return DESC(foo)(); }\n");
+        var (code, o) = w.Carve("[stages.aggressive]\ncarveSourceFileContents = true\n");
+        Assert.True(code == 0, o);
+        var text = w.Read("main.c", "aggressive");
+        Assert.Contains("foo_desc(void)", text);
+        Assert.DoesNotContain("bar_desc", text);   // ends in _desc, but no use builds it
     }
 }

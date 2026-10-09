@@ -4,14 +4,15 @@ namespace CodeCarver.Core.Preprocess;
 
 /// <summary>
 /// Names built by a macro that pastes its own parameters: <c>#define CAT(a, b) a##b</c> builds nothing a body scan
-/// can see, but a wrapper <c>#define DESC(n) CAT(n, _desc)</c> builds names ending in <c>_desc</c>, and a use
-/// <c>CAT(uart, _desc)</c> in code builds <c>uart_desc</c>. Without this, the definition such a name refers to looked
-/// unused and a carve inside the file removed it (work eval, 1.0.189: the build said "undeclared").
+/// can see, but a wrapper <c>#define DESC(n) CAT(n, _desc)</c> used as <c>DESC(uart)</c> builds <c>uart_desc</c>.
+/// Without this, the definition such a name refers to looked unused and a carve inside the file removed it (work
+/// eval, 1.0.189: the build said "undeclared").
 ///
 /// <see cref="Build"/> learns, for each function-like macro, what its pastes build in terms of its own parameters,
-/// through any depth of wrappers. <see cref="Fragments(IReadOnlyDictionary{string, List{Piece[]}}, string)"/> gives the literal
-/// pieces a macro's own text adds; <see cref="Fragments(IReadOnlyDictionary{string, List{Piece[]}}, string, string)"/>
-/// those of one use with its arguments.
+/// through any depth of wrappers. A use names its target exactly (<see cref="UseFragments"/>): linking the macro to
+/// every name ending in <c>_desc</c> instead kept far more than the use needs (1.0.194). Only a use with an argument
+/// that is not a plain name (an expression, or an object-like macro that may expand first) falls back to the literal
+/// prefix or suffix, and only for that use.
 /// </summary>
 public static class PasteMacros
 {
@@ -23,14 +24,23 @@ public static class PasteMacros
 
     public enum Kind { Prefix, Suffix, Exact }
 
+    /// <summary>Per macro, the templates its pastes build (each holding a parameter), and the names a macro's own
+    /// body builds outright (a pasting macro called with literals inside another macro's body).</summary>
+    public sealed class Table
+    {
+        public readonly Dictionary<string, List<Piece[]>> Templates = new(StringComparer.Ordinal);
+        public readonly Dictionary<string, HashSet<string>> BodyNames = new(StringComparer.Ordinal);
+        public bool IsEmpty => Templates.Count == 0 && BodyNames.Count == 0;
+    }
+
     private static readonly Regex Token = new(@"##|[A-Za-z_]\w*|\S", RegexOptions.Compiled);
     private static readonly Regex Ident = new(@"^[A-Za-z_]\w*$", RegexOptions.Compiled);
     const int MaxPerMacro = 32;
 
-    /// <summary>Per macro, the names its pastes build: from a <c>##</c> chain in its body with two or more parameters
-    /// (<c>a##b</c>), and from its calls of such macros, with its own arguments put in. Only templates holding a
-    /// parameter are kept: an all-literal paste is already handled where the macro is defined.</summary>
-    public static Dictionary<string, List<Piece[]>> Build(IReadOnlyDictionary<string, (bool FnLike, List<string> Bodies)> bodies)
+    /// <summary>The templates of each macro: a <c>##</c> chain in its body with two or more parameters
+    /// (<c>a##b</c>), and its calls of such macros with its own arguments put in. <paramref name="isObjectMacro"/>
+    /// names the object-like macros: such an argument may expand before it is pasted, so it is unknown.</summary>
+    public static Table Build(IReadOnlyDictionary<string, (bool FnLike, List<string> Bodies)> bodies, Func<string, bool> isObjectMacro)
     {
         var parsed = new List<(string Name, List<string> Params, List<string> Tokens)>();
         foreach (var (name, (fnLike, list)) in bodies)
@@ -47,10 +57,10 @@ public static class PasteMacros
             }
         }
 
-        var result = new Dictionary<string, List<Piece[]>>(StringComparer.Ordinal);
+        var table = new Table();
         bool AddT(string m, Piece[] t)
         {
-            if (!result.TryGetValue(m, out var l)) result[m] = l = new List<Piece[]>();
+            if (!table.Templates.TryGetValue(m, out var l)) table.Templates[m] = l = new List<Piece[]>();
             if (l.Count >= MaxPerMacro || l.Any(x => x.SequenceEqual(t))) return false;
             l.Add(t);
             return true;
@@ -74,59 +84,91 @@ public static class PasteMacros
             foreach (var (name, ps, toks) in parsed)
                 for (var i = 0; i + 1 < toks.Count; i++)
                 {
-                    if (toks[i + 1] != "(" || toks[i] == name || !result.TryGetValue(toks[i], out var inner)) continue;
+                    if (toks[i + 1] != "(" || toks[i] == name || !table.Templates.TryGetValue(toks[i], out var inner)) continue;
                     var args = SplitArgs(toks, i + 1);
                     foreach (var t in inner.ToList())
                     {
-                        var nt = Substitute(t, args, ps);
-                        if (nt.Any(p => !p.IsText) && AddT(name, nt)) added = true;
+                        var nt = Substitute(t, args, ps, isObjectMacro);
+                        if (nt.Any(p => !p.IsText)) { if (AddT(name, nt)) added = true; }
+                        else
+                        {
+                            if (!table.BodyNames.TryGetValue(name, out var names)) table.BodyNames[name] = names = new HashSet<string>(StringComparer.Ordinal);
+                            names.Add(string.Concat(nt.Select(p => p.Text)));
+                        }
                     }
                 }
             if (!added) break;
         }
-        return result;
+        return table;
     }
 
-    /// <summary>The literal pieces macro <paramref name="name"/> adds to the names it builds: a leading literal is a
-    /// prefix, a trailing one a suffix.</summary>
-    public static IEnumerable<(Kind Kind, string Frag)> Fragments(IReadOnlyDictionary<string, List<Piece[]>> templates, string name)
-    {
-        if (!templates.TryGetValue(name, out var list)) yield break;
-        foreach (var t in list)
-            foreach (var f in FragmentsOf(t)) yield return f;
-    }
+    /// <summary>The names macro <paramref name="name"/>'s own body builds outright.</summary>
+    public static IEnumerable<string> BodyNames(Table table, string name)
+        => table.BodyNames.TryGetValue(name, out var s) ? s : Enumerable.Empty<string>();
 
     /// <summary>What one use <c>name(args)</c> builds; <paramref name="argumentText"/> is the text inside the
-    /// parentheses. An argument that is not a plain name is unknown.</summary>
-    public static IEnumerable<(Kind Kind, string Frag)> Fragments(IReadOnlyDictionary<string, List<Piece[]>> templates, string name, string argumentText)
+    /// parentheses. All-literal: the exact name. Otherwise the literal prefix and suffix around the unknown part.</summary>
+    public static IEnumerable<(Kind Kind, string Frag)> UseFragments(Table table, string name, string argumentText, Func<string, bool> isObjectMacro)
     {
-        if (!templates.TryGetValue(name, out var list)) yield break;
+        if (!table.Templates.TryGetValue(name, out var list)) yield break;
         var toks = new List<string> { "(" };
-        toks.AddRange(Token.Matches(SourceText.CodeOnly(argumentText)).Select(m => m.Value));
+        toks.AddRange(Token.Matches(argumentText).Select(m => m.Value));
         toks.Add(")");
         var args = SplitArgs(toks, 0);
         foreach (var t in list)
-            foreach (var f in FragmentsOf(Substitute(t, args, new List<string>()))) yield return f;
+        {
+            var s = Substitute(t, args, new List<string>(), isObjectMacro);
+            if (s.All(p => p.IsText)) { yield return (Kind.Exact, string.Concat(s.Select(p => p.Text))); continue; }
+            if (s[0].IsText && s[0].Text!.Length > 0) yield return (Kind.Prefix, s[0].Text!);
+            if (s[^1].IsText && s[^1].Text!.Length > 0) yield return (Kind.Suffix, s[^1].Text!);
+        }
     }
 
-    static IEnumerable<(Kind, string)> FragmentsOf(Piece[] t)
+    /// <summary>Uses of the macros with templates in <paramref name="code"/> (already <see cref="SourceText.CodeOnly"/>:
+    /// directives blanked, so a use inside another macro's body is not one): the 1-based line, the macro, and the
+    /// text inside its parentheses.</summary>
+    public static IEnumerable<(int Line, string Macro, string Args)> Uses(Table table, Regex use, string code)
     {
-        if (t.Length == 0) yield break;
-        if (t.All(p => p.IsText)) { yield return (Kind.Exact, string.Concat(t.Select(p => p.Text))); yield break; }
-        if (t[0].IsText && t[0].Text!.Length > 0) yield return (Kind.Prefix, t[0].Text!);
-        if (t[^1].IsText && t[^1].Text!.Length > 0) yield return (Kind.Suffix, t[^1].Text!);
+        List<int>? lineStarts = null;
+        foreach (Match m in use.Matches(code))
+        {
+            var open = m.Index + m.Length - 1;
+            var depth = 0;
+            var close = -1;
+            for (var k = open; k < code.Length; k++)
+            {
+                if (code[k] == '(') depth++;
+                else if (code[k] == ')' && --depth == 0) { close = k; break; }
+            }
+            if (close < 0) continue;
+            if (lineStarts is null)
+            {
+                lineStarts = new List<int> { 0 };
+                for (var k = 0; k < code.Length; k++) if (code[k] == '\n') lineStarts.Add(k + 1);
+            }
+            var at = lineStarts.BinarySearch(m.Index);
+            yield return ((at >= 0 ? at : ~at - 1) + 1, m.Groups[1].Value, code[(open + 1)..close]);
+        }
     }
+
+    /// <summary>A regex finding a use of any macro with templates (<c>NAME (</c>), or null when there are none.</summary>
+    public static Regex? UseRegex(Table table)
+        => table.Templates.Count == 0 ? null
+           : new Regex(@"(?<![\w$])(" + string.Join("|", table.Templates.Keys.Select(Regex.Escape)) + @")\s*\(", RegexOptions.Compiled);
 
     /// <summary>Template <paramref name="t"/> with each parameter replaced by its argument: a plain name or a paste
-    /// chain of names and the caller's parameters <paramref name="ps"/>; anything else is unknown.</summary>
-    static Piece[] Substitute(Piece[] t, List<List<string>> args, List<string> ps)
+    /// chain of names and the caller's parameters <paramref name="ps"/>; anything else is unknown, and so is an
+    /// object-like macro outside a paste (it may expand first).</summary>
+    static Piece[] Substitute(Piece[] t, List<List<string>> args, List<string> ps, Func<string, bool> isObjectMacro)
     {
         var parts = new List<Piece>();
         foreach (var p in t)
         {
             if (p.IsText) { parts.Add(p); continue; }
             var a = p.Param >= 0 && p.Param < args.Count ? args[p.Param] : null;
-            if (a is { Count: > 0 } && ChainAt(a, 0, out var chain, out var end) && end == a.Count - 1) parts.AddRange(Pieces(chain, ps));
+            if (a is { Count: > 0 } && ChainAt(a, 0, out var chain, out var end) && end == a.Count - 1
+                && !(chain.Count == 1 && ps.IndexOf(chain[0]) < 0 && isObjectMacro(chain[0])))
+                parts.AddRange(Pieces(chain, ps));
             else parts.Add(new Piece(null, -1));
         }
         return Merge(parts);
