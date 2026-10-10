@@ -1406,6 +1406,7 @@ public static class CarveCommand
         // instead the summary reports how many resolved in-scope.
         var traceRoots = new List<Root>();
         var traceTotal = 0;
+        var observedFunctions = new HashSet<string>(StringComparer.Ordinal);   // what ran: never stubbed
         if (traceList.Count > 0)
         {
             // Union the function names across every trace (the files were validated/pruned up front).
@@ -1418,6 +1419,7 @@ public static class CarveCommand
                 if (bad > 0) err.WriteLine($"  warn    : {bad} line(s) of function trace '{Path.GetFileName(tp)}' had no readable function name");
             }
             traceTotal = traceNames.Count;
+            observedFunctions.UnionWith(traceNames);
             traceRoots = new ExplicitRootProvider(symbols: traceNames).Discover(graph).ToList();
             if (traceTotal == 0)
                 err.WriteLine("  warn    : runTraceLogs produced 0 function names (expected one function name per line, optionally `file:line`)");
@@ -1779,24 +1781,98 @@ public static class CarveCommand
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
         }
-        var stagePlans = new Dictionary<bool, CarvePlan>();
+        // Kinds of stage plan: whole files (0), source contents carved (1), and carved with the bodies of functions the
+        // run never executed stubbed (2, stubUnexecuted).
+        const int FileLevel = 0, Carved = 1, Stubbed = 2;
+        int KindOf(ResolvedStage s) => !s.CarveSourceFileContents || lang is not ("c" or "cpp") ? FileLevel : s.StubUnexecuted ? Stubbed : Carved;
+        var stagePlans = new Dictionary<int, CarvePlan>();
         // Definitions the link check found emitted code using after a stage's plan left them out (see the stage loop):
         // rooted in every later plan of the same kind, so the next stage of that kind starts from them.
-        var checkRoots = new Dictionary<bool, List<Root>> { [false] = new(), [true] = new() };
+        var checkRoots = new Dictionary<int, List<Root>> { [FileLevel] = new(), [Carved] = new(), [Stubbed] = new() };
         // What those roots were for: counts by cause (and shape) and the KEPT lines, per kind of stage.
-        var checkCauses = new Dictionary<bool, Dictionary<string, int>> { [false] = new(StringComparer.Ordinal), [true] = new(StringComparer.Ordinal) };
-        var checkLog = new Dictionary<bool, List<string>> { [false] = new(), [true] = new() };
-        CarvePlan PlanFor(bool pruned)
+        var checkCauses = new[] { FileLevel, Carved, Stubbed }.ToDictionary(k => k, _ => new Dictionary<string, int>(StringComparer.Ordinal));
+        var checkLog = new Dictionary<int, List<string>> { [FileLevel] = new(), [Carved] = new(), [Stubbed] = new() };
+
+        // Stubs: per file, the bodies to replace (StubBodies). A C function the run trace never names, not a root and not
+        // force-kept; with its #if-split twins (one body, several names) only when none of them ran; never one holding
+        // another definition. Asked by the plan (what a stubbed body no longer uses) and the emitter alike.
+        var rootIds = rootSet.Select(r => r.Node).ToHashSet();
+        var stubCache = new Dictionary<string, Dictionary<NodeId, StubBodies.Body>>(StringComparer.Ordinal);
+        // What ran, as definitions. A trace names linker symbols; the source may write another name: an object-like
+        // rename macro (`#define summon_fn real_summon`), an asm label or `#pragma redefine_extname` (an Alias node calls
+        // the definition), a -D rename. A traced name that matches no definition at all is counted: one CodeCarver could
+        // not map back would leave what ran unspared (eldritch oracle: four such functions were stubbed and the run hung).
+        HashSet<NodeId>? spared = null;
+        var traceNamesWithoutDefinition = 0;
+        var unmappedTraceNames = new List<string>();   // for stubs.txt (local: real names)
+        HashSet<NodeId> Spared()
+        {
+            if (spared is not null) return spared;
+            var byName = new Dictionary<string, List<NodeId>>(StringComparer.Ordinal);
+            foreach (var n in graph.Nodes)
+                if (n.Kind == NodeKind.Function)
+                {
+                    if (!byName.TryGetValue(n.Name, out var l)) byName[n.Name] = l = new List<NodeId>();
+                    l.Add(n.Id);
+                }
+            spared = new HashSet<NodeId>();
+            var work = new Queue<NodeId>();
+            foreach (var symbol in observedFunctions)
+            {
+                var names = fe is TreeSitterFrontEnd tsf ? tsf.SourceNamesOf(symbol).Prepend(symbol) : new[] { symbol };
+                var found = false;
+                foreach (var name in names)
+                    if (byName.TryGetValue(name, out var ids))
+                        foreach (var id in ids) { found = true; if (spared.Add(id)) work.Enqueue(id); }
+                if (!found) { traceNamesWithoutDefinition++; unmappedTraceNames.Add(symbol); }
+            }
+            while (work.Count > 0)
+            {
+                var id = work.Dequeue();
+                if ((graph.GetNode(id).Flags & NodeFlags.Alias) == 0) continue;
+                foreach (var e in graph.OutEdges(id))
+                    if (e.Kind == EdgeKind.Calls && graph.GetNode(e.To).Kind == NodeKind.Function && spared.Add(e.To)) work.Enqueue(e.To);
+            }
+            return spared;
+        }
+        StubBodies.Body? StubOf(NodeId id)
+        {
+            var n = graph.GetNode(id);
+            if (n.Kind != NodeKind.Function || n.FilePath is not { } f || !f.EndsWith(".c", StringComparison.OrdinalIgnoreCase)) return null;
+            if (!stubCache.TryGetValue(f, out var m)) stubCache[f] = m = StubsIn(f);
+            return m.TryGetValue(id, out var b) ? b : null;
+        }
+        Dictionary<NodeId, StubBodies.Body> StubsIn(string f)
+        {
+            var m = new Dictionary<NodeId, StubBodies.Body>();
+            var text = SourceText(f);
+            var defs = defsByFile?.GetValueOrDefault(f);
+            if (text is null || defs is null || text.Length > 1 && (text[0] == 'ÿ' && text[1] == 'þ' || text[0] == 'þ' && text[1] == 'ÿ'))
+                return m;
+            var src = new StubBodies.Source(text);
+            foreach (var n in defs)
+            {
+                if (n.Kind != NodeKind.Function || !n.Span.IsKnown) continue;
+                var twins = defs.Where(o => o.Span == n.Span).ToList();
+                if (twins.Any(o => Spared().Contains(o.Id) || rootIds.Contains(o.Id) || (o.Flags & NodeFlags.Keep) != 0)) continue;
+                if (defs.Any(o => o.Span.IsKnown && o.Span != n.Span && o.Span.StartLine >= n.Span.StartLine && o.Span.EndLine <= n.Span.EndLine))
+                    continue;
+                if (StubBodies.Find(src, n.Span.StartLine, n.Span.EndLine, n.Name) is { } b) m[n.Id] = b;
+            }
+            return m;
+        }
+
+        CarvePlan PlanFor(int kind)
         {
             if (!closeOverEmit) return plan;
-            if (stagePlans.TryGetValue(pruned, out var sp)) return sp;
+            if (stagePlans.TryGetValue(kind, out var sp)) return sp;
             var (gate, initial) = NewCtorGate();
-            sp = EmitClosure.Close(graph, rootSet.Concat(initial).Concat(checkRoots[pruned]),
-                (f, kept) => FileTreeEmitter.RetainedWhenEmitted(f, defsByFile!.GetValueOrDefault(f), kept, SourceText, pruned),
-                constructorsIn: CtorsIn(gate));
-            return stagePlans[pruned] = sp;
+            sp = EmitClosure.Close(graph, rootSet.Concat(initial).Concat(checkRoots[kind]),
+                (f, kept) => FileTreeEmitter.RetainedWhenEmitted(f, defsByFile!.GetValueOrDefault(f), kept, SourceText, kind != FileLevel),
+                constructorsIn: CtorsIn(gate), stubbed: kind == Stubbed ? id => StubOf(id) is not null : null);
+            return stagePlans[kind] = sp;
         }
-        var whyPlan = PlanFor(!cv.AnalysisOnly && cv.Stages.Count > 0 && cv.Stages[0].CarveSourceFileContents);
+        var whyPlan = PlanFor(!cv.AnalysisOnly && cv.Stages.Count > 0 ? KindOf(cv.Stages[0]) : FileLevel);
 
         // --why <symbol>: explain the keep-chain (or that it was carved) for a named symbol — for debugging
         // a carve against a real tree ("why is this huge thing still here?" / "why did this get dropped?").
@@ -2308,7 +2384,7 @@ public static class CarveCommand
 
         if (cv.AnalysisOnly)
         {
-            var aplan = PlanFor(false);   // what a file-level emit would write, closed over (D-A)
+            var aplan = PlanFor(FileLevel);   // what a file-level emit would write, closed over (D-A)
             var aPlaceholders = PlaceholderTus(aplan);
             if (aPlaceholders.Count > 0)
                 @out.WriteLine($"  placeholders: {aPlaceholders.Count:N0} dropped file(s) the build compiled would be written as stand-ins (build files that list them keep working)");
@@ -2421,7 +2497,8 @@ public static class CarveCommand
                 @out.WriteLine($"  note    : carveSourceFileContents applies to C/C++ only; stage '{stage.Name}' carves '{lang}' file-level.");
                 prune = false;
             }
-            var splan = PlanFor(prune);
+            var kind = prune ? KindOf(stage) : FileLevel;
+            var splan = PlanFor(kind);
             var stageIndex = cv.Stages.IndexOf(stage);
             summaryStage = $"stage{stageIndex}";
             summary[$"{summaryStage}.carveSourceFileContents"] = prune;
@@ -2446,10 +2523,10 @@ public static class CarveCommand
             List<(string Rel, string Path)> verifyFiles;
             (LinkCheckResult R, List<LinkViolation> Hard, List<LinkViolation> NotBuiltOnly)? checkedAlready = null;
             // Cumulative per kind of stage: a later stage of the same kind starts from these roots, so it reports them too.
-            var keptByCheck = checkCauses[prune];
+            var keptByCheck = checkCauses[kind];
             for (var round = 0; ; round++)
             {
-                res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir) : FileTreeEmitter.Emit(splan, dir, stageDir);
+                res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir, kind == Stubbed ? StubOf : null) : FileTreeEmitter.Emit(splan, dir, stageDir);
                 // The code plus the assembly files the infrastructure copy will carry (they define symbols C calls:
                 // fast_copy in a .S), read from the tree: the infrastructure is copied once, after the plan settles.
                 var droppedInfra = new HashSet<string>(InfraDropped(splan), StringComparer.Ordinal);
@@ -2464,17 +2541,17 @@ public static class CarveCommand
                 var (add, kept) = RootsForMissing(splan, checkedAlready.Value.Hard, keptByCheck, verifyFiles);
                 if (add.Count == 0) break;
                 foreach (var v in kept)
-                    checkLog[prune].Add($"KEPT {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined in {v.DefinedIn}:{v.DefinedLine}");
-                checkRoots[prune].AddRange(add);
-                stagePlans.Remove(prune);
-                splan = PlanFor(prune);
+                    checkLog[kind].Add($"KEPT {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined in {v.DefinedIn}:{v.DefinedLine}");
+                checkRoots[kind].AddRange(add);
+                stagePlans.Remove(kind);
+                splan = PlanFor(kind);
                 checkedAlready = null;
                 // A fresh tree: the larger plan writes a superset, but pruned files are written differently.
                 try { Directory.Delete(stageDir, recursive: true); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
                 Directory.CreateDirectory(stageDir);
             }
             keptByCheckLog.Clear();
-            keptByCheckLog.AddRange(checkLog[prune]);
+            keptByCheckLog.AddRange(checkLog[kind]);
             // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
             // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
             var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel);
@@ -2495,6 +2572,27 @@ public static class CarveCommand
                 // Source carving cuts unreached definitions out of kept .c files only; headers are never pruned.
                 summary[$"{summaryStage}.sourceCarve.filesPruned"] = res.PrunedFiles;
                 summary[$"{summaryStage}.sourceCarve.bytesRemoved"] = res.PrunedBytes;
+                summary[$"{summaryStage}.stubUnexecuted"] = kind == Stubbed;
+                if (kind == Stubbed)
+                {
+                    summary[$"{summaryStage}.stub.functions"] = res.StubbedFunctions;
+                    summary[$"{summaryStage}.stub.traceNamesWithoutDefinition"] = traceNamesWithoutDefinition;
+                    @out.WriteLine($"  stubs   : {res.StubbedFunctions} function(s) the run trace never executed kept as an endless-loop stub "
+                        + $"({observedFunctions.Count} traced name(s)); only as safe as the trace is complete");
+                    if (traceNamesWithoutDefinition > 0)
+                        @out.WriteLine($"  stubs   : {traceNamesWithoutDefinition} traced name(s) match no definition in the tree (library code, or a "
+                            + "rename CodeCarver does not follow: if one is yours, what ran under it may be stubbed)");
+                    // What was stubbed and what the trace named but CodeCarver could not find, by name: to review locally.
+                    var stubLines = new System.Text.StringBuilder();
+                    stubLines.AppendLine("# CodeCarver stubUnexecuted: functions whose body became an endless loop (the run trace never named them),");
+                    stubLines.AppendLine("# and traced names that match no definition (library code, a name built by a macro, or a rename not followed).");
+                    foreach (var n in graph.Nodes.Where(n => n.Kind == NodeKind.Function && splan.IsKept(n.Id) && StubOf(n.Id) is not null)
+                                          .OrderBy(n => n.FilePath, StringComparer.Ordinal).ThenBy(n => n.Span.StartLine))
+                        stubLines.AppendLine($"STUB {n.Name}\t{n.FilePath}:{n.Span.StartLine}");
+                    foreach (var u in unmappedTraceNames.OrderBy(x => x, StringComparer.Ordinal)) stubLines.AppendLine($"UNMAPPED {u}");
+                    Directory.CreateDirectory(ccDir);
+                    WriteArtifact(Path.Combine(ccDir, "stubs.txt"), stubLines.ToString(), "stubs");
+                }
             }
             var carvedBytes = res.BytesWritten;
             var buildRequiredFiles = res.Written;

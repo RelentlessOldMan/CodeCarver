@@ -27,6 +27,9 @@ public enum NodeFlags
     /// <summary>A file-scope <c>static</c> function of a translation unit: uses from other translation units do
     /// not resolve to it. Informational (verify's cause classification); resolution itself is in the front-end.</summary>
     FileLocal = 1 << 6,
+    /// <summary>Another name for the definition it calls: the symbol of an asm label or `#pragma redefine_extname`, a
+    /// command-line rename. A run trace names symbols, so what ran under this name is what it calls.</summary>
+    Alias = 1 << 7,
 }
 
 /// <summary>

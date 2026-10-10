@@ -22,10 +22,13 @@ public static class EmitClosure
     /// write although they are unreached. Called again whenever the file gains a reached node.</param>
     /// <param name="constructorsIn">Optional: the C++ constructors a kept file's text releases
     /// (<see cref="ConstructorGate"/>); rooted as <see cref="RootKind.Constructor"/>. Called once per kept file.</param>
+    /// <param name="stubbed">Optional: the definitions whose body the emitter replaces with a stub (<see cref="Emit.StubBodies"/>):
+    /// the functions and variables only such a body used are not reached through it.</param>
     public static CarvePlan Close(CodeGraph graph, IEnumerable<Root> roots,
                                   Func<string, Func<NodeId, bool>, IEnumerable<NodeId>> retainedIn,
                                   ReachabilityOptions? options = null,
-                                  Func<string, IEnumerable<NodeId>>? constructorsIn = null)
+                                  Func<string, IEnumerable<NodeId>>? constructorsIn = null,
+                                  Func<NodeId, bool>? stubbed = null)
     {
         ArgumentNullException.ThrowIfNull(graph);
         options ??= ReachabilityOptions.Safe;
@@ -49,9 +52,11 @@ public static class EmitClosure
             {
                 var from = work.Dequeue();
                 if (graph.GetNode(from).FilePath is { } f) dirty.Add(f);
+                // A stubbed body uses nothing: only what its signature and file need (its file, types, macros).
+                var bodyless = stubbed is not null && stubbed(from);
                 foreach (var edge in graph.OutEdges(from))
                 {
-                    if (!options.Follows(edge.Kind) || !reached.Add(edge.To)) continue;
+                    if (!options.Follows(edge.Kind) || (bodyless && UsedByBody(graph, edge)) || !reached.Add(edge.To)) continue;
                     why[edge.To] = KeepReason.Reached(from, edge.Kind);
                     work.Enqueue(edge.To);
                 }
@@ -71,6 +76,11 @@ public static class EmitClosure
         }
         return new CarvePlan(graph, reached, why);
     }
+
+    /// <summary>An edge a stubbed body no longer has: to a function or variable it called or named. Its file, the
+    /// types and macros of its signature, stay.</summary>
+    static bool UsedByBody(CodeGraph graph, Edge edge) => edge.Kind is not (EdgeKind.DefinedIn or EdgeKind.Includes)
+                                                          && graph.GetNode(edge.To).Kind is NodeKind.Function or NodeKind.Global;
 
     /// <summary>Index of definition nodes (Function/Global with a known span) per file, for the policies.</summary>
     public static Dictionary<string, List<Node>> DefinitionsByFile(CodeGraph graph)

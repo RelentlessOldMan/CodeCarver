@@ -82,7 +82,36 @@ Write-Host "original: $((Get-Content (Join-Path $Work 'expected.txt')).Count) ou
 
 $fail = 0
 $rows = @()
-foreach ($mode in 'log+trace', 'log', 'trace', 'none') {
+
+# 1b. A function trace of the same run (when the example's build.sh takes EXTRA_CFLAGS): a copy built with
+# -finstrument-functions -no-pie and tools/eldritch/fntrace.c records every function entered; nm names the addresses
+# (every name at an address: aliases). Its output must match the original's. It drives the 'stubbed' stage.
+$modes = @('log+trace', 'log', 'trace', 'none')
+if ((Get-Content -Raw (Join-Path $src 'build.sh')) -match 'EXTRA_CFLAGS') {
+    $fnW = "/tmp/$Example-fn"
+    $traceC = ToWsl (Join-Path $PSScriptRoot 'fntrace.c')
+    $r = Invoke-Wsl ("set -e; rm -rf '$fnW'; mkdir -p '$fnW'; gcc -O0 -c '$traceC' -o '$fnW/zz_fntrace.o'; " +
+        "EXTRA_CFLAGS='-finstrument-functions' EXTRA_LDFLAGS='-no-pie' sh '$srcW/build.sh' '$srcW' '$fnW' '$sdkW' > '$workW/fn-build.log' 2>&1; " +
+        "cd '$fnW'; rm -f fntrace.raw; timeout 60 ./$bin > '$workW/fn-out.txt'; nm '$bin' > '$workW/fn.nm'; sort -u fntrace.raw > '$workW/fntrace.raw'")
+    if ($r.Code -ne 0) { Write-Host "function trace: instrumented build/run failed`n$($r.Out)"; $fail++ }
+    elseif ((Get-Content -Raw (Join-Path $Work 'fn-out.txt')) -ne $expected) { Write-Host 'function trace: the instrumented run printed something else'; $fail++ }
+    else {
+        $byAddr = @{}
+        foreach ($l in Get-Content (Join-Path $Work 'fn.nm')) {
+            if ($l -match '^([0-9a-fA-F]+) [TtWwi] (\S+)$') {
+                $a = $Matches[1].ToLowerInvariant().TrimStart('0')
+                if (-not $byAddr.ContainsKey($a)) { $byAddr[$a] = @() }
+                $byAddr[$a] += $Matches[2]
+            }
+        }
+        $names = @(Get-Content (Join-Path $Work 'fntrace.raw') | ForEach-Object { $byAddr[$_.Trim().ToLowerInvariant().TrimStart('0')] } | Where-Object { $_ } | Sort-Object -Unique)
+        $names | Set-Content -Encoding ascii (Join-Path $Work 'run.log')
+        Write-Host "function trace: $($names.Count) function name(s) ran"
+        $modes += 'log+trace+fn'
+    }
+}
+
+foreach ($mode in $modes) {
     $out = Join-Path $Work ("out-" + ($mode -replace '\+', '-'))
     $builds = ''
     if ($mode -ne 'none') {
@@ -91,6 +120,14 @@ foreach ($mode in 'log+trace', 'log', 'trace', 'none') {
         if ($mode -match 'trace') { $builds += "buildTraceFiles = [`"$(($Work -replace '\\','/'))/build.trace`"]`n" }
     }
     $cfg = Join-Path $Work "carve-$($mode -replace '\+','-').toml"
+    # With the function trace: one stage, carved with what never ran stubbed (stubUnexecuted).
+    $stageNames = if ($mode -eq 'log+trace+fn') { @('stubbed') } else { @('safe', 'headers', 'aggressive', 'max') }
+    $stagesToml = if ($mode -eq 'log+trace+fn') {
+        "[runs.r]`nrunTraceLogs = [`"$(($Work -replace '\\','/'))/run.log`"]`n[stages.stubbed]`ncarveSourceFileContents = true`nstubUnexecuted = true`n"
+    } else {
+        "[stages.safe]`ncarveSourceFileContents = false`ncarveHeaderFileContents = false`n[stages.headers]`ncarveSourceFileContents = false`ncarveHeaderFileContents = true`n" +
+        "[stages.aggressive]`ncarveSourceFileContents = true`ncarveHeaderFileContents = false`n[stages.max]`ncarveSourceFileContents = true`ncarveHeaderFileContents = true`n"
+    }
     @"
 outputDirectory = "$($out -replace '\\','/')"
 [common]
@@ -99,23 +136,12 @@ languages = ["c"]
 $builds
 [advanced]
 pathMap = [{ from = "$srcW", to = "." }, { from = "$sdkW", to = "../sdk" }]
-[stages.safe]
-carveSourceFileContents = false
-carveHeaderFileContents = false
-[stages.headers]
-carveSourceFileContents = false
-carveHeaderFileContents = true
-[stages.aggressive]
-carveSourceFileContents = true
-carveHeaderFileContents = false
-[stages.max]
-carveSourceFileContents = true
-carveHeaderFileContents = true
+$stagesToml
 "@ | Set-Content -Encoding utf8 $cfg
     $ErrorActionPreference = 'Continue'
     $carve = @(& dotnet $CliDll carve $src --config $cfg 2>&1 | ForEach-Object { "$_" })
     $code = $LASTEXITCODE
-    foreach ($stage in 'safe', 'headers', 'aggressive', 'max') {
+    foreach ($stage in $stageNames) {
         $carved = Join-Path $out "$stage/carved"
         $row = [ordered]@{ mode = $mode; stage = $stage; carve = $code; verify = '-'; build = '-'; output = '-'; notes = '' }
         # Exit 3 = verify failed: the tree was still emitted, so build it anyway. A verify FAIL that builds is a
@@ -130,7 +156,7 @@ carveHeaderFileContents = true
         if ($vfails -gt 0) { $row.verify = "FAIL $vfails"; $fail++ } else { $row.verify = 'ok' }
         $tag = ($mode -replace '\+', '-') + "-$stage"
         $cW = ToWsl $carved
-        $b = Invoke-Wsl "cd '$workW'; rm -rf 'b-$tag'; sh '$cW/build.sh' '$cW' 'b-$tag' '$sdkW' > 'b-$tag.log' 2>&1 && ./b-$tag/$bin > 'b-$tag.txt'"
+        $b = Invoke-Wsl "cd '$workW'; rm -rf 'b-$tag'; sh '$cW/build.sh' '$cW' 'b-$tag' '$sdkW' > 'b-$tag.log' 2>&1 && timeout 60 ./b-$tag/$bin > 'b-$tag.txt'"
         if ($b.Code -ne 0) {
             $row.build = 'FAIL'; $fail++
             $errs = @(Get-Content (Join-Path $Work "b-$tag.log") | Where-Object { $_ -match 'error|undefined reference' } | Select-Object -First 4)
@@ -145,6 +171,16 @@ carveHeaderFileContents = true
                 $diff = @(Compare-Object ($expected -split "`n") ($got -split "`n") | Where-Object SideIndicator -eq '=>' | ForEach-Object { $_.InputObject.Trim() })
                 $row.notes = 'got: ' + ($diff -join ' | ')
             }
+        }
+        if ($stage -eq 'stubbed') {
+            # Proves something: the run must still match with real bodies stubbed, and every traced name must map back.
+            $sum = Get-Content (Join-Path $out "$stage/codecarver/summary.txt")
+            $n = ($sum | Where-Object { $_ -match '\.stub\.functions = (\d+)' } | ForEach-Object { [int]$Matches[1] } | Select-Object -First 1)
+            $u = ($sum | Where-Object { $_ -match '\.stub\.traceNamesWithoutDefinition = (\d+)' } | ForEach-Object { [int]$Matches[1] } | Select-Object -First 1)
+            $row.notes = ("$n stub(s), $u traced name(s) unmapped " + $row.notes).Trim()
+            if (-not $n) { $row.notes += ' NOTHING STUBBED'; $fail++ }
+            $st = Join-Path $out "$stage/codecarver/stubs.txt"
+            if (Test-Path $st) { Write-Host "stubs.txt:"; Get-Content $st | Where-Object { $_ -notmatch '^#' } | ForEach-Object { Write-Host "  $_" } }
         }
         if ($mode -eq 'log+trace') {
             $bad = @()

@@ -25,7 +25,7 @@ public static class TraceFile
     /// An optional leading hex address (<c>0x0800a1c4</c>) or timestamp (<c>12.345</c>) is skipped, and a C++
     /// qualified name (<c>ns::Class::method</c>) yields its last component (review T6).
     public static readonly Regex DefaultPattern = new(
-        @"^\s*(?:(?:0x)?[0-9A-Fa-f]{6,}:?\s+|\[?\d+(?:[.:]\d+)*\]?\s+)?(?<fn>[A-Za-z_~][\w~]*(?:::[A-Za-z_~][\w~]*)*)\b(?:.*?\s(?<file>[^\s:]+):(?<line>\d+))?",
+        @"^\s*(?:(?:0x)?[0-9A-Fa-f]{6,}:?\s+|\[?\d+(?:[.:]\d+)*\]?\s+)?(?<fn>[A-Za-z_~$][\w~$]*(?:::[A-Za-z_~$][\w~$]*)*)(?![\w$])(?:.*?\s(?<file>[^\s:]+):(?<line>\d+))?",
         RegexOptions.Compiled);
 
     public static IReadOnlyList<TraceRecord> Parse(string text, Regex? pattern = null) => Parse(text, pattern, out _);

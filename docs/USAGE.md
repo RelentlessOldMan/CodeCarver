@@ -156,6 +156,8 @@ use only letters, digits, `_` and `-`.
 | `dropUnobservedCmm = true` | opt in to dropping `.cmm` scripts the run neither opened nor reaches by `DO`/`GOSUB` (see Languages). Needed on **every** selected run that has a file trace. |
 
 **`[stages.NAME]`** — aggressiveness tiers; each sets the two carve toggles. `--stage` picks one; omit to run all.
+A stage may also set `stubUnexecuted = true` (with `carveSourceFileContents = true` and a function trace): see
+[Stubbing what never ran](#stubbing-what-never-ran).
 **`[use]`** — `builds = [...]` / `runs = [...]` to select a subset (default: all defined).
 **`[advanced]`** — rarely needed:
 
@@ -324,6 +326,40 @@ compiled.
 > nothing, and every file it didn't open would be skipped. With the build log given too, that is caught up front
 > (the trace misses files the log compiled, so nothing is skipped); without it, verify fails with `definedInFileNotBuilt`.
 > Give every build's trace: a selected build without one turns the skip off, since its files aren't covered.
+
+## Stubbing what never ran
+
+A stage with `stubUnexecuted = true` goes one step past the static carve, using a function trace
+(`runTraceLogs`): a C function the trace never names keeps its name and signature, so every caller, table and
+pointer still compiles and links, but its body becomes an endless loop:
+
+```c
+int fail_path(int code, int extra)
+{ (void)code; (void)extra; for (;;) { } /* CodeCarver: not executed in the run trace */
+}
+```
+
+What only those bodies used (static helpers, tables, whole files) then falls out of the carve. Static carving
+can't drop code that reached code names (a handler in a table, a callback); a stub can.
+
+```toml
+[runs.smoke]
+runTraceLogs = ["run.log"]
+
+[stages.traced]
+carveSourceFileContents = true   # required
+stubUnexecuted = true
+```
+
+- **Only as safe as the trace is complete.** A path the traced run did not take (an error path, another mode, a
+  rare interrupt) reaches a stub and stops there. Capture the trace from every scenario the carved image must run,
+  and test the image in those scenarios.
+- **Never stubbed:** the entry points and other roots, functions the trace names (by name, so a same-named static
+  elsewhere is spared too), force-kept code (`used`, `section`, constructors), headers, `.cpp` files, and any body
+  CodeCarver can't read cleanly (an `#if` that splits its braces, a definition inside another). Those are kept whole
+  and their uses are followed as usual.
+- `<stage>.stub.functions` in `summary.txt` counts the stubbed bodies; `<stage>.stubUnexecuted` says the stage stubbed.
+- The verify check reads the stubbed output, so whatever a stub still names is kept.
 
 ## Languages
 

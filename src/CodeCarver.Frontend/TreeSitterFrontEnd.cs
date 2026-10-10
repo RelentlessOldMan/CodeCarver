@@ -325,6 +325,26 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // (`#define adler32 z_adler32`, zlib's Z_PREFIX) CAN coincide with a real function name, so those must
     // NOT reject the definition — doing so dropped adler32 and broke the link (caught by the map oracle).
     private HashSet<string> _funcLikeMacroNames = new(StringComparer.Ordinal);
+    // Names the source writes for a symbol, by symbol: object-like rename macros (`#define summon_fn real_summon`:
+    // real_summon <- summon_fn), asm labels and `#pragma redefine_extname` (surface_name <- hidden_name).
+    private readonly Dictionary<string, HashSet<string>> _renamedFrom = new(StringComparer.Ordinal);
+    private static readonly Regex IdentifierOnly = new(@"^[A-Za-z_$][\w$]*$", RegexOptions.Compiled);
+
+    /// <summary>The names the source may write for linker symbol <paramref name="symbol"/>: through asm labels,
+    /// <c>#pragma redefine_extname</c> and object-like rename
+    /// macros (<c>#define summon_fn real_summon</c>: <c>real_summon</c> is written <c>summon_fn</c>), through chains of them.
+    /// A run trace names symbols; the graph names what the source wrote.</summary>
+    public IEnumerable<string> SourceNamesOf(string symbol)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal) { symbol };
+        var work = new Queue<string>();
+        work.Enqueue(symbol);
+        while (work.Count > 0 && seen.Count < 64)
+            if (_renamedFrom.TryGetValue(work.Dequeue(), out var from))
+                foreach (var f in from) if (seen.Add(f)) work.Enqueue(f);
+        seen.Remove(symbol);
+        return seen;
+    }
     // Macros whose body places a symbol in a section or marks it used/retained/constructor (directly or via
     // another such macro): `#define INITCALL(fn) static void (*__init_##fn)(void) __attribute__((section(".initcalls"),
     // used)) = fn`. A use of one registers something the linker keeps although nothing calls it (review R1).
@@ -437,6 +457,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _macroNamedHeaders.Clear();
         _includeDirectives.Clear();
         _c99InlineFns.Clear();
+        _renamedFrom.Clear();
         _fileLocal.Clear();
         _condExternMacros.Clear();
         _callFreeMacros.Clear();
@@ -745,12 +766,27 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             bytesTotal += text.Length; filesTotal++;
             if (!IsTranslationUnit(path) && TemplateInstances.HasMacroNamedHead(text)) _macroNamedHeaders.Add(path);
             if (!IsTranslationUnit(path)) _c99InlineFns.UnionWith(C99Inline.HeaderDefinitions(text));
+            // Symbols the source writes under another name, wherever the label is (often a header): see SourceNamesOf.
+            void Renamed(string cname, string sym)
+            {
+                if (!_renamedFrom.TryGetValue(sym, out var from)) _renamedFrom[sym] = from = new HashSet<string>(StringComparer.Ordinal);
+                from.Add(cname);
+            }
+            if (text.Contains("asm", StringComparison.Ordinal))
+                foreach (Match m in AsmLabelDecl.Matches(text)) Renamed(m.Groups["name"].Value, m.Groups["sym"].Value);
+            if (text.Contains("redefine_extname", StringComparison.Ordinal))
+                foreach (Match m in RedefineExtname.Matches(text)) Renamed(m.Groups["name"].Value, m.Groups["sym"].Value);
 
             foreach (Match m in ObjectLikeDefine.Matches(text))
             {
                 var name = m.Groups[1].Value;
                 var repl = Regex.Replace(m.Groups[2].Value, @"\\\r?\n", " ").Replace("\r", " ").Replace("\n", " ").Trim();
                 if (!defs.ContainsKey(name)) defs[name] = repl;
+                if (IdentifierOnly.IsMatch(repl))
+                {
+                    if (!_renamedFrom.TryGetValue(repl, out var from)) _renamedFrom[repl] = from = new HashSet<string>(StringComparer.Ordinal);
+                    from.Add(name);
+                }
                 if (map.ContainsKey(name)) continue;
                 if (repl.Length == 0 || repl.Length > 200) continue;
                 // Scope OPENERS/CLOSERS only: an unbalanced net brace count (`namespace fmt {` = +2, `}}` =
@@ -1939,6 +1975,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var (defined, target) = bodyHere ? (sym, cname) : (cname, sym);
             var lid = graph.GetOrAddNode(NodeKind.Function, defined, path, new SourceSpan(ln, ln));
             graph.AddEdge(lid, fileNode, EdgeKind.DefinedIn);
+            graph.AddFlag(lid, NodeFlags.Alias);
             Add(functionsByName, defined, lid);
             pendingCalls.Add((lid, target));
         }
@@ -1953,6 +1990,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 {
                     var rid = graph.GetOrAddNode(NodeKind.Function, to, path, new SourceSpan(s, e));
                     graph.AddEdge(rid, fileNode, EdgeKind.DefinedIn);
+                    graph.AddFlag(rid, NodeFlags.Alias);
                     Add(functionsByName, to, rid);
                     pendingCalls.Add((rid, graph.GetNode(id).Name));
                 }

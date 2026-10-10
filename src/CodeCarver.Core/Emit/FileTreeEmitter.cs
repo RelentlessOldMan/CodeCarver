@@ -8,7 +8,11 @@ namespace CodeCarver.Core.Emit;
 /// <summary>Outcome of writing a carved tree: how many files (and bytes) were emitted, and which.</summary>
 /// <param name="PrunedFiles">Files the pruned emitter rewrote with unreached definitions removed.</param>
 /// <param name="PrunedBytes">Bytes those removals took out.</param>
-public sealed record EmitResult(int FilesWritten, long BytesWritten, IReadOnlyList<string> Written, int PrunedFiles = 0, long PrunedBytes = 0);
+public sealed record EmitResult(int FilesWritten, long BytesWritten, IReadOnlyList<string> Written, int PrunedFiles = 0, long PrunedBytes = 0)
+{
+    /// <summary>Function bodies replaced by a stub (<see cref="StubBodies"/>).</summary>
+    public int StubbedFunctions { get; init; }
+}
 
 /// <summary>
 /// The simplest emitter: file-level carve. It copies the plan's kept files (preserving their relative
@@ -71,7 +75,10 @@ public static class FileTreeEmitter
     /// spot — which is exactly why intra-file output must be validated by actually building it (the
     /// linker-map / build oracle), not trusted blind.
     /// </summary>
-    public static EmitResult EmitPruned(CarvePlan plan, CodeGraph graph, string sourceRoot, string outDir)
+    /// <param name="stubOf">Optional: the stub body of a kept function whose body is replaced (<see cref="StubBodies"/>);
+    /// the same answers the plan was closed with.</param>
+    public static EmitResult EmitPruned(CarvePlan plan, CodeGraph graph, string sourceRoot, string outDir,
+                                        Func<NodeId, StubBodies.Body?>? stubOf = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(graph);
@@ -89,6 +96,7 @@ public static class FileTreeEmitter
         var written = new List<string>();
         long bytes = 0, prunedBytes = 0;
         var prunedFiles = 0;
+        var stubbedFunctions = 0;
         foreach (var rel in plan.KeptFiles)
         {
             var src = Path.Combine(sourceRoot, rel);
@@ -107,22 +115,30 @@ public static class FileTreeEmitter
             // multi-GB headers kept whole — is stream-copied, so a big kept file never becomes a
             // >2GB string in memory (it would throw) and is emitted in bounded memory.
             var ranges = !IsHeader(rel) && defsByFile.TryGetValue(rel, out var defs) ? DropRangesFor(defs, plan.IsKept) : null;
+            var stubs = stubOf is not null && !IsHeader(rel) && defsByFile.TryGetValue(rel, out var sdefs)
+                ? sdefs.Where(n => n.Kind == NodeKind.Function && plan.IsKept(n.Id)).Select(n => stubOf(n.Id))
+                       .Where(b => b.HasValue).Select(b => b!.Value).Distinct().ToList()
+                : new List<StubBodies.Body>();
             // Rewritten byte-transparently (Latin-1): a Latin-1/Shift-JIS/UTF-8 string literal must come out with
             // exactly its original bytes (review E1). UTF-16 text can't be edited line-wise this way: copy it whole
             // (CarvePlan already closed over the whole file being written; see EmitClosure).
             try
             {
-                if (ranges is { Count: > 0 } && !IsUtf16(src))
+                if ((ranges is { Count: > 0 } || stubs.Count > 0) && !IsUtf16(src))
                 {
                     // Bytes in, bytes out: ReadAllText would honour (and strip) a UTF-8 BOM even when told Latin-1.
                     var original = File.ReadAllBytes(src);
+                    ranges ??= new List<(int Start, int End)>();
+                    // Stubs first: they keep every line, so the line ranges below still line up.
+                    var text = Encoding.Latin1.GetString(original);
+                    if (stubs.Count > 0) { text = StubBodies.Apply(text, stubs); stubbedFunctions += stubs.Count; }
                     // Every function removed from this file, static or not (a `STATIC`/`PRIVATE` macro hides the keyword),
                     // unless the same name also has a kept definition here (#if-split twins): its prototypes go with it.
                     var fns = defsByFile[rel].Where(n => n.Kind == NodeKind.Function && n.Span.IsKnown).ToList();
                     var keptNames = fns.Where(n => plan.IsKept(n.Id)).Select(n => n.Name).ToHashSet(StringComparer.Ordinal);
                     var removed = fns.Where(n => !plan.IsKept(n.Id) && !keptNames.Contains(n.Name))
                                      .Select(n => (n.Span.StartLine, n.Name)).ToList();
-                    var pruned = Encoding.Latin1.GetBytes(RemoveLineRanges(Encoding.Latin1.GetString(original), ranges, removed));
+                    var pruned = Encoding.Latin1.GetBytes(RemoveLineRanges(text, ranges, removed));
                     File.WriteAllBytes(dst, pruned);
                     if (pruned.Length < original.Length) { prunedFiles++; prunedBytes += original.Length - pruned.Length; }
                 }
@@ -136,7 +152,7 @@ public static class FileTreeEmitter
         }
 
         CopyUnscannedIncludes(plan.KeptFiles, plan.DroppedFiles, sourceRoot, outDir, written, ref bytes);
-        return new EmitResult(written.Count, bytes, written, prunedFiles, prunedBytes);
+        return new EmitResult(written.Count, bytes, written, prunedFiles, prunedBytes) { StubbedFunctions = stubbedFunctions };
     }
 
     /// <summary>

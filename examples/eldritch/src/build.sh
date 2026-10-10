@@ -5,6 +5,8 @@
 set -e
 S=$(cd "$1" && pwd); mkdir -p "$2"; O=$(cd "$2" && pwd); K=$(cd "$3" && pwd)
 CF="-O0 -w -I$S/include -I $K/include -I$S/include2 -iquote $S/quoted -isystem $S/sys -idirafter $S/after -include force.h -D VERBOSE_LEVEL=2 @$S/flags.rsp"
+# EXTRA_CFLAGS / EXTRA_LDFLAGS: the oracle builds an instrumented copy this way to record which functions run.
+CF="$CF${EXTRA_CFLAGS:+ $EXTRA_CFLAGS}"
 has() { [ -f "$S/$1" ] || [ -z "${SKIP_MISSING:-}" ]; }
 cc1() { src=$1; shift; has "$src" || return 0; echo "gcc $CF $* -c \"$S/$src\""; gcc $CF "$@" -c "$S/$src"; }
 cd "$O"
@@ -42,5 +44,5 @@ if has deep/abyss.c; then
   echo "cd $S/deep && gcc $CF -I. -Iinner -c abyss.c -o $O/abyss.o"
   (cd "$S/deep" && gcc $CF -I. -Iinner -c abyss.c -o "$O/abyss.o")
 fi
-echo "gcc -rdynamic -Wl,--wrap=beast -Wl,--defsym=omen_call=omen_real -o eldritch *.o"
-gcc -rdynamic -Wl,--wrap=beast -Wl,--defsym=omen_call=omen_real -o eldritch *.o
+echo "gcc${EXTRA_LDFLAGS:+ $EXTRA_LDFLAGS} -rdynamic -Wl,--wrap=beast -Wl,--defsym=omen_call=omen_real -o eldritch *.o"
+gcc${EXTRA_LDFLAGS:+ $EXTRA_LDFLAGS} -rdynamic -Wl,--wrap=beast -Wl,--defsym=omen_call=omen_real -o eldritch *.o

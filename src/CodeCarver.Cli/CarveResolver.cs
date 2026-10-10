@@ -3,7 +3,7 @@ namespace CodeCarver.Cli;
 /// <summary>One aggressiveness tier to emit. <see cref="Name"/> is "" for the implicit single carve (no
 /// <c>[stages]</c> in the config) — which writes straight under <c>outputDirectory/</c> — or the stage's name,
 /// which writes under <c>outputDirectory/&lt;name&gt;/</c>.</summary>
-public sealed record ResolvedStage(string Name, bool CarveSourceFileContents, bool CarveHeaderFileContents);
+public sealed record ResolvedStage(string Name, bool CarveSourceFileContents, bool CarveHeaderFileContents, bool StubUnexecuted = false);
 
 /// <summary>The carve config resolved into flat engine inputs: the selected builds/runs UNIONED, the open/closed
 /// world DERIVED, entryPoints expanded (incl. entryPointsFile), and the stage list chosen. This is the whole
@@ -164,16 +164,24 @@ public static class CarveResolver
         else if (stageName is not null)
         {
             if (cfg.Stages.TryGetValue(stageName, out var st))
-                r.Stages.Add(new ResolvedStage(stageName, st.CarveSourceFileContents, st.CarveHeaderFileContents));
+                r.Stages.Add(new ResolvedStage(stageName, st.CarveSourceFileContents, st.CarveHeaderFileContents, st.StubUnexecuted));
             else
                 errors.Add($"--stage '{stageName}' is not defined. Stages: {string.Join(", ", cfg.Stages.Keys)}.");
         }
         else
         {
             // No --stage: run them all, ordered by aggressiveness (least first) so comparisons read naturally.
-            foreach (var kv in cfg.Stages.OrderBy(k => (k.Value.CarveSourceFileContents ? 1 : 0) + (k.Value.CarveHeaderFileContents ? 1 : 0)))
-                r.Stages.Add(new ResolvedStage(kv.Key, kv.Value.CarveSourceFileContents, kv.Value.CarveHeaderFileContents));
+            foreach (var kv in cfg.Stages.OrderBy(k => (k.Value.CarveSourceFileContents ? 1 : 0) + (k.Value.CarveHeaderFileContents ? 1 : 0) + (k.Value.StubUnexecuted ? 2 : 0)))
+                r.Stages.Add(new ResolvedStage(kv.Key, kv.Value.CarveSourceFileContents, kv.Value.CarveHeaderFileContents, kv.Value.StubUnexecuted));
         }
+
+        // Stubbing keeps what ran: without a function trace there is nothing to tell it what ran.
+        foreach (var s in r.Stages.Where(s => s.StubUnexecuted))
+            if (r.RunTraceLogs.Count == 0)
+                errors.Add($"[stages.{s.Name}]: stubUnexecuted = true needs a function trace (runTraceLogs in a selected [runs.X]) — "
+                    + "it stubs the functions the run did not execute.");
+            else if (!r.Languages.Contains("c"))
+                errors.Add($"[stages.{s.Name}]: stubUnexecuted = true applies to C (languages must include \"c\").");
 
         return new Result(errors.Count == 0 ? r : null, errors);
     }

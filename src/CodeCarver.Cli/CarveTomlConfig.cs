@@ -58,6 +58,7 @@ public sealed class StageSection
 {
     public bool CarveSourceFileContents;
     public bool CarveHeaderFileContents;
+    public bool StubUnexecuted;
 }
 
 /// <summary>Loads and validates a carve.toml. Parsing is strict on purpose: an unknown key is an ERROR (a typo'd
@@ -74,7 +75,7 @@ public static class ConfigLoader
           "carveSourceFileContents", "carveHeaderFileContents" };
     private static readonly string[] BuildKeys = { "buildLogs", "compiler", "compilerNames", "defines", "buildTraceFiles" };
     private static readonly string[] RunKeys = { "runTraceFiles", "runTraceLogs", "dropUnobservedCmm" };
-    private static readonly string[] StageKeys = { "carveSourceFileContents", "carveHeaderFileContents" };
+    private static readonly string[] StageKeys = { "carveSourceFileContents", "carveHeaderFileContents", "stubUnexecuted" };
     private static readonly string[] UseKeys = { "builds", "runs" };
 
     public static Result Load(string path)
@@ -178,7 +179,11 @@ public static class ConfigLoader
             {
                 CarveSourceFileContents = GetBool(t, "carveSourceFileContents", $"[stages.{name}]", ctx) ?? false,
                 CarveHeaderFileContents = GetBool(t, "carveHeaderFileContents", $"[stages.{name}]", ctx) ?? false,
+                StubUnexecuted = GetBool(t, "stubUnexecuted", $"[stages.{name}]", ctx) ?? false,
             };
+            // Stubbing rewrites function bodies inside kept source files: a kind of source carving.
+            if (s.StubUnexecuted && !s.CarveSourceFileContents)
+                ctx.Errors.Add($"[stages.{name}]: stubUnexecuted = true needs carveSourceFileContents = true (it rewrites function bodies in kept source files).");
             // Orthogonal but unusual: stripping header #defines while NOT carving source bodies. Allowed, warned.
             if (s.CarveHeaderFileContents && !s.CarveSourceFileContents)
                 warnings.Add($"[stages.{name}]: carveHeaderFileContents=true with carveSourceFileContents=false is unusual "
@@ -292,6 +297,9 @@ public static class ConfigLoader
         # [stages.max]
         # carveSourceFileContents = true
         # carveHeaderFileContents = true
+        # [stages.traced]                # needs runTraceLogs. A function the run never executed keeps its name and
+        # carveSourceFileContents = true # signature, but its body becomes an endless loop (C files only). Only as
+        # stubUnexecuted = true          # safe as the trace is complete: a path the run did not take stops there.
 
         # ===== use (optional: which builds/runs apply; default = all defined) =====
         # [use]
