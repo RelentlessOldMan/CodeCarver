@@ -95,11 +95,11 @@ public static class UseShape
         if (defs is null || defs.Count == 0) { yield return "macro.notInTree"; yield break; }
         if (defs.Count > 1) yield return "macro.severalDefinitions";
         if (defs.Any(d => d.Body.Length == 0)) yield return "macro.emptyDefinition";
-        var uses = defs.Select(d => commas < d.Params.Count && d.Params[commas] is var p && p.Length > 0
-                                    && System.Text.RegularExpressions.Regex.IsMatch(d.Body, @"(?<![\w#])" + System.Text.RegularExpressions.Regex.Escape(p) + @"(?!\w)"))
-                       .ToList();
-        if (uses.Any(u => u)) yield return "macro.usesArg";
-        if (uses.Any(u => !u)) yield return "macro.dropsArg";
+        // The same reading the front end registers by (FileScopeInvocations.UseOf).
+        var uses = defs.Select(d => FileScopeInvocations.UseOf(d.Body, FileScopeInvocations.ParamFor(d.Params, commas))).ToList();
+        if (uses.Contains(FileScopeInvocations.ParamUse.References)) yield return "macro.usesArg";
+        if (uses.Contains(FileScopeInvocations.ParamUse.Declares)) yield return "macro.declaresArg";
+        if (uses.Contains(FileScopeInvocations.ParamUse.None)) yield return "macro.dropsArg";
     }
 
     static bool IsWord(char c) => char.IsLetterOrDigit(c) || c == '_' || c == '$';

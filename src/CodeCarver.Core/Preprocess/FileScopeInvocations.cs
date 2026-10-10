@@ -28,11 +28,11 @@ public static class FileScopeInvocations
     };
 
     /// <summary>Each invocation in <paramref name="code"/> (already <see cref="SourceText.CodeOnly"/>): its 1-based line,
-    /// the macro name, the identifiers in its arguments, and whether words came first (<c>static REGISTER(fn);</c>:
+    /// the macro name, the identifiers in each of its arguments, and whether words came first (<c>static REGISTER(fn);</c>:
     /// shaped like a prototype too, so the caller decides by whether the name is a function or macro anywhere).</summary>
-    public static IEnumerable<(int Line, string Macro, List<string> Names, bool AfterWords)> Find(string code)
+    public static IEnumerable<(int Line, string Macro, List<List<string>> Args, bool AfterWords)> Find(string code)
     {
-        var results = new List<(int, string, List<string>, bool)>();
+        var results = new List<(int, string, List<List<string>>, bool)>();
         var depth = 0;
         var line = 1;
         var statementStart = true;
@@ -47,8 +47,8 @@ public static class FileScopeInvocations
                     && Close(code, m.Index + m.Length - 1) is var close && close > 0 && Ends(code, close + 1, words.Count > 0))
                 {
                     var args = code[(m.Index + m.Length)..close];
-                    var names = Ident.Matches(args).Select(x => x.Value).Distinct(StringComparer.Ordinal).ToList();
-                    results.Add((line, m.Groups["name"].Value, names, words.Count > 0));
+                    var perArg = SplitTop(args).Select(a => Ident.Matches(a).Select(x => x.Value).Distinct(StringComparer.Ordinal).ToList()).ToList();
+                    results.Add((line, m.Groups["name"].Value, perArg, words.Count > 0));
                     for (var k = i; k <= close; k++) if (code[k] == '\n') line++;
                     i = close;
                     statementStart = true;
@@ -62,6 +62,60 @@ public static class FileScopeInvocations
             else if (c == ';' && depth == 0) statementStart = true;
         }
         return results;
+    }
+
+    public enum ParamUse { None, Declares, References }
+
+    /// <summary>What a macro body does with parameter <paramref name="param"/>: names something with it
+    /// (<c>= fn</c>, <c>{ #fn, fn }</c>, <c>&amp;fn</c>, <c>OTHER(fn)</c>), only declares it (<c>void fn(void)</c>), or
+    /// neither (absent, or only stringized or pasted: <c>#fn</c>, <c>entry_##fn</c>).</summary>
+    public static ParamUse UseOf(string body, string param)
+    {
+        if (param.Length == 0) return ParamUse.None;
+        var result = ParamUse.None;
+        foreach (Match m in Regex.Matches(body, @"(?<![\w$])" + Regex.Escape(param) + @"(?![\w$])"))
+        {
+            var p = m.Index - 1;
+            while (p >= 0 && char.IsWhiteSpace(body[p])) p--;
+            var n = m.Index + m.Length;
+            while (n < body.Length && char.IsWhiteSpace(body[n])) n++;
+            if (p >= 0 && body[p] == '#') continue;                                  // #fn, x##fn
+            if (n + 1 < body.Length && body[n] == '#' && body[n + 1] == '#') continue; // fn##x
+            if (p < 0 || "=,(&{!?:+-/|^<>[".Contains(body[p])) return ParamUse.References;
+            if (char.IsLetterOrDigit(body[p]) || body[p] is '_' or '*' or '$')
+            {
+                // A word before: a type (declares) unless it is `return fn`.
+                var w = p;
+                while (w >= 0 && (char.IsLetterOrDigit(body[w]) || body[w] == '_')) w--;
+                if (body[(w + 1)..(p + 1)] == "return") return ParamUse.References;
+                result = ParamUse.Declares;
+            }
+            else return ParamUse.References;
+        }
+        return result;
+    }
+
+    /// <summary>The parameter argument <paramref name="index"/> binds to: a named one, or <c>__VA_ARGS__</c> past the
+    /// last named one of a variadic macro; "" when there is none.</summary>
+    public static string ParamFor(IReadOnlyList<string> ps, int index)
+    {
+        var variadic = ps.Count > 0 && ps[^1] == "...";
+        if (index < ps.Count - (variadic ? 1 : 0)) return ps[index];
+        return variadic ? "__VA_ARGS__" : "";
+    }
+
+    /// <summary>Top-level comma-separated parts of an argument list.</summary>
+    static IEnumerable<string> SplitTop(string s)
+    {
+        var depth = 0;
+        var start = 0;
+        for (var i = 0; i < s.Length; i++)
+        {
+            if (s[i] is '(' or '[' or '{') depth++;
+            else if (s[i] is ')' or ']' or '}') depth--;
+            else if (s[i] == ',' && depth == 0) { yield return s[start..i]; start = i + 1; }
+        }
+        yield return s[start..];
     }
 
     /// <summary>The ')' closing the '(' at <paramref name="open"/>, or -1.</summary>

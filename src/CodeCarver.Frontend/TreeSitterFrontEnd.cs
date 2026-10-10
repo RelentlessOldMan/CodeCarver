@@ -2086,13 +2086,24 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     pendingPastes.Add((from, ToPasteKind(kind), frag));
             }
 
-        // Pass 3c: `REGISTER_INIT(on_start);` at file scope with a macro the tree doesn't define (an SDK header outside
-        // the root): the parser reads a prototype, but it registers its arguments (see FileScopeInvocations). A macro
-        // the tree defines is read through its body instead.
+        // Pass 3c: `REGISTER_INIT(on_start);` at file scope: the parser reads a prototype, but it registers its arguments
+        // (see FileScopeInvocations). A macro the tree doesn't define (an SDK header outside the root) is taken to use all
+        // of them; one it defines, the arguments some definition's body names something with (`= fn`, `{ #fn, fn }`),
+        // not those it only declares (`void fn(void)`), stringizes or pastes (work eval, 1.0.199: two statics registered
+        // by a tree macro whose body uses the argument, kept only by the check).
         if (IsTranslationUnit(path))
-            foreach (var (line, macro, names, afterWords) in FileScopeInvocations.Find(SourceText.CodeOnly(text)))
+            foreach (var (line, macro, args, afterWords) in FileScopeInvocations.Find(SourceText.CodeOnly(text)))
             {
-                if (_funcLikeMacroNames.Contains(macro) || (dead is not null && line < dead.Length && dead[line])) continue;
+                if (dead is not null && line < dead.Length && dead[line]) continue;
+                if (_funcLikeMacroNames.Contains(macro))
+                {
+                    var defs = FunctionMacro(macro) ?? Array.Empty<(IReadOnlyList<string> Params, string Body)>();
+                    for (var i = 0; i < args.Count; i++)
+                        if (defs.Any(d => FileScopeInvocations.UseOf(d.Body, FileScopeInvocations.ParamFor(d.Params, i)) == FileScopeInvocations.ParamUse.References))
+                            foreach (var name in args[i]) pendingRefs.Add((fileNode, name));
+                    continue;
+                }
+                var names = args.SelectMany(a => a).Distinct(StringComparer.Ordinal).ToList();
                 if (afterWords) _wordInvocations.Add((fileNode, macro, names));   // decided once every file is read
                 else foreach (var name in names) pendingRefs.Add((fileNode, name));
             }

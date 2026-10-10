@@ -66,6 +66,12 @@ public sealed class CheckClosureTests
     [InlineData("#if 0\n#define REG(fn) static int (*const reg_##fn)(void) = fn\n#else\n#define REG(fn)\n#endif\n", "REG(on_start);")]
     [InlineData("", "__typeof__(on_start) *const start_ptr;")]
     [InlineData("", "UNSEEN_A UNSEEN_REG(on_start);")]
+    // A tree macro that uses the argument without pasting a name of its own (work eval, 1.0.199: stmt.macroCall +
+    // macro.usesArg): no definer path, so before 1.0.200 only the check kept it.
+    [InlineData("#define REG(fn) static const struct entry the_entry = { #fn, fn }\n", "REG(on_start);")]
+    [InlineData("#define TABLE_ADD(f) static int (*const tbl)(void) = f\n#define REG(fn) TABLE_ADD(fn)\n", "REG(on_start);")]
+    [InlineData("#define REG(fn) const void *const reg_ptr = (const void *)&fn\n", "REG(on_start);")]
+    [InlineData("#define REG(name, ...) static int (*const reg_tbl[])(void) = { __VA_ARGS__ }\n", "REG(tbl, on_start);")]
     public void FileScopeRegistration_IsKeptWithoutTheCheck(string macro, string use)
     {
         using var t = new TreeCarve();
@@ -76,8 +82,23 @@ public sealed class CheckClosureTests
         var (code, o, e) = t.Carve(extraToml: "[stages.p]\ncarveSourceFileContents = true\n");
         Assert.True(code == 0, o + e);
         var summary = File.ReadAllText(Path.Combine(t.Root, "out", "p", "codecarver", "summary.txt"));
+        var carved = File.ReadAllText(Path.Combine(t.Root, "out", "p", "carved", "main.c"));
         Assert.True(summary.Contains("stage0.verify.keptByCheck = 0"),
-            string.Join("\n", summary.Split('\n').Where(l => l.Contains("keptByCheck"))) + "\n" + File.ReadAllText(Path.Combine(t.Root, "out", "p", "carved", "main.c")));
+            string.Join("\n", summary.Split('\n').Where(l => l.Contains("keptByCheck"))) + "\n" + carved);
+        if (use.EndsWith(";")) Assert.DoesNotContain("unused_one", carved);   // without it the parse runs into the next function
+    }
+
+    /// <summary>What a macro body does with a parameter: only a reference registers (`void fn(void)` declares; `#fn`,
+    /// `n_##fn` stringize and paste).</summary>
+    [Fact]
+    public void MacroBody_ParamUse()
+    {
+        Assert.Equal(CodeCarver.Core.Preprocess.FileScopeInvocations.ParamUse.Declares,
+                     CodeCarver.Core.Preprocess.FileScopeInvocations.UseOf("static int fn(void)", "fn"));
+        Assert.Equal(CodeCarver.Core.Preprocess.FileScopeInvocations.ParamUse.None,
+                     CodeCarver.Core.Preprocess.FileScopeInvocations.UseOf("static const char *n_##fn = #fn", "fn"));
+        Assert.Equal(CodeCarver.Core.Preprocess.FileScopeInvocations.ParamUse.References,
+                     CodeCarver.Core.Preprocess.FileScopeInvocations.UseOf("{ #fn, fn }", "fn"));
     }
 
     /// <summary>A macro in the tree that drops the name (empty, or not using that argument): the carve is right that
@@ -119,7 +140,7 @@ public sealed class CheckClosureTests
         var found = CodeCarver.Core.Preprocess.FileScopeInvocations.Find(code).ToList();
         Assert.Equal(new[] { "REG", "REG2", "REG" }, found.Select(x => x.Macro));
         Assert.Equal(new[] { 2, 3, 10 }, found.Select(x => x.Line));
-        Assert.Contains("on_b", found[1].Names);
+        Assert.Contains("on_b", found[1].Args[0]);
     }
 
     [Theory]
