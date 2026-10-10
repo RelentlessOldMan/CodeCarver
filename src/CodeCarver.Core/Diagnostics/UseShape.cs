@@ -16,7 +16,10 @@ namespace CodeCarver.Core.Diagnostics;
 /// </summary>
 public static class UseShape
 {
-    public static IReadOnlyList<string> Describe(string text, int line, string name)
+    /// <param name="macroOf">The tree's definitions of a function-like macro (parameters, body), or null when it has
+    /// none: says, for a use at file scope inside a macro call, what that macro does with the name.</param>
+    public static IReadOnlyList<string> Describe(string text, int line, string name,
+        Func<string, IReadOnlyList<(IReadOnlyList<string> Params, string Body)>?>? macroOf = null)
     {
         var lines = text.Split('\n');
         if (line < 1 || line > lines.Length) return new[] { "lineNotFound" };
@@ -31,16 +34,75 @@ public static class UseShape
         var code = SourceText.CodeOnly(text);
         var lineStart = 0;
         for (var i = 0; i < line - 1; i++) lineStart = code.IndexOf('\n', lineStart) + 1;
+        var lineEnd = text.IndexOf('\n', lineStart);
         if (inDefine) shapes.Add("inMacroDefinition");
-        else shapes.Add(Place(code, lineStart));
+        else
+        {
+            // Up to the name itself: `static const int x = sizeof(name);` is an initializer although its line starts at file scope.
+            var to = lineStart;
+            var rest = code[lineStart..(lineEnd < 0 ? code.Length : lineEnd)];
+            for (var k = rest.IndexOf(name, StringComparison.Ordinal); k >= 0; k = rest.IndexOf(name, k + 1, StringComparison.Ordinal))
+                if ((k == 0 || !IsWord(rest[k - 1])) && (k + name.Length >= rest.Length || !IsWord(rest[k + name.Length]))) { to = lineStart + k; break; }
+            shapes.Add(Place(code, to));
+        }
 
         // The form: the line's own text (raw for a #define, which CodeOnly blanks).
-        var lineEnd = text.IndexOf('\n', lineStart);
         var own = inDefine ? text[lineStart..(lineEnd < 0 ? text.Length : lineEnd)] : code[lineStart..(lineEnd < 0 ? code.Length : lineEnd)];
-        shapes.Add(Form(own, name));
+        var form = Form(own, name);
+        if (form == "nameNotOnLine" && !inDefine && Form(text[lineStart..(lineEnd < 0 ? text.Length : lineEnd)], name) != "nameNotOnLine")
+            form = "nameInStringOrComment";   // an alias("name") attribute, file-scope asm, a comment
+        shapes.Add(form);
         if (InConditional(lines, line - 1)) shapes.Add("inConditional");
+        if (shapes[0] == "atFileScope" && form is "reference" or "call") shapes.AddRange(Statement(code, lineStart, lineEnd < 0 ? code.Length : lineEnd, name, macroOf));
         return shapes;
     }
+
+    /// <summary>A use at file scope: how its statement starts (<c>stmt.macroCall</c>: <c>NAME(...)</c>;
+    /// <c>stmt.wordsThenCall</c>: <c>static NAME(...)</c>; <c>stmt.declaration</c>), and for the macro call holding the
+    /// name, whether the tree defines it and what its definitions do with that argument.</summary>
+    static IEnumerable<string> Statement(string code, int lineStart, int lineEnd, string name,
+        Func<string, IReadOnlyList<(IReadOnlyList<string> Params, string Body)>?>? macroOf)
+    {
+        // The statement: back to the previous ';' or '}' (or the start).
+        var start = lineStart;
+        while (start > 0 && code[start - 1] is not (';' or '}')) start--;
+        var at = -1;
+        for (var k = code.IndexOf(name, lineStart, lineEnd - lineStart, StringComparison.Ordinal); k >= 0;
+             k = k + 1 < lineEnd ? code.IndexOf(name, k + 1, lineEnd - k - 1, StringComparison.Ordinal) : -1)
+            if ((k == 0 || !IsWord(code[k - 1])) && (k + name.Length >= code.Length || !IsWord(code[k + name.Length]))) { at = k; break; }
+        if (at < 0) yield break;
+
+        // The innermost '(' around the name, and the word before it: the macro called.
+        int depth = 0, open = -1, commas = 0;
+        for (var k = at - 1; k >= start; k--)
+        {
+            if (code[k] == ')') depth++;
+            else if (code[k] == '(') { if (depth == 0) { open = k; break; } depth--; }
+            else if (code[k] == ',' && depth == 0) commas++;
+        }
+        if (open < 0) { yield return "stmt.declaration"; yield break; }
+        var e = open - 1;
+        while (e >= start && char.IsWhiteSpace(code[e])) e--;
+        var b = e;
+        while (b >= start && IsWord(code[b])) b--;
+        var macro = code[(b + 1)..(e + 1)];
+        if (macro.Length == 0) { yield return "stmt.declaration"; yield break; }
+        var before = code[start..(b + 1)].Trim();
+        yield return before.Length == 0 ? "stmt.macroCall" : before.All(c => IsWord(c) || char.IsWhiteSpace(c)) ? "stmt.wordsThenCall" : "stmt.declaration";
+
+        if (macroOf is null) yield break;
+        var defs = macroOf(macro);
+        if (defs is null || defs.Count == 0) { yield return "macro.notInTree"; yield break; }
+        if (defs.Count > 1) yield return "macro.severalDefinitions";
+        if (defs.Any(d => d.Body.Length == 0)) yield return "macro.emptyDefinition";
+        var uses = defs.Select(d => commas < d.Params.Count && d.Params[commas] is var p && p.Length > 0
+                                    && System.Text.RegularExpressions.Regex.IsMatch(d.Body, @"(?<![\w#])" + System.Text.RegularExpressions.Regex.Escape(p) + @"(?!\w)"))
+                       .ToList();
+        if (uses.Any(u => u)) yield return "macro.usesArg";
+        if (uses.Any(u => !u)) yield return "macro.dropsArg";
+    }
+
+    static bool IsWord(char c) => char.IsLetterOrDigit(c) || c == '_' || c == '$';
 
     /// <summary>The block the offset sits in, read from the brace nesting before it: a block opened after <c>)</c>
     /// is a function body, after <c>=</c> an initializer.</summary>

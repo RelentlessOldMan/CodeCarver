@@ -55,11 +55,67 @@ public sealed class CheckClosureTests
         Assert.Contains("stage0.verify.keptByCheck = 0", summary);
     }
 
+    /// <summary>Registrations at file scope the carve keeps on its own: macro seen or not, words before it or not.</summary>
+    [Theory]
+    [InlineData("#define REG(fn) static const struct entry entry_##fn = { #fn, fn }\n", "REG(on_start);")]
+    [InlineData("#define REG(fn) static int (*const reg_##fn)(void) = fn\n", "REG(on_start);")]
+    [InlineData("#define REG2(fn, n) static const struct entry entry_##n = { #fn, fn }\n#define REG(fn) REG2(fn, fn)\n", "REG(on_start);")]
+    [InlineData("#define REG(fn) static const struct entry entry_##fn = { #fn, fn }\n", "static REG(on_start);")]
+    [InlineData("#define REG(fn) static const struct entry entry_##fn = { #fn, fn }\n", "REG(on_start)")]
+    [InlineData("", "static UNSEEN_REG(on_start);")]
+    [InlineData("#if 0\n#define REG(fn) static int (*const reg_##fn)(void) = fn\n#else\n#define REG(fn)\n#endif\n", "REG(on_start);")]
+    [InlineData("", "__typeof__(on_start) *const start_ptr;")]
+    [InlineData("", "UNSEEN_A UNSEEN_REG(on_start);")]
+    public void FileScopeRegistration_IsKeptWithoutTheCheck(string macro, string use)
+    {
+        using var t = new TreeCarve();
+        t.W("reg.h", "struct entry { const char *n; int (*f)(void); };\n" + macro)
+         .W("main.c", "#include \"reg.h\"\nstatic int on_start(void) { return 1; }\n" + use + "\n"
+                    + "static int unused_one(void) { return 3; }\nint main(void) { return 0; }\n")
+         .Compile("main.c");
+        var (code, o, e) = t.Carve(extraToml: "[stages.p]\ncarveSourceFileContents = true\n");
+        Assert.True(code == 0, o + e);
+        var summary = File.ReadAllText(Path.Combine(t.Root, "out", "p", "codecarver", "summary.txt"));
+        Assert.True(summary.Contains("stage0.verify.keptByCheck = 0"),
+            string.Join("\n", summary.Split('\n').Where(l => l.Contains("keptByCheck"))) + "\n" + File.ReadAllText(Path.Combine(t.Root, "out", "p", "carved", "main.c")));
+    }
+
+    /// <summary>A macro in the tree that drops the name (empty, or not using that argument): the carve is right that
+    /// nothing uses it, the check keeps it anyway, and the use's shape says so (work eval, 1.0.197: three statics
+    /// kept at file scope that 1.0.197 did not explain).</summary>
+    [Theory]
+    [InlineData("#define REG(fn)\n", "macro.emptyDefinition")]
+    [InlineData("#define REG(fn) extern int reg_marker\n", "macro.dropsArg")]
+    public void FileScopeUse_ThroughAMacroThatDropsIt_SaysSo(string macro, string shape)
+    {
+        using var t = new TreeCarve();
+        t.W("reg.h", macro)
+         .W("main.c", "#include \"reg.h\"\nstatic int on_start(void) { return 1; }\nREG(on_start);\nint main(void) { return 0; }\n")
+         .Compile("main.c");
+        var (code, o, e) = t.Carve(extraToml: "[stages.p]\ncarveSourceFileContents = true\n");
+        Assert.True(code == 0, o + e);
+        var summary = File.ReadAllText(Path.Combine(t.Root, "out", "p", "codecarver", "summary.txt"));
+        Assert.Contains("stage0.verify.keptByCheck.prunedFromKeptFile.use.stmt.macroCall = 1", summary);
+        Assert.Contains($"stage0.verify.keptByCheck.prunedFromKeptFile.use.{shape} = 1", summary);
+    }
+
+    [Theory]
+    [InlineData("static REG(on_x);\n", "stmt.wordsThenCall", "macro.notInTree")]
+    [InlineData("REG(on_x);\n", "stmt.macroCall", "macro.notInTree")]
+    [InlineData("int (*p)(void) __attribute__((unused));\nstatic const int x = sizeof(on_x);\n", null, null)]
+    public void UseShape_DescribesTheFileScopeStatement(string text, string? stmt, string? macro)
+    {
+        var shapes = CodeCarver.Core.Diagnostics.UseShape.Describe(text, text.Split('\n').Length - 1, "on_x", _ => null);
+        if (stmt is null) { Assert.DoesNotContain(shapes, s => s.StartsWith("stmt.")); return; }
+        Assert.Contains(stmt, shapes);
+        Assert.Contains(macro!, shapes);
+    }
+
     [Fact]
     public void FileScopeInvocations_FindRegistrations_NotPrototypesOrKnRHeads()
     {
         const string code = "int proto(int a);\nREG(on_a);\nREG2(on_b, 3)\nstatic int f(void) { return 0; }\n"
-                          + "old(a, b)\nint a;\nint b;\n{ return a; }\nstatic int g = 1;\nREG(on_c);\n";
+                          + "old(a, b)\nint a;\nint b;\n{ return a; }\nstatic int g = 1;\nREG(on_c);\nstatic unsigned helper(long x);\n";
         var found = CodeCarver.Core.Preprocess.FileScopeInvocations.Find(code).ToList();
         Assert.Equal(new[] { "REG", "REG2", "REG" }, found.Select(x => x.Macro));
         Assert.Equal(new[] { 2, 3, 10 }, found.Select(x => x.Line));

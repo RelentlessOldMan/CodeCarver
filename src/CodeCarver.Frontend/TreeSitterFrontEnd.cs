@@ -328,6 +328,26 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // Names the source writes for a symbol, by symbol: object-like rename macros (`#define summon_fn real_summon`:
     // real_summon <- summon_fn), asm labels and `#pragma redefine_extname` (surface_name <- hidden_name).
     private readonly Dictionary<string, HashSet<string>> _renamedFrom = new(StringComparer.Ordinal);
+    // File-scope `words NAME(args);` statements: a registration when NAME is no function or macro (decided after the parse).
+    private readonly List<(NodeId File, string Macro, List<string> Names)> _wordInvocations = new();
+    // Every #define's body by name (function-like: "params) body"), at most 8 per name.
+    private Dictionary<string, (bool FnLike, List<string> Bodies)> _macroBodies = new(StringComparer.Ordinal);
+
+    /// <summary>The definitions in the tree of function-like macro <paramref name="name"/>: parameters and body (comments
+    /// blanked), or null when the tree does not define it so. For diagnostics (UseShape).</summary>
+    public IReadOnlyList<(IReadOnlyList<string> Params, string Body)>? FunctionMacro(string name)
+    {
+        if (!_macroBodies.TryGetValue(name, out var b) || !b.FnLike) return null;
+        var list = new List<(IReadOnlyList<string>, string)>();
+        foreach (var raw in b.Bodies)
+        {
+            var flat = Regex.Replace(raw, @"\\\r?\n", " ");
+            var close = flat.IndexOf(')');
+            if (close < 0) continue;
+            list.Add((flat[..close].Split(',').Select(p => p.Trim()).ToList(), SourceText.CodeOnly(flat[(close + 1)..]).Trim()));
+        }
+        return list;
+    }
     private static readonly Regex IdentifierOnly = new(@"^[A-Za-z_$][\w$]*$", RegexOptions.Compiled);
 
     /// <summary>The names the source may write for linker symbol <paramref name="symbol"/>: through asm labels,
@@ -458,6 +478,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _includeDirectives.Clear();
         _c99InlineFns.Clear();
         _renamedFrom.Clear();
+        _wordInvocations.Clear();
         _fileLocal.Clear();
         _condExternMacros.Clear();
         _callFreeMacros.Clear();
@@ -605,6 +626,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
         foreach (var (from, name) in pendingCalls)
             ResolveUse(graph, from, name, functionsByName, macrosByName, globalsByName, EdgeKind.Calls, Visible);
+        // `static REGISTER(fn);`: words before the call. A prototype looks the same (`static int f(int x);`), so the call
+        // counts only when nothing in the tree is a function or macro of that name (see FileScopeInvocations).
+        foreach (var (from, macro, names) in _wordInvocations)
+            if (!functionsByName.ContainsKey(macro) && !macrosByName.ContainsKey(macro) && !_funcLikeMacroNames.Contains(macro))
+                foreach (var name in names) pendingRefs.Add((from, name));
+        _wordInvocations.Clear();
         foreach (var (from, name) in pendingRefs)
             ResolveUse(graph, from, name, functionsByName, macrosByName, globalsByName, EdgeKind.AddressTaken, Visible);
         // A macro that expands to a call/another macro reaches those — so a function or global used ONLY
@@ -857,6 +884,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             : new Regex(@"\b(?:" + string.Join("|", keep.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
 
         _definers = DefinerMacros.Build(bodies);
+        _macroBodies = bodies;
         _objectMacros = new HashSet<string>(defs.Keys, StringComparer.Ordinal);
         _pasteTable = PasteMacros.Build(bodies, _objectMacros.Contains);
         _pasteUse = PasteMacros.UseRegex(_pasteTable);
@@ -2062,10 +2090,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // the root): the parser reads a prototype, but it registers its arguments (see FileScopeInvocations). A macro
         // the tree defines is read through its body instead.
         if (IsTranslationUnit(path))
-            foreach (var (line, macro, names) in FileScopeInvocations.Find(SourceText.CodeOnly(text)))
+            foreach (var (line, macro, names, afterWords) in FileScopeInvocations.Find(SourceText.CodeOnly(text)))
             {
                 if (_funcLikeMacroNames.Contains(macro) || (dead is not null && line < dead.Length && dead[line])) continue;
-                foreach (var name in names) pendingRefs.Add((fileNode, name));
+                if (afterWords) _wordInvocations.Add((fileNode, macro, names));   // decided once every file is read
+                else foreach (var name in names) pendingRefs.Add((fileNode, name));
             }
 
         // Pass 4: non-call references INSIDE functions (address-taken: a callback passed/assigned).

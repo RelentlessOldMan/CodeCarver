@@ -17,14 +17,22 @@ namespace CodeCarver.Core.Preprocess;
 /// </summary>
 public static class FileScopeInvocations
 {
-    private static readonly Regex Head = new(@"\G\s*([A-Za-z_]\w*)\s*\(", RegexOptions.Compiled);
+    // Optional words first (`static REGISTER(fn);`, `MODULE_ATTR REGISTER(fn);`), then the name and its '('.
+    private static readonly Regex Head = new(@"\G\s*(?<words>(?:[A-Za-z_]\w*\s+){0,4}?)(?<name>[A-Za-z_]\w*)\s*\(", RegexOptions.Compiled);
     private static readonly Regex Ident = new(@"[A-Za-z_]\w*", RegexOptions.Compiled);
+    // A word that makes the statement a declaration (its return type), not a registration.
+    private static readonly HashSet<string> TypeWords = new(StringComparer.Ordinal)
+    {
+        "void", "int", "char", "short", "long", "float", "double", "signed", "unsigned", "struct", "union", "enum",
+        "_Bool", "bool", "typedef", "return", "sizeof",
+    };
 
     /// <summary>Each invocation in <paramref name="code"/> (already <see cref="SourceText.CodeOnly"/>): its 1-based line,
-    /// the macro name, and the identifiers in its arguments.</summary>
-    public static IEnumerable<(int Line, string Macro, List<string> Names)> Find(string code)
+    /// the macro name, the identifiers in its arguments, and whether words came first (<c>static REGISTER(fn);</c>:
+    /// shaped like a prototype too, so the caller decides by whether the name is a function or macro anywhere).</summary>
+    public static IEnumerable<(int Line, string Macro, List<string> Names, bool AfterWords)> Find(string code)
     {
-        var results = new List<(int, string, List<string>)>();
+        var results = new List<(int, string, List<string>, bool)>();
         var depth = 0;
         var line = 1;
         var statementStart = true;
@@ -34,11 +42,13 @@ public static class FileScopeInvocations
             {
                 statementStart = false;
                 var m = Head.Match(code, i);
-                if (m.Success && m.Index == i && Close(code, m.Index + m.Length - 1) is var close && close > 0 && Ends(code, close + 1))
+                var words = m.Success ? Ident.Matches(m.Groups["words"].Value).Select(x => x.Value).ToList() : new List<string>();
+                if (m.Success && m.Index == i && !words.Any(TypeWords.Contains) && !TypeWords.Contains(m.Groups["name"].Value)
+                    && Close(code, m.Index + m.Length - 1) is var close && close > 0 && Ends(code, close + 1, words.Count > 0))
                 {
                     var args = code[(m.Index + m.Length)..close];
                     var names = Ident.Matches(args).Select(x => x.Value).Distinct(StringComparer.Ordinal).ToList();
-                    results.Add((line, m.Groups[1].Value, names));
+                    results.Add((line, m.Groups["name"].Value, names, words.Count > 0));
                     for (var k = i; k <= close; k++) if (code[k] == '\n') line++;
                     i = close;
                     statementStart = true;
@@ -69,11 +79,12 @@ public static class FileScopeInvocations
 
     /// <summary>After the ')': a ';', the end, or a following statement with '(' before its ';' or '{' (so not K&amp;R
     /// parameter declarations, and not a body).</summary>
-    static bool Ends(string code, int at)
+    static bool Ends(string code, int at, bool afterWords)
     {
         var k = at;
         while (k < code.Length && char.IsWhiteSpace(code[k])) k++;
         if (k >= code.Length || code[k] == ';') return true;
+        if (afterWords) return false;   // `static int f(a, b) {` and friends: only `words NAME(args);` counts
         if (code[k] == '{') return false;
         var sawNewline = code.AsSpan(at, k - at).Contains('\n');
         if (!sawNewline) return false;

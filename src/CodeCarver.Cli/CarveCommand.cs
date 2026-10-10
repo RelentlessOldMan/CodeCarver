@@ -2148,7 +2148,8 @@ public static class CarveCommand
                 string useText;
                 try { useText = usePath is null ? "" : File.ReadAllText(usePath, System.Text.Encoding.Latin1); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { useText = ""; }
-                var useShapes = useText.Length == 0 ? new[] { "fileNotRead" } : CodeCarver.Core.Diagnostics.UseShape.Describe(useText, v.Line, v.Name);
+                var useShapes = useText.Length == 0 ? new[] { "fileNotRead" } : CodeCarver.Core.Diagnostics.UseShape.Describe(useText, v.Line, v.Name,
+                    fe is TreeSitterFrontEnd tsm ? tsm.FunctionMacro : null);
                 if (EmittedLinkCheck.IsHeader(v.ReferencedIn)) useShapes = useShapes.Append("inHeader").ToArray();
                 foreach (var s in useShapes) byCause[$"{cause}.use.{s}"] = byCause.GetValueOrDefault($"{cause}.use.{s}") + 1;
                 // What an unrecognised definition looks like, as for a failure (the parser gap stays visible).
