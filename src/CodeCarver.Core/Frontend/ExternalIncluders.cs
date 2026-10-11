@@ -31,6 +31,19 @@ public static class ExternalIncluders
         { ".h", ".hh", ".hpp", ".hxx", ".h++", ".inc", ".def", ".inl", ".ipp", ".tcc", ".tpp",
           ".c", ".cc", ".cpp", ".cxx", ".c++", ".s", ".sx" };
 
+    /// <summary>The only lines <see cref="Find"/> looks at: an <c>#include</c> or a <c>#define</c> of a header name. A caller
+    /// that reads the file anyway keeps these and passes them as <c>cachedLines</c>.</summary>
+    public static List<string> RelevantLines(string text)
+    {
+        // Split as File.ReadLines splits (\n, \r\n or a lone \r), which is what Find reads otherwise.
+        var lines = new List<string>();
+        using var r = new StringReader(text);
+        for (var line = r.ReadLine(); line is not null; line = r.ReadLine())
+            if (line.Contains("include", StringComparison.Ordinal)
+                || line.Contains("define", StringComparison.Ordinal) && (line.Contains('"') || line.Contains('<'))) lines.Add(line);
+        return lines;
+    }
+
     /// <param name="outsideFiles">Full paths of outside code the build compiled or opened.</param>
     /// <param name="includeDirs">Every include directory of the build log's commands (full paths).</param>
     /// <param name="root">The carve root (full path).</param>
@@ -43,11 +56,14 @@ public static class ExternalIncluders
     /// command's directory: looked for there first, then through the include directories, like the compiler does.</param>
     /// <param name="realDirectory">A directory's real path through links (junctions, symlinks, subst and mapped
     /// drives), or null; defaults to <see cref="RealPath.Directory"/>.</param>
+    /// <param name="cachedLines">A file's <see cref="RelevantLines"/>, when the caller already read it, or null: such a
+    /// file is not read again.</param>
     public static Result Find(IEnumerable<string> outsideFiles, IEnumerable<string> includeDirs, string root,
                               IEnumerable<string> rootFiles, Func<string, bool> skip, Func<string, IEnumerable<string>?> readLines,
                               FileLookup? files = null, int maxFiles = 200_000,
                               IEnumerable<(string Dir, string Raw)>? forcedIncludes = null,
-                              Func<string, string?>? realDirectory = null)
+                              Func<string, string?>? realDirectory = null,
+                              Func<string, IReadOnlyList<string>?>? cachedLines = null)
     {
         var cmp = PathComparer.Comparison;
         var rootFull = Path.GetFullPath(root);
@@ -66,7 +82,8 @@ public static class ExternalIncluders
         var walkSpelling = rootList.GroupBy(r => r, PathComparer.Default).ToDictionary(g => g.Key, g => g.First(), PathComparer.Default);
         var found = new HashSet<string>(StringComparer.Ordinal);
         var seen = new HashSet<string>(PathComparer.Default);
-        var queue = new Queue<string>();
+        var queue = new List<string>();   // breadth-first: read from `head`, the next ReadAhead.Window read ahead
+        var head = 0;
         var queued = 0;
         var capped = false;
         // The file's path relative to the root, or null outside it: by spelling first, then through the real path of
@@ -91,7 +108,7 @@ public static class ExternalIncluders
                 if (queued >= maxFiles) { capped = true; return; }
                 queued++;
             }
-            queue.Enqueue(full);
+            queue.Add(full);
         }
         // Under the root (as the walk spells it): found, and followed. Outside it: followed.
         void Reached(string full)
@@ -148,15 +165,34 @@ public static class ExternalIncluders
 
         var scanned = 0;
         var literals = new List<string>();
-        while (queue.Count > 0)
+        // Small files are read ahead on the thread pool (a network drive waits a round trip per open); a big one, maybe
+        // a gigabyte generated header, is streamed when its turn comes.
+        const long ReadAheadMaxBytes = 8_000_000;
+        ReadAhead.EnsureThreads();
+        var reads = new List<Task<(List<string>? Lines, bool Stream)>?>();
+        (List<string>? Lines, bool Stream) Prefetch(string p, Func<string, IEnumerable<string>?> read)
         {
-            var full = queue.Dequeue();
+            if (cachedLines?.Invoke(p) is { } kept) return (kept as List<string> ?? kept.ToList(), false);
+            try { return new FileInfo(p).Length > ReadAheadMaxBytes ? (null, true) : (read(p)?.ToList(), false); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return (null, true); }   // the stream says why
+        }
+        while (head < queue.Count)
+        {
+            for (var a = reads.Count; a < queue.Count && a < head + ReadAhead.Window; a = reads.Count)
+            {
+                var p = queue[a];
+                reads.Add(Task.Run(() => Prefetch(p, readLines)));
+            }
+            var full = queue[head];
+            var pre = reads[head]!.GetAwaiter().GetResult();
+            reads[head] = null;
+            head++;
             var fromDir = Path.GetDirectoryName(full) ?? "";
             var computed = false;
             literals.Clear();
             try
             {
-                if (!files.Exists(full) || readLines(full) is not { } lines) continue;
+                if (!files.Exists(full) || (pre.Stream ? readLines(full) : pre.Lines) is not { } lines) continue;
                 scanned++;
                 foreach (var line in lines)
                 {

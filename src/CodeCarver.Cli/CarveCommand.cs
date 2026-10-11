@@ -862,13 +862,41 @@ public static class CarveCommand
         }
         var readErrors = 0;
         var readWarned = new HashSet<string>(StringComparer.Ordinal);
+        // Read-ahead: every pass walks parseRels in order, so reading file i starts the next ReadAhead.Window on the
+        // thread pool (a network drive waits a round trip per file: a work-shaped tree's macro pre-pass took 4.5 s on a
+        // share against 0.15 s locally). At most a window of texts is held; a read out of order just reads.
+        var relIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var i = 0; i < parseRels.Count; i++) relIndex.TryAdd(parseRels[i], i);
+        CodeCarver.Core.Util.ReadAhead.EnsureThreads();
+        var ahead = new Dictionary<int, Task<(string? Text, Exception? Error)>>();
+        (string? Text, Exception? Error) Load(string full)
+        {
+            try { return (File.ReadAllText(full), null); }
+            catch (Exception ex) { return (null, ex); }
+        }
+        bool Readable(string rel) => !skipParse.Contains(rel) && !notBuilt.Contains(rel) && fullByRel.ContainsKey(rel);
         string ReadRel(string rel)
         {
-            if (skipParse.Contains(rel) || notBuilt.Contains(rel)) return "";
-            if (!fullByRel.TryGetValue(rel, out var full)) return "";
-            try { return File.ReadAllText(full); }
-            catch (Exception ex)   // an unreadable/locked/odd file must not sink the whole run
-            {
+            if (!Readable(rel)) return "";
+            var full = fullByRel[rel];
+            (string? Text, Exception? Error) got;
+            Task<(string? Text, Exception? Error)>? pre = null;
+            if (relIndex.TryGetValue(rel, out var at))
+                lock (ahead)
+                {
+                    foreach (var k in ahead.Keys.Where(k => k < at || k > at + CodeCarver.Core.Util.ReadAhead.Window).ToList()) ahead.Remove(k);
+                    ahead.Remove(at, out pre);
+                    for (var j = at + 1; j < parseRels.Count && j <= at + CodeCarver.Core.Util.ReadAhead.Window; j++)
+                        if (!ahead.ContainsKey(j) && Readable(parseRels[j]))
+                        {
+                            var next = fullByRel[parseRels[j]];
+                            ahead[j] = Task.Run(() => Load(next));
+                        }
+                }
+            got = pre is not null ? pre.GetAwaiter().GetResult() : Load(full);
+            if (got.Text is { } text) return text;
+            var ex = got.Error!;
+            {   // an unreadable/locked/odd file must not sink the whole run
                 if (readWarned.Add(rel))
                 {
                     readErrors++;
@@ -943,58 +971,63 @@ public static class CarveCommand
             var queue = new Queue<string>();
             foreach (var rel in parseRels)
                 if (!skipParse.Contains(rel) && !notBuilt.Contains(rel)) queue.Enqueue(fullByRel[rel]);
+            static string? TryRead(string full) { try { return File.ReadAllText(full); } catch { return null; } }
             while (queue.Count > 0)
             {
-                var fromFull = queue.Dequeue();
-                string text;
-                try { text = File.ReadAllText(fromFull); } catch { continue; }
-                var fromDir = Path.GetDirectoryName(fromFull) ?? dir;
-                foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
+                // Everything queued now, read ahead in order (what it adds is queued behind it, as one at a time would).
+                var batch = queue.ToList();
+                queue.Clear();
+                foreach (var (fromFull, read) in CodeCarver.Core.Util.ReadAhead.Map(batch, TryRead))
                 {
-                    var inc = m.Groups[1].Value;
-                    if (exts.Any(e => inc.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue; // .h: parsed already
-
-                    // Resolve in order: beside the includer, then each -I dir, then (last resort) by basename
-                    // anywhere in the tree. Over-approximate: take every in-tree match (sound for building).
-                    // Existence comes from directory listings, and each name's -I search runs once.
-                    var cands = new List<string>();
-                    if (fileLookup.Probe(fromDir, inc) is { } beside && beside.StartsWith(rootUnder, StringComparison.OrdinalIgnoreCase)) cands.Add(beside);
-                    if (!refViaDirs.TryGetValue(inc, out var viaDirs))
-                        refViaDirs[inc] = viaDirs = searchDirs.Select(sd => fileLookup.Probe(sd, inc))
-                            .OfType<string>().Where(f => f.StartsWith(rootUnder, StringComparison.OrdinalIgnoreCase)).ToList();
-                    cands.AddRange(viaDirs);
-                    if (cands.Count == 0 && BaseIndex().TryGetValue(Path.GetFileName(inc), out var hits))
+                    if (read is not { } text) continue;
+                    var fromDir = Path.GetDirectoryName(fromFull) ?? dir;
+                    foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
                     {
-                        cands.AddRange(hits);
-                        // The basename fallback is over-approximate: if a name occurs in several dirs it emits
-                        // ALL of them (sound for building, but a source of bloat). Note it so an over-keep is
-                        // attributable -- supply -I via --build-log to resolve it exactly.
-                        if (hits.Count > 1 && unresolved.Add(("ambig:" + Path.GetFileName(inc), inc)))
-                            CappedWarn("include", $"#include \"{inc}\" matched {hits.Count} files by basename "
-                                                    + "(kept all — sound but may over-keep; a build log with -I flags (buildLogs) disambiguates)");
-                    }
-
-                    if (cands.Count == 0)
-                    {
-                        var fromRel = Path.GetRelativePath(dir, fromFull).Replace('\\', '/');
-                        if (unresolved.Add((fromRel, inc)))
-                            CappedWarn("include", $"{fromRel}: #include \"{inc}\" resolved to no file in the tree — "
-                                                    + "the carved tree may not compile (a build log with -I flags (buildLogs) resolves it)");
-                        continue;
-                    }
-                    foreach (var target in cands)
-                    {
-                        if (have.Contains(target) || !gathered.Add(target) || !File.Exists(target)) continue;
-                        if (SafeLength(target) > maxParseBytes) continue;   // vanished/locked: long.MaxValue, skipped (RB4)
-                        string itext;
-                        try { itext = File.ReadAllText(target); }
-                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                        var inc = m.Groups[1].Value;
+                        if (exts.Any(e => inc.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue; // .h: parsed already
+    
+                        // Resolve in order: beside the includer, then each -I dir, then (last resort) by basename
+                        // anywhere in the tree. Over-approximate: take every in-tree match (sound for building).
+                        // Existence comes from directory listings, and each name's -I search runs once.
+                        var cands = new List<string>();
+                        if (fileLookup.Probe(fromDir, inc) is { } beside && beside.StartsWith(rootUnder, StringComparison.OrdinalIgnoreCase)) cands.Add(beside);
+                        if (!refViaDirs.TryGetValue(inc, out var viaDirs))
+                            refViaDirs[inc] = viaDirs = searchDirs.Select(sd => fileLookup.Probe(sd, inc))
+                                .OfType<string>().Where(f => f.StartsWith(rootUnder, StringComparison.OrdinalIgnoreCase)).ToList();
+                        cands.AddRange(viaDirs);
+                        if (cands.Count == 0 && BaseIndex().TryGetValue(Path.GetFileName(inc), out var hits))
                         {
-                            err.WriteLine($"  warn    : could not read included {Path.GetFileName(target)} ({ex.GetType().Name}) — not scanned; check it is in the carved tree");
+                            cands.AddRange(hits);
+                            // The basename fallback is over-approximate: if a name occurs in several dirs it emits
+                            // ALL of them (sound for building, but a source of bloat). Note it so an over-keep is
+                            // attributable -- supply -I via --build-log to resolve it exactly.
+                            if (hits.Count > 1 && unresolved.Add(("ambig:" + Path.GetFileName(inc), inc)))
+                                CappedWarn("include", $"#include \"{inc}\" matched {hits.Count} files by basename "
+                                                        + "(kept all — sound but may over-keep; a build log with -I flags (buildLogs) disambiguates)");
+                        }
+    
+                        if (cands.Count == 0)
+                        {
+                            var fromRel = Path.GetRelativePath(dir, fromFull).Replace('\\', '/');
+                            if (unresolved.Add((fromRel, inc)))
+                                CappedWarn("include", $"{fromRel}: #include \"{inc}\" resolved to no file in the tree — "
+                                                        + "the carved tree may not compile (a build log with -I flags (buildLogs) resolves it)");
                             continue;
                         }
-                        refIncludes.Add((Path.GetRelativePath(dir, target).Replace('\\', '/'), itext));
-                        queue.Enqueue(target); // an .inc may include another — re-read on dequeue (cache-hot)
+                        foreach (var target in cands)
+                        {
+                            if (have.Contains(target) || !gathered.Add(target) || !File.Exists(target)) continue;
+                            if (SafeLength(target) > maxParseBytes) continue;   // vanished/locked: long.MaxValue, skipped (RB4)
+                            string itext;
+                            try { itext = File.ReadAllText(target); }
+                            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                            {
+                                err.WriteLine($"  warn    : could not read included {Path.GetFileName(target)} ({ex.GetType().Name}) — not scanned; check it is in the carved tree");
+                                continue;
+                            }
+                            refIncludes.Add((Path.GetRelativePath(dir, target).Replace('\\', '/'), itext));
+                            queue.Enqueue(target); // an .inc may include another — re-read on dequeue (cache-hot)
+                        }
                     }
                 }
             }
@@ -1141,6 +1174,8 @@ public static class CarveCommand
             };
         }
         var outsideNames = new HashSet<string>(StringComparer.Ordinal);   // identifiers in headers read outside the root
+        // What ExternalIncluders reads of each outside header the macro scan already read: not read a second time.
+        var outsideIncludeLines = new Dictionary<string, List<string>>(CodeCarver.Core.Util.PathComparer.Default);
         if (defines is not null && closedWorld && closureLang)
         {
             // pre-parse is often the longest phase on a product tree: say which part.
@@ -1195,18 +1230,36 @@ public static class CarveCommand
             var outsideScanned = 0;
             var notHere = 0;                      // headers the trace says the build opened that aren't on this machine
             var unseen = new List<string>();      // why some header can't be read: shown on the config line
-            void ScanFile(string full)
+            // Whether to read it: once, a header, and on this machine.
+            bool Wanted(string full)
             {
-                if (!scannedFull.Add(full) || !headerExt.Contains(Path.GetExtension(full))) return;
+                if (!scannedFull.Add(full) || !headerExt.Contains(Path.GetExtension(full))) return false;
+                // tools/capture records successful opens only, so a missing one is a path from another machine
+                // (a WSL or CI path with no pathMap): its macros can't be seen.
+                if (!fileLookup.Exists(full)) { if (Path.GetExtension(full).Length > 0) notHere++; return false; }
+                return true;
+            }
+            // Its text, or null when it can't be read; extensionless paths are mostly programs, not headers.
+            static (string? Text, bool Unreadable) ReadOutside(string full)
+            {
                 try
                 {
-                    // tools/capture records successful opens only, so a missing one is a path from another machine
-                    // (a WSL or CI path with no pathMap): its macros can't be seen. Extensionless paths are mostly
-                    // programs, not headers.
-                    if (!fileLookup.Exists(full)) { if (Path.GetExtension(full).Length > 0) notHere++; return; }
-                    if (Path.GetExtension(full).Length == 0 && new FileInfo(full).Length > 4_000_000) return;  // not a header
-                    var text = File.ReadAllText(full);
+                    if (Path.GetExtension(full).Length == 0 && new FileInfo(full).Length > 4_000_000) return (null, false);  // not a header
+                    return (File.ReadAllText(full), false);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return (null, true); }
+            }
+            void ScanFile(string full)
+            {
+                if (Wanted(full)) ScanRead(full, ReadOutside(full));
+            }
+            void ScanRead(string full, (string? Text, bool Unreadable) read)
+            {
+                if (read.Unreadable) { unseen.Add("an unreadable header"); return; }
+                if (read.Text is not { } text) return;
+                {
                     outsideScanned++;
+                    outsideIncludeLines[full] = ExternalIncluders.RelevantLines(text);
                     // What it names may be a macro a carved big header defines (an SDK header testing a config
                     // macro): header carving must keep those.
                     foreach (var m in Identifier.EnumerateMatches(text)) outsideNames.Add(text.Substring(m.Index, m.Length));
@@ -1214,7 +1267,6 @@ public static class CarveCommand
                         if (condIdents.Contains(m.Groups[1].Value)) ambientMacros.Add(m.Groups[1].Value);
                     Includes(Path.GetDirectoryName(full) ?? dir, text);
                 }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { unseen.Add("an unreadable header"); }
             }
             var incDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var cc in buildCmds)
@@ -1227,7 +1279,7 @@ public static class CarveCommand
             var rootFull = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir));
             if (buildOpenedOutside is not null)
             {
-                foreach (var f in buildOpenedOutside) ScanFile(f);
+                foreach (var (f, read) in CodeCarver.Core.Util.ReadAhead.Map(buildOpenedOutside.Where(Wanted).ToList(), ReadOutside)) ScanRead(f, read);
                 if (notHere > 0) unseen.Add($"{notHere} header(s) the build trace opened aren't on this machine (system headers of another OS, or paths that need pathMap)");
             }
             else
@@ -1239,8 +1291,8 @@ public static class CarveCommand
                     // A dir that contains the root (-I.. ) would mean the whole disk: its top level only.
                     var holdsRoot = rootFull.StartsWith(Path.TrimEndingDirectorySeparator(d) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
                     var opt = new EnumerationOptions { RecurseSubdirectories = !holdsRoot, IgnoreInaccessible = true };
-                    foreach (var f in Directory.EnumerateFiles(d, "*", opt))
-                        if (Path.GetExtension(f).Length > 0) ScanFile(Path.GetFullPath(f));
+                    var inDir = Directory.EnumerateFiles(d, "*", opt).Where(f => Path.GetExtension(f).Length > 0).Select(Path.GetFullPath).Where(Wanted).ToList();
+                    foreach (var (f, read) in CodeCarver.Core.Util.ReadAhead.Map(inDir, ReadOutside)) ScanRead(f, read);
                 }
                 if (missingDirs > 0) unseen.Add($"{missingDirs} include dir(s) from the build log don't exist here");
             }
@@ -1619,7 +1671,8 @@ public static class CarveCommand
             {
                 var extSw = System.Diagnostics.Stopwatch.StartNew();
                 var ext = ExternalIncluders.Find(outsideCode, logIncDirs, rootFullX, fullByRel.Keys, isSystemPath, p => File.ReadLines(p), fileLookup,
-                                                 forcedIncludes: outsideForced);
+                                                 forcedIncludes: outsideForced,
+                                                 cachedLines: p => outsideIncludeLines.TryGetValue(p, out var l) ? l : null);
                 summary["time.outsideIncludes.ms"] = extSw.ElapsedMilliseconds;
                 summary["outsideIncludes.filesRead"] = ext.FilesScanned;
                 summary["outsideIncludes.capped"] = ext.Capped;

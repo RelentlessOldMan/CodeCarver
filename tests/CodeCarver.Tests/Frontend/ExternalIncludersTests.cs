@@ -191,4 +191,46 @@ public sealed class ExternalIncludersTests
         }
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException) { return false; }
     }
+
+    /// <summary>A header the caller already read (its RelevantLines passed as cachedLines) gives the same answer as
+    /// reading it, and isn't read again: here the cached copy exists only in memory.</summary>
+    [Fact]
+    public void CachedLines_GiveTheSameAnswer_WithoutReadingAgain()
+    {
+        var work = Path.Combine(Path.GetTempPath(), "cc-ext-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var root = Path.Combine(work, "mod");
+            Directory.CreateDirectory(Path.Combine(root, "pub"));
+            File.WriteAllText(Path.Combine(root, "pub", "mod_api.h"), "int mod_api(void);\n");
+            File.WriteAllText(Path.Combine(root, "pub", "mod_cfg.h"), "#define MOD_CFG 1\n");
+            var sdk = Path.Combine(work, "sdk");
+            Directory.CreateDirectory(sdk);
+            var glue = Path.Combine(sdk, "glue.h");
+            var text = "#ifndef GLUE_H\r#define GLUE_H\r#include \"pub/mod_api.h\"\r#define CFG_HEADER \"pub/mod_cfg.h\"\r#include CFG_HEADER\rint g;\r#endif\r";
+            File.WriteAllText(glue, text);
+            var rootFiles = new[] { "pub/mod_api.h", "pub/mod_cfg.h" };
+            var dirs = new[] { root, sdk };
+            var read = ExternalIncluders.Find(new[] { glue }, dirs, root, rootFiles, _ => false, File.ReadLines);
+            var cached = ExternalIncluders.RelevantLines(text);
+            Assert.DoesNotContain(cached, l => l.Contains("int g"));
+            var reads = 0;
+            var fromCache = ExternalIncluders.Find(new[] { glue }, dirs, root, rootFiles, _ => false,
+                p => { if (p == glue) Interlocked.Increment(ref reads); return File.ReadLines(p); },
+                cachedLines: p => p == glue ? cached : null);
+            Assert.Equal(new[] { "pub/mod_api.h", "pub/mod_cfg.h" }, read.Headers);
+            Assert.Equal(read.Headers, fromCache.Headers);
+            Assert.Equal(0, reads);
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
+    [Fact]
+    public void ReadAhead_KeepsTheOrder()
+    {
+        var items = Enumerable.Range(0, 500).ToList();
+        var got = CodeCarver.Core.Util.ReadAhead.Map(items, i => { Thread.Sleep(i % 7); return i * 2; }).ToList();
+        Assert.Equal(items, got.Select(g => g.Item));
+        Assert.All(got, g => Assert.Equal(g.Item * 2, g.Value));
+    }
 }

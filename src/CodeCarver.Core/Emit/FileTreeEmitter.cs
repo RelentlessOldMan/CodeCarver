@@ -26,6 +26,9 @@ public sealed record EmitResult(int FilesWritten, long BytesWritten, IReadOnlyLi
 /// </summary>
 public static class FileTreeEmitter
 {
+    // Files read and written at once: the work is waiting on the disk (a network drive: a round trip each), not the CPU.
+    private const int IoParallelism = CodeCarver.Core.Util.ReadAhead.Window;
+
     public static EmitResult Emit(CarvePlan plan, string sourceRoot, string outDir)
     {
         ArgumentNullException.ThrowIfNull(plan);
@@ -39,13 +42,18 @@ public static class FileTreeEmitter
         var written = new List<string>();
         long bytes = 0;
 
-        foreach (var rel in keptFiles)
+        // Copied in parallel (a network drive waits a round trip per file), listed in the kept order.
+        var copied = new long[keptFiles.Count];
+        CodeCarver.Core.Util.ReadAhead.EnsureThreads();
+        Parallel.For(0, keptFiles.Count, new ParallelOptions { MaxDegreeOfParallelism = IoParallelism }, i =>
         {
+            copied[i] = -1;
+            var rel = keptFiles[i];
             var src = Path.Combine(sourceRoot, rel);
-            if (!File.Exists(src)) continue; // a header/path not present on disk (e.g. synthesized) — skip
+            if (!File.Exists(src)) return; // a header/path not present on disk (e.g. synthesized) — skip
 
             var dst = Path.Combine(outDir, rel);
-            if (SameFile(src, dst)) continue; // out overlaps source — never copy a file onto itself
+            if (SameFile(src, dst)) return; // out overlaps source — never copy a file onto itself
             var dstDir = Path.GetDirectoryName(dst);
             if (!string.IsNullOrEmpty(dstDir))
                 Directory.CreateDirectory(dstDir);
@@ -53,11 +61,11 @@ public static class FileTreeEmitter
             // Best-effort: a kept file that's locked/vanished between planning and emit (rare — antivirus, a
             // Perforce sync, a file kept-whole precisely because it was unreadable) must not crash the whole
             // emit. Skip it (it just won't be in the output); the read-time warning already flagged it.
-            try { File.Copy(src, dst, overwrite: true); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
-            bytes += new FileInfo(dst).Length;
-            written.Add(rel);
-        }
+            try { File.Copy(src, dst, overwrite: true); copied[i] = new FileInfo(dst).Length; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        });
+        for (var i = 0; i < keptFiles.Count; i++)
+            if (copied[i] >= 0) { bytes += copied[i]; written.Add(keptFiles[i]); }
 
         CopyUnscannedIncludes(keptFiles, droppedFiles, sourceRoot, outDir, written, ref bytes);
         return new EmitResult(written.Count, bytes, written);
@@ -97,20 +105,13 @@ public static class FileTreeEmitter
         long bytes = 0, prunedBytes = 0;
         var prunedFiles = 0;
         var stubbedFunctions = 0;
-        foreach (var rel in plan.KeptFiles)
+        // What to cut from each file, decided here (stubOf may cache as it goes); the files are then read and written
+        // in parallel (a network drive waits a round trip per file) and listed in the kept order.
+        var kept = plan.KeptFiles;
+        var cuts = new (List<(int Start, int End)>? Ranges, List<StubBodies.Body> Stubs, List<(int, string)>? Removed)[kept.Count];
+        for (var i = 0; i < kept.Count; i++)
         {
-            var src = Path.Combine(sourceRoot, rel);
-            if (!File.Exists(src)) continue;
-
-            var dst = Path.Combine(outDir, rel);
-            // CRITICAL: out overlapping source would make dst==src, and the WriteAllText below would replace
-            // the user's source with its function-stripped version. The CLI already refuses overlapping
-            // --out; this is the last line of defence for direct library callers.
-            if (SameFile(src, dst)) continue;
-            var dstDir = Path.GetDirectoryName(dst);
-            if (!string.IsNullOrEmpty(dstDir))
-                Directory.CreateDirectory(dstDir);
-
+            var rel = kept[i];
             // Only files with something to prune are read+rewritten. Everything else — including
             // multi-GB headers kept whole — is stream-copied, so a big kept file never becomes a
             // >2GB string in memory (it would throw) and is emitted in bounded memory.
@@ -119,36 +120,69 @@ public static class FileTreeEmitter
                 ? sdefs.Where(n => n.Kind == NodeKind.Function && plan.IsKept(n.Id)).Select(n => stubOf(n.Id))
                        .Where(b => b.HasValue).Select(b => b!.Value).Distinct().ToList()
                 : new List<StubBodies.Body>();
+            List<(int, string)>? removed = null;
+            if (ranges is { Count: > 0 } || stubs.Count > 0)
+            {
+                // Every function removed from this file, static or not (a `STATIC`/`PRIVATE` macro hides the keyword),
+                // unless the same name also has a kept definition here (#if-split twins): its prototypes go with it.
+                var fns = defsByFile[rel].Where(n => n.Kind == NodeKind.Function && n.Span.IsKnown).ToList();
+                var keptNames = fns.Where(n => plan.IsKept(n.Id)).Select(n => n.Name).ToHashSet(StringComparer.Ordinal);
+                removed = fns.Where(n => !plan.IsKept(n.Id) && !keptNames.Contains(n.Name))
+                             .Select(n => (n.Span.StartLine, n.Name)).ToList();
+            }
+            cuts[i] = (ranges, stubs, removed);
+        }
+        var done = new (long Bytes, long Cut, int Stubs)[kept.Count];
+        CodeCarver.Core.Util.ReadAhead.EnsureThreads();
+        Parallel.For(0, kept.Count, new ParallelOptions { MaxDegreeOfParallelism = IoParallelism }, i =>
+        {
+            done[i] = (-1, 0, 0);
+            var rel = kept[i];
+            var src = Path.Combine(sourceRoot, rel);
+            if (!File.Exists(src)) return;
+
+            var dst = Path.Combine(outDir, rel);
+            // CRITICAL: out overlapping source would make dst==src, and the WriteAllText below would replace
+            // the user's source with its function-stripped version. The CLI already refuses overlapping
+            // --out; this is the last line of defence for direct library callers.
+            if (SameFile(src, dst)) return;
+            var dstDir = Path.GetDirectoryName(dst);
+            if (!string.IsNullOrEmpty(dstDir))
+                Directory.CreateDirectory(dstDir);
+
+            var (ranges, stubs, removed) = cuts[i];
             // Rewritten byte-transparently (Latin-1): a Latin-1/Shift-JIS/UTF-8 string literal must come out with
             // exactly its original bytes (review E1). UTF-16 text can't be edited line-wise this way: copy it whole
             // (CarvePlan already closed over the whole file being written; see EmitClosure).
             try
             {
-                if ((ranges is { Count: > 0 } || stubs.Count > 0) && !IsUtf16(src))
+                long cut = 0;
+                var stubbed = 0;
+                if (removed is not null && !IsUtf16(src))
                 {
                     // Bytes in, bytes out: ReadAllText would honour (and strip) a UTF-8 BOM even when told Latin-1.
                     var original = File.ReadAllBytes(src);
-                    ranges ??= new List<(int Start, int End)>();
                     // Stubs first: they keep every line, so the line ranges below still line up.
                     var text = Encoding.Latin1.GetString(original);
-                    if (stubs.Count > 0) { text = StubBodies.Apply(text, stubs); stubbedFunctions += stubs.Count; }
-                    // Every function removed from this file, static or not (a `STATIC`/`PRIVATE` macro hides the keyword),
-                    // unless the same name also has a kept definition here (#if-split twins): its prototypes go with it.
-                    var fns = defsByFile[rel].Where(n => n.Kind == NodeKind.Function && n.Span.IsKnown).ToList();
-                    var keptNames = fns.Where(n => plan.IsKept(n.Id)).Select(n => n.Name).ToHashSet(StringComparer.Ordinal);
-                    var removed = fns.Where(n => !plan.IsKept(n.Id) && !keptNames.Contains(n.Name))
-                                     .Select(n => (n.Span.StartLine, n.Name)).ToList();
-                    var pruned = Encoding.Latin1.GetBytes(RemoveLineRanges(text, ranges, removed));
+                    if (stubs.Count > 0) { text = StubBodies.Apply(text, stubs); stubbed = stubs.Count; }
+                    var pruned = Encoding.Latin1.GetBytes(RemoveLineRanges(text, ranges ?? new List<(int Start, int End)>(), removed));
                     File.WriteAllBytes(dst, pruned);
-                    if (pruned.Length < original.Length) { prunedFiles++; prunedBytes += original.Length - pruned.Length; }
+                    cut = original.Length - pruned.Length;
                 }
                 else
                     File.Copy(src, dst, overwrite: true);
+                done[i] = (new FileInfo(dst).Length, cut, stubbed);
             }
             // A locked/vanished file must not sink the whole emit (review RB5) — same tolerance as Emit.
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
-            bytes += new FileInfo(dst).Length;
-            written.Add(rel);
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        });
+        for (var i = 0; i < kept.Count; i++)
+        {
+            if (done[i].Bytes < 0) continue;
+            bytes += done[i].Bytes;
+            written.Add(kept[i]);
+            stubbedFunctions += done[i].Stubs;
+            if (done[i].Cut > 0) { prunedFiles++; prunedBytes += done[i].Cut; }
         }
 
         CopyUnscannedIncludes(plan.KeptFiles, plan.DroppedFiles, sourceRoot, outDir, written, ref bytes);
@@ -298,35 +332,41 @@ public static class FileTreeEmitter
         var missing = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
         var result = new List<string>();
         var queue = new Queue<string>(emitted);                      // scan every emitted file for includes
-
-        while (queue.Count > 0)
+        // Files over 8 MB (a multi-GB kept file must never become a >2GB string) and unreadable ones contribute no
+        // includes. Read ahead: on a network drive each read waits a round trip.
+        static string? ReadSmall(string full)
         {
-            var rel = queue.Dequeue();
-            var full = Path.Combine(sourceRoot, rel);
-            // Read only a bounded prefix: includes live at the top, and a multi-GB kept file must never
-            // become a >2GB string. Files without readable text simply contribute no includes.
-            string text;
             try
             {
                 var info = new FileInfo(full);
-                if (!info.Exists || info.Length > 8 * 1024 * 1024) continue;
-                text = File.ReadAllText(full);
+                return !info.Exists || info.Length > 8 * 1024 * 1024 ? null : File.ReadAllText(full);
             }
-            catch { continue; }
+            catch { return null; }
+        }
 
-            var fromDir = Path.GetDirectoryName(full) ?? sourceRoot;
-            foreach (Match m in LocalInclude.Matches(text))
+        while (queue.Count > 0)
+        {
+            // Everything queued now, in order (what it adds is queued behind it, as one at a time would).
+            var batch = new List<string>(queue);
+            queue.Clear();
+            foreach (var (rel, read) in CodeCarver.Core.Util.ReadAhead.Map(batch, r => ReadSmall(Path.Combine(sourceRoot, r))))
             {
-                string target;
-                try { target = Path.GetFullPath(Path.Combine(fromDir, m.Groups[1].Value)); } catch { continue; }
-                // Under the root WITH a separator: "/repo2" must not pass for root "/repo" (review RB9).
-                if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue; // outside the tree
-                var trel = Path.GetRelativePath(sourceRoot, target).Replace(Path.DirectorySeparatorChar, '/');
-                if (known.Contains(trel) || added.Contains(trel) || missing.Contains(trel)) continue;   // decided: no disk query
-                if (!File.Exists(target)) { missing.Add(trel); continue; }   // unresolved here (system/other -I dir)
-                added.Add(trel);
-                result.Add(trel);
-                queue.Enqueue(trel);                                 // its own includes may be needed too
+                if (read is not { } text) continue;
+                var full = Path.Combine(sourceRoot, rel);
+                var fromDir = Path.GetDirectoryName(full) ?? sourceRoot;
+                foreach (Match m in LocalInclude.Matches(text))
+                {
+                    string target;
+                    try { target = Path.GetFullPath(Path.Combine(fromDir, m.Groups[1].Value)); } catch { continue; }
+                    // Under the root WITH a separator: "/repo2" must not pass for root "/repo" (review RB9).
+                    if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue; // outside the tree
+                    var trel = Path.GetRelativePath(sourceRoot, target).Replace(Path.DirectorySeparatorChar, '/');
+                    if (known.Contains(trel) || added.Contains(trel) || missing.Contains(trel)) continue;   // decided: no disk query
+                    if (!File.Exists(target)) { missing.Add(trel); continue; }   // unresolved here (system/other -I dir)
+                    added.Add(trel);
+                    result.Add(trel);
+                    queue.Enqueue(trel);                                 // its own includes may be needed too
+                }
             }
         }
         return result;
