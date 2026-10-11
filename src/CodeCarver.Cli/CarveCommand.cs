@@ -728,6 +728,54 @@ public static class CarveCommand
             if (cv.SkipFilesNotBuilt) summary["parse.filesNotBuiltSkipped"] = notBuilt.Count;
         }
         Mark("buildTraces");
+        // Entry points before the graph: a name no text holds can't resolve, and finding that out after the graph cost a
+        // whole-tree run hours (see RootNameCheck). Only names nothing could produce fail here; the rest wait for the
+        // exact check after the graph.
+        if (closureLang && roots.Length > 0 && whySymbol is null)
+        {
+            var check = new CodeCarver.Core.Preprocess.RootNameCheck(roots);
+            var bigRels = new HashSet<string>(bigFiles.Select(b => b.Rel), StringComparer.Ordinal);
+            void Scan(IEnumerable<string> files) => Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                (f, state) =>
+                {
+                    if (!check.AnyPending) { state.Stop(); return; }
+                    try { check.Add(File.ReadAllText(f)); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                });
+            // Built files first, then the rest of the tree, the build logs (-D renames, --defsym) and the headers outside
+            // the root the build opened: each later set is read only while some name is still unseen.
+            Scan(parseRels.Where(r => !bigRels.Contains(r) && !notBuilt.Contains(r)).Select(r => fullByRel[r]));
+            if (check.AnyPending) Scan(parseRels.Where(r => !bigRels.Contains(r) && notBuilt.Contains(r)).Select(r => fullByRel[r]));
+            if (check.AnyPending) Scan(buildLogs.Distinct());
+            if (check.AnyPending && buildOpenedOutside is not null) Scan(buildOpenedOutside);
+            var missing = check.Missing();
+            if (missing.Count > 0)
+            {
+                // Near misses from the built files' names followed by '(' (functions and function-like macros).
+                var near = missing.ToDictionary(m => m, _ => new SortedSet<string>(StringComparer.Ordinal), StringComparer.Ordinal);
+                var call = new System.Text.RegularExpressions.Regex(@"(?<![\w$])([A-Za-z_][\w$]*)\s*\(", System.Text.RegularExpressions.RegexOptions.Compiled);
+                Parallel.ForEach(parseRels.Where(r => !bigRels.Contains(r) && !notBuilt.Contains(r)), rel =>
+                {
+                    string text;
+                    try { text = File.ReadAllText(fullByRel[rel]); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return; }
+                    foreach (System.Text.RegularExpressions.Match mt in call.Matches(text))
+                    {
+                        var w = mt.Groups[1].Value;
+                        foreach (var m in missing)
+                            if (Math.Abs(w.Length - m.Length) <= 2 && Distance(w, m) <= 2)
+                                lock (near) near[m].Add(w);
+                    }
+                });
+                foreach (var m in missing)
+                    err.WriteLine($"  warn    : requested root '{m}' was NOT found: the name occurs nowhere in the tree, the build logs or the "
+                        + "headers the build opened, and no ## paste could build it"
+                        + (near[m].Count > 0 ? $" — did you mean: {string.Join(", ", near[m].Take(3))}?" : ""));
+                err.WriteLine($"{missing.Count} of {roots.Length} entry point(s) can't resolve — failing before the graph is built. "
+                    + "Fix or remove the name in entryPoints.");
+                return 1;
+            }
+        }
+        Mark("rootNames");
         // With a compiler to run and the build's commands, its own preprocessor decides the #if branches (see
         // CompilerPreprocess): config-header macros, #undef and include order included. Only GCC/Clang-style drivers run:
         // one named like a configured compiler runs as that compiler, another only from the full path the log gives.
@@ -2525,9 +2573,20 @@ public static class CarveCommand
             (LinkCheckResult R, List<LinkViolation> Hard, List<LinkViolation> NotBuiltOnly)? checkedAlready = null;
             // Cumulative per kind of stage: a later stage of the same kind starts from these roots, so it reports them too.
             var keptByCheck = checkCauses[kind];
+            // Where a stage's time goes: stageN.time.<step>.ms, summed over the check rounds.
+            var stageClock = System.Diagnostics.Stopwatch.StartNew();
+            void Step(string step)
+            {
+                var key = $"{summaryStage}.time.{step}.ms";
+                summary[key] = (summary.TryGetValue(key, out var was) && was is long w ? w : 0L) + stageClock.ElapsedMilliseconds;
+                stageClock.Restart();
+            }
+            var rounds = 0;
             for (var round = 0; ; round++)
             {
+                rounds = round + 1;
                 res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir, kind == Stubbed ? StubOf : null) : FileTreeEmitter.Emit(splan, dir, stageDir);
+                Step("emit");
                 // The code plus the assembly files the infrastructure copy will carry (they define symbols C calls:
                 // fast_copy in a .S), read from the tree: the infrastructure is copied once, after the plan settles.
                 var droppedInfra = new HashSet<string>(InfraDropped(splan), StringComparer.Ordinal);
@@ -2538,8 +2597,10 @@ public static class CarveCommand
                     .ToList();
                 if (!linkCheck || !closeOverEmit) break;
                 checkedAlready = CheckEmitted(splan, verifyFiles, prune);
+                Step("check");
                 if (round >= MaxCheckRounds || checkedAlready.Value.Hard.Count == 0) break;
                 var (add, kept) = RootsForMissing(splan, checkedAlready.Value.Hard, keptByCheck, verifyFiles);
+                Step("rootsForMissing");
                 if (add.Count == 0) break;
                 foreach (var v in kept)
                     checkLog[kind].Add($"KEPT {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined in {v.DefinedIn}:{v.DefinedLine}");
@@ -2550,12 +2611,15 @@ public static class CarveCommand
                 // A fresh tree: the larger plan writes a superset, but pruned files are written differently.
                 try { Directory.Delete(stageDir, recursive: true); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
                 Directory.CreateDirectory(stageDir);
+                Step("replan");
             }
+            summary[$"{summaryStage}.checkRounds"] = rounds;
             keptByCheckLog.Clear();
             keptByCheckLog.AddRange(checkLog[kind]);
             // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
             // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
             var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel);
+            Step("copyInfrastructure");
             summary[$"{summaryStage}.keptFiles"] = splan.KeptFiles.Count;
             summary[$"{summaryStage}.droppedFiles"] = splan.DroppedFiles.Count;
             summary[$"{summaryStage}.closureAddedFiles"] = splan.KeptFiles.Count - plan.KeptFiles.Count;
@@ -2600,8 +2664,11 @@ public static class CarveCommand
             @out.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{(prune ? "intra-file (unused functions removed)" : "file-level (whole kept files)")}]");
             if (prune) @out.WriteLine("  note    : carveSourceFileContents is EXPERIMENTAL — always build-verify.");
 
+            Step("stats");
             if (VerifyEmitted(splan, verifyFiles, ccDir, pruned: prune, checkedAlready)) verifyFailed = true;
+            Step("verify");
             BuildOutputCases(splan, baseDir, outDir, ccDir, prune);
+            Step("buildOutputCases");
             carvedBytes += infra.Bytes;
             var origTotal = originalCodeBytes + infra.Bytes;   // delta-neutral passthrough (both sides)
             if (infra.Count > 0)
@@ -2623,6 +2690,7 @@ public static class CarveCommand
                 @out.WriteLine($"  placeholders: {placeholders.Count:N0} dropped file(s) the build compiled written as stand-ins (build files that list them keep working)");
             summary[$"{summaryStage}.placeholderFiles"] = placeholders.Count;
 
+            Step("placeholders");
             // After the infrastructure copy: assembly, linker scripts and other text files seed what the header
             // carve must keep (review H1).
             if (pruneHeaders && lang is "c" or "cpp")
@@ -2649,6 +2717,7 @@ public static class CarveCommand
                 }
             }
 
+            Step("headerCarve");
             try { CancelHook.Promote(staged); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -2701,6 +2770,7 @@ public static class CarveCommand
             WriteArtifact(Path.Combine(ccDir, "resolved-config.toml"), ResolvedConfigToml(stage), "config");
             WriteDecisions(ccDir, stage.Name, splan);
             WriteRepro(ccDir, splan);
+            Step("promoteAndArtifacts");
             WriteSummary(ccDir);
         }
         Mark("emit");

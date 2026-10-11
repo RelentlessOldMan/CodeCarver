@@ -478,7 +478,7 @@ public sealed class NameBindingTests
         t.Compile("main.c").TraceCompiled();
         var r = t.Carve(entry: "no_such_fn");
         Assert.Equal(1, r.Code);
-        Assert.Contains("not defined anywhere", r.Out + r.Err);
+        Assert.Contains("occurs nowhere in the tree", r.Out + r.Err);
     }
 
     [Fact]

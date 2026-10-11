@@ -19,13 +19,17 @@ On a successful carve it also says where the carve could get tighter and where t
 `header`: included by kept code; `reached`: called or referenced from a root), `keep.bytes.largest10Percent` is the
 share of kept bytes in the ten largest kept files, and `time.<phase>.ms` is each phase's time, in run order from
 the start: `buildLogs`, `defines` (per-file define sets, compiler probe), `walk` (the tree walk and file sizes),
-`buildTraces`, `preprocess` (rerunning the build's compile commands with `-E`, when a build has a `compiler`; see
+`buildTraces`, `rootNames` (every entry point looked up as a word in the tree, the build logs and the headers the build
+opened; a name none holds, and no `##` paste could build, fails the run here instead of after the graph), `preprocess` (rerunning the build's compile commands with `-E`, when a build has a `compiler`; see
 `world.preprocessed.*`), `input+refscan`, `pre-parse`, `build-graph`, `roots`, `reachability`, `precision`, then `emit` (a
 carve) or `analyze` (an analysis-only run, which writes no tree). Those add up to the run. A key with a further dot inside (`time.pre-parse.<part>.ms`, `time.build-graph.<part>.ms`,
 `time.outsideIncludes.ms`, which is part of `roots`) is part of a phase, not added to it.
 `time.pre-parse.<part>.ms` splits the macro scan before parsing: `treeMacros` (the tree's own files),
 `outsideHeaders` (headers the build reads outside the root), `quotedIncludes` (following `#include "..."` out of the
 tree) and `unparsedHeaders` (big and dense headers, streamed).
+`stageN.time.<step>.ms` splits one stage's share of `emit`: `emit` (writing the tree), `check` (the link check of what was
+written), `rootsForMissing` and `replan` (these four summed over `stageN.checkRounds`, the emit-and-check rounds), `copyInfrastructure`,
+`stats`, `verify`, `buildOutputCases`, `placeholders`, `headerCarve` and `promoteAndArtifacts`.
 `stageN` is a stage's position in that run, least aggressive first: with no `--stage` and stages `safe` and `max`,
 `max` is `stage1`; run alone with `--stage max`, it is `stage0`. `stageN.carveSourceFileContents` and
 `stageN.carveHeaderFileContents` say which stage it is.
