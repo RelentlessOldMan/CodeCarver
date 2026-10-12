@@ -5,7 +5,8 @@ namespace CodeCarver.Core.Preprocess;
 /// the graph, the run's most expensive part: a list of guessed names cost a whole-tree carve 5 h 39 min of nothing
 /// (work eval, 1.0.200). A name that occurs nowhere in the text the build reads, and that no <c>##</c> paste could
 /// assemble from words that do occur, can't resolve, so it fails here in seconds. Anything else waits for the exact
-/// check after the graph.
+/// check after the graph. A name only a prebuilt binary in the tree holds (<see cref="AddBinary"/>) has no source to
+/// carve: the caller notes it and leaves it out of the roots.
 /// </summary>
 public sealed class RootNameCheck
 {
@@ -50,10 +51,27 @@ public sealed class RootNameCheck
 
     /// <summary>Reads one text (a source file, a build log): its identifiers, and whether it pastes. Safe to call from
     /// several threads at once.</summary>
-    public void Add(string text)
+    public void Add(string text) => Add(text, binary: false);
+
+    /// <summary>Reads a binary file (a prebuilt object or archive, a symbol dump) for whole pending names; true if it held
+    /// one. A prebuilt binary is the only place some names are defined: there's no source to carve for them, and the
+    /// file itself is kept. Its bytes count only as whole names, never as pieces of a paste. Read in chunks, so a large
+    /// image never sits in memory whole. Safe to call from several threads at once.</summary>
+    public bool AddBinary(string path)
     {
-        if (!AnyPending) return;
-        var paste = text.Contains("##", StringComparison.Ordinal);
+        var found = false;
+        foreach (var text in CodeCarver.Core.Util.BinaryText.Chunks(path, _maxLen))
+        {
+            if (!AnyPending) break;
+            found |= Add(text, binary: true);
+        }
+        return found;
+    }
+
+    bool Add(string text, bool binary)
+    {
+        if (!AnyPending) return false;
+        var paste = !binary && text.Contains("##", StringComparison.Ordinal);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var span = text.AsSpan();
         for (var i = 0; i < span.Length;)
@@ -74,11 +92,17 @@ public sealed class RootNameCheck
             foreach (var p in cands)
                 if (word.SequenceEqual(p)) { seen.Add(p); break; }
         }
+        var removed = false;
         lock (_pending)
         {
             _sawPaste |= paste;
-            foreach (var p in seen) { _seenPieces.Add(p); _pending.Remove(p); }
+            foreach (var p in seen)
+            {
+                if (!binary) _seenPieces.Add(p);
+                removed |= _pending.Remove(p);
+            }
         }
+        return removed;
     }
 
     /// <summary>The requested names that can't resolve: never seen as a word, and not assembled by a paste from two or

@@ -728,12 +728,26 @@ public static class CarveCommand
             if (cv.SkipFilesNotBuilt) summary["parse.filesNotBuiltSkipped"] = notBuilt.Count;
         }
         Mark("buildTraces");
+        // The binaries the tree carries (prebuilt archives and objects, symbol dumps), read once on first use: they are
+        // copied to every stage as they are, and their symbol tables name what they define and what they call.
+        List<string>? treeBinaries = null;
+        List<string> TreeBinaries()
+        {
+            if (treeBinaries is not null) return treeBinaries;
+            var code = new HashSet<string>(paths, StringComparer.OrdinalIgnoreCase);
+            return treeBinaries = CodeCarver.Core.Util.SourceWalk.Files(dir)
+                .Where(p => !code.Contains(p) && !Excluded(p)
+                            && !InfraClassifier.IsGarbage(Path.GetRelativePath(dir, p).Replace('\\', '/'), p))
+                .AsParallel().Where(CodeCarver.Core.Util.BinaryText.MayHoldSymbols).ToList();
+        }
         // Entry points before the graph: a name no text holds can't resolve, and finding that out after the graph cost a
         // whole-tree run hours (see RootNameCheck). Only names nothing could produce fail here; the rest wait for the
         // exact check after the graph.
         if (closureLang && roots.Length > 0 && whySymbol is null)
         {
             var check = new CodeCarver.Core.Preprocess.RootNameCheck(roots);
+            var requested = roots.Length;
+            summary["roots.entryPointsOnlyInBinaries"] = 0;
             var bigRels = new HashSet<string>(bigFiles.Select(b => b.Rel), StringComparer.Ordinal);
             void Scan(IEnumerable<string> files) => Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
                 (f, state) =>
@@ -749,6 +763,30 @@ public static class CarveCommand
             if (check.AnyPending) Scan(buildLogs.Distinct());
             if (check.AnyPending && buildOpenedOutside is not null) Scan(buildOpenedOutside);
             var missing = check.Missing();
+            if (missing.Count > 0)
+            {
+                // A name no text holds may be defined in a prebuilt binary the tree carries (an archive, an object, a
+                // symbol dump): there's no source to carve for it, and the binary is copied to every stage as it is.
+                // It is no entry point of the carve then: noted and counted, not failed.
+                var holding = new System.Collections.Concurrent.ConcurrentBag<string>();
+                Parallel.ForEach(TreeBinaries(), new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, (f, state) =>
+                {
+                    if (!check.AnyPending) { state.Stop(); return; }
+                    if (check.AddBinary(f)) holding.Add(f);
+                });
+                var stillMissing = new HashSet<string>(check.Missing(), StringComparer.Ordinal);
+                var inBinaries = missing.Where(m => !stillMissing.Contains(m)).ToHashSet(StringComparer.Ordinal);
+                if (inBinaries.Count > 0)
+                {
+                    roots = roots.Where(r => !inBinaries.Contains(r)).ToArray();
+                    err.WriteLine($"  roots   : {inBinaries.Count:N0} entry point(s) are defined only in {holding.Count:N0} prebuilt binary file(s) "
+                        + $"(no source in the tree) -> not carved; the binaries are kept as they are, e.g. "
+                        + $"{Path.GetRelativePath(dir, holding.First()).Replace('\\', '/')}");
+                }
+                summary["roots.entryPointsOnlyInBinaries"] = inBinaries.Count;
+                summary["roots.binaryFilesHoldingEntryPoints"] = holding.Count;
+                missing = missing.Where(stillMissing.Contains).ToList();
+            }
             if (missing.Count > 0)
             {
                 // Near misses from the built files' names followed by '(' (functions and function-like macros).
@@ -767,10 +805,10 @@ public static class CarveCommand
                     }
                 });
                 foreach (var m in missing)
-                    err.WriteLine($"  warn    : requested root '{m}' was NOT found: the name occurs nowhere in the tree, the build logs or the "
-                        + "headers the build opened, and no ## paste could build it"
+                    err.WriteLine($"  warn    : requested root '{m}' was NOT found: the name occurs nowhere in the tree, the build logs, the "
+                        + "headers the build opened or a prebuilt binary, and no ## paste could build it"
                         + (near[m].Count > 0 ? $" — did you mean: {string.Join(", ", near[m].Take(3))}?" : ""));
-                err.WriteLine($"{missing.Count} of {roots.Length} entry point(s) can't resolve — failing before the graph is built. "
+                err.WriteLine($"{missing.Count} of {requested} entry point(s) can't resolve — failing before the graph is built. "
                     + "Fix or remove the name in entryPoints.");
                 return 1;
             }
@@ -1813,6 +1851,39 @@ public static class CarveCommand
         linkRoots.AddRange(genRoots);
         var definedFns = genRoots.Select(r => graph.GetNode(r.Node).Name).ToHashSet(StringComparer.Ordinal);
         linkUses.AddRange(genUses.Where(u => definedFns.Contains(u.Name)));
+        // Calls from a prebuilt binary the tree carries into the tree's own code: the binary is kept as it is, and its
+        // calls are seen nowhere else, so a carve that dropped their targets would fail only at the final link. Every
+        // function or global whose name a binary holds as a whole word is rooted. A symbol table lists what the binary
+        // defines as well as what it calls; rooting one of those keeps a little more, never less.
+        var binaryRoots = new List<Root>();
+        if (lang is "c" or "cpp")
+        {
+            var wanted = graph.Nodes.Where(n => n.Kind is NodeKind.Function or NodeKind.Global).Select(n => n.Name)
+                                    .ToHashSet(StringComparer.Ordinal);
+            var binaries = wanted.Count > 0 ? TreeBinaries() : new List<string>();
+            if (binaries.Count > 0)
+            {
+                var maxLen = wanted.Max(n => n.Length);
+                var usedBy = new System.Collections.Concurrent.ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+                Parallel.ForEach(binaries, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, f =>
+                {
+                    foreach (var n in CodeCarver.Core.Util.BinaryText.NamesIn(f, wanted, maxLen))
+                        usedBy.TryAdd(n, Path.GetRelativePath(dir, f).Replace('\\', '/'));
+                });
+                if (!usedBy.IsEmpty)
+                {
+                    binaryRoots = new ExplicitRootProvider(symbols: usedBy.Keys.OrderBy(n => n, StringComparer.Ordinal)).Discover(graph)
+                        .Where(r => graph.GetNode(r.Node).Kind is NodeKind.Function or NodeKind.Global)
+                        .Select(r => r with { Kind = RootKind.LinkerKeep, Note = "named by a prebuilt binary" }).ToList();
+                    linkUses.AddRange(usedBy.Select(u => (u.Key, u.Value, 0)));
+                    err.WriteLine($"  roots   : {usedBy.Count:N0} function/global name(s) of the tree appear in {binaries.Count:N0} prebuilt binary file(s) "
+                        + "-> kept (the binaries may call them)");
+                }
+            }
+            summary["files.prebuiltBinaries"] = binaries.Count;
+        }
+        summary["roots.namedByBinaries"] = binaryRoots.Count;
+        linkRoots.AddRange(binaryRoots);
 
         var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots).Concat(linkRoots)
                                    .Concat(forceKeepRoots).Concat(forcedRoots).Concat(traceRoots).Concat(fileTraceRoots).Concat(outsideRoots).ToList();
