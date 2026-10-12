@@ -609,9 +609,23 @@ public static class CarveCommand
             var rel = "/" + Path.GetRelativePath(dir, fullPath).Replace('\\', '/') + "/";
             return excludeSegs.Any(seg => rel.Contains(seg, StringComparison.OrdinalIgnoreCase));
         }
-        static long SafeLength(string p) { try { return new FileInfo(p).Length; } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return long.MaxValue; } }
         var skippedLinks = new List<string>();
-        var paths = CodeCarver.Core.Util.SourceWalk.Files(dir, skippedLinks.Add)
+        // The tree, walked once with each file's size: every scan below filters this list. On a network drive each
+        // walk lists every directory again and each size lookup is a round trip, so seven walks and a stat per file
+        // kept a whole-tree run waiting on the drive for most of an hour.
+        var treeFiles = new List<string>();
+        var treeLength = new Dictionary<string, long>(CodeCarver.Core.Util.PathComparer.Default);
+        foreach (var (p, len) in CodeCarver.Core.Util.SourceWalk.Entries(dir, skippedLinks.Add))
+        {
+            treeFiles.Add(p);
+            if (len >= 0) treeLength[p] = len;
+        }
+        long SafeLength(string p)
+        {
+            if (treeLength.TryGetValue(p, out var len)) return len;
+            try { return new FileInfo(p).Length; } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return long.MaxValue; }
+        }
+        var paths = treeFiles
             .Where(p => exts.Any(e => p.EndsWith(e, StringComparison.OrdinalIgnoreCase)))
             .Where(p => !Excluded(p))
             .ToList();
@@ -654,17 +668,28 @@ public static class CarveCommand
         long originalBytes = 0;
         var bigFiles = new List<(string Rel, long Bytes)>();       // > --max-parse-bytes
         var denseFiles = new List<(string Rel, long Bytes)>();     // macro-dense, auto-skipped
+        long LengthOf(string p)
+        {
+            if (treeLength.TryGetValue(p, out var l)) return l;
+            try { return new FileInfo(p).Length; } catch { return 0; } // a vanished/locked file: size 0, still tracked
+        }
+        // The prefix samples are reads: a window of them at a time.
+        var dense = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
+        if (closureLang)
+            foreach (var (p, isDense) in CodeCarver.Core.Util.ReadAhead.Map(
+                         paths.Where(p => LengthOf(p) is var l && l >= AutoSkipMinBytes && l <= maxParseBytes),
+                         CodeCarver.Core.Preprocess.MacroDensity.IsMacroDenseHeader))
+                if (isDense) dense.Add(p);
         foreach (var p in paths)
         {
             var rel = Path.GetRelativePath(dir, p).Replace('\\', '/');
-            long len;
-            try { len = new FileInfo(p).Length; } catch { len = 0; } // a vanished/locked file: size 0, still tracked
+            var len = LengthOf(p);
             sizeByRel[rel] = len;
             fullByRel[rel] = p;
             parseRels.Add(rel);
             originalBytes += len;
             if (closureLang && len > maxParseBytes) bigFiles.Add((rel, len));
-            else if (closureLang && len >= AutoSkipMinBytes && CodeCarver.Core.Preprocess.MacroDensity.IsMacroDenseHeader(p)) denseFiles.Add((rel, len));
+            else if (closureLang && len >= AutoSkipMinBytes && dense.Contains(p)) denseFiles.Add((rel, len));
         }
         // Both populations skip the parser and are kept whole via include-closure.
         var skipParse = new HashSet<string>(bigFiles.Select(b => b.Rel).Concat(denseFiles.Select(d => d.Rel)),
@@ -749,7 +774,7 @@ public static class CarveCommand
             if (cv.SkipFilesNotBuilt && complete && opened.Count > 0 && traceMissedCompiled <= 0)
             {
                 foreach (var glob in auxGlobs.Where(g => !BuildSupportEmitter.GlobEscapesRoot(g)))
-                    foreach (var p in BuildSupportEmitter.MatchGlob(dir, glob)) opened.Add(Path.GetRelativePath(dir, p).Replace('\\', '/'));
+                    foreach (var p in BuildSupportEmitter.MatchGlob(dir, glob, treeFiles)) opened.Add(Path.GetRelativePath(dir, p).Replace('\\', '/'));
                 foreach (var rel in parseRels)
                     if (!opened.Contains(rel) && !skipParse.Contains(rel)) notBuilt.Add(rel);
                 err.WriteLine($"  build   : {notBuilt.Count:N0} of {parseRels.Count:N0} code file(s) were not opened by the traced build(s) -> not read or parsed (dropped unless kept code needs them; verify checks)");
@@ -764,7 +789,7 @@ public static class CarveCommand
         {
             if (treeBinaries is not null) return treeBinaries;
             var code = new HashSet<string>(paths, StringComparer.OrdinalIgnoreCase);
-            return treeBinaries = CodeCarver.Core.Util.SourceWalk.Files(dir)
+            return treeBinaries = treeFiles
                 .Where(p => !code.Contains(p) && !Excluded(p)
                             && !InfraClassifier.IsGarbage(Path.GetRelativePath(dir, p).Replace('\\', '/'), p))
                 .AsParallel().Where(CodeCarver.Core.Util.BinaryText.MayHoldSymbols).ToList();
@@ -1020,7 +1045,7 @@ public static class CarveCommand
                 if (byBase is null)
                 {
                     byBase = new(StringComparer.OrdinalIgnoreCase);
-                    foreach (var f in CodeCarver.Core.Util.SourceWalk.Files(rootFull))
+                    foreach (var f in treeFiles)
                     {
                         var bn = Path.GetFileName(f);
                         if (!byBase.TryGetValue(bn, out var l)) byBase[bn] = l = new List<string>();
@@ -1146,7 +1171,7 @@ public static class CarveCommand
         // count even when no build log was given.
         // Also the C source templates the build fills in (table.c.in, config.h.in): see GeneratedCode.
         var buildFiles = lang is "c" or "cpp"
-            ? CodeCarver.Core.Util.SourceWalk.Files(dir).Select(p => (Rel: Path.GetRelativePath(dir, p).Replace('\\', '/'), Path: p))
+            ? treeFiles.Select(p => (Rel: Path.GetRelativePath(dir, p).Replace('\\', '/'), Path: p))
                 .Where(f => (IsScript(f) || GeneratedCode.IsTemplate(f.Rel)) && !Excluded(f.Path) && SafeLength(f.Path) <= maxParseBytes).ToList()
             : new List<(string Rel, string Path)>();
         var buildScripts = buildFiles.Where(IsScript).ToList();
@@ -1518,7 +1543,7 @@ public static class CarveCommand
         var sectionRoots = new List<Root>();
         if (lang is "c" or "cpp")
         {
-            var linkerScripts = CodeCarver.Core.Util.SourceWalk.Files(dir)
+            var linkerScripts = treeFiles
                 .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".ld" or ".lds" or ".ldscript")
                 .Where(p => !Excluded(p)).Where(p => SafeLength(p) <= maxParseBytes)
                 .Select(SafeRead).ToList();
@@ -1546,7 +1571,7 @@ public static class CarveCommand
         {
             ctorGoverned = new ConstructorGate(graph).ConstructorCount;
             if (ctorGoverned > 0)
-                ctorHeaders = CodeCarver.Core.Util.SourceWalk.Files(dir).Where(p => !Excluded(p))
+                ctorHeaders = treeFiles.Where(p => !Excluded(p))
                     .Select(p => Path.GetRelativePath(dir, p).Replace('\\', '/'))
                     .Where(EmittedLinkCheck.IsHeader).OrderBy(r => r, StringComparer.Ordinal).ToList();
         }
@@ -1792,7 +1817,7 @@ public static class CarveCommand
         var asmFilesInTree = new List<string>();   // every in-scope assembly file (verify reads their symbols)
         if (lang is "c" or "cpp")
         {
-            asmFilesInTree = CodeCarver.Core.Util.SourceWalk.Files(dir).Where(p => EmittedLinkCheck.IsAssembly(p)).Where(p => !Excluded(p)).ToList();
+            asmFilesInTree = treeFiles.Where(p => EmittedLinkCheck.IsAssembly(p)).Where(p => !Excluded(p)).ToList();
             var asmPaths = asmFilesInTree
                 .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".s" or ".asm" or ".sx")
                 .Where(p => !Excluded(p))
@@ -1826,7 +1851,7 @@ public static class CarveCommand
             if (BuildSupportEmitter.GlobEscapesRoot(glob))
             { err.WriteLine($"forceKeepFiles '{glob}' refused: contains '..' or an absolute path"); return 2; }
             var n = 0;
-            foreach (var p in BuildSupportEmitter.MatchGlob(dir, glob)) { forcedRel.Add(Path.GetRelativePath(dir, p).Replace('\\', '/')); n++; }
+            foreach (var p in BuildSupportEmitter.MatchGlob(dir, glob, treeFiles)) { forcedRel.Add(Path.GetRelativePath(dir, p).Replace('\\', '/')); n++; }
             err.WriteLine(n == 0 ? $"  warn    : forceKeepFiles '{glob}' matched no file (a bare pattern like '*.inc' searches all subdirectories)"
                                  : $"  force   : forceKeepFiles '{glob}' -> {n} file(s) kept");
         }
@@ -2149,11 +2174,11 @@ public static class CarveCommand
             var rootFullC = Path.GetFullPath(dir);
             var relToFull = new Dictionary<string, string>(CodeCarver.Core.Util.PathComparer.Default);
             var allCmm = new List<(string Rel, long Bytes)>();
-            foreach (var p in CodeCarver.Core.Util.SourceWalk.Files(dir))
+            foreach (var p in treeFiles)
             {
                 if (!p.EndsWith(".cmm", StringComparison.OrdinalIgnoreCase)) continue;
                 var rel = Path.GetRelativePath(rootFullC, p).Replace('\\', '/');
-                long len; try { len = new FileInfo(p).Length; } catch { len = 0; }
+                var len = LengthOf(p);
                 allCmm.Add((rel, len));
                 relToFull[rel] = p;
             }
@@ -2775,7 +2800,7 @@ public static class CarveCommand
             keptByCheckLog.AddRange(checkLog[kind]);
             // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
             // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
-            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel, infraEarlier);
+            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel, infraEarlier, treeFiles);
             Step("copyInfrastructure");
             summary[$"{summaryStage}.keptFiles"] = splan.KeptFiles.Count;
             summary[$"{summaryStage}.droppedFiles"] = splan.DroppedFiles.Count;

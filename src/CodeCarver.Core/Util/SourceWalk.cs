@@ -25,7 +25,17 @@ public static class SourceWalk
     /// <summary>As <see cref="Files(string)"/>; <paramref name="onSkippedLink"/> receives the full path of each
     /// directory junction/symlink that was not entered, so a caller can say so instead of skipping silently
     /// (review RB7).</summary>
-    public static IEnumerable<string> Files(string root, Action<string>? onSkippedLink)
+    public static IEnumerable<string> Files(string root, Action<string>? onSkippedLink) =>
+        Walk(root, onSkippedLink, (ref FileSystemEntry e) => e.ToFullPath());
+
+    /// <summary>As <see cref="Files(string, Action{string})"/>, with each file's size. The size comes with the directory
+    /// listing, so no file is opened or looked up again: on a network drive that saves a round trip per file. A
+    /// symlinked file's size is the link's, not its target's, so it comes back as -1 (look it up).</summary>
+    public static IEnumerable<(string Path, long Length)> Entries(string root, Action<string>? onSkippedLink) =>
+        Walk(root, onSkippedLink, (ref FileSystemEntry e) =>
+            (e.ToFullPath(), (e.Attributes & FileAttributes.ReparsePoint) != 0 ? -1L : e.Length));
+
+    static IEnumerable<T> Walk<T>(string root, Action<string>? onSkippedLink, FileSystemEnumerable<T>.FindTransform transform)
     {
         var opts = new EnumerationOptions
         {
@@ -33,7 +43,7 @@ public static class SourceWalk
             IgnoreInaccessible = true,
             AttributesToSkip = FileAttributes.System,
         };
-        return new FileSystemEnumerable<string>(root, (ref FileSystemEntry e) => e.ToFullPath(), opts)
+        return new FileSystemEnumerable<T>(root, transform, opts)
         {
             ShouldIncludePredicate = (ref FileSystemEntry e) => !e.IsDirectory,
             // Recurse into a subdirectory only if it is NOT a reparse point (junction/symlink).

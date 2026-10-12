@@ -35,7 +35,9 @@ public static class BuildSupportEmitter
     /// unreadable dirs (common on a network share) instead of throwing LATER inside this lazy loop — where a
     /// try around the call can't catch it — and leaving a partial tree.
     /// </summary>
-    public static IEnumerable<string> MatchGlob(string root, string glob)
+    /// <param name="treeFiles">The files under root from a walk the caller already made (full paths), so a glob
+    /// doesn't walk the tree again.</param>
+    public static IEnumerable<string> MatchGlob(string root, string glob, IReadOnlyList<string>? treeFiles = null)
     {
         glob = (glob ?? "").Replace('\\', '/').Trim();
         while (glob.StartsWith("./", StringComparison.Ordinal)) glob = glob.Substring(2);
@@ -45,7 +47,7 @@ public static class BuildSupportEmitter
         var rx = GlobToRegex(glob, matchAnyDepth: !glob.Contains('/'));
         var hits = new List<string>();
         IEnumerable<string> files;
-        try { files = CodeCarver.Core.Util.SourceWalk.Files(root); }
+        try { files = treeFiles ?? CodeCarver.Core.Util.SourceWalk.Files(root); }
         catch (Exception) { return hits; }
         foreach (var f in files)
             if (rx.IsMatch(Path.GetRelativePath(root, f).Replace('\\', '/')))

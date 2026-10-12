@@ -33,6 +33,8 @@ public static class InfrastructureEmitter
     /// <param name="earlier">A copy this run already made into another stage: the directory and the relative paths it
     /// copied. A file it holds is copied from there, not from the source tree. On a network share that turns one read
     /// of the tree per stage into one per run; the bytes are the same.</param>
+    /// <param name="treeFiles">The files under the source root from a walk the caller already made (full paths): the
+    /// tree is not walked again for each stage.</param>
     public static InfraEmitResult Copy(
         string sourceRoot, string outDir,
         IReadOnlyCollection<string> alreadyEmittedRel,
@@ -41,7 +43,8 @@ public static class InfrastructureEmitter
         IReadOnlyList<string> auxGlobs,
         bool pruneGarbage = true,
         IReadOnlyCollection<string>? observed = null,
-        (string Dir, IReadOnlySet<string> Files)? earlier = null)
+        (string Dir, IReadOnlySet<string> Files)? earlier = null,
+        IReadOnlyList<string>? treeFiles = null)
     {
         var warnings = new List<string>();
         var outFull = Path.GetFullPath(outDir);
@@ -92,7 +95,7 @@ public static class InfrastructureEmitter
             return (rel, null, copied, false);
         }
 
-        var selected = Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, pruneGarbage, observed, warnings);
+        var selected = Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, pruneGarbage, observed, warnings, treeFiles);
         foreach (var (_, r) in CodeCarver.Core.Util.ReadAhead.Map(selected, CopyOne))
         {
             if (r.Garbage) { garbageBytes += r.Bytes; garbage.Add(r.Rel); continue; }
@@ -120,7 +123,8 @@ public static class InfrastructureEmitter
         IReadOnlyList<string> auxGlobs,
         bool pruneGarbage,
         IReadOnlyCollection<string>? observed,
-        List<string> warnings)
+        List<string> warnings,
+        IReadOnlyList<string>? treeFiles = null)
     {
         var skip = new HashSet<string>(alreadyEmittedRel, CodeCarver.Core.Util.PathComparer.Default);
         var dropped = new HashSet<string>(droppedCodeFilesRel, CodeCarver.Core.Util.PathComparer.Default);
@@ -151,7 +155,7 @@ public static class InfrastructureEmitter
             if (BuildSupportEmitter.GlobEscapesRoot(glob))
             { warnings.Add($"forceKeepFiles '{glob}' refused: contains '..' or an absolute path (would write outside the output)"); continue; }
             var matched = 0;
-            foreach (var p in BuildSupportEmitter.MatchGlob(sourceRoot, glob))
+            foreach (var p in BuildSupportEmitter.MatchGlob(sourceRoot, glob, treeFiles))
             { forced.Add(Path.GetRelativePath(sourceRoot, p).Replace('\\', '/')); matched++; }
             if (matched == 0)
                 warnings.Add($"forceKeepFiles '{glob}' matched no files under {sourceRoot} "
@@ -160,7 +164,7 @@ public static class InfrastructureEmitter
 
         // SourceWalk: skips unreadable dirs and doesn't recurse into junctions/symlinks (loop / double-copy),
         // while still returning symlinked files.
-        foreach (var p in CodeCarver.Core.Util.SourceWalk.Files(sourceRoot))
+        foreach (var p in treeFiles ?? CodeCarver.Core.Util.SourceWalk.Files(sourceRoot))
         {
             var rel = Path.GetRelativePath(sourceRoot, p).Replace('\\', '/');
             if (skip.Contains(rel)) continue;      // already emitted (kept code + include closure)
