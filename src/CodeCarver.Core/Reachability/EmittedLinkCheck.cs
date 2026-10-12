@@ -1,3 +1,5 @@
+using CodeCarver.Core.Util;
+
 namespace CodeCarver.Core.Reachability;
 
 /// <summary>One unresolved reference found by <see cref="EmittedLinkCheck"/>: emitted code names a function
@@ -74,38 +76,49 @@ public static class EmittedLinkCheck
         // Template headers (see TemplateInstances): the names a translation unit defines by including one.
         var byBase = emitted.Concat(dropped).GroupBy(f => Path.GetFileName(f.Rel), StringComparer.OrdinalIgnoreCase)
                             .ToDictionary(g => g.Key, g => g.Select(f => f.Path).ToList(), StringComparer.OrdinalIgnoreCase);
+        // Files are read and scanned on several threads (ReadAhead), so these caches take a lock.
         var templateText = new Dictionary<string, string?>(StringComparer.Ordinal);
         var templates = new HashSet<string>(StringComparer.Ordinal);
         // A header's text as TemplateInstances reads it: whole for a template, its directive lines otherwise (a config
-        // header still carries macros a template after it uses). The same string every time.
+        // header still carries macros a template after it uses).
+        (string? Text, bool Template) PrepareHeader(string p)
+        {
+            var t = TryRead(p, maxBytes);
+            if (t is null) return (null, false);
+            t = CodeCarver.Core.Preprocess.SourceText.Normalize(t);
+            return CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(t)
+                ? (t, true) : (CodeCarver.Core.Preprocess.TemplateInstances.DirectivesOnly(t), false);
+        }
+        // The same string every time: the first one stored wins.
+        string? StoreHeader(string p, (string? Text, bool Template) h)
+        {
+            lock (templateText)
+            {
+                if (templateText.TryGetValue(p, out var t)) return t;
+                if (h.Template) templates.Add(p);
+                return templateText[p] = h.Text;
+            }
+        }
         string? ReadHeader(string p)
         {
-            if (!templateText.TryGetValue(p, out var t))
-            {
-                t = TryRead(p, maxBytes);
-                if (t is not null) t = CodeCarver.Core.Preprocess.SourceText.Normalize(t);
-                if (t is not null && CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(t)) templates.Add(p);
-                else if (t is not null) t = CodeCarver.Core.Preprocess.TemplateInstances.DirectivesOnly(t);
-                templateText[p] = t;
-            }
-            return t;
+            lock (templateText) if (templateText.TryGetValue(p, out var t)) return t;
+            return StoreHeader(p, PrepareHeader(p));
         }
         string? ReadTemplate(string raw)
         {
             if (!byBase.TryGetValue(Path.GetFileName(raw), out var ps)) return null;
             foreach (var p in ps) ReadHeader(p);
-            return ReadHeader(ps.FirstOrDefault(templates.Contains) ?? ps[0]);
+            lock (templateText) return ReadHeader(ps.FirstOrDefault(templates.Contains) ?? ps[0]);
         }
-        bool? anyTemplate = null;
-        bool AnyTemplate()
+        // Every header, read ahead in parallel before the scans start (a scan asks as soon as it meets an #include).
+        var anyTemplate = false;
+        if (emitted.Concat(dropped).Any(f => !IsHeader(f.Rel) && !IsAssembly(f.Rel)))
         {
-            if (anyTemplate is null)
-            {
-                foreach (var p in byBase.Values.SelectMany(ps => ps).Where(p => IsHeader(p))) ReadHeader(p);
-                anyTemplate = templates.Count > 0;
-            }
-            return anyTemplate.Value;
+            foreach (var (p, h) in ReadAhead.Map(byBase.Values.SelectMany(ps => ps).Where(p => IsHeader(p)), PrepareHeader))
+                StoreHeader(p, h);
+            anyTemplate = templates.Count > 0;
         }
+        bool AnyTemplate() => anyTemplate;
         var cmdFnMacros = CodeCarver.Core.Preprocess.CommandLineMacros.AnyFunctionLike(commandLineMacros);
         // Names a translation unit defines beyond its own function heads: template-header instances (with the build's
         // function-like -D macros, `int HIDE(den)(void) {`), and the C99 inline functions it emits by declaring them.
@@ -143,15 +156,20 @@ public static class EmittedLinkCheck
         var typedDef = new HashSet<string>(StringComparer.Ordinal);
         var definers = new Dictionary<string, List<string>>(StringComparer.Ordinal);
         var functionMacros = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var (rel, path) in dropped.OrderBy(d => d.Rel, StringComparer.Ordinal))
+        ScanResult? ScanDropped((string Rel, string Path) f)
         {
-            var text = TryRead(path, maxBytes);
-            if (text is null) { skipped++; continue; }
+            var text = TryRead(f.Path, maxBytes);
+            if (text is null) return null;
+            var s = Scan(text, IsHeader(f.Rel), declarators: false, definerMacros);
+            s.Definitions.AddRange(Instances(f.Rel, text));
+            Renamed(s);
+            return s;
+        }
+        foreach (var ((rel, _), dscan) in ReadAhead.Map(dropped.OrderBy(d => d.Rel, StringComparer.Ordinal), ScanDropped))
+        {
+            if (dscan is null) { skipped++; continue; }
             checkedFiles++;
             var header = IsHeader(rel);
-            var dscan = Scan(text, header, declarators: false, definerMacros);
-            dscan.Definitions.AddRange(Instances(rel, text));
-            Renamed(dscan);
             functionMacros.UnionWith(dscan.FunctionMacros);
             foreach (var d in dscan.Definitions)
                 if (header || !d.Static)
@@ -164,18 +182,24 @@ public static class EmittedLinkCheck
         }
         // Functions pruned out of kept files. A pruned static is only visible in its own file.
         var prunedStatics = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
+        // The original's definitions the emitted copy doesn't have, or null when the file is unchanged.
+        IEnumerable<Definition>? Pruned((string Rel, string Path) f)
+        {
+            if (IsAssembly(f.Rel) || original!(f.Rel) is not { } op) return null;
+            var otext = TryRead(op, maxBytes);
+            var etext = otext is null ? null : TryRead(f.Path, maxBytes);
+            if (otext is null || etext is null || otext == etext) return null;
+            var header = IsHeader(f.Rel);
+            var kept = Scan(etext, header, declarators: false, definerMacros).Definitions.Select(d => d.Name).ToHashSet(StringComparer.Ordinal);
+            return Scan(otext, header, declarators: false, definerMacros).Definitions.Where(d => !kept.Contains(d.Name)).ToList();
+        }
         if (original is not null)
-            foreach (var (rel, path) in emitted)
+            foreach (var ((rel, _), gone) in ReadAhead.Map(emitted, Pruned))
             {
-                if (IsAssembly(rel) || original(rel) is not { } op) continue;
-                var otext = TryRead(op, maxBytes);
-                var etext = otext is null ? null : TryRead(path, maxBytes);
-                if (otext is null || etext is null || otext == etext) continue;
+                if (gone is null) continue;
                 var header = IsHeader(rel);
-                var kept = Scan(etext, header, declarators: false, definerMacros).Definitions.Select(d => d.Name).ToHashSet(StringComparer.Ordinal);
-                foreach (var d in Scan(otext, header, declarators: false, definerMacros).Definitions)
+                foreach (var d in gone)
                 {
-                    if (kept.Contains(d.Name)) continue;
                     if (d.Static && !header)
                     {
                         if (!prunedStatics.TryGetValue(rel, out var ps)) prunedStatics[rel] = ps = new(StringComparer.Ordinal);
@@ -213,16 +237,22 @@ public static class EmittedLinkCheck
         var weakUse = new HashSet<string>(StringComparer.Ordinal);
         // Only a symbol the build wraps (--wrap=X): a __wrap_X elsewhere is a unit-test mock, not part of this link.
         var anyWrap = wrapped is { Count: > 0 } && droppedDefs.Keys.Any(k => k.StartsWith("__wrap_", StringComparison.Ordinal));
-        foreach (var (rel, path) in emitted.OrderBy(e => e.Rel, StringComparer.Ordinal))
+        (ScanResult Scan, bool[]? Map)? ScanEmitted((string Rel, string Path) f)
         {
-            var text = TryRead(path, maxBytes);
-            if (text is null) { skipped++; continue; }
+            var text = TryRead(f.Path, maxBytes);
+            if (text is null) return null;
+            var map = deadLines?.Invoke(f.Rel, text);
+            var s = IsAssembly(f.Rel) ? ScanAssembly(text) : Scan(text, IsHeader(f.Rel), definerMacros: definerMacros);
+            s.Definitions.AddRange(Instances(f.Rel, text));
+            Renamed(s);
+            return (s, map);
+        }
+        foreach (var ((rel, _), scanned) in ReadAhead.Map(emitted.OrderBy(e => e.Rel, StringComparer.Ordinal), ScanEmitted))
+        {
+            if (scanned is not { } got) { skipped++; continue; }
+            var (scan, map) = got;
             checkedFiles++;
-            var map = deadLines?.Invoke(rel, text);
             bool IsDead(int line) => map is not null && line < map.Length && map[line];
-            var scan = IsAssembly(rel) ? ScanAssembly(text) : Scan(text, IsHeader(rel), definerMacros: definerMacros);
-            scan.Definitions.AddRange(Instances(rel, text));
-            Renamed(scan);
             functionMacros.UnionWith(scan.FunctionMacros);
             fileMacros[rel] = scan.FunctionMacroLines.Where(m => !IsDead(m.Line)).Select(m => m.Name).ToHashSet(StringComparer.Ordinal);
             fileIncludes[rel] = scan.Includes;
