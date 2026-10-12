@@ -28,6 +28,7 @@ public static class ReadAhead
     public static IEnumerable<(T Item, R Value)> Map<T, R>(IEnumerable<T> items, Func<T, R> read, int window = Window)
     {
         EnsureThreads();
+        if (items is IReadOnlyCollection<T> c) Activity.Expect(c.Count);
         var pending = new Queue<(T Item, Task<R> Value)>();
         using var e = items.GetEnumerator();
         while (true)
@@ -39,6 +40,7 @@ public static class ReadAhead
             }
             if (pending.Count == 0) yield break;
             var (i, t) = pending.Dequeue();
+            Activity.Tick();
             yield return (i, t.GetAwaiter().GetResult());
         }
     }

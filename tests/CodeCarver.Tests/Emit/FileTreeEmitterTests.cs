@@ -116,6 +116,40 @@ public class FileTreeEmitterTests
     }
 
     [Fact]
+    public void BuildSupport_LaterStageCopiesFromTheEarlierStage()
+    {
+        // A tree on a share is read once per run: a later stage copies what an earlier stage already copied from that
+        // stage's output, and anything that copy lacks from the tree.
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-sup-" + Guid.NewGuid().ToString("N"));
+        var srcDir = Path.Combine(work, "src");
+        var first = Path.Combine(work, "first");
+        var second = Path.Combine(work, "second");
+        Directory.CreateDirectory(Path.Combine(srcDir, "data"));
+        try
+        {
+            File.WriteAllText(Path.Combine(srcDir, "main.c"), "int main(void){return 0;}\n");
+            File.WriteAllText(Path.Combine(srcDir, "flash.ld"), "MEMORY { }\n");
+            File.WriteAllText(Path.Combine(srcDir, "data", "table.bin"), "tree\n");
+            var none = System.Array.Empty<string>();
+            var r1 = InfrastructureEmitter.Copy(srcDir, first, new[] { "main.c" }, none, none, none);
+            Assert.Equal(2, r1.Count);
+            // Mark the earlier copies, so the test sees where each later copy came from.
+            File.WriteAllText(Path.Combine(first, "data", "table.bin"), "earlier\n");
+            File.Delete(Path.Combine(first, "flash.ld"));
+            var r2 = InfrastructureEmitter.Copy(srcDir, second, new[] { "main.c" }, none, none, none,
+                earlier: (first, r1.Files.ToHashSet(StringComparer.Ordinal)));
+            Assert.Equal(2, r2.Count);
+            Assert.Empty(r2.Warnings);
+            Assert.Equal("earlier\n", File.ReadAllText(Path.Combine(second, "data", "table.bin")));
+            Assert.Equal("MEMORY { }\n", File.ReadAllText(Path.Combine(second, "flash.ld")));   // gone there: from the tree
+        }
+        finally
+        {
+            TempDir.Delete(work);
+        }
+    }
+
+    [Fact]
     public void BuildSupport_RespectsExcludedDirs()
     {
         var work = Path.Combine(Path.GetTempPath(), "codecarver-sup-" + Guid.NewGuid().ToString("N"));

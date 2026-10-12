@@ -102,6 +102,7 @@ public static class CarveCommand
 
     static int RunCore(string[] args, TextWriter @out, TextWriter err)
     {
+        err = TextWriter.Synchronized(err);   // the heartbeat writes from a timer thread
         // carve <source-dir> --config carve.toml [--stage <name>] [--why <symbol>] [--emit-from <analysis output>]
         if (args.Length < 2 || !Directory.Exists(args[1]))
         {
@@ -285,8 +286,36 @@ public static class CarveCommand
         // Phase timing, from here to the end: summary time.<phase>.ms (and stderr with CODECARVER_TIMING=1).
         var _tsw = System.Diagnostics.Stopwatch.StartNew();
         var _timing = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null;
+        // Sign of life on a long run: a line per phase and per stage step that took a moment, and one a minute while a
+        // step runs on, saying how far it got, so whoever watches the log (often an agent tailing it) can tell a slow
+        // run from a stuck one.
+        var _run = System.Diagnostics.Stopwatch.StartNew();
+        var _after = "start";
+        var _stepClock = System.Diagnostics.Stopwatch.StartNew();
+        var _lastBeat = TimeSpan.Zero;
+        static string Clock(TimeSpan t) => $"{(int)t.TotalHours}:{t.Minutes:D2}:{t.Seconds:D2}";
+        void Progress(string done)
+        {
+            var took = _stepClock.Elapsed.TotalSeconds;
+            if (took >= 0.5) err.WriteLine($"  progress: {done,-34} {took,8:N1} s   (run {Clock(_run.Elapsed)})");
+            lock (_run) { _after = done; _stepClock.Restart(); _lastBeat = TimeSpan.Zero; }
+            CodeCarver.Core.Util.Activity.Begin();
+        }
+        using var _heartbeat = new Timer(_ =>
+        {
+            string after; TimeSpan inStep;
+            lock (_run)
+            {
+                after = _after; inStep = _stepClock.Elapsed;
+                if (inStep.TotalSeconds < 60 || inStep - _lastBeat < TimeSpan.FromSeconds(60)) return;
+                _lastBeat = inStep;
+            }
+            err.WriteLine($"  working : {(int)inStep.TotalMinutes} min into the step after '{after}'"
+                + (CodeCarver.Core.Util.Activity.Describe() is { } got ? $": {got} so far" : "") + $" (run {Clock(_run.Elapsed)})");
+        }, null, 15_000, 15_000);
         void Mark(string phase)
         {
+            Progress(phase);
             if (_timing) err.WriteLine($"  timing  : {phase,-14} {_tsw.ElapsedMilliseconds,7} ms");
             diag.Event($"phase {phase}: {_tsw.ElapsedMilliseconds} ms"); // breadcrumb for the diagnostic package
             summary[$"time.{phase}.ms"] = _tsw.ElapsedMilliseconds;     // where a long run spends its time
@@ -2659,6 +2688,9 @@ public static class CarveCommand
                 sb.AppendLine("pathMap = [" + string.Join(", ", cv.PathMap.Select(m => $"{{ from = {Q(m.From)}, to = {Q(m.To)} }}")) + "]");
             return sb.ToString();
         }
+        // The first stage's copy of the files no stage changes (none the carve writes: code, placeholders, carved
+        // headers): the later stages copy those from it, so a tree on a share is read once, not once per stage.
+        (string Dir, IReadOnlySet<string> Files)? infraEarlier = null;
         foreach (var stage in cv.Stages)
         {
             prune = stage.CarveSourceFileContents;
@@ -2701,6 +2733,7 @@ public static class CarveCommand
             var stageClock = System.Diagnostics.Stopwatch.StartNew();
             void Step(string step)
             {
+                Progress($"{(stage.Name.Length == 0 ? "stage" : stage.Name)} {step}");
                 var key = $"{summaryStage}.time.{step}.ms";
                 summary[key] = (summary.TryGetValue(key, out var was) && was is long w ? w : 0L) + stageClock.ElapsedMilliseconds;
                 stageClock.Restart();
@@ -2742,7 +2775,7 @@ public static class CarveCommand
             keptByCheckLog.AddRange(checkLog[kind]);
             // Keep-by-default: copy every non-code file verbatim so the output is a COMPLETE buildable project
             // (the only omissions are emitted code, proven-dead code, and auto-excluded non-inputs).
-            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel);
+            var infra = InfrastructureEmitter.Copy(dir, stageDir, res.Written, InfraDropped(splan), excludeDirs, auxGlobs, pruneGarbage, observedRel, infraEarlier);
             Step("copyInfrastructure");
             summary[$"{summaryStage}.keptFiles"] = splan.KeptFiles.Count;
             summary[$"{summaryStage}.droppedFiles"] = splan.DroppedFiles.Count;
@@ -2853,6 +2886,8 @@ public static class CarveCommand
                 return 1;
             }
 
+            infraEarlier ??= (outDir, infra.Files.Where(r => !exts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)))
+                                                  .ToHashSet(StringComparer.Ordinal));
             var saved = origTotal - carvedBytes;
             var pct = origTotal > 0 ? (double)saved / origTotal : 0;
             @out.WriteLine($"  size    : {origTotal:N0} B -> {carvedBytes:N0} B  ({pct:0%} smaller, saved {saved:N0} B)");

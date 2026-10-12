@@ -30,6 +30,9 @@ public readonly record struct InfraEmitResult(
 /// </summary>
 public static class InfrastructureEmitter
 {
+    /// <param name="earlier">A copy this run already made into another stage: the directory and the relative paths it
+    /// copied. A file it holds is copied from there, not from the source tree. On a network share that turns one read
+    /// of the tree per stage into one per run; the bytes are the same.</param>
     public static InfraEmitResult Copy(
         string sourceRoot, string outDir,
         IReadOnlyCollection<string> alreadyEmittedRel,
@@ -37,7 +40,8 @@ public static class InfrastructureEmitter
         IReadOnlyList<string> excludeDirs,
         IReadOnlyList<string> auxGlobs,
         bool pruneGarbage = true,
-        IReadOnlyCollection<string>? observed = null)
+        IReadOnlyCollection<string>? observed = null,
+        (string Dir, IReadOnlySet<string> Files)? earlier = null)
     {
         var warnings = new List<string>();
         var outFull = Path.GetFullPath(outDir);
@@ -46,35 +50,56 @@ public static class InfrastructureEmitter
         long bytes = 0;
         long garbageBytes = 0;
         var count = 0;
+        CodeCarver.Core.Util.Activity.Begin("files copied");
 
-        foreach (var (rel, full, isGarbage) in Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, pruneGarbage, observed, warnings))
+        // What to do with each file is decided in walk order; the copies run on the thread pool, a window at a time
+        // (one file after another waits a round trip per file on a share), and are taken back in order.
+        (string Rel, string? Error, long Bytes, bool Garbage) CopyOne((string Rel, string Full, bool Garbage) f)
         {
+            var (rel, full, isGarbage) = f;
             // Garbage (VCS/scratch/editor/coverage) is the ONLY thing dropped without evidence from the carve, and
             // only when pruneGarbage is on and --aux didn't force it back. Record it (for the report) and skip the
             // copy. One stat for the byte total — bounded by the walk we're already doing.
             if (isGarbage)
             {
-                try { garbageBytes += new FileInfo(full).Length; } catch { /* vanished/locked: count the file, skip bytes */ }
-                garbage.Add(rel);
-                continue;
+                try { return (rel, null, new FileInfo(full).Length, true); }
+                catch { return (rel, null, 0, true); /* vanished/locked: count the file, skip bytes */ }
             }
             var dst = Path.Combine(outDir, rel);
             var dstFull = Path.GetFullPath(dst);
             // Belt-and-braces: NEVER write outside --out, whatever the rel path resolved to.
             if (!dstFull.StartsWith(outFull + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
                 && !string.Equals(dstFull, outFull, StringComparison.OrdinalIgnoreCase))
-            { warnings.Add($"skipped '{rel}': destination would fall outside the output directory"); continue; }
+                return (rel, $"skipped '{rel}': destination would fall outside the output directory", -1, false);
             // out overlapping source would make dst==src; File.Copy onto itself throws. The CLI refuses
             // overlapping --out, but skip defensively for direct library callers.
-            if (string.Equals(full, dstFull, StringComparison.OrdinalIgnoreCase)) continue;
+            if (string.Equals(full, dstFull, StringComparison.OrdinalIgnoreCase)) return (rel, null, -1, false);
 
             var dd = Path.GetDirectoryName(dst);
             if (!string.IsNullOrEmpty(dd)) Directory.CreateDirectory(dd);
-            try { File.Copy(full, dst, overwrite: true); }
+            var from = earlier is { } e && e.Files.Contains(rel) ? Path.Combine(e.Dir, rel) : full;
+            try { File.Copy(from, dst, overwrite: true); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            { warnings.Add($"could not copy '{rel}' ({ex.GetType().Name}) — skipped"); continue; }
-            bytes += new FileInfo(dst).Length;
-            files.Add(rel);
+            {
+                if (from == full) return (rel, $"could not copy '{rel}' ({ex.GetType().Name}) — skipped", -1, false);
+                // The earlier copy went missing: the tree still has the file.
+                try { File.Copy(full, dst, overwrite: true); }
+                catch (Exception ex2) when (ex2 is IOException or UnauthorizedAccessException)
+                { return (rel, $"could not copy '{rel}' ({ex2.GetType().Name}) — skipped", -1, false); }
+            }
+            var copied = new FileInfo(dst).Length;
+            CodeCarver.Core.Util.Activity.Tick(copied);
+            return (rel, null, copied, false);
+        }
+
+        var selected = Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, pruneGarbage, observed, warnings);
+        foreach (var (_, r) in CodeCarver.Core.Util.ReadAhead.Map(selected, CopyOne))
+        {
+            if (r.Garbage) { garbageBytes += r.Bytes; garbage.Add(r.Rel); continue; }
+            if (r.Error is not null) { warnings.Add(r.Error); continue; }
+            if (r.Bytes < 0) continue;
+            bytes += r.Bytes;
+            files.Add(r.Rel);
             count++;
         }
         files.Sort(StringComparer.Ordinal);
