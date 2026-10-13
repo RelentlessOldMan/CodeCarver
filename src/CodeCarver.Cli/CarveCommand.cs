@@ -294,25 +294,99 @@ public static class CarveCommand
         var _stepClock = System.Diagnostics.Stopwatch.StartNew();
         var _lastBeat = TimeSpan.Zero;
         static string Clock(TimeSpan t) => $"{(int)t.TotalHours}:{t.Minutes:D2}:{t.Seconds:D2}";
+        static string Span(TimeSpan t) => t.TotalSeconds < 120 ? $"{(int)t.TotalSeconds} s" : $"{(int)t.TotalMinutes} min";
+        // Watchdog: when nothing counted has moved for a while (no item done, no wait finished) or one wait has gone on
+        // for minutes, say what the run is doing: the step, its count, CPU, memory, threads, and the waits of this step
+        // and those still going. Numbers only, no path or name; once per step, again if it stays like that. It only
+        // reports, never stops the run.
+        var _stepIo = CodeCarver.Core.Util.IoMeter.Now();
+        var _runIo = _stepIo;
+        long _lastDone = 0, _lastIoDone = _stepIo.DoneSince(null);
+        var _lastMove = TimeSpan.Zero;          // when in the step a count last moved
+        TimeSpan? _lastReport = null;
+        var _cpu = new Queue<(TimeSpan At, TimeSpan Cpu)>();
+        var _watchdogReports = 0;
+        // CODECARVER_WATCHDOG_SECONDS shortens the quiet time (tests); the heartbeat then looks more often too.
+        var _quiet = int.TryParse(Environment.GetEnvironmentVariable("CODECARVER_WATCHDOG_SECONDS"), out var wds) && wds > 0
+            ? TimeSpan.FromSeconds(wds) : TimeSpan.FromMinutes(3);
+        var _beatEvery = (int)Math.Min(15_000, Math.Max(250, _quiet.TotalMilliseconds / 4));
+        var _beatGate = new object();
+        var _again = TimeSpan.FromMinutes(15);
         void Progress(string done)
         {
             var took = _stepClock.Elapsed.TotalSeconds;
             if (took >= 0.5) err.WriteLine($"  progress: {done,-34} {took,8:N1} s   (run {Clock(_run.Elapsed)})");
-            lock (_run) { _after = done; _stepClock.Restart(); _lastBeat = TimeSpan.Zero; }
-            CodeCarver.Core.Util.Activity.Begin();
+            lock (_run)
+            {
+                _after = done; _stepClock.Restart(); _lastBeat = TimeSpan.Zero;
+                _stepIo = CodeCarver.Core.Util.IoMeter.Now(); _lastMove = TimeSpan.Zero; _lastReport = null;
+                CodeCarver.Core.Util.Activity.Begin();
+                _lastDone = 0; _lastIoDone = _stepIo.DoneSince(null);
+            }
         }
         using var _heartbeat = new Timer(_ =>
         {
-            string after; TimeSpan inStep;
+            if (!Monitor.TryEnter(_beatGate)) return;   // a slow look must not pile up behind itself
+            try { Heartbeat(); }
+            catch (Exception ex) when (ex is not OutOfMemoryException) { /* a report must never take the run down */ }
+            finally { Monitor.Exit(_beatGate); }
+        }, null, _beatEvery, _beatEvery);
+        void Heartbeat()
+        {
+            string after; TimeSpan inStep; bool beat;
+            string? report = null;
+            var io = CodeCarver.Core.Util.IoMeter.Now();
+            using var self = System.Diagnostics.Process.GetCurrentProcess();
+            var runAt = _run.Elapsed;
+            _cpu.Enqueue((runAt, self.TotalProcessorTime));
+            while (_cpu.Count > 1 && runAt - _cpu.Peek().At > _quiet) _cpu.Dequeue();
+            var (cpuFrom, cpuThen) = _cpu.Peek();
+            var cpuShare = runAt > cpuFrom ? (self.TotalProcessorTime - cpuThen) / (runAt - cpuFrom) : 0;
             lock (_run)
             {
                 after = _after; inStep = _stepClock.Elapsed;
-                if (inStep.TotalSeconds < 60 || inStep - _lastBeat < TimeSpan.FromSeconds(60)) return;
-                _lastBeat = inStep;
+                var done = CodeCarver.Core.Util.Activity.Done;
+                var ioDone = io.DoneSince(null);
+                if (done != _lastDone || ioDone != _lastIoDone) { _lastMove = inStep; _lastDone = done; _lastIoDone = ioDone; }
+                var still = inStep - _lastMove;
+                var longestWait = CodeCarver.Core.Util.IoMeter.LongestWaitSeconds(io);
+                string? why = still >= _quiet ? $"nothing counted has moved for {Span(still)}"
+                    : longestWait >= _quiet.TotalSeconds ? $"one wait has gone on for {Span(TimeSpan.FromSeconds(longestWait))}"
+                    : null;
+                if (why is not null && (_lastReport is null || inStep - _lastReport >= _again))
+                {
+                    _lastReport = inStep;
+                    _watchdogReports++;
+                    ThreadPool.GetAvailableThreads(out var freeWorkers, out _);
+                    ThreadPool.GetMaxThreads(out var maxWorkers, out _);
+                    var lines = new List<string>
+                    {
+                        $"watchdog: {why} ({Span(inStep)} into the step after '{after}', run {Clock(runAt)})",
+                        $"  count   : {CodeCarver.Core.Util.Activity.Describe() ?? "nothing counted in this step"}",
+                        $"  cpu     : {cpuShare:P0} of one core over the last {Span(runAt - cpuFrom)} ({Environment.ProcessorCount} cores)",
+                        $"  memory  : {self.WorkingSet64 / 1e6:N0} MB in use, {GC.GetTotalMemory(false) / 1e6:N0} MB managed",
+                        $"  threads : {self.Threads.Count} in the process; pool {ThreadPool.ThreadCount} threads, {maxWorkers - freeWorkers} busy, {ThreadPool.PendingWorkItemCount:N0} queued",
+                    };
+                    var waits = CodeCarver.Core.Util.IoMeter.Describe(io, _stepIo).ToList();
+                    lines.Add(waits.Count == 0 ? "  waits   : none in this step" : "  waits in this step:");
+                    lines.AddRange(waits.Select(w => "    " + w));
+                    lines.Add(cpuShare < 0.1
+                        ? (io.Waiting.Sum() > 0 ? "  verdict : mostly waiting on the waits above (a slow drive or share)" : "  verdict : idle, waiting on something not counted (a file check, a lock, a child process)")
+                        : "  verdict : busy computing; this step may just not count what it does");
+                    report = string.Join(Environment.NewLine, lines);
+                }
+                beat = inStep.TotalSeconds >= 60 && inStep - _lastBeat >= TimeSpan.FromSeconds(60);
+                if (beat) _lastBeat = inStep;
             }
-            err.WriteLine($"  working : {(int)inStep.TotalMinutes} min into the step after '{after}'"
-                + (CodeCarver.Core.Util.Activity.Describe() is { } got ? $": {got} so far" : "") + $" (run {Clock(_run.Elapsed)})");
-        }, null, 15_000, 15_000);
+            if (beat)
+                err.WriteLine($"  working : {(int)inStep.TotalMinutes} min into the step after '{after}'"
+                    + (CodeCarver.Core.Util.Activity.Describe() is { } got ? $": {got} so far" : "") + $" (run {Clock(runAt)})");
+            if (report is not null)
+            {
+                err.WriteLine(report);
+                diag.Event(report);
+            }
+        }
         void Mark(string phase)
         {
             Progress(phase);
@@ -339,14 +413,14 @@ public static class CarveCommand
                     cmdDir = MapPath(cmdDir);
                     var bd = Path.IsPathFullyQualified(cmdDir) ? cmdDir : Path.Combine(dir, cmdDir);
                     var full = MapPath(Path.IsPathFullyQualified(path) ? path : Path.Combine(bd, path));
-                    return File.Exists(full) ? File.ReadAllText(full) : null;
+                    return File.Exists(full) ? CodeCarver.Core.Util.IoMeter.ReadAllText(full) : null;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return null; }
             },
         };
         foreach (var bl in buildLogs.Distinct())
         {
-            var cmds = BuildLogScraper.Parse(File.ReadAllText(bl), scrape);
+            var cmds = BuildLogScraper.Parse(CodeCarver.Core.Util.IoMeter.ReadAllText(bl), scrape);
             // A configured build log that yields nothing is a configuration error, not "no #ifdef config" (BL3).
             if (cmds.Count == 0)
             {
@@ -478,7 +552,7 @@ public static class CarveCommand
                             var full = (Path.IsPathFullyQualified(fi) ? new[] { fi }
                                         : new[] { Path.Combine(bd, fi) }.Concat(cc.Includes.Select(i => Path.Combine(Path.IsPathFullyQualified(i) ? i : Path.Combine(bd, i), fi))))
                                        .FirstOrDefault(File.Exists);
-                            if (full is not null) text = File.ReadAllText(full);
+                            if (full is not null) text = CodeCarver.Core.Util.IoMeter.ReadAllText(full);
                         }
                         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
                         if (text is null) { openWorldFiles.Add(kv.Key); continue; }
@@ -815,7 +889,7 @@ public static class CarveCommand
                 (f, state) =>
                 {
                     if (!check.AnyPending) { state.Stop(); return; }
-                    try { check.Add(File.ReadAllText(f)); }
+                    try { check.Add(CodeCarver.Core.Util.IoMeter.ReadAllText(f)); }
                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
                 });
             // Built files first, then the rest of the tree, the build logs (-D renames, --defsym) and the headers outside
@@ -857,7 +931,7 @@ public static class CarveCommand
                 Parallel.ForEach(parseRels.Where(r => !bigRels.Contains(r) && !notBuilt.Contains(r)), rel =>
                 {
                     string text;
-                    try { text = File.ReadAllText(fullByRel[rel]); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return; }
+                    try { text = CodeCarver.Core.Util.IoMeter.ReadAllText(fullByRel[rel]); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return; }
                     foreach (System.Text.RegularExpressions.Match mt in call.Matches(text))
                     {
                         var w = mt.Groups[1].Value;
@@ -971,7 +1045,7 @@ public static class CarveCommand
         var ahead = new Dictionary<int, Task<(string? Text, Exception? Error)>>();
         (string? Text, Exception? Error) Load(string full)
         {
-            try { return (File.ReadAllText(full), null); }
+            try { return (CodeCarver.Core.Util.IoMeter.ReadAllText(full), null); }
             catch (Exception ex) { return (null, ex); }
         }
         bool Readable(string rel) => !skipParse.Contains(rel) && !notBuilt.Contains(rel) && fullByRel.ContainsKey(rel);
@@ -1071,7 +1145,7 @@ public static class CarveCommand
             var queue = new Queue<string>();
             foreach (var rel in parseRels)
                 if (!skipParse.Contains(rel) && !notBuilt.Contains(rel)) queue.Enqueue(fullByRel[rel]);
-            static string? TryRead(string full) { try { return File.ReadAllText(full); } catch { return null; } }
+            static string? TryRead(string full) { try { return CodeCarver.Core.Util.IoMeter.ReadAllText(full); } catch { return null; } }
             while (queue.Count > 0)
             {
                 // Everything queued now, read ahead in order (what it adds is queued behind it, as one at a time would).
@@ -1119,7 +1193,7 @@ public static class CarveCommand
                             if (have.Contains(target) || !gathered.Add(target) || !File.Exists(target)) continue;
                             if (SafeLength(target) > maxParseBytes) continue;   // vanished/locked: long.MaxValue, skipped (RB4)
                             string itext;
-                            try { itext = File.ReadAllText(target); }
+                            try { itext = CodeCarver.Core.Util.IoMeter.ReadAllText(target); }
                             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                             {
                                 err.WriteLine($"  warn    : could not read included {Path.GetFileName(target)} ({ex.GetType().Name}) — not scanned; check it is in the carved tree");
@@ -1349,7 +1423,7 @@ public static class CarveCommand
                 try
                 {
                     if (Path.GetExtension(full).Length == 0 && new FileInfo(full).Length > 4_000_000) return (null, false);  // not a header
-                    return (File.ReadAllText(full), false);
+                    return (CodeCarver.Core.Util.IoMeter.ReadAllText(full), false);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return (null, true); }
             }
@@ -1526,7 +1600,7 @@ public static class CarveCommand
                     return isDead
                         ? $"it is defined at {p.Rel}:{p.Line} inside an #if branch this build's configuration turns off — it isn't compiled in this build"
                         : $"it is defined at {p.Rel}:{p.Line} but the parser didn't recognise the definition (see --why {name})";
-                if (notBuilt.Count > 0 && FindDef(notBuilt, r => File.ReadAllText(fullByRel[r]), false, out _) is { } q)
+                if (notBuilt.Count > 0 && FindDef(notBuilt, r => CodeCarver.Core.Util.IoMeter.ReadAllText(fullByRel[r]), false, out _) is { } q)
                     return $"it is defined only in {q.Rel}, a file the traced build never compiled — it isn't part of this build (another target or component?)";
                 return "it is not defined anywhere in the tree (typo? defined by a macro? in an excluded directory?)";
             }
@@ -1550,7 +1624,7 @@ public static class CarveCommand
         // the graph was already built) on a file locked between the walk and the read — routine on a live tree.
         string SafeRead(string full)
         {
-            try { return File.ReadAllText(full); }
+            try { return CodeCarver.Core.Util.IoMeter.ReadAllText(full); }
             catch (Exception ex)
             {
                 if (readWarned.Add(full)) err.WriteLine($"  warn    : could not read {Path.GetFileName(full)} for root scan ({ex.GetType().Name}) — skipped");
@@ -1627,7 +1701,7 @@ public static class CarveCommand
             foreach (var tp in traceList)
             {
                 if (!File.Exists(tp)) continue; // defensive; missing ones were already handled
-                var recs = TraceFile.Parse(File.ReadAllText(tp), null, out var bad);
+                var recs = TraceFile.Parse(CodeCarver.Core.Util.IoMeter.ReadAllText(tp), null, out var bad);
                 foreach (var n in TraceFile.FunctionNames(recs)) traceNames.Add(n);
                 if (bad > 0) err.WriteLine($"  warn    : {bad} line(s) of function trace '{Path.GetFileName(tp)}' had no readable function name");
             }
@@ -2024,7 +2098,7 @@ public static class CarveCommand
             {
                 var full = Path.Combine(dir, rel);
                 var fi = new FileInfo(full);
-                return fi.Exists && fi.Length <= maxParseBytes ? File.ReadAllText(full, System.Text.Encoding.Latin1) : null;
+                return fi.Exists && fi.Length <= maxParseBytes ? CodeCarver.Core.Util.IoMeter.ReadAllText(full, System.Text.Encoding.Latin1) : null;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
         }
@@ -2208,7 +2282,7 @@ public static class CarveCommand
                 var observedCmm = observedRel.Where(r => r.EndsWith(".cmm", StringComparison.OrdinalIgnoreCase))
                     .Concat(forcedRel.Where(r => r.EndsWith(".cmm", StringComparison.OrdinalIgnoreCase)))
                     .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-                var cc = CmmTraceClosure.Compute(allCmm, observedCmm, rel => File.ReadAllText(relToFull[rel]), maxParseBytes,
+                var cc = CmmTraceClosure.Compute(allCmm, observedCmm, rel => CodeCarver.Core.Util.IoMeter.ReadAllText(relToFull[rel]), maxParseBytes,
                                                  cv.DropUnobservedCmm);
                 cmmDropped = cc.Dropped.ToList();
                 var unobserved = cc.Total - cc.ObservedSeeds - cc.ClosureAdded;
@@ -2252,7 +2326,7 @@ public static class CarveCommand
             if (exactPre is null || !exactPre.Decides(rel) || !fullByRel.TryGetValue(rel, out var src)) return false;
             var o = originalHash.GetOrAdd(rel, _ =>
             {
-                try { var s = File.ReadAllText(src, System.Text.Encoding.Latin1); return (s.Length, s.GetHashCode()); }
+                try { var s = CodeCarver.Core.Util.IoMeter.ReadAllText(src, System.Text.Encoding.Latin1); return (s.Length, s.GetHashCode()); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
             });
             return o is { } h && h.Length == text.Length && h.Hash == text.GetHashCode();
@@ -2290,7 +2364,7 @@ public static class CarveCommand
             if (FailureCases.Replaying || !File.Exists(path) || lang is not ("c" or "cpp")) return;
             try
             {
-                var buildLog = File.ReadAllText(path);
+                var buildLog = CodeCarver.Core.Util.IoMeter.ReadAllText(path);
                 // What kind of errors, as counts (and the -Werror warning names, compiler flags): enough to tell from a
                 // summary alone whether a cut broke the text, left a declaration behind, or dropped a definition.
                 foreach (var g in CodeCarver.Core.Diagnostics.BuildErrors.Parse(buildLog).GroupBy(e => e.Kind))
@@ -2393,7 +2467,7 @@ public static class CarveCommand
                 // And where the use sits in the emitted text (work eval, 1.0.195: 8 kept, no clue which use was missed).
                 var usePath = emitted.FirstOrDefault(e => string.Equals(e.Rel, v.ReferencedIn, StringComparison.Ordinal)).Path;
                 string useText;
-                try { useText = usePath is null ? "" : File.ReadAllText(usePath, System.Text.Encoding.Latin1); }
+                try { useText = usePath is null ? "" : CodeCarver.Core.Util.IoMeter.ReadAllText(usePath, System.Text.Encoding.Latin1); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { useText = ""; }
                 var useShapes = useText.Length == 0 ? new[] { "fileNotRead" } : CodeCarver.Core.Diagnostics.UseShape.Describe(useText, v.Line, v.Name,
                     fe is TreeSitterFrontEnd tsm ? tsm.FunctionMacro : null);
@@ -2519,6 +2593,8 @@ public static class CarveCommand
                 WriteArtifact(Path.Combine(ccDir, "warnings.txt"),
                     "# Every capped warning of this run, in full. Names paths and symbols — keep it local.\n"
                     + string.Concat(warnLog.Select(w => w + "\n")), "warnings");
+            foreach (var (key, value) in CodeCarver.Core.Util.IoMeter.Totals(CodeCarver.Core.Util.IoMeter.Now(), _runIo)) summary[key] = value;
+            summary["watchdog.reports"] = _watchdogReports;
             summary["exitCode"] = verifyFailed ? 3 : 0;
             WriteArtifact(Path.Combine(ccDir, "summary.txt"),
                 "# CodeCarver summary — numbers only: no path, file name or symbol. Safe to send back.\n"

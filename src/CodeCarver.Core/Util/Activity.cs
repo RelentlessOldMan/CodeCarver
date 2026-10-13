@@ -30,6 +30,9 @@ public static class Activity
         if (bytes > 0) Interlocked.Add(ref _bytes, bytes);
     }
 
+    /// <summary>Items done in this step so far.</summary>
+    public static long Done => Interlocked.Read(ref _done);
+
     /// <summary>"12,400/48,000 files copied, 3.1 GB", or null before anything was counted.</summary>
     public static string? Describe()
     {

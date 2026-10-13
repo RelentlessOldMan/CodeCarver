@@ -63,6 +63,7 @@ public static class SourceWalk
         var files = new List<(string, long)>();
         var dirs = new List<(string, bool)>();
         var opts = new EnumerationOptions { IgnoreInaccessible = true, AttributesToSkip = FileAttributes.System };
+        using var listing = IoMeter.Start(IoMeter.Kind.List);
         try
         {
             var entries = new FileSystemEnumerable<(bool Dir, bool Link, string Path, long Length)>(dir,

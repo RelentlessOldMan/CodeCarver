@@ -52,7 +52,8 @@ public sealed class DiagnosticReport
         new(Guid.NewGuid().ToString("N")[..12], DateTimeOffset.UtcNow);
 
     /// <summary>Record a breadcrumb with the elapsed time since start (phase transitions, milestones).</summary>
-    public void Event(string message) => _events.Add((_sw.ElapsedMilliseconds, message));
+    public void Event(string message) { lock (_events) _events.Add((_sw.ElapsedMilliseconds, message)); }   // the watchdog adds from its timer
+    private List<(long Ms, string Message)> Events() { lock (_events) return _events.ToList(); }
 
     /// <summary>Record a warning surfaced during the run (kept-whole fragments, unresolved includes, …). Only
     /// its <see cref="WarningCategory"/> is kept — never the text.</summary>
@@ -203,8 +204,9 @@ public sealed class DiagnosticReport
         foreach (var kv in _fields)
             sb.AppendLine($"{kv.Key}: {Scrub(FormatValue(kv.Value))}");
         sb.AppendLine();
-        sb.AppendLine($"== Events ({_events.Count}) ==");
-        foreach (var (ms, msg) in _events)
+        var events = Events();
+        sb.AppendLine($"== Events ({events.Count}) ==");
+        foreach (var (ms, msg) in events)
             sb.AppendLine($"[{ms,7} ms] {Scrub(msg)}");
         sb.AppendLine();
         sb.AppendLine($"== Warnings by category ({_warnings.Values.Sum()}) ==");
@@ -224,7 +226,7 @@ public sealed class DiagnosticReport
             ["startedUtc"] = _started.ToString("o"),
             ["durationMs"] = _sw.ElapsedMilliseconds,
             ["fields"] = _fields.ToDictionary(kv => kv.Key, kv => (object?)Scrub(FormatValue(kv.Value))),
-            ["events"] = _events.Select(e => new Dictionary<string, object?> { ["ms"] = e.Ms, ["message"] = Scrub(e.Message) }).ToList(),
+            ["events"] = Events().Select(e => new Dictionary<string, object?> { ["ms"] = e.Ms, ["message"] = Scrub(e.Message) }).ToList(),
             ["warningCategories"] = _warnings.ToDictionary(kv => kv.Key, kv => (object?)kv.Value),
         };
         return JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true });

@@ -43,6 +43,7 @@ public static class MacroProbe
             if (useStdin) { psi.ArgumentList.Add("-x"); psi.ArgumentList.Add("c"); psi.ArgumentList.Add("-"); }
             else psi.ArgumentList.Add(Path.GetFullPath(throughFile!));
 
+            using var launch = CodeCarver.Core.Util.IoMeter.Start(CodeCarver.Core.Util.IoMeter.Kind.Launch);   // until the compiler exits
             using var p = Process.Start(psi);
             if (p is null) return null;
             // Read both pipes concurrently (a full stderr pipe would otherwise deadlock a ReadToEnd on stdout)

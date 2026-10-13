@@ -609,6 +609,16 @@ header is kept whole regardless — and a normal large `.c` (mostly code) is una
 Read the `warn:` lines — they're where the carve was uncertain. For a slow run, `CODECARVER_TIMING=1`
 prints a per-phase + slow-file breakdown to stderr.
 
+A long run says how far it has got on stderr: a `progress:` line for each step that took half a second or
+more, and a `working :` line once a minute while a step runs on, with its count so far. If nothing counted
+moves for 3 minutes, or one directory listing, file read, copy or compiler run has been waiting that long, a
+`watchdog:` block follows: the step, its count, CPU over the last minutes, memory, threads, and this step's
+waits (how many, average and slowest time, how many still waiting and for how long), ending in a one-line
+verdict — busy computing, waiting on a slow drive, or idle on something not counted. It names no path or
+symbol, goes into the `--diag` package too, and repeats every 15 minutes while the step stays like that; it
+never stops the run. The summary carries the run's totals: `io.<list|read|copy|launch>.count`, `.ms` (time
+spent waiting, summed over threads) and `.maxMs`, and `watchdog.reports`.
+
 ## Diagnostics
 
 ```

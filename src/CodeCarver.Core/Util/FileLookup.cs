@@ -27,7 +27,7 @@ public sealed class FileLookup
         if (listings.TryGetValue(dir, out var names)) return names;
         if (unlistable.Contains(dir)) return null;
         names = new HashSet<string>(PathComparer.Default);
-        try { foreach (var f in enumerate(dir)) names.Add(Path.GetFileName(f)); }
+        try { using (IoMeter.Start(IoMeter.Kind.List)) foreach (var f in enumerate(dir)) names.Add(Path.GetFileName(f)); }
         catch (Exception ex) when (ex is DirectoryNotFoundException or ArgumentException) { names.Clear(); }   // truly absent
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { unlistable.Add(dir); return null; }
         DirectoriesListed++;

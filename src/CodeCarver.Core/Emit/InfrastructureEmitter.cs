@@ -1,3 +1,5 @@
+using CodeCarver.Core.Util;
+
 namespace CodeCarver.Core.Emit;
 
 /// <summary>Outcome of the keep-by-default infrastructure pass: how many non-code files were passed
@@ -81,12 +83,12 @@ public static class InfrastructureEmitter
             var dd = Path.GetDirectoryName(dst);
             if (!string.IsNullOrEmpty(dd)) Directory.CreateDirectory(dd);
             var from = earlier is { } e && e.Files.Contains(rel) ? Path.Combine(e.Dir, rel) : full;
-            try { File.Copy(from, dst, overwrite: true); }
+            try { IoMeter.Copy(from, dst, overwrite: true); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 if (from == full) return (rel, $"could not copy '{rel}' ({ex.GetType().Name}) — skipped", -1, false);
                 // The earlier copy went missing: the tree still has the file.
-                try { File.Copy(full, dst, overwrite: true); }
+                try { IoMeter.Copy(full, dst, overwrite: true); }
                 catch (Exception ex2) when (ex2 is IOException or UnauthorizedAccessException)
                 { return (rel, $"could not copy '{rel}' ({ex2.GetType().Name}) — skipped", -1, false); }
             }

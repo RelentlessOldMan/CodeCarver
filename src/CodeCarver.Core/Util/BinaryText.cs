@@ -14,6 +14,7 @@ public static class BinaryText
     {
         try
         {
+            using var read = IoMeter.Start(IoMeter.Kind.Read);
             using var s = File.OpenRead(path);
             var buf = new byte[8192];
             var n = s.ReadAtLeast(buf, buf.Length, throwOnEndOfStream: false);
@@ -49,6 +50,7 @@ public static class BinaryText
         try { s = File.OpenRead(path); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { yield break; }
         using (s)
+        using (IoMeter.Start(IoMeter.Kind.Read))
         {
             var buf = new byte[ChunkBytes];
             var carry = "";

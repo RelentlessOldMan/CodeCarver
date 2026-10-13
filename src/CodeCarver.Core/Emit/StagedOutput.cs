@@ -1,3 +1,5 @@
+using CodeCarver.Core.Util;
+
 namespace CodeCarver.Core.Emit;
 
 /// <summary>
@@ -224,7 +226,7 @@ public sealed class StagedOutput : IDisposable
             var d = Path.Combine(dst, rel);
             var dd = Path.GetDirectoryName(d);
             if (!string.IsNullOrEmpty(dd)) Directory.CreateDirectory(dd);
-            try { File.Copy(Path.Combine(src, rel), d, overwrite: true); ClearReadOnly(d); }
+            try { IoMeter.Copy(Path.Combine(src, rel), d, overwrite: true); ClearReadOnly(d); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 throw new PromoteFailedException(
@@ -290,7 +292,7 @@ public sealed class StagedOutput : IDisposable
         foreach (var f in Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories))
         {
             var d = Path.Combine(dst, Path.GetRelativePath(src, f));
-            File.Copy(f, d, overwrite: true);
+            IoMeter.Copy(f, d, overwrite: true);
             ClearReadOnly(d); // keep the carved output writable/editable
         }
     }

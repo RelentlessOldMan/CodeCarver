@@ -278,6 +278,7 @@ public sealed class CompilerPreprocess
             else
                 foreach (var a in args) psi.ArgumentList.Add(a);
 
+            using var launch = IoMeter.Start(IoMeter.Kind.Launch);   // until the compiler exits
             using var p = Process.Start(psi);
             if (p is null) return false;
             p.StandardInput.Close();

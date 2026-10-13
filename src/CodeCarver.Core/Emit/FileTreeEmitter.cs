@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using CodeCarver.Core.Graph;
 using CodeCarver.Core.Reachability;
+using CodeCarver.Core.Util;
 
 namespace CodeCarver.Core.Emit;
 
@@ -61,7 +62,7 @@ public static class FileTreeEmitter
             // Best-effort: a kept file that's locked/vanished between planning and emit (rare — antivirus, a
             // Perforce sync, a file kept-whole precisely because it was unreadable) must not crash the whole
             // emit. Skip it (it just won't be in the output); the read-time warning already flagged it.
-            try { File.Copy(src, dst, overwrite: true); copied[i] = new FileInfo(dst).Length; }
+            try { IoMeter.Copy(src, dst, overwrite: true); copied[i] = new FileInfo(dst).Length; }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         });
         for (var i = 0; i < keptFiles.Count; i++)
@@ -161,7 +162,7 @@ public static class FileTreeEmitter
                 if (removed is not null && !IsUtf16(src))
                 {
                     // Bytes in, bytes out: ReadAllText would honour (and strip) a UTF-8 BOM even when told Latin-1.
-                    var original = File.ReadAllBytes(src);
+                    var original = IoMeter.ReadAllBytes(src);
                     // Stubs first: they keep every line, so the line ranges below still line up.
                     var text = Encoding.Latin1.GetString(original);
                     if (stubs.Count > 0) { text = StubBodies.Apply(text, stubs); stubbed = stubs.Count; }
@@ -170,7 +171,7 @@ public static class FileTreeEmitter
                     cut = original.Length - pruned.Length;
                 }
                 else
-                    File.Copy(src, dst, overwrite: true);
+                    IoMeter.Copy(src, dst, overwrite: true);
                 done[i] = (new FileInfo(dst).Length, cut, stubbed);
             }
             // A locked/vanished file must not sink the whole emit (review RB5) — same tolerance as Emit.
@@ -309,7 +310,7 @@ public static class FileTreeEmitter
             if (SameFile(target, dst)) continue; // out overlaps source - don't copy onto the original
             var dstDir = Path.GetDirectoryName(dst);
             if (!string.IsNullOrEmpty(dstDir)) Directory.CreateDirectory(dstDir);
-            try { File.Copy(target, dst, overwrite: true); }
+            try { IoMeter.Copy(target, dst, overwrite: true); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
             bytes += new FileInfo(dst).Length;
             written.Add(trel);
@@ -339,7 +340,7 @@ public static class FileTreeEmitter
             try
             {
                 var info = new FileInfo(full);
-                return !info.Exists || info.Length > 8 * 1024 * 1024 ? null : File.ReadAllText(full);
+                return !info.Exists || info.Length > 8 * 1024 * 1024 ? null : IoMeter.ReadAllText(full);
             }
             catch { return null; }
         }
