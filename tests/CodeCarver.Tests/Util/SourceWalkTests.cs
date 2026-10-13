@@ -79,6 +79,55 @@ public sealed class SourceWalkTests
     }
 
     [Fact]
+    public void Entries_ListsDirectoriesAtOnce_InTheWalkOrder_WithSizes()
+    {
+        // The parallel listing must give back exactly what the recursive walk yields, in the same order: the order
+        // decides which file a run reads first.
+        var root = Path.Combine(Path.GetTempPath(), "cc-walk-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var rnd = new Random(5);
+            for (var a = 0; a < 6; a++)
+                for (var b = 0; b < 5; b++)
+                {
+                    var d = Path.Combine(root, $"m{a}", b % 2 == 0 ? $"s{b}" : Path.Combine($"s{b}", "deep", $"x{b}"));
+                    Directory.CreateDirectory(d);
+                    for (var k = 0; k < rnd.Next(0, 6); k++) File.WriteAllText(Path.Combine(d, $"f{k}.c"), new string('x', rnd.Next(0, 300)));
+                }
+            File.WriteAllText(Path.Combine(root, "top.mk"), "all:");
+            Directory.CreateDirectory(Path.Combine(root, ".git"));
+            File.WriteAllText(Path.Combine(root, ".git", "HEAD"), "ref");
+
+            var walked = SourceWalk.Files(root).ToList();
+            var entries = SourceWalk.Entries(root, null).ToList();
+            Assert.Equal(walked, entries.Select(e => e.Path).ToList());
+            Assert.All(entries, e => Assert.Equal(new FileInfo(e.Path).Length, e.Length));
+            Assert.DoesNotContain(entries, e => e.Path.Contains(".git", StringComparison.Ordinal));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public void Entries_ReportsLinksNotFollowed_LikeTheWalk()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cc-walk-" + Guid.NewGuid().ToString("N"));
+        var real = Path.Combine(root, "real");
+        Directory.CreateDirectory(real);
+        File.WriteAllText(Path.Combine(real, "a.c"), "x");
+        try
+        {
+            if (!TryJunction(Path.Combine(real, "loop"), root)) return;
+            var a = new List<string>(); var b = new List<string>();
+            var walked = SourceWalk.Files(root, a.Add).ToList();
+            var entries = SourceWalk.Entries(root, b.Add).Select(e => e.Path).ToList();
+            Assert.Equal(walked, entries);
+            Assert.Equal(a, b);
+            Assert.Single(b);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
     public void DotFilesAndHiddenEntries_AreWalked_VcsMetadataIsNot()
     {
         // Review RB6: Linux reports every dot-file as Hidden; skipping Hidden lost .config (Kconfig) etc.

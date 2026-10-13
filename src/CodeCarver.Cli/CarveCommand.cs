@@ -705,6 +705,7 @@ public static class CarveCommand
         // Files OUTSIDE the root the traced builds opened (SDK and generated headers): the closed world reads their
         // #defines. Null when not every selected build has a trace.
         List<string>? buildOpenedOutside = null;
+        List<string> buildOpenedUnwalked = new();
         // Every path the build traces name, as read (for the anonymized failure bundles: a missing file counts too).
         var buildTraceFull = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         // The build log and the build trace describe the same build: every in-root source the log compiled must show
@@ -741,7 +742,14 @@ public static class CarveCommand
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { complete = false; }   // reported (exit 2) where traces are ingested
             }
-            if (complete) buildOpenedOutside = outside.ToList();
+            if (complete)
+            {
+                buildOpenedOutside = outside.ToList();
+                // And the files inside the root the builds opened that the walk left out (an excluded directory, a
+                // header type the walk doesn't collect): their #defines count like those outside.
+                buildOpenedUnwalked = openedByBuild.Where(r => !fullByRel.ContainsKey(r))
+                                                   .Select(r => Path.GetFullPath(Path.Combine(rootF, r))).ToList();
+            }
             if (complete && buildCmds.Count > 0)
             {
                 // Only files the tree has: a configure probe prints "gcc -c conftest.c" for a file it then deletes.
@@ -1150,9 +1158,11 @@ public static class CarveCommand
             }
             var incRe = new System.Text.RegularExpressions.Regex("^\\s*#\\s*include\\s+\"([^\"]+)\"",
                 System.Text.RegularExpressions.RegexOptions.Multiline);
+            CodeCarver.Core.Util.Activity.Begin("tree files scanned", parseRels.Count);
             foreach (var rel in parseRels)
             {
                 var text = ReadRel(rel);
+                CodeCarver.Core.Util.Activity.Tick();
                 if (text.Length == 0 || !text.Contains("#include", StringComparison.Ordinal)) continue;
                 foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
                 {
@@ -1272,7 +1282,7 @@ public static class CarveCommand
         {
             // pre-parse is often the longest phase on a product tree: say which part.
             var ppSw = System.Diagnostics.Stopwatch.StartNew();
-            void PreParsePart(string part) { summary[$"time.pre-parse.{part}.ms"] = ppSw.ElapsedMilliseconds; ppSw.Restart(); }
+            void PreParsePart(string part) { summary[$"time.pre-parse.{part}.ms"] = ppSw.ElapsedMilliseconds; ppSw.Restart(); Progress($"pre-parse {part}"); }
             // PP1: every macro name #defined/#undef'd anywhere in the tree. Parsed files are read in full; the
             // big/dense headers the parser skips are streamed, keeping only names some #if actually tests.
             // Any directive spelling: #, the digraph %:, the trigraph ??=.
@@ -1303,9 +1313,11 @@ public static class CarveCommand
                     if (m.Groups[1].Success) quoted.Add((fromDir, m.Groups[1].Value));
                     else if (m.Groups[3].Success) computedIncludes++;
             }
+            CodeCarver.Core.Util.Activity.Begin("tree files scanned for macros", parseRels.Count);
             foreach (var rel in parseRels)
             {
                 var text = ReadRel(rel);
+                CodeCarver.Core.Util.Activity.Tick();
                 ScanText(text);
                 Includes(Path.GetDirectoryName(fullByRel[rel]) ?? dir, text);
             }
@@ -1369,9 +1381,10 @@ public static class CarveCommand
                     catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { }
             }
             var rootFull = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir));
+            CodeCarver.Core.Util.Activity.Begin("outside headers read");
             if (buildOpenedOutside is not null)
             {
-                foreach (var (f, read) in CodeCarver.Core.Util.ReadAhead.Map(buildOpenedOutside.Where(Wanted).ToList(), ReadOutside)) ScanRead(f, read);
+                foreach (var (f, read) in CodeCarver.Core.Util.ReadAhead.Map(buildOpenedOutside.Concat(buildOpenedUnwalked).Where(Wanted).ToList(), ReadOutside)) ScanRead(f, read);
                 if (notHere > 0) unseen.Add($"{notHere} header(s) the build trace opened aren't on this machine (system headers of another OS, or paths that need pathMap)");
             }
             else
@@ -1389,14 +1402,19 @@ public static class CarveCommand
                 if (missingDirs > 0) unseen.Add($"{missingDirs} include dir(s) from the build log don't exist here");
             }
             PreParsePart("outsideHeaders");
-            // Quoted includes: follow the ones that leave the tree; one that resolves nowhere hides its macros.
+            // Quoted includes: follow the ones that leave the tree; one that resolves nowhere hides its macros. With a
+            // trace of every build there is nothing to follow: the trace names every header the builds opened outside
+            // the tree, and those were read above. Following them anyway looked up one directory after another across
+            // every -I dir, a round trip each on a network drive: a whole-tree run waited on it for over 13 minutes.
             var basenames = new HashSet<string>(fullByRel.Keys.Select(r => Path.GetFileName(r)), StringComparer.OrdinalIgnoreCase);
             var unresolved = 0;
             // Each (dir, name) once, and each name's -I search once: thousands of files x hundreds of -I dirs.
             var seenQuoted = new HashSet<(string, string)>();
             var viaIncDirs = new Dictionary<string, string?>(StringComparer.Ordinal);
-            for (var qi = 0; qi < quoted.Count; qi++)
+            CodeCarver.Core.Util.Activity.Begin("#include lookups");
+            for (var qi = 0; buildOpenedOutside is null && qi < quoted.Count; qi++)
             {
+                CodeCarver.Core.Util.Activity.Tick();
                 var (fromDir, raw) = quoted[qi];
                 if (!seenQuoted.Add((fromDir, raw))) continue;
                 var hit = fileLookup.Probe(fromDir, raw);
@@ -1425,22 +1443,25 @@ public static class CarveCommand
                     + "A build trace makes this exact; so does mapping the include dir(s) with [advanced] pathMap.");
                 summary["world.invisibleMacroNames"] = invisible.Count;
             }
-            foreach (var rel in skipParse)
+            // The big and dense headers the parser skips, streamed a window at a time: the names they #define that some
+            // #if tests, or null when one can't be read (then every tested name might come from it).
+            List<string>? DefinedTested(string rel)
             {
+                var found = new List<string>();
                 try
                 {
                     foreach (var line in File.ReadLines(fullByRel[rel]))
                     {
                         var m = defRe.Match(line);
-                        if (m.Success && condIdents.Contains(m.Groups[1].Value)) ambientMacros.Add(m.Groups[1].Value);
+                        if (m.Success && condIdents.Contains(m.Groups[1].Value)) found.Add(m.Groups[1].Value);
                     }
+                    return found;
                 }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    // Can't see its defines: every tested name might come from it.
-                    ambientMacros.UnionWith(condIdents);
-                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
             }
+            CodeCarver.Core.Util.Activity.Begin("unparsed headers read", skipParse.Count);
+            foreach (var (_, names) in CodeCarver.Core.Util.ReadAhead.Map(skipParse.ToList(), DefinedTested))
+                ambientMacros.UnionWith(names ?? (IEnumerable<string>)condIdents);
             PreParsePart("unparsedHeaders");
             err.WriteLine($"  config  : {ambientMacros.Count:N0} macro name(s) #defined in the tree stay unknown unless the build defines them");
             summary["world.ambientMacros"] = ambientMacros.Count;
