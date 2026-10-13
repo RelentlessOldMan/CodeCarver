@@ -28,6 +28,24 @@ public sealed class IoMeterTests
     }
 
     [Fact]
+    public void ReadLines_ThrowsAtTheCall_AndCountsTheRead()
+    {
+        var dir = Directory.CreateTempSubdirectory("iometer-");
+        try
+        {
+            // As File.ReadLines: a missing file throws where it is called, inside the caller's try, not later at the loop.
+            Assert.Throws<FileNotFoundException>(() => IoMeter.ReadLines(Path.Combine(dir.FullName, "absent.h")));
+            var path = Path.Combine(dir.FullName, "lines.h");
+            File.WriteAllText(path, "a\nb\nc\n");
+            var before = IoMeter.Now();
+            Assert.Equal(3, IoMeter.ReadLines(path).Count());
+            var after = IoMeter.Now();
+            Assert.True(after.Count[(int)IoMeter.Kind.Read] - before.Count[(int)IoMeter.Kind.Read] >= 1);
+        }
+        finally { dir.Delete(recursive: true); }
+    }
+
+    [Fact]
     public void Reads_AreCounted_AndDescribedWithoutTheirPaths()
     {
         var dir = Directory.CreateTempSubdirectory("iometer-");

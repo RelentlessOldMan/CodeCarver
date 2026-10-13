@@ -776,6 +776,10 @@ public static class CarveCommand
         // code needs fails loudly (cause definedInFileNotBuilt) instead of cutting silently. Files a run opened and
         // forceKeepFiles are always read. Off with [advanced] skipFilesNotBuilt = false.
         var notBuilt = new HashSet<string>(StringComparer.Ordinal);
+        // The big and dense headers the parser skips that no traced build or run opened: no compile saw their #defines,
+        // so pre-parse doesn't stream them for macro names (on a product tree, thousands of multi-MB files on the drive).
+        // They stay in the graph and are kept whole by include-closure as before.
+        var skipParseNotOpened = new HashSet<string>(StringComparer.Ordinal);
         // Files OUTSIDE the root the traced builds opened (SDK and generated headers): the closed world reads their
         // #defines. Null when not every selected build has a trace.
         List<string>? buildOpenedOutside = null;
@@ -798,7 +802,7 @@ public static class CarveCommand
                 var isBuild = buildFileTraces.Contains(tp);
                 try
                 {
-                    foreach (var cand in FileAccessTrace.Paths(File.ReadLines(tp)))
+                    foreach (var cand in FileAccessTrace.Paths(CodeCarver.Core.Util.IoMeter.ReadLines(tp)))
                     {
                         string full;
                         try { var mp = MapPath(cand); full = Path.IsPathFullyQualified(mp) ? Path.GetFullPath(mp) : Path.GetFullPath(Path.Combine(rootF, mp)); }
@@ -858,7 +862,7 @@ public static class CarveCommand
                 foreach (var glob in auxGlobs.Where(g => !BuildSupportEmitter.GlobEscapesRoot(g)))
                     foreach (var p in BuildSupportEmitter.MatchGlob(dir, glob, treeFiles)) opened.Add(Path.GetRelativePath(dir, p).Replace('\\', '/'));
                 foreach (var rel in parseRels)
-                    if (!opened.Contains(rel) && !skipParse.Contains(rel)) notBuilt.Add(rel);
+                    if (!opened.Contains(rel)) (skipParse.Contains(rel) ? skipParseNotOpened : notBuilt).Add(rel);
                 err.WriteLine($"  build   : {notBuilt.Count:N0} of {parseRels.Count:N0} code file(s) were not opened by the traced build(s) -> not read or parsed (dropped unless kept code needs them; verify checks)");
             }
             if (cv.SkipFilesNotBuilt) summary["parse.filesNotBuiltSkipped"] = notBuilt.Count;
@@ -892,18 +896,23 @@ public static class CarveCommand
                     try { check.Add(CodeCarver.Core.Util.IoMeter.ReadAllText(f)); }
                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
                 });
-            // Built files first, then the rest of the tree, the build logs (-D renames, --defsym) and the headers outside
-            // the root the build opened: each later set is read only while some name is still unseen.
+            // Built files first, then the build logs (-D renames, --defsym), the headers outside the root the build opened,
+            // the prebuilt binaries and last the code files the traced build never opened: each later set is read only
+            // while some name is still unseen. Binaries come before the unbuilt files: a name the build gets only from a
+            // binary is no entry point of the carve even when an unbuilt copy of its source sits in the tree, and the
+            // unbuilt files are most of a big tree.
+            var rnSw = System.Diagnostics.Stopwatch.StartNew();
+            void RootNamesPart(string part) { summary[$"time.rootNames.{part}.ms"] = rnSw.ElapsedMilliseconds; rnSw.Restart(); Progress($"rootNames {part}"); }
             Scan(parseRels.Where(r => !bigRels.Contains(r) && !notBuilt.Contains(r)).Select(r => fullByRel[r]));
-            if (check.AnyPending) Scan(parseRels.Where(r => !bigRels.Contains(r) && notBuilt.Contains(r)).Select(r => fullByRel[r]));
             if (check.AnyPending) Scan(buildLogs.Distinct());
             if (check.AnyPending && buildOpenedOutside is not null) Scan(buildOpenedOutside);
+            RootNamesPart("built");
             var missing = check.Missing();
             if (missing.Count > 0)
             {
-                // A name no text holds may be defined in a prebuilt binary the tree carries (an archive, an object, a
-                // symbol dump): there's no source to carve for it, and the binary is copied to every stage as it is.
-                // It is no entry point of the carve then: noted and counted, not failed.
+                // A name no built text holds may be defined in a prebuilt binary the tree carries (an archive, an object,
+                // a symbol dump): there's no source the build compiles for it, and the binary is copied to every stage as
+                // it is. It is no entry point of the carve then: noted and counted, not failed.
                 var holding = new System.Collections.Concurrent.ConcurrentBag<string>();
                 Parallel.ForEach(TreeBinaries(), new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, (f, state) =>
                 {
@@ -916,13 +925,19 @@ public static class CarveCommand
                 {
                     roots = roots.Where(r => !inBinaries.Contains(r)).ToArray();
                     err.WriteLine($"  roots   : {inBinaries.Count:N0} entry point(s) are defined only in {holding.Count:N0} prebuilt binary file(s) "
-                        + $"(no source in the tree) -> not carved; the binaries are kept as they are, e.g. "
+                        + $"(no source the build compiles) -> not carved; the binaries are kept as they are, e.g. "
                         + $"{Path.GetRelativePath(dir, holding.First()).Replace('\\', '/')}");
                 }
                 summary["roots.entryPointsOnlyInBinaries"] = inBinaries.Count;
                 summary["roots.binaryFilesHoldingEntryPoints"] = holding.Count;
-                missing = missing.Where(stillMissing.Contains).ToList();
+                RootNamesPart("binaries");
             }
+            if (check.AnyPending && notBuilt.Count > 0)
+            {
+                Scan(parseRels.Where(r => !bigRels.Contains(r) && notBuilt.Contains(r)).Select(r => fullByRel[r]));
+                RootNamesPart("unbuilt");
+            }
+            missing = check.Missing();
             if (missing.Count > 0)
             {
                 // Near misses from the built files' names followed by '(' (functions and function-like macros).
@@ -1524,7 +1539,7 @@ public static class CarveCommand
                 var found = new List<string>();
                 try
                 {
-                    foreach (var line in File.ReadLines(fullByRel[rel]))
+                    foreach (var line in CodeCarver.Core.Util.IoMeter.ReadLines(fullByRel[rel]))
                     {
                         var m = defRe.Match(line);
                         if (m.Success && condIdents.Contains(m.Groups[1].Value)) found.Add(m.Groups[1].Value);
@@ -1533,8 +1548,12 @@ public static class CarveCommand
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
             }
-            CodeCarver.Core.Util.Activity.Begin("unparsed headers read", skipParse.Count);
-            foreach (var (_, names) in CodeCarver.Core.Util.ReadAhead.Map(skipParse.ToList(), DefinedTested))
+            var unparsedToRead = skipParse.Where(r => !skipParseNotOpened.Contains(r)).ToList();
+            if (skipParseNotOpened.Count > 0)
+                err.WriteLine($"  config  : {skipParseNotOpened.Count:N0} of {skipParse.Count:N0} unparsed header(s) were not opened by the traced build(s) -> not read for macro names");
+            summary["world.unparsedHeadersNotOpenedSkipped"] = skipParseNotOpened.Count;
+            CodeCarver.Core.Util.Activity.Begin("unparsed headers read", unparsedToRead.Count);
+            foreach (var (_, names) in CodeCarver.Core.Util.ReadAhead.Map(unparsedToRead, DefinedTested))
                 ambientMacros.UnionWith(names ?? (IEnumerable<string>)condIdents);
             PreParsePart("unparsedHeaders");
             err.WriteLine($"  config  : {ambientMacros.Count:N0} macro name(s) #defined in the tree stay unknown unless the build defines them");
@@ -1760,7 +1779,7 @@ public static class CarveCommand
                     IReadOnlyCollection<string> cands;
                     // Streamed (File.ReadLines): a multi-GB raw capture is never one string. A trace that can't be
                     // read is an error like a missing one — carving on with fewer roots would be silent (review T2).
-                    try { cands = FileAccessTrace.Paths(File.ReadLines(tp)); }
+                    try { cands = FileAccessTrace.Paths(CodeCarver.Core.Util.IoMeter.ReadLines(tp)); }
                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OutOfMemoryException)
                     { err.WriteLine($"{kind} file-trace '{tp}' could not be read ({ex.GetType().Name}: {ex.Message})."); return false; }
                     var inTree = 0;
@@ -1857,7 +1876,7 @@ public static class CarveCommand
             if (outsideCode.Count + outsideForced.Count > 0)
             {
                 var extSw = System.Diagnostics.Stopwatch.StartNew();
-                var ext = ExternalIncluders.Find(outsideCode, logIncDirs, rootFullX, fullByRel.Keys, isSystemPath, p => File.ReadLines(p), fileLookup,
+                var ext = ExternalIncluders.Find(outsideCode, logIncDirs, rootFullX, fullByRel.Keys, isSystemPath, p => CodeCarver.Core.Util.IoMeter.ReadLines(p), fileLookup,
                                                  forcedIncludes: outsideForced,
                                                  cachedLines: p => outsideIncludeLines.TryGetValue(p, out var l) ? l : null);
                 summary["time.outsideIncludes.ms"] = extSw.ElapsedMilliseconds;
@@ -1893,7 +1912,7 @@ public static class CarveCommand
                 try
                 {
                     // Generated register headers run to millions of identifiers: a string only for a likely name.
-                    foreach (var line in File.ReadLines(fullByRel[h]))
+                    foreach (var line in CodeCarver.Core.Util.IoMeter.ReadLines(fullByRel[h]))
                         foreach (var m in Identifier.EnumerateMatches(line))
                         {
                             var span = line.AsSpan(m.Index, m.Length);

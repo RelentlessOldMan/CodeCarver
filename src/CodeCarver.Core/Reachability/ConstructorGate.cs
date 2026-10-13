@@ -69,7 +69,7 @@ public sealed class ConstructorGate
             if (len <= maxTextBytes) return ReleasedBy(file, File.ReadAllText(fullPath, System.Text.Encoding.Latin1));
             _scanned.Add(file);
             var words = new List<string>();
-            foreach (var line in File.ReadLines(fullPath, System.Text.Encoding.Latin1))
+            foreach (var line in CodeCarver.Core.Util.IoMeter.ReadLines(fullPath, System.Text.Encoding.Latin1))
                 foreach (System.Text.RegularExpressions.Match m in Word.Matches(line))
                     if (_ctorsByType.ContainsKey(m.Value) && !_released.Contains(m.Value)) words.Add(m.Value);
             return Release(words);

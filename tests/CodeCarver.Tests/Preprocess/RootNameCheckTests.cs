@@ -121,6 +121,35 @@ public sealed class RootNameCheckTests
     }
 
     [Fact]
+    public void Carve_NameInABinary_AndInASourceTheTracedBuildNeverOpened_IsTheBinarys()
+    {
+        // The build links the prebuilt archive; the module's source sits in the tree but no compile opens it. The name is
+        // the binary's (not carved), not "defined only in a file the build never compiled" (a failure after the graph).
+        var work = Path.Combine(Path.GetTempPath(), "cc-rootname-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var src = Path.Combine(work, "src");
+            Directory.CreateDirectory(Path.Combine(src, "modt"));
+            File.WriteAllText(Path.Combine(src, "main.c"), "int main(void){ return 0; }\n");
+            File.WriteAllText(Path.Combine(src, "modt", "modt.c"), "int modt_open(void){ return 1; }\n");
+            Blob(Path.Combine(src, "modt"), "libmodt.a", "modt_open");
+            var trace = Path.Combine(work, "build.trace");
+            File.WriteAllText(trace, Path.Combine(src, "main.c").Replace('\\', '/') + "\n");
+            var cfg = Path.Combine(work, "carve.toml");
+            File.WriteAllText(cfg, "outputDirectory = \"out\"\n[common]\nentryPoints = [\"main\", \"modt_open\"]\n"
+                + $"[builds.b]\nbuildTraceFiles = [\"{trace.Replace('\\', '/')}\"]\n");
+            var se = new StringWriter();
+            Assert.Equal(0, CarveCommand.Run(new[] { "carve", src, "--config", cfg }, new StringWriter(), se));
+            var e = se.ToString();
+            Assert.Contains("1 entry point(s) are defined only in 1 prebuilt binary file(s)", e);
+            var summary = File.ReadAllText(Path.Combine(work, "out", "codecarver", "summary.txt"));
+            Assert.Contains("time.rootNames.binaries.ms", summary);
+            Assert.DoesNotContain("time.rootNames.unbuilt.ms", summary);    // nothing left to look for in the unbuilt files
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
+    [Fact]
     public void Carve_KeepsWhatAPrebuiltBinaryCalls()
     {
         var work = Path.Combine(Path.GetTempPath(), "cc-rootname-" + Guid.NewGuid().ToString("N"));

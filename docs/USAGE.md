@@ -279,6 +279,10 @@ compiled.
     none of them opened can't be part of the build. It's dropped without being read or parsed, which on a big
     tree is most of the carve time (and most of the round trips on a network drive). The `build :` line says how
     many; `parse.filesNotBuiltSkipped` counts them. `[advanced] skipFilesNotBuilt = false` turns this off.
+    The same goes for the big and dense headers the parser skips: one no traced build opened isn't read for
+    macro names (`world.unparsedHeadersNotOpenedSkipped`); it is still kept whole when kept code includes it.
+    And an entry point found only in a prebuilt binary and in a source file the build never opened is the
+    binary's: it is counted in `roots.entryPointsOnlyInBinaries`, not failed after the graph.
   - **Give the build log too: it checks the trace.** The log and the trace describe the same build, so every
     in-root source the log compiled must appear in the trace as opened. If any don't, the trace is incomplete
     (strace without `-f`, a build in a container or a build server started before tracing, a compiler cache, an
@@ -618,6 +622,10 @@ verdict — busy computing, waiting on a slow drive, or idle on something not co
 symbol, goes into the `--diag` package too, and repeats every 15 minutes while the step stays like that; it
 never stops the run. The summary carries the run's totals: `io.<list|read|copy|launch>.count`, `.ms` (time
 spent waiting, summed over threads) and `.maxMs`, and `watchdog.reports`.
+
+The two longest steps before the parse also say which part took the time: `rootNames built / binaries /
+unbuilt` and `pre-parse treeMacros / outsideHeaders / quotedIncludes / unparsedHeaders`, each a `progress:`
+line and a `time.<step>.<part>.ms` summary key.
 
 ## Diagnostics
 

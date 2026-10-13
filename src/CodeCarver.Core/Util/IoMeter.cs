@@ -58,6 +58,30 @@ public static class IoMeter
     public static string ReadAllText(string path) { using (Start(Kind.Read)) return File.ReadAllText(path); }
     public static string ReadAllText(string path, Encoding encoding) { using (Start(Kind.Read)) return File.ReadAllText(path, encoding); }
     public static byte[] ReadAllBytes(string path) { using (Start(Kind.Read)) return File.ReadAllBytes(path); }
+    /// <summary>File.ReadLines, timed as one read from the open until the last line is taken (or the loop stops). The
+    /// file opens here, as File.ReadLines opens it, so a missing file throws at the call and not at the loop.</summary>
+    public static IEnumerable<string> ReadLines(string path) => ReadLines(path, null);
+    public static IEnumerable<string> ReadLines(string path, Encoding? encoding)
+    {
+        // The open waits like any read, but a caller that never loops must not leave a wait open for the watchdog: the
+        // open's wait ends here, and the read is counted once, from the open to the last line, when the loop runs.
+        var id = Interlocked.Increment(ref _next);
+        var start = Stopwatch.GetTimestamp();
+        InFlight[id] = (Kind.Read, start);
+        IEnumerable<string> lines;
+        try { lines = encoding is null ? File.ReadLines(path) : File.ReadLines(path, encoding); }
+        catch { new Op(id, Kind.Read, start).Dispose(); throw; }
+        finally { InFlight.TryRemove(id, out _); }
+        return Timed(lines, start);
+    }
+
+    static IEnumerable<string> Timed(IEnumerable<string> lines, long start)
+    {
+        var id = Interlocked.Increment(ref _next);
+        InFlight[id] = (Kind.Read, start);
+        using var op = new Op(id, Kind.Read, start);
+        foreach (var line in lines) yield return line;
+    }
     public static void Copy(string from, string to, bool overwrite) { using (Start(Kind.Copy)) File.Copy(from, to, overwrite); }
 
     /// <summary>The totals so far, and what is waiting now.</summary>

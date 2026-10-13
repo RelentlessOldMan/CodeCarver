@@ -68,6 +68,27 @@ public sealed class BuildTraceTests
     }
 
     [Fact]
+    public void BigHeaderTheBuildNeverOpened_IsNotReadForMacroNames()
+    {
+        using var w = new Work();
+        // Two headers over the parse cap: the build includes one; the other is another target's.
+        var pad = "\n" + string.Concat(Enumerable.Range(0, 200).Select(i => $"#define PAD_{i} {i}\n"));
+        File.WriteAllText(Path.Combine(w.Src, "big_used.h"), "#define MODK_FAST 1" + pad);
+        File.WriteAllText(Path.Combine(w.Src, "big_other.h"), "#define MODK_SLOW 1" + pad);
+        File.WriteAllText(Path.Combine(w.Src, "main.c"),
+            "#include \"big_used.h\"\nint helper(void);\n#if MODK_FAST\nint main(void){ return helper(); }\n#endif\n#if MODK_SLOW\nint slow;\n#endif\n");
+        // The build's commands too: they decide the #if world pre-parse reads macro names for.
+        var log = Path.Combine(w.Root, "build.log");
+        File.WriteAllText(log, string.Join("\n", new[] { "main.c", "helper.c", "tool.c" }.Select(r => $"gcc -c {w.Path_(r)} -o {r}.o")) + "\n");
+        var (code, o, e) = w.Carve(w.Trace("main.c", "helper.c", "tool.c", "big_used.h"),
+            $"buildLogs = [\"{w.F(log)}\"]\n[advanced]\nmaxParseBytes = 2000\n");
+        Assert.True(code == 0, o + e);
+        Assert.Contains("world.unparsedHeadersNotOpenedSkipped = 1", w.Summary);
+        Assert.Contains("1 of 2 unparsed header(s) were not opened by the traced build(s)", e);
+        Assert.Contains("int main", File.ReadAllText(w.Carved("main.c")));
+    }
+
+    [Fact]
     public void IncompleteBuildTrace_FailsVerify_NamingTheCause()
     {
         using var w = new Work();
