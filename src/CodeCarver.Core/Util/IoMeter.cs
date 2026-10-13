@@ -55,8 +55,28 @@ public static class IoMeter
         return new Op(id, kind, start);
     }
 
-    public static string ReadAllText(string path) { using (Start(Kind.Read)) return File.ReadAllText(path); }
-    public static string ReadAllText(string path, Encoding encoding) { using (Start(Kind.Read)) return File.ReadAllText(path, encoding); }
+    // File.ReadAllText and File.ReadLines read 4 KB at a time: on a network share that is a round trip per 4 KB, and a
+    // header of hundreds of MB took minutes. The same reader (UTF-8 unless a byte-order mark says otherwise) over 1 MB reads.
+    // A small file gets a buffer its own size (most of a tree is small files, read many at once).
+    const int Buffer = 1 << 20;
+    static StreamReader Open(string path, Encoding? encoding)
+    {
+        var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 0, FileOptions.SequentialScan);
+        try
+        {
+            var size = (int)Math.Clamp(fs.Length, 4096, Buffer);
+            return new StreamReader(fs, encoding ?? Encoding.UTF8, detectEncodingFromByteOrderMarks: true, size);
+        }
+        catch { fs.Dispose(); throw; }
+    }
+
+    public static string ReadAllText(string path) => ReadAllText(path, null);
+    public static string ReadAllText(string path, Encoding? encoding)
+    {
+        using (Start(Kind.Read))
+        using (var r = Open(path, encoding))
+            return r.ReadToEnd();
+    }
     public static byte[] ReadAllBytes(string path) { using (Start(Kind.Read)) return File.ReadAllBytes(path); }
     /// <summary>File.ReadLines, timed as one read from the open until the last line is taken (or the loop stops). The
     /// file opens here, as File.ReadLines opens it, so a missing file throws at the call and not at the loop.</summary>
@@ -68,19 +88,22 @@ public static class IoMeter
         var id = Interlocked.Increment(ref _next);
         var start = Stopwatch.GetTimestamp();
         InFlight[id] = (Kind.Read, start);
-        IEnumerable<string> lines;
-        try { lines = encoding is null ? File.ReadLines(path) : File.ReadLines(path, encoding); }
+        StreamReader reader;
+        try { reader = Open(path, encoding); }
         catch { new Op(id, Kind.Read, start).Dispose(); throw; }
         finally { InFlight.TryRemove(id, out _); }
-        return Timed(lines, start);
+        return Timed(reader, start);
     }
 
-    static IEnumerable<string> Timed(IEnumerable<string> lines, long start)
+    static IEnumerable<string> Timed(StreamReader reader, long start)
     {
-        var id = Interlocked.Increment(ref _next);
-        InFlight[id] = (Kind.Read, start);
-        using var op = new Op(id, Kind.Read, start);
-        foreach (var line in lines) yield return line;
+        using (reader)
+        {
+            var id = Interlocked.Increment(ref _next);
+            InFlight[id] = (Kind.Read, start);
+            using var op = new Op(id, Kind.Read, start);
+            while (reader.ReadLine() is { } line) yield return line;
+        }
     }
     public static void Copy(string from, string to, bool overwrite) { using (Start(Kind.Copy)) File.Copy(from, to, overwrite); }
 

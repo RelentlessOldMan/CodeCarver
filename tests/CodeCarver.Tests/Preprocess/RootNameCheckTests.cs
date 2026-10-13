@@ -150,6 +150,38 @@ public sealed class RootNameCheckTests
     }
 
     [Fact]
+    public void Carve_NameTheSourceOnlyCalls_DefinedInABinary_IsNotedAfterTheGraph()
+    {
+        // The source calls and declares modt_open, so the check before the graph finds the word; only the archive
+        // defines it. After the graph it is no node: the binary holds it, so it is noted, not failed. A name defined
+        // nowhere at all still fails, and the reasons are counted on one line.
+        var work = Path.Combine(Path.GetTempPath(), "cc-rootname-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var src = Path.Combine(work, "src");
+            Directory.CreateDirectory(Path.Combine(src, "modt"));
+            File.WriteAllText(Path.Combine(src, "main.c"),
+                "int modt_open(void);\nint modk_gone(void);\nint main(void){ return modt_open() + modk_gone(); }\n");
+            Blob(Path.Combine(src, "modt"), "libmodt.a", "modt_open");
+            var cfg = Path.Combine(work, "carve.toml");
+            File.WriteAllText(cfg, "outputDirectory = \"out\"\n[common]\nentryPoints = [\"main\", \"modt_open\", \"modk_gone\"]\n");
+            var se = new StringWriter();
+            Assert.Equal(1, CarveCommand.Run(new[] { "carve", src, "--config", cfg }, new StringWriter(), se));
+            var e = se.ToString();
+            Assert.Contains("1 entry point(s) the source only declares or calls are defined in 1 prebuilt binary file(s)", e);
+            Assert.Contains("unresolved by reason: 0 in an #if branch turned off, 0 not recognised by the parser, 0 only in files the build never compiled, 1 defined nowhere", e);
+            Assert.Contains("1 of 2 entry point(s) unresolved", e);
+            Assert.DoesNotContain("'modt_open' was NOT found", e);
+
+            File.WriteAllText(cfg, "outputDirectory = \"out\"\n[common]\nentryPoints = [\"main\", \"modt_open\"]\n");
+            se = new StringWriter();
+            Assert.Equal(0, CarveCommand.Run(new[] { "carve", src, "--config", cfg }, new StringWriter(), se));
+            Assert.Contains("roots.entryPointsCalledButDefinedInBinaries = 1", File.ReadAllText(Path.Combine(work, "out", "codecarver", "summary.txt")));
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
+    [Fact]
     public void Carve_KeepsWhatAPrebuiltBinaryCalls()
     {
         var work = Path.Combine(Path.GetTempPath(), "cc-rootname-" + Guid.NewGuid().ToString("N"));

@@ -282,7 +282,9 @@ compiled.
     The same goes for the big and dense headers the parser skips: one no traced build opened isn't read for
     macro names (`world.unparsedHeadersNotOpenedSkipped`); it is still kept whole when kept code includes it.
     And an entry point found only in a prebuilt binary and in a source file the build never opened is the
-    binary's: it is counted in `roots.entryPointsOnlyInBinaries`, not failed after the graph.
+    binary's: it is counted in `roots.entryPointsOnlyInBinaries`, not failed after the graph. So is one the
+    source only declares or calls and a prebuilt binary defines (`roots.entryPointsCalledButDefinedInBinaries`).
+    When entry points still don't resolve, a `roots   : unresolved by reason:` line counts them by reason.
   - **Give the build log too: it checks the trace.** The log and the trace describe the same build, so every
     in-root source the log compiled must appear in the trace as opened. If any don't, the trace is incomplete
     (strace without `-f`, a build in a container or a build server started before tracing, a compiler cache, an

@@ -46,6 +46,34 @@ public sealed class IoMeterTests
     }
 
     [Fact]
+    public void BufferedReads_DecodeExactlyAsFileDoes()
+    {
+        var dir = Directory.CreateTempSubdirectory("iometer-");
+        try
+        {
+            var big = string.Concat(Enumerable.Range(0, 60_000).Select(i => $"#define MODK_R{i} {i}\r\n")) + "last\rlone\nend";
+            var cases = new (string Name, byte[] Bytes)[]
+            {
+                ("utf8.h", System.Text.Encoding.UTF8.GetBytes("int a; /* é */\nint b;\n")),
+                ("bom8.h", System.Text.Encoding.UTF8.GetPreamble().Concat(System.Text.Encoding.UTF8.GetBytes("int c;\r\n")).ToArray()),
+                ("utf16.h", System.Text.Encoding.Unicode.GetPreamble().Concat(System.Text.Encoding.Unicode.GetBytes("int d;\n")).ToArray()),
+                ("latin.h", new byte[] { (byte)'x', 0xE9, (byte)'\n' }),
+                ("empty.h", Array.Empty<byte>()),
+                ("big.h", System.Text.Encoding.UTF8.GetBytes(big)),   // over the 1 MB buffer
+            };
+            foreach (var (name, bytes) in cases)
+            {
+                var p = Path.Combine(dir.FullName, name);
+                File.WriteAllBytes(p, bytes);
+                Assert.Equal(File.ReadAllText(p), IoMeter.ReadAllText(p));
+                Assert.Equal(File.ReadLines(p).ToList(), IoMeter.ReadLines(p).ToList());
+                Assert.Equal(File.ReadLines(p, System.Text.Encoding.Latin1).ToList(), IoMeter.ReadLines(p, System.Text.Encoding.Latin1).ToList());
+            }
+        }
+        finally { dir.Delete(recursive: true); }
+    }
+
+    [Fact]
     public void Reads_AreCounted_AndDescribedWithoutTheirPaths()
     {
         var dir = Directory.CreateTempSubdirectory("iometer-");

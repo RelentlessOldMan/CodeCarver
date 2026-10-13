@@ -370,9 +370,12 @@ public static class CarveCommand
                     var waits = CodeCarver.Core.Util.IoMeter.Describe(io, _stepIo).ToList();
                     lines.Add(waits.Count == 0 ? "  waits   : none in this step" : "  waits in this step:");
                     lines.AddRange(waits.Select(w => "    " + w));
-                    lines.Add(cpuShare < 0.1
-                        ? (io.Waiting.Sum() > 0 ? "  verdict : mostly waiting on the waits above (a slow drive or share)" : "  verdict : idle, waiting on something not counted (a file check, a lock, a child process)")
-                        : "  verdict : busy computing; this step may just not count what it does");
+                    // Under one core with reads still waiting is the drive, not the computing (a run at work: 0.72 of one
+                    // core of 32, ten reads waiting up to 188 s, was called busy).
+                    lines.Add(io.Waiting.Sum() > 0 && cpuShare < 0.9 ? "  verdict : mostly waiting on the waits above (a slow drive or share)"
+                        : cpuShare >= 0.9 ? "  verdict : busy computing; this step may just not count what it does"
+                        : cpuShare < 0.1 ? "  verdict : idle, waiting on something not counted (a file check, a lock, a child process)"
+                        : "  verdict : partly busy, under one core, with nothing counted waiting (a lock, a file check, or work that waits often)");
                     report = string.Join(Environment.NewLine, lines);
                 }
                 beat = inStep.TotalSeconds >= 60 && inStep - _lastBeat >= TimeSpan.FromSeconds(60);
@@ -1553,8 +1556,15 @@ public static class CarveCommand
                 err.WriteLine($"  config  : {skipParseNotOpened.Count:N0} of {skipParse.Count:N0} unparsed header(s) were not opened by the traced build(s) -> not read for macro names");
             summary["world.unparsedHeadersNotOpenedSkipped"] = skipParseNotOpened.Count;
             CodeCarver.Core.Util.Activity.Begin("unparsed headers read", unparsedToRead.Count);
-            foreach (var (_, names) in CodeCarver.Core.Util.ReadAhead.Map(unparsedToRead, DefinedTested))
-                ambientMacros.UnionWith(names ?? (IEnumerable<string>)condIdents);
+            // In any order (the names go into a set): in file order, one header of hundreds of MB held up every read
+            // behind it, and only a few stayed in flight on the share.
+            CodeCarver.Core.Util.ReadAhead.EnsureThreads();
+            Parallel.ForEach(unparsedToRead, new ParallelOptions { MaxDegreeOfParallelism = CodeCarver.Core.Util.ReadAhead.Window }, rel =>
+            {
+                var names = DefinedTested(rel);
+                lock (ambientMacros) ambientMacros.UnionWith(names ?? (IEnumerable<string>)condIdents);
+                CodeCarver.Core.Util.Activity.Tick(sizeByRel.TryGetValue(rel, out var size) ? size : 0);
+            });
             PreParsePart("unparsedHeaders");
             err.WriteLine($"  config  : {ambientMacros.Count:N0} macro name(s) #defined in the tree stay unknown unless the build defines them");
             summary["world.ambientMacros"] = ambientMacros.Count;
@@ -1593,41 +1603,82 @@ public static class CarveCommand
         if (unresolvedRoots.Count > 0)
         {
             var near = NearMisses(graph, unresolvedRoots);
-            // Why a name isn't a node: look for its definition in the text itself (only on this failure path).
-            string WhyUnresolved(string name)
+            // Why a name isn't a node: look for its definition in the text itself (only on this failure path). One read of
+            // the tree answers every name: a run with 85 such names once re-read the whole tree 85 times on the drive.
+            var why = new Dictionary<string, string>(StringComparer.Ordinal);
+            var unresolvedSet = new HashSet<string>(unresolvedRoots, StringComparer.Ordinal);
+            var anyName = new System.Text.RegularExpressions.Regex(@"\b(?:" + string.Join("|", unresolvedRoots.Select(System.Text.RegularExpressions.Regex.Escape)) + @")\b");
+            void FindDefs(List<string> rels, Func<string, string> read, bool checkDead)
             {
-                var re = new System.Text.RegularExpressions.Regex(@"\b" + System.Text.RegularExpressions.Regex.Escape(name) + @"\b");
-                (string Rel, int Line)? FindDef(IEnumerable<string> rels, Func<string, string> read, bool checkDead, out bool dead)
+                (string Text, bool Hit) Load(string rel)
                 {
-                    dead = false;
-                    foreach (var rel in rels)
-                    {
-                        string text;
-                        try { text = read(rel); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
-                        if (text.Length == 0 || !re.IsMatch(text)) continue;
-                        var def = EmittedLinkCheck.Scan(text, EmittedLinkCheck.IsHeader(rel)).Definitions.FirstOrDefault(d => d.Name == name);
-                        if (def.Name is null) continue;
-                        if (checkDead && (exactPre?.DeadLines(rel, text) ?? ((perFileDefines?.Invoke(rel) ?? defines) is { } t
-                                ? PreprocessorScanner.DeadLineMap(text, t, closedWorld) : null)) is { } dl
-                            && def.Line < dl.Length && dl[def.Line])
-                            dead = true;
-                        return (rel, def.Line);
-                    }
-                    return null;
+                    try { var t = read(rel); return anyName.IsMatch(t) ? (t, true) : ("", false); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return ("", false); }
                 }
-                if (FindDef(parseRels.Where(r => !notBuilt.Contains(r)), ReadRel, true, out var isDead) is { } p)
-                    return isDead
-                        ? $"it is defined at {p.Rel}:{p.Line} inside an #if branch this build's configuration turns off — it isn't compiled in this build"
-                        : $"it is defined at {p.Rel}:{p.Line} but the parser didn't recognise the definition (see --why {name})";
-                if (notBuilt.Count > 0 && FindDef(notBuilt, r => CodeCarver.Core.Util.IoMeter.ReadAllText(fullByRel[r]), false, out _) is { } q)
-                    return $"it is defined only in {q.Rel}, a file the traced build never compiled — it isn't part of this build (another target or component?)";
-                return "it is not defined anywhere in the tree (typo? defined by a macro? in an excluded directory?)";
+                foreach (var (rel, got) in CodeCarver.Core.Util.ReadAhead.Map(rels, Load))
+                {
+                    if (!got.Hit) continue;
+                    bool[]? dl = null;
+                    var deadDone = false;
+                    foreach (var def in EmittedLinkCheck.Scan(got.Text, EmittedLinkCheck.IsHeader(rel)).Definitions)
+                    {
+                        if (def.Name is null || why.ContainsKey(def.Name) || !unresolvedSet.Contains(def.Name)) continue;
+                        if (checkDead && !deadDone)
+                        {
+                            deadDone = true;
+                            dl = exactPre?.DeadLines(rel, got.Text) ?? ((perFileDefines?.Invoke(rel) ?? defines) is { } t
+                                ? PreprocessorScanner.DeadLineMap(got.Text, t, closedWorld) : null);
+                        }
+                        why[def.Name] = !checkDead
+                            ? $"it is defined only in {rel}, a file the traced build never compiled — it isn't part of this build (another target or component?)"
+                            : dl is not null && def.Line < dl.Length && dl[def.Line]
+                                ? $"it is defined at {rel}:{def.Line} inside an #if branch this build's configuration turns off — it isn't compiled in this build"
+                                : $"it is defined at {rel}:{def.Line} but the parser didn't recognise the definition (see --why {def.Name})";
+                    }
+                    if (why.Count == unresolvedRoots.Count) return;
+                }
+            }
+            FindDefs(parseRels.Where(Readable).ToList(), r => CodeCarver.Core.Util.IoMeter.ReadAllText(fullByRel[r]), true);
+            if (why.Count < unresolvedRoots.Count && notBuilt.Count > 0)
+                FindDefs(parseRels.Where(notBuilt.Contains).ToList(), r => CodeCarver.Core.Util.IoMeter.ReadAllText(fullByRel[r]), false);
+            var reasonCounts = new int[4];   // off #if branch, not recognised, only in unbuilt files, nowhere
+            foreach (var u in unresolvedRoots)
+                reasonCounts[!why.TryGetValue(u, out var w) ? 3 : w.Contains("turns off") ? 0 : w.Contains("didn't recognise") ? 1 : 2]++;
+            // A name the source only declares or calls, defined nowhere in it, may be defined in a prebuilt binary the
+            // tree carries: like a name only a binary holds (before the graph), it has no source to carve. Noted, not failed.
+            var nowhere = unresolvedRoots.Where(u => !why.ContainsKey(u)).ToList();
+            var inBinaries = new HashSet<string>(StringComparer.Ordinal);
+            if (nowhere.Count > 0 && closureLang)
+            {
+                var bcheck = new CodeCarver.Core.Preprocess.RootNameCheck(nowhere.ToArray());
+                var holding = new System.Collections.Concurrent.ConcurrentBag<string>();
+                Parallel.ForEach(TreeBinaries(), new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, (f, state) =>
+                {
+                    if (!bcheck.AnyPending) { state.Stop(); return; }
+                    if (bcheck.AddBinary(f)) holding.Add(f);
+                });
+                var stillMissing = new HashSet<string>(bcheck.Missing(), StringComparer.Ordinal);
+                inBinaries.UnionWith(nowhere.Where(n => !stillMissing.Contains(n)));
+                if (inBinaries.Count > 0)
+                {
+                    roots = roots.Where(r => !inBinaries.Contains(r)).ToArray();
+                    unresolvedRoots = unresolvedRoots.Where(r => !inBinaries.Contains(r)).ToList();
+                    reasonCounts[3] -= inBinaries.Count;
+                    err.WriteLine($"  roots   : {inBinaries.Count:N0} entry point(s) the source only declares or calls are defined in {holding.Count:N0} prebuilt "
+                        + "binary file(s) (no source the build compiles) -> not carved; the binaries are kept as they are");
+                }
+                summary["roots.entryPointsCalledButDefinedInBinaries"] = inBinaries.Count;
             }
             foreach (var u in unresolvedRoots)
-                err.WriteLine($"  warn    : requested root '{u}' was NOT found as a symbol — nothing rooted for it: {WhyUnresolved(u)}"
+                err.WriteLine($"  warn    : requested root '{u}' was NOT found as a symbol — nothing rooted for it: "
+                              + (why.TryGetValue(u, out var w) ? w : "it is not defined anywhere in the tree or a prebuilt binary (typo? defined by a macro? in an excluded directory?)")
                               + (near.TryGetValue(u, out var cands) && cands.Count > 0 ? $" — did you mean: {string.Join(", ", cands)}?" : ""));
+            if (unresolvedRoots.Count > 0)
+                err.WriteLine($"  roots   : unresolved by reason: {reasonCounts[0]} in an #if branch turned off, {reasonCounts[1]} not recognised by the parser, "
+                    + $"{reasonCounts[2]} only in files the build never compiled, {reasonCounts[3]} defined nowhere");
+            Progress("rootCheck");
             // --why still answers (review U8): explaining a symbol is how you debug a missing root.
-            if (whySymbol is null)
+            if (whySymbol is null && unresolvedRoots.Count > 0)
             {
                 err.WriteLine($"{unresolvedRoots.Count} of {roots.Length} entry point(s) unresolved — failing so a typo can't silently carve "
                     + "the symbol away. Fix or remove the name in entryPoints.");
