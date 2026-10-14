@@ -2474,6 +2474,14 @@ public static class CarveCommand
         var keptByCheckLog = new List<string>();   // this stage's KEPT lines for verify.txt
         // The link check over one stage's emitted files: hard failures, #ifdef-dead-only uses, and uses whose only
         // definitions are in files the build never compiled (notes, not failures).
+        // The source tree doesn't change during the run (the output is outside it): what the check read from it in one
+        // round or stage serves the next.
+        var sourceRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)) + Path.DirectorySeparatorChar;
+        var linkCache = new LinkCheckCache(p =>
+        {
+            try { return Path.GetFullPath(p).StartsWith(sourceRoot, StringComparison.OrdinalIgnoreCase); }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return false; }
+        });
         (LinkCheckResult R, List<LinkViolation> Hard, List<LinkViolation> NotBuiltOnly) CheckEmitted(
             CarvePlan p, IReadOnlyList<(string Rel, string Path)> emittedFiles, bool pruned)
         {
@@ -2482,7 +2490,10 @@ public static class CarveCommand
                                          original: pruned ? rel => Path.Combine(dir, rel) : null,
                                          definerMacros: (fe as TreeSitterFrontEnd)?.DefinerSet, linkUses: linkUses,
                                          commandLineMacros: commandLineMacros, c99InlineFns: (fe as TreeSitterFrontEnd)?.C99InlineFunctions,
-                                         wrapped: wrapped);
+                                         wrapped: wrapped, cache: linkCache);
+            // Summed over the stage's rounds.
+            foreach (var (k, v) in r.Stats)
+                summary[$"{summaryStage}.check.{k}"] = (summary.TryGetValue($"{summaryStage}.check.{k}", out var was) && was is long l ? l : 0L) + v;
             var hard = r.Hard.ToList();
             // Defined only in files the traced build never compiled, with the build log confirming the trace is
             // complete: the real build linked without those files, so dropping them can't break it. The name comes

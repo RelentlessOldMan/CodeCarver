@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using CodeCarver.Core.Util;
 
 namespace CodeCarver.Core.Reachability;
@@ -26,6 +27,41 @@ public sealed record LinkCheckResult(IReadOnlyList<LinkViolation> Violations, in
     public IReadOnlyList<LinkViolation> Hard => Violations.Where(v => !v.DeadOnly).ToList();
     /// <summary>References only on #ifdef-dead lines: correct exactly when the #ifdef model is.</summary>
     public IReadOnlyList<LinkViolation> DeadOnly => Violations.Where(v => v.DeadOnly).ToList();
+    /// <summary>Where the time went (headersMs, droppedMs, prunedMs, emittedScanMs, restMs) and how files were had (filesRead,
+    /// fromCache, instancesRedone).</summary>
+    public IReadOnlyDictionary<string, long> Stats { get; init; } = new Dictionary<string, long>();
+}
+
+/// <summary>
+/// What <see cref="EmittedLinkCheck.Run"/> keeps between the rounds and stages of one carve: for each file that cannot
+/// change during the run (the source tree's dropped files, headers and originals) its definitions and its header text.
+/// Every round otherwise read the whole tree again, from a share at a round trip per file. Only what a later run needs
+/// is kept (a dropped file's definitions, not its uses), so it stays small. Every run sharing one must pass the same
+/// inputs (size limit, definer macros, command-line macros, C99 inline functions); a run that doesn't is not served
+/// from it.
+/// </summary>
+public sealed class LinkCheckCache
+{
+    /// <param name="unchanging">True for a path whose content cannot change during the run: the source tree, not the
+    /// output.</param>
+    public LinkCheckCache(Func<string, bool> unchanging) => Unchanging = unchanging;
+
+    internal Func<string, bool> Unchanging { get; }
+    internal readonly ConcurrentDictionary<string, EmittedLinkCheck.DroppedEntry?> Dropped = new(StringComparer.Ordinal);
+    internal readonly ConcurrentDictionary<string, (string? Text, bool Template)> Headers = new(StringComparer.Ordinal);
+    internal readonly ConcurrentDictionary<string, EmittedLinkCheck.OriginalEntry?> Originals = new(StringComparer.Ordinal);
+
+    private object?[]? _inputs;
+
+    /// <summary>True when these are the inputs of the first run that used it.</summary>
+    internal bool Matches(params object?[] inputs)
+    {
+        lock (Dropped)
+        {
+            _inputs ??= inputs;
+            return _inputs.Length == inputs.Length && _inputs.Zip(inputs).All(p => Equals(p.First, p.Second));
+        }
+    }
 }
 
 /// <summary>
@@ -66,12 +102,27 @@ public static class EmittedLinkCheck
         IEnumerable<(string Name, string Rel, int Line)>? linkUses = null,
         IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? commandLineMacros = null,
         IReadOnlySet<string>? c99InlineFns = null,
-        IReadOnlySet<string>? wrapped = null)
+        IReadOnlySet<string>? wrapped = null,
+        LinkCheckCache? cache = null)
     {
-        emitted = emitted.ToList();
-        dropped = dropped.ToList();
+        var emittedList = emitted.ToList();
+        var droppedList = dropped.ToList();
+        emitted = emittedList;
+        dropped = droppedList;
         var skipped = 0;
         var checkedFiles = 0;
+        var stats = new Dictionary<string, long>(StringComparer.Ordinal);
+        var phase = System.Diagnostics.Stopwatch.StartNew();
+        void Lap(string key) { stats[key + "Ms"] = phase.ElapsedMilliseconds; phase.Restart(); }
+        long filesRead = 0, fromCache = 0, instancesRedone = 0;
+        LinkCheckResult Done(IReadOnlyList<LinkViolation> v)
+        {
+            Lap("rest");
+            stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["instancesRedone"] = instancesRedone;
+            return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
+        }
+        if (cache is not null && !cache.Matches(maxBytes, definerMacros, commandLineMacros, c99InlineFns)) cache = null;
+        bool Cached(string path) => cache is not null && cache.Unchanging(path);
 
         // Template headers (see TemplateInstances): the names a translation unit defines by including one.
         var byBase = emitted.Concat(dropped).GroupBy(f => Path.GetFileName(f.Rel), StringComparer.OrdinalIgnoreCase)
@@ -83,11 +134,18 @@ public static class EmittedLinkCheck
         // header still carries macros a template after it uses).
         (string? Text, bool Template) PrepareHeader(string p)
         {
+            var cached = Cached(p);
+            if (cached && cache!.Headers.TryGetValue(p, out var hit)) { Interlocked.Increment(ref fromCache); return hit; }
+            Interlocked.Increment(ref filesRead);
             var t = TryRead(p, maxBytes);
-            if (t is null) return (null, false);
-            t = CodeCarver.Core.Preprocess.SourceText.Normalize(t);
-            return CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(t)
-                ? (t, true) : (CodeCarver.Core.Preprocess.TemplateInstances.DirectivesOnly(t), false);
+            (string? Text, bool Template) h = (null, false);
+            if (t is not null)
+            {
+                t = CodeCarver.Core.Preprocess.SourceText.Normalize(t);
+                h = CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(t)
+                    ? (t, true) : (CodeCarver.Core.Preprocess.TemplateInstances.DirectivesOnly(t), false);
+            }
+            return cached ? cache!.Headers.GetOrAdd(p, h) : h;
         }
         // The same string every time: the first one stored wins.
         string? StoreHeader(string p, (string? Text, bool Template) h)
@@ -114,10 +172,12 @@ public static class EmittedLinkCheck
         var anyTemplate = false;
         if (emitted.Concat(dropped).Any(f => !IsHeader(f.Rel) && !IsAssembly(f.Rel)))
         {
-            foreach (var (p, h) in ReadAhead.Map(byBase.Values.SelectMany(ps => ps).Where(p => IsHeader(p)), PrepareHeader))
-                StoreHeader(p, h);
+            var headerPaths = byBase.Values.SelectMany(ps => ps).Where(p => IsHeader(p)).ToList();
+            var prepared = InParallel(headerPaths, PrepareHeader);
+            for (var i = 0; i < headerPaths.Count; i++) StoreHeader(headerPaths[i], prepared[i]);
             anyTemplate = templates.Count > 0;
         }
+        Lap("headers");
         bool AnyTemplate() => anyTemplate;
         var cmdFnMacros = CodeCarver.Core.Preprocess.CommandLineMacros.AnyFunctionLike(commandLineMacros);
         // Names a translation unit defines beyond its own function heads: template-header instances (with the build's
@@ -126,18 +186,30 @@ public static class EmittedLinkCheck
         {
             if (IsHeader(rel) || IsAssembly(rel)) return Array.Empty<Definition>();
             var r = new List<Definition>();
-            if ((text.Contains("include", StringComparison.Ordinal) && AnyTemplate())
-                || (CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(text)
-                    && (cmdFnMacros || text.Contains("define", StringComparison.Ordinal))))
-                r.AddRange(CodeCarver.Core.Preprocess.TemplateInstances.Find(text, ReadTemplate, commandLineMacros)
-                               .Select(i => new Definition(i.Name, i.Line, false, false)));
-            if (c99InlineFns is { Count: > 0 })
-            {
-                var starts = LineStarts(text);
-                r.AddRange(CodeCarver.Core.Preprocess.C99Inline.Emitters(text, c99InlineFns)
-                               .Select(e => new Definition(e.Name, LineOf(starts, e.Index), false, false)));
-            }
+            if (TemplateGate(text.Contains("include", StringComparison.Ordinal),
+                             CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(text),
+                             text.Contains("define", StringComparison.Ordinal)))
+                r.AddRange(TemplateDefs(text, null));
+            r.AddRange(C99Defs(text));
             return r;
+        }
+        bool TemplateGate(bool hasInclude, bool macroHead, bool hasDefine)
+            => (hasInclude && AnyTemplate()) || (macroHead && (cmdFnMacros || hasDefine));
+        // deps: each include the walk read and the text it got, so a later run can tell whether the answer still holds.
+        List<Definition> TemplateDefs(string text, List<(string Raw, string? Text)>? deps)
+            => CodeCarver.Core.Preprocess.TemplateInstances.Find(text, raw =>
+                   {
+                       var t = ReadTemplate(raw);
+                       deps?.Add((raw, t));
+                       return t;
+                   }, commandLineMacros)
+                   .Select(i => new Definition(i.Name, i.Line, false, false)).ToList();
+        List<Definition> C99Defs(string text)
+        {
+            if (c99InlineFns is not { Count: > 0 }) return new List<Definition>();
+            var starts = LineStarts(text);
+            return CodeCarver.Core.Preprocess.C99Inline.Emitters(text, c99InlineFns)
+                       .Select(e => new Definition(e.Name, LineOf(starts, e.Index), false, false)).ToList();
         }
         // A command-line rename (-Dsecret_rite=true_rite): a function defined as secret_rite is the symbol true_rite.
         void Renamed(ScanResult s)
@@ -156,17 +228,70 @@ public static class EmittedLinkCheck
         var typedDef = new HashSet<string>(StringComparer.Ordinal);
         var definers = new Dictionary<string, List<string>>(StringComparer.Ordinal);
         var functionMacros = new HashSet<string>(StringComparer.Ordinal);
+        // A dropped file's definitions: its own scan (kept for the run when the file can't change), the names template
+        // headers it includes define (redone when a header it read now reads differently), and C99 inline emitters.
         ScanResult? ScanDropped((string Rel, string Path) f)
         {
-            var text = TryRead(f.Path, maxBytes);
-            if (text is null) return null;
-            var s = Scan(text, IsHeader(f.Rel), declarators: false, definerMacros);
-            s.Definitions.AddRange(Instances(f.Rel, text));
+            var header = IsHeader(f.Rel);
+            var plain = header || IsAssembly(f.Rel);
+            var key = (header ? "h|" : "c|") + f.Path;
+            var cached = Cached(f.Path);
+            string? text = null;
+            DroppedEntry? e;
+            if (cached && cache!.Dropped.TryGetValue(key, out e)) Interlocked.Increment(ref fromCache);
+            else
+            {
+                Interlocked.Increment(ref filesRead);
+                text = TryRead(f.Path, maxBytes);
+                e = null;
+                if (text is not null)
+                {
+                    var own = Scan(text, header, declarators: false, definerMacros);
+                    e = new DroppedEntry
+                    {
+                        Definitions = own.Definitions,
+                        FunctionMacros = own.FunctionMacros,
+                        HasInclude = text.Contains("include", StringComparison.Ordinal),
+                        MacroHead = CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(text),
+                        HasDefine = text.Contains("define", StringComparison.Ordinal),
+                        C99 = plain ? new List<Definition>() : C99Defs(text),
+                    };
+                }
+                if (cached) e = cache!.Dropped.GetOrAdd(key, e);
+            }
+            if (e is null) return null;
+            var templateDefs = new List<Definition>();
+            if (!plain && TemplateGate(e.HasInclude, e.MacroHead, e.HasDefine))
+            {
+                List<(string Raw, string? Text)>? deps;
+                List<Definition>? had;
+                lock (e) { deps = e.Deps; had = e.TemplateDefs; }
+                if (deps is not null && deps.All(d => string.Equals(ReadTemplate(d.Raw), d.Text, StringComparison.Ordinal)))
+                    templateDefs = had!;
+                else
+                {
+                    if (text is null) Interlocked.Increment(ref instancesRedone);
+                    text ??= TryRead(f.Path, maxBytes);
+                    if (text is null) return null;
+                    var nd = new List<(string Raw, string? Text)>();
+                    templateDefs = TemplateDefs(text, nd);
+                    lock (e) { e.Deps = nd; e.TemplateDefs = templateDefs; }
+                }
+            }
+            var s = new ScanResult();
+            s.Definitions.AddRange(e.Definitions);
+            s.Definitions.AddRange(templateDefs);
+            s.Definitions.AddRange(e.C99);
+            s.FunctionMacros.UnionWith(e.FunctionMacros);
             Renamed(s);
             return s;
         }
-        foreach (var ((rel, _), dscan) in ReadAhead.Map(dropped.OrderBy(d => d.Rel, StringComparer.Ordinal), ScanDropped))
+        var droppedSorted = droppedList.OrderBy(d => d.Rel, StringComparer.Ordinal).ToList();
+        var droppedScans = InParallel(droppedSorted, ScanDropped);
+        for (var di = 0; di < droppedSorted.Count; di++)
         {
+            var rel = droppedSorted[di].Rel;
+            var dscan = droppedScans[di];
             if (dscan is null) { skipped++; continue; }
             checkedFiles++;
             var header = IsHeader(rel);
@@ -183,19 +308,39 @@ public static class EmittedLinkCheck
         // Functions pruned out of kept files. A pruned static is only visible in its own file.
         var prunedStatics = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
         // The original's definitions the emitted copy doesn't have, or null when the file is unchanged.
+        // The original's length, content hash and definitions are kept for the run when it can't change.
         IEnumerable<Definition>? Pruned((string Rel, string Path) f)
         {
             if (IsAssembly(f.Rel) || original!(f.Rel) is not { } op) return null;
-            var otext = TryRead(op, maxBytes);
-            var etext = otext is null ? null : TryRead(f.Path, maxBytes);
-            if (otext is null || etext is null || otext == etext) return null;
             var header = IsHeader(f.Rel);
-            var kept = Scan(etext, header, declarators: false, definerMacros).Definitions.Select(d => d.Name).ToHashSet(StringComparer.Ordinal);
-            return Scan(otext, header, declarators: false, definerMacros).Definitions.Where(d => !kept.Contains(d.Name)).ToList();
-        }
-        if (original is not null)
-            foreach (var ((rel, _), gone) in ReadAhead.Map(emitted, Pruned))
+            var key = (header ? "h|" : "c|") + op;
+            var cached = Cached(op);
+            string? otext = null;
+            OriginalEntry? oe;
+            if (cached && cache!.Originals.TryGetValue(key, out oe)) Interlocked.Increment(ref fromCache);
+            else
             {
+                Interlocked.Increment(ref filesRead);
+                otext = TryRead(op, maxBytes);
+                oe = otext is null ? null
+                    : new OriginalEntry(otext.Length, ContentHash(otext), Scan(otext, header, declarators: false, definerMacros).Definitions);
+                if (cached) oe = cache!.Originals.GetOrAdd(key, oe);
+            }
+            if (oe is null) return null;
+            var etext = TryRead(f.Path, maxBytes);
+            if (etext is null) return null;
+            if (otext is not null ? otext == etext : etext.Length == oe.Length && ContentHash(etext) == oe.Hash) return null;
+            var kept = Scan(etext, header, declarators: false, definerMacros).Definitions.Select(d => d.Name).ToHashSet(StringComparer.Ordinal);
+            return oe.Definitions.Where(d => !kept.Contains(d.Name)).ToList();
+        }
+        Lap("dropped");
+        if (original is not null)
+        {
+            var goneAll = InParallel(emittedList, Pruned);
+            for (var pi = 0; pi < emittedList.Count; pi++)
+            {
+                var rel = emittedList[pi].Rel;
+                var gone = goneAll[pi];
                 if (gone is null) continue;
                 var header = IsHeader(rel);
                 foreach (var d in gone)
@@ -212,9 +357,11 @@ public static class EmittedLinkCheck
                     if (!d.Bare) typedDef.Add(d.Name);
                 }
             }
+        }
+        Lap("pruned");
         var staticViolations = new List<LinkViolation>();
         if (droppedDefs.Count == 0 && prunedStatics.Count == 0)
-            return new LinkCheckResult(Array.Empty<LinkViolation>(), checkedFiles, skipped);
+            return Done(Array.Empty<LinkViolation>());
 
         // 2+3. Definitions and uses in the emitted files.
         var emittedDefs = new HashSet<string>(StringComparer.Ordinal);
@@ -245,10 +392,21 @@ public static class EmittedLinkCheck
             var s = IsAssembly(f.Rel) ? ScanAssembly(text) : Scan(text, IsHeader(f.Rel), definerMacros: definerMacros);
             s.Definitions.AddRange(Instances(f.Rel, text));
             Renamed(s);
+            // A use is read below only for a name a dropped file defines, a static pruned from this file, or a wrapped
+            // symbol: the others are let go here, so every file's result can be held at once.
+            var prunedHere = prunedStatics.TryGetValue(f.Rel, out var ph) ? ph : null;
+            bool Wanted(string n) => droppedDefs.ContainsKey(n) || (prunedHere?.ContainsKey(n) ?? false) || (anyWrap && wrapped!.Contains(n));
+            s.Uses.RemoveAll(u => !Wanted(u.Name));
+            s.CallUses.RemoveWhere(u => !Wanted(u.Name));
             return (s, map);
         }
-        foreach (var ((rel, _), scanned) in ReadAhead.Map(emitted.OrderBy(e => e.Rel, StringComparer.Ordinal), ScanEmitted))
+        var emittedSorted = emittedList.OrderBy(e => e.Rel, StringComparer.Ordinal).ToList();
+        var emittedScans = InParallel(emittedSorted, ScanEmitted);
+        Lap("emittedScan");
+        for (var ei = 0; ei < emittedSorted.Count; ei++)
         {
+            var rel = emittedSorted[ei].Rel;
+            var scanned = emittedScans[ei];
             if (scanned is not { } got) { skipped++; continue; }
             var (scan, map) = got;
             checkedFiles++;
@@ -343,7 +501,50 @@ public static class EmittedLinkCheck
             violations.Add(new LinkViolation(name, def.Rel, at.Rel, at.Line, DeadOnly: !isLive, DefinedLine: def.Line) { DefinedInAll = definers[name], Weak = weakNames.Contains(name) || (weakUse.Contains(name) && !strongUse.Contains(name)) });
         }
         violations.AddRange(staticViolations);
-        return new LinkCheckResult(violations, checkedFiles, skipped);
+        return Done(violations);
+    }
+
+    /// <summary>A dropped file's part of a check that later runs can reuse (see <see cref="LinkCheckCache"/>).</summary>
+    internal sealed class DroppedEntry
+    {
+        public required List<Definition> Definitions;
+        public required HashSet<string> FunctionMacros;
+        public required bool HasInclude, MacroHead, HasDefine;
+        public required List<Definition> C99;
+        // The template-header names, with what the walk read to find them; under lock(this).
+        public List<(string Raw, string? Text)>? Deps;
+        public List<Definition>? TemplateDefs;
+    }
+
+    /// <summary>An original file of a carve inside kept files: what its emitted copy is compared with.</summary>
+    internal sealed record OriginalEntry(int Length, ulong Hash, List<Definition> Definitions);
+
+    static ulong ContentHash(string s)
+    {
+        var h = 14695981039346656037UL;
+        foreach (var c in s) { h ^= c; h *= 1099511628211UL; }
+        return h;
+    }
+
+    /// <summary><paramref name="f"/> over every item, up to <see cref="ReadAhead.Window"/> at once, results by position.
+    /// <see cref="ReadAhead.Map"/> hands results back in order, so one slow file (a read of 11 minutes on a share) held
+    /// every file after it; here the caller waits once, for all of them, and merges in its own order.</summary>
+    static R[] InParallel<T, R>(IReadOnlyList<T> items, Func<T, R> f)
+    {
+        ReadAhead.EnsureThreads();
+        Activity.Expect(items.Count);
+        var results = new R[items.Count];
+        try
+        {
+            Parallel.ForEach(Partitioner.Create(Enumerable.Range(0, items.Count), EnumerablePartitionerOptions.NoBuffering),
+                             new ParallelOptions { MaxDegreeOfParallelism = ReadAhead.Window },
+                             i => { results[i] = f(items[i]); Activity.Tick(); });
+        }
+        catch (AggregateException ae) when (ae.InnerExceptions.Count == 1)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
+        }
+        return results;
     }
 
     static string? TryRead(string path, long maxBytes)
