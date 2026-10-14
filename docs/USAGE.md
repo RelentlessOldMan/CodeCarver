@@ -615,6 +615,10 @@ header is kept whole regardless — and a normal large `.c` (mostly code) is una
 Read the `warn:` lines — they're where the carve was uncertain. For a slow run, `CODECARVER_TIMING=1`
 prints a per-phase + slow-file breakdown to stderr.
 
+The parse (the `build-graph` step) reads and processes one file per core at once, then adds them to the graph
+in path order, so the graph and the carve are the same whatever the number. `CODECARVER_PARSE_THREADS=N`
+sets the number (`1` for one file at a time).
+
 A long run says how far it has got on stderr: a `progress:` line for each step that took half a second or
 more, and a `working :` line once a minute while a step runs on, with its count so far. If nothing counted
 moves for 3 minutes, or one directory listing, file read, copy or compiler run has been waiting that long, a

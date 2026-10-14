@@ -96,4 +96,78 @@ public sealed class DeterminismTests
         foreach (var dead in new[] { "dead_a", "dead_b", "also_dead", "unused_module" })
             Assert.False(Reached(dead), $"{dead} should be dropped");
     }
+
+    // Files are parsed on several threads and merged in path order: the graph must be the one a one-file-at-a-time parse
+    // builds, node for node and edge for edge, with the same notes. A tree with every shape the per-file pass records
+    // outside the graph: statics, parse errors, pastes, keep attributes, includes, a #define-only header.
+    private static readonly (string, string)[] Shapes =
+    {
+        ("a.c", "#include \"a.h\"\nstatic int s_a(void){ return 1; }\nint fa(void){ return s_a() + MODK_CALL(fb); }\n"
+              + "__attribute__((used)) int kept_a(void){ return 2; }\nint table_a[] = { 1, 2 };\n"),
+        ("b.c", "#include \"a.h\"\nint fb(void){ return fa(); }\nint broken( { return 0;\nint after_broken(void){ return fb(); }\n"),
+        ("a.h", "#ifndef A_H\n#define A_H\n#define MODK_CALL(f) f ## _impl()\n#define MODK_GEN(n) int n ## _gen(void)\nint fa(void);\n#endif\n"),
+        ("c.c", "#include \"a.h\"\nMODK_GEN(c);\nint fb_impl(void){ return 0; }\nstatic int s_c;\nint use_c(void){ return s_c + fb_impl(); }\n"),
+        ("d.c", "int main(void){ extern int fa(void); return fa(); }\n"),
+    };
+
+    private static List<string> GraphOf(Func<TreeSitterFrontEnd> make, IReadOnlyList<(string Path, string Text)> files, int threads)
+    {
+        using var fe = make();
+        fe.ParseThreads = threads;
+        var g = fe.BuildGraph(files);
+        var dump = new List<string>();
+        foreach (var n in g.Nodes)
+        {
+            dump.Add($"N {n.Id.Value} {n.Kind} {n.Name} {n.File} {n.Span.StartLine}-{n.Span.EndLine} {n.Flags}");
+            foreach (var e in g.OutEdges(n.Id)) dump.Add($"  E {e.To.Value} {e.Kind}");
+        }
+        dump.AddRange(fe.Warnings.Select(w => "W " + w));
+        dump.AddRange(fe.ForceKeepFiles.Select(f => "K " + f));
+        dump.AddRange(fe.UnparsedFiles.OrderBy(f => f, StringComparer.Ordinal).Select(f => "U " + f));
+        dump.AddRange(fe.SymbolBudgetKeptWhole.Select(s => $"B {s.Path} {s.Symbols}"));
+        dump.AddRange(fe.CallSites.Select(c => $"C {c.From.Value} {c.Name}"));
+        dump.Add($"R {fe.DefinitionsRecoveredByScan}");
+        return dump;
+    }
+
+    [Fact]
+    public void ParallelParse_BuildsTheSameGraph_AsOneFileAtATime()
+    {
+        var one = GraphOf(() => new CFrontEnd(), Shapes, 1);
+        Assert.Contains(one, l => l.StartsWith("N ") && l.Contains("FileLocal"));
+        Assert.Contains(one, l => l.StartsWith("C "));
+        for (var run = 0; run < 3; run++)
+            Assert.Equal(one, GraphOf(() => new CFrontEnd(), Shapes, 8));
+    }
+
+    /// <summary>The same on real code, when a corpus repo is fetched (.corpus): thousands of definitions, real parse
+    /// errors and macros.</summary>
+    [SkippableTheory]
+    [InlineData("janet", "c")]
+    [InlineData("FreeRTOS-Kernel", "c")]
+    [InlineData("Monocypher", "c")]
+    [InlineData("fmt", "cpp")]
+    public void ParallelParse_BuildsTheSameGraph_OnARealRepo(string repoName, string lang)
+    {
+        var repo = FindUp(Path.Combine(".corpus", repoName));
+        Skip.If(repo is null, $".corpus/{repoName} not fetched");
+        var ext = lang == "c" ? new[] { ".c", ".h" } : new[] { ".cc", ".cpp", ".h", ".hpp" };
+        var files = Directory.EnumerateFiles(repo!, "*", SearchOption.AllDirectories)
+            .Where(f => ext.Contains(Path.GetExtension(f), StringComparer.OrdinalIgnoreCase) && new FileInfo(f).Length < 2_000_000)
+            .Select(f => (Path.GetRelativePath(repo!, f).Replace('\\', '/'), File.ReadAllText(f)))
+            .OrderBy(f => f.Item1, StringComparer.Ordinal).Take(1500).ToList();
+        Func<TreeSitterFrontEnd> make = lang == "c" ? () => new CFrontEnd() : () => new CppFrontEnd();
+        var one = GraphOf(make, files, 1);
+        Assert.Equal(one, GraphOf(make, files, 8));
+    }
+
+    private static string? FindUp(string relative)
+    {
+        for (var d = new DirectoryInfo(AppContext.BaseDirectory); d is not null; d = d.Parent)
+        {
+            var p = Path.Combine(d.FullName, relative);
+            if (Directory.Exists(p)) return p;
+        }
+        return null;
+    }
 }

@@ -1061,6 +1061,8 @@ public static class CarveCommand
         for (var i = 0; i < parseRels.Count; i++) relIndex.TryAdd(parseRels[i], i);
         CodeCarver.Core.Util.ReadAhead.EnsureThreads();
         var ahead = new Dictionary<int, Task<(string? Text, Exception? Error)>>();
+        var aheadAt = -1;   // the furthest file the parse has read
+        var taken = new HashSet<int>();   // files near it already read (or being read)
         (string? Text, Exception? Error) Load(string full)
         {
             try { return (CodeCarver.Core.Util.IoMeter.ReadAllText(full), null); }
@@ -1073,21 +1075,29 @@ public static class CarveCommand
             var full = fullByRel[rel];
             (string? Text, Exception? Error) got;
             Task<(string? Text, Exception? Error)>? pre = null;
+            // The parse reads several files at once, in nearly path order: the read-ahead follows the furthest of them and
+            // keeps what the ones just behind still need. A read well behind that (a header a template reads) is read alone.
+            const int W = CodeCarver.Core.Util.ReadAhead.Window;
             if (relIndex.TryGetValue(rel, out var at))
                 lock (ahead)
-                {
-                    foreach (var k in ahead.Keys.Where(k => k < at || k > at + CodeCarver.Core.Util.ReadAhead.Window).ToList()) ahead.Remove(k);
-                    ahead.Remove(at, out pre);
-                    for (var j = at + 1; j < parseRels.Count && j <= at + CodeCarver.Core.Util.ReadAhead.Window; j++)
-                        if (!ahead.ContainsKey(j) && Readable(parseRels[j]))
-                        {
-                            var next = fullByRel[parseRels[j]];
-                            ahead[j] = Task.Run(() => Load(next));
-                        }
-                }
+                    if (at >= aheadAt - 2 * W)
+                    {
+                        aheadAt = Math.Max(aheadAt, at);
+                        foreach (var k in ahead.Keys.Where(k => k < aheadAt - 2 * W).ToList()) ahead.Remove(k);
+                        taken.RemoveWhere(k => k < aheadAt - 2 * W);
+                        ahead.Remove(at, out pre);
+                        taken.Add(at);   // read now: not read ahead again for a file just behind
+                        for (var j = at + 1; j < parseRels.Count && j <= at + W; j++)
+                            if (!ahead.ContainsKey(j) && !taken.Contains(j) && Readable(parseRels[j]))
+                            {
+                                var next = fullByRel[parseRels[j]];
+                                ahead[j] = Task.Run(() => Load(next));
+                            }
+                    }
             got = pre is not null ? pre.GetAwaiter().GetResult() : Load(full);
             if (got.Text is { } text) return text;
             var ex = got.Error!;
+            lock (readWarned)
             {   // an unreadable/locked/odd file must not sink the whole run
                 if (readWarned.Add(rel))
                 {

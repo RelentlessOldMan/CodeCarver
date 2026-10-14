@@ -188,11 +188,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // Functions with internal linkage (`static` at file scope in a .c/.cpp): only their own translation unit
     // can call them (P2). Filled while parsing, consulted when uses are resolved.
     private readonly HashSet<NodeId> _fileLocal = new();
-    // Reused across the sequential parse loop: a native TSParser is cheap to re-use but not free to
-    // create/destroy, and BuildGraph parses thousands of files one at a time on this thread. The budgeted
-    // (large-file) path still uses its OWN parser on the worker thread — this instance is single-threaded,
-    // touched only by the inline path. Lazily created; disposed with the front-end.
-    private Parser? _inlineParser;
+    // One parser per thread of the parse loop: a native TSParser is cheap to re-use but not free to create/destroy,
+    // and one is never used by two threads at once. The budgeted (large-file) path still uses its OWN parser on its
+    // own thread. Lazily created; disposed with the front-end.
+    private readonly ThreadLocal<Parser> _inlineParser;
 
     private readonly List<string> _warnings = new();
     // Files kept whole without extraction (fragment, parse timeout, symbol budget, extraction failure).
@@ -217,9 +216,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// Before, such a file contributed no uses at all, and a function only it called was dropped while it was
     /// written — a carve that does not link.
     /// </summary>
-    private void KeptWholeRefs(string path, string text, NodeId fileNode, UseList pendingRefs, bool callShapedOnly = false)
+    private static void KeptWholeRefs(FileWork w, string path, string text, NodeId fileNode, UseList pendingRefs, bool callShapedOnly = false)
     {
-        _unparsed.Add(path);
+        w.Unparsed = true;
         IdentifierRefs(text, fileNode, pendingRefs, callShapedOnly);
     }
 
@@ -248,7 +247,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // Headers with a definition whose name a macro computes (a template header: see TemplateInstances).
     private readonly HashSet<string> _macroNamedHeaders = new(StringComparer.Ordinal);
     /// <summary>Header text as TemplateInstances reads it (whole for a template header, directive lines otherwise), by path.</summary>
-    private readonly Dictionary<string, string> _includeDirectives = new(StringComparer.Ordinal);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _includeDirectives = new(StringComparer.Ordinal);
     /// <summary>Files whose extraction threw and were skipped (kept whole rather than crashing the run) —
     /// the CLI roots these so their code is emitted intact, since we couldn't analyse them.</summary>
     public IReadOnlyList<string> ForceKeepFiles => _forceKeepFiles;
@@ -264,6 +263,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// recovery on invalid #include fragments stalling a whole run. Only applied to files big enough to
     /// plausibly stall (below that they parse near-instantly even when invalid). 0 disables the budget.</summary>
     public int ParseBudgetMs { get; set; } = 20_000;
+
+    /// <summary>How many files are read and processed at once (one per core by default; CODECARVER_PARSE_THREADS
+    /// overrides it, 1 for one at a time). The graph is the same whatever the number.</summary>
+    public int ParseThreads { get; set; } =
+        int.TryParse(Environment.GetEnvironmentVariable("CODECARVER_PARSE_THREADS"), out var t) && t > 0 ? t : Environment.ProcessorCount;
     private const int BudgetMinBytes = 256 * 1024;
 
     /// <summary>Per-file SYMBOL budget: the max number of definitions (functions + macros + types +
@@ -425,6 +429,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     protected TreeSitterFrontEnd(string grammarLib, string grammarFn, string defsQuery, string callsQuery)
     {
         _lang = new Language(grammarLib, grammarFn);
+        _inlineParser = new ThreadLocal<Parser>(() => new Parser(_lang), trackAllValues: true);
         _cGrammar = grammarLib == "tree-sitter-c";
         _defs = new Query(_lang, defsQuery);
         _calls = new Query(_lang, callsQuery);
@@ -529,50 +534,33 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var keepNames = new HashSet<string>(StringComparer.Ordinal);
         var keepAt = new List<(string Name, string Path)>();   // where each keep attribute sits (translation units)
         var timeFiles = logTiming;
-        var fsw = new System.Diagnostics.Stopwatch();
         long slowestMs = 0, slowestBytes = 0, slowMsTotal = 0, parsedBytes = 0, largestBytes = 0;
         int slowFiles = 0, verySlowFiles = 0, parsedFiles = 0, filesOver1MB = 0;
 
         long bytesDone = 0; var filesDone = 0;
 
-        foreach (var path in paths)
+        // Files are read and processed on ParseThreads threads at once, each into its own FileWork, and merged here one
+        // at a time in path order: the graph is the one a one-file-at-a-time parse builds, in a fraction of the time.
+        var threads = ParseThreads;
+        foreach (var (path, w) in CodeCarver.Core.Util.ReadAhead.Map(paths,
+                     p => ParseOne(p, read, fileNodeByPath, pathsByBasename, defines, closedWorldDefines), threads))
         {
-            var tr = System.Diagnostics.Stopwatch.GetTimestamp();
-            var text = read(path);
-            _tRead += System.Diagnostics.Stopwatch.GetTimestamp() - tr;
-            if (text.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
-            fsw.Restart();
-            try
-            {
-                // Per-file #ifdef config: when a build log supplies per-TU defines, PerFileDefines yields the
-                // set consistent for THIS file (a macro defined in only SOME of a file's compile commands is
-                // omitted -> UNKNOWN -> both branches kept, sound). Falls back to the global `defines` when no
-                // per-file table exists (no build log, or a file absent from it).
-                var fileDefines = PerFileDefines?.Invoke(path) ?? defines;
-                ProcessFile(graph, path, text, fileNodeByPath, pathsByBasename,
-                            functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
-                            pendingMacroRefs, pendingPastes, fileDefines, closedWorldDefines);
-                foreach (var n in ScanKeepAttributes(text)) { keepNames.Add(n); if (IsTranslationUnit(path)) keepAt.Add((n, path)); }
-                if (_keepMacroUse is not null && fileNodeByPath.TryGetValue(path, out var kfile))
-                    ScanKeepMacroUses(graph, text, kfile, keepNames, pendingRefs);
-            }
-            catch (Exception ex)   // never let one pathological file sink a whole-repo carve
-            {
-                _warnings.Add($"{path}: extraction failed ({ex.GetType().Name}: {ex.Message}) — kept whole, not carved");
-                ForceKeep(path);
-                if (fileNodeByPath.TryGetValue(path, out var failedFile)) KeptWholeRefs(path, text, failedFile, pendingRefs);
-            }
-            var fileMs = fsw.ElapsedMilliseconds;
+            _tRead += w.TRead;
+            if (w.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
+            MergeFile(path, w, graph, functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
+                      pendingMacroRefs, pendingPastes, keepNames, keepAt);
+            var fileMs = w.Ms;
+            var length = w.Length;
             if (timeFiles && fileMs >= 300)
-                Log.WriteLine($"  slowfile: {fileMs,6} ms  {path} ({text.Length:N0} B)");
-            parsedFiles++; parsedBytes += text.Length;
-            largestBytes = Math.Max(largestBytes, text.Length);
-            if (text.Length >= 1 << 20) filesOver1MB++;
+                lock (Log) Log.WriteLine($"  slowfile: {fileMs,6} ms  {path} ({length:N0} B)");
+            parsedFiles++; parsedBytes += length;
+            largestBytes = Math.Max(largestBytes, length);
+            if (length >= 1 << 20) filesOver1MB++;
             if (fileMs >= 1000) { slowFiles++; slowMsTotal += fileMs; }
             if (fileMs >= 10_000) verySlowFiles++;
-            if (fileMs > slowestMs) { slowestMs = fileMs; slowestBytes = text.Length; }
+            if (fileMs > slowestMs) { slowestMs = fileMs; slowestBytes = length; }
 
-            bytesDone += text.Length; filesDone++;
+            bytesDone += length; filesDone++;
             OnParseProgress?.Invoke(filesDone, filesTotal, bytesDone, bytesTotal);
         }
 
@@ -710,9 +698,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// (<c>INITCALL(drv_init);</c>) roots its file and takes the address of every identifier in its arguments;
     /// either kind also keeps the symbol it decorates (<c>RAMFUNC void f(void)</c>), found like an attribute.
     /// </summary>
-    private void ScanKeepMacroUses(CodeGraph graph, string text, NodeId fileNode, HashSet<string> keepNames,
-                                   UseList pendingRefs)
+    private void ScanKeepMacroUses(FileWork w, string text, NodeId fileNode)
     {
+        var graph = w.Graph;
+        var keepNames = w.KeepNames;
+        var pendingRefs = w.Refs;
         foreach (Match m in _keepMacroUse!.Matches(text))
         {
             var lineStart = text.LastIndexOf('\n', Math.Max(0, m.Index - 1)) + 1;
@@ -735,8 +725,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             }
             // A registration nobody names (`RITE(1)` placing a static's pointer in a walked section): the
             // translation unit stays whole.
-            if (_registerMacros.Contains(m.Value) && IsTranslationUnit(graph.GetNode(fileNode).Name) && !_forceKeepSet.Contains(graph.GetNode(fileNode).Name))
-                ForceKeep(graph.GetNode(fileNode).Name);
+            if (_registerMacros.Contains(m.Value) && IsTranslationUnit(graph.GetNode(fileNode).Name))
+                w.ForceKeeps.Add(graph.GetNode(fileNode).Name);   // ForceKeep keeps each file once, at the merge
             var before = text.AsSpan(0, m.Index);
             var mb = NameBeforeAttr.Match(before.Length > 200 ? before[^200..].ToString() : before.ToString());
             if (mb.Success && mb.Groups[1].Value is var bn && !_keepMacros.Contains(bn)) keepNames.Add(bn);
@@ -983,16 +973,19 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // never on the inline main-thread path). A large explicit stack lets the recursion fit.
     private const int WorkerStackBytes = 64 * 1024 * 1024;
 
-    private Tree? ParseWithBudget(string text, string path, out bool timedOut)
+    private Tree? ParseWithBudget(FileWork w, string text, string path, out bool timedOut)
     {
         timedOut = false;
         if (ParseBudgetMs <= 0 || text.Length < BudgetMinBytes)
-            return (_inlineParser ??= new Parser(_lang)).Parse(text);
+            return _inlineParser.Value!.Parse(text);
 
         // Breadcrumb BEFORE the parse: an AV is a corrupted-state exception we can't catch, so this stderr
         // line (flushed) is the only way a crash is attributable to a file instead of reading as a CI flake.
-        Log.WriteLine($"  bigparse: {path} ({text.Length:N0} B, {ParseBudgetMs} ms budget) ...");
-        Log.Flush();
+        lock (Log)
+        {
+            Log.WriteLine($"  bigparse: {path} ({text.Length:N0} B, {ParseBudgetMs} ms budget) ...");
+            Log.Flush();
+        }
 
         Tree? result = null;
         Exception? failure = null;
@@ -1006,7 +999,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         worker.Start();
         if (worker.Join(ParseBudgetMs)) // Join true => happens-before on `result`/`failure`
         {
-            if (failure is not null) { _warnings.Add($"{path}: parse threw {failure.GetType().Name} — kept whole, not carved"); return null; }
+            if (failure is not null) { w.Warnings.Add($"{path}: parse threw {failure.GetType().Name} — kept whole, not carved"); return null; }
             return result;
         }
         timedOut = true;
@@ -1609,19 +1602,134 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
     }
 
-    private void ProcessFile(CodeGraph graph, string path, string text,
+    /// <summary>
+    /// What one file adds to the graph, built on a worker thread apart from every other file: its own small graph (with
+    /// the nodes of the files it names), its names, its uses, and what it records outside the graph. Merged into the
+    /// run's graph in file order (<see cref="MergeFile"/>), so ids and every list come out as a one-file-at-a-time
+    /// parse made them.
+    /// </summary>
+    private sealed class FileWork
+    {
+        public readonly CodeGraph Graph = new();
+        public readonly Dictionary<string, List<NodeId>> Functions = new(StringComparer.Ordinal);
+        public readonly Dictionary<string, List<NodeId>> Macros = new(StringComparer.Ordinal);
+        public readonly Dictionary<string, List<NodeId>> Globals = new(StringComparer.Ordinal);
+        public readonly UseList Calls, Refs, MacroRefs;
+        public readonly List<(NodeId Macro, PasteKind Kind, string Frag)> Pastes = new();
+        public readonly HashSet<string> KeepNames = new(StringComparer.Ordinal);
+        public readonly List<(string Name, string Path)> KeepAt = new();
+        public readonly List<string> Warnings = new();
+        public readonly List<string> ForceKeeps = new();
+        public readonly List<NodeId> FileLocal = new();
+        public readonly List<(NodeId Id, string Header, bool CondExtern)> HeaderData = new();
+        public readonly List<(NodeId File, string Macro, List<string> Names)> WordInvocations = new();
+        public bool DefinesExternFlag, Unparsed;
+        public int? BudgetSymbols;
+        public long TPrep, TParse, TScan, TRead, Ms;
+        public int ErrorFiles, Recovered, Length;
+
+        public FileWork()
+        {
+            var pool = new Dictionary<string, string>(StringComparer.Ordinal);
+            Calls = new UseList(pool); Refs = new UseList(pool); MacroRefs = new UseList(pool);
+        }
+
+        /// <summary>A file's node in this file's graph (the merge finds it again in the run's graph by its path).</summary>
+        public NodeId FileNode(string path) => Graph.GetOrAddNode(NodeKind.File, path);
+    }
+
+    /// <summary>Read and process one file into its own <see cref="FileWork"/>. Safe to run for many files at once: it
+    /// writes nothing shared.</summary>
+    private FileWork ParseOne(string path, Func<string, string> read, Dictionary<string, NodeId> fileNodeByPath,
+                              Dictionary<string, List<string>> pathsByBasename, MacroTable? defines, bool closedWorldDefines)
+    {
+        var w = new FileWork();
+        var tr = System.Diagnostics.Stopwatch.GetTimestamp();
+        var text = read(path);
+        w.TRead = System.Diagnostics.Stopwatch.GetTimestamp() - tr;
+        w.Length = text.Length;
+        if (text.Length == 0) return w; // oversized/empty file: File node already registered; nothing to parse
+        var fsw = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            // Per-file #ifdef config: when a build log supplies per-TU defines, PerFileDefines yields the
+            // set consistent for THIS file (a macro defined in only SOME of a file's compile commands is
+            // omitted -> UNKNOWN -> both branches kept, sound). Falls back to the global `defines` when no
+            // per-file table exists (no build log, or a file absent from it).
+            var fileDefines = PerFileDefines?.Invoke(path) ?? defines;
+            ProcessFile(w, path, text, fileNodeByPath, pathsByBasename, fileDefines, closedWorldDefines);
+            foreach (var n in ScanKeepAttributes(text)) { w.KeepNames.Add(n); if (IsTranslationUnit(path)) w.KeepAt.Add((n, path)); }
+            if (_keepMacroUse is not null && fileNodeByPath.ContainsKey(path))
+                ScanKeepMacroUses(w, text, w.FileNode(path));
+        }
+        catch (Exception ex)   // never let one pathological file sink a whole-repo carve
+        {
+            w.Warnings.Add($"{path}: extraction failed ({ex.GetType().Name}: {ex.Message}) — kept whole, not carved");
+            w.ForceKeeps.Add(path);
+            if (fileNodeByPath.ContainsKey(path)) KeptWholeRefs(w, path, text, w.FileNode(path), w.Refs);
+        }
+        w.Ms = fsw.ElapsedMilliseconds;
+        return w;
+    }
+
+    /// <summary>Add one file's work to the run's graph and lists, in the order a one-file-at-a-time parse added it: its
+    /// nodes in the order it made them (new ids follow on from the files before it), each node's edges in order, its
+    /// names and uses in order.</summary>
+    private void MergeFile(string path, FileWork w, CodeGraph graph,
+                           Dictionary<string, List<NodeId>> functionsByName,
+                           Dictionary<string, List<NodeId>> macrosByName,
+                           Dictionary<string, List<NodeId>> globalsByName,
+                           UseList pendingCalls, UseList pendingRefs, UseList pendingMacroRefs,
+                           List<(NodeId Macro, PasteKind Kind, string Frag)> pendingPastes,
+                           HashSet<string> keepNames, List<(string Name, string Path)> keepAt)
+    {
+        var local = w.Graph;
+        var map = new NodeId[local.NodeCount];
+        foreach (var n in local.Nodes) map[n.Id.Value] = graph.GetOrAddNode(n.Kind, n.Name, n.File, n.Span, n.Flags);
+        foreach (var n in local.Nodes)
+            foreach (var e in local.OutEdges(n.Id))
+                graph.AddEdge(map[n.Id.Value], map[e.To.Value], e.Kind);
+        NodeId M(NodeId id) => map[id.Value];
+        void Names(Dictionary<string, List<NodeId>> from, Dictionary<string, List<NodeId>> to)
+        {
+            foreach (var (name, ids) in from)
+                foreach (var id in ids) Add(to, name, M(id));
+        }
+        Names(w.Functions, functionsByName);
+        Names(w.Macros, macrosByName);
+        Names(w.Globals, globalsByName);
+        foreach (var (from, name) in w.Calls) pendingCalls.Add(M(from), name);
+        foreach (var (from, name) in w.Refs) pendingRefs.Add(M(from), name);
+        foreach (var (from, name) in w.MacroRefs) pendingMacroRefs.Add(M(from), name);
+        foreach (var (macro, kind, frag) in w.Pastes) pendingPastes.Add((M(macro), kind, frag));
+        keepNames.UnionWith(w.KeepNames);
+        keepAt.AddRange(w.KeepAt);
+        _warnings.AddRange(w.Warnings);
+        foreach (var p in w.ForceKeeps) ForceKeep(p);
+        foreach (var id in w.FileLocal) _fileLocal.Add(M(id));
+        foreach (var (id, header, condExtern) in w.HeaderData) _headerData.Add((M(id), header, condExtern));
+        foreach (var (file, macro, names) in w.WordInvocations) _wordInvocations.Add((M(file), macro, names));
+        if (w.DefinesExternFlag) _definesExternFlag.Add(path);
+        if (w.Unparsed) _unparsed.Add(path);
+        if (w.BudgetSymbols is { } symbols) _symbolBudgetKeptWhole.Add((path, symbols));
+        _tPrep += w.TPrep; _tParse += w.TParse; _tScan += w.TScan;
+        _errorFiles += w.ErrorFiles; _recoveredByScan += w.Recovered;
+    }
+
+    private void ProcessFile(FileWork w, string path, string text,
                              Dictionary<string, NodeId> fileNodeByPath,
                              Dictionary<string, List<string>> pathsByBasename,
-                             Dictionary<string, List<NodeId>> functionsByName,
-                             Dictionary<string, List<NodeId>> macrosByName,
-                             Dictionary<string, List<NodeId>> globalsByName,
-                             UseList pendingCalls,
-                             UseList pendingRefs,
-                             UseList pendingMacroRefs,
-                             List<(NodeId, PasteKind, string)> pendingPastes,
                              MacroTable? defines,
                              bool closedWorldDefines)
     {
+        var graph = w.Graph;
+        var functionsByName = w.Functions;
+        var macrosByName = w.Macros;
+        var globalsByName = w.Globals;
+        var pendingCalls = w.Calls;
+        var pendingRefs = w.Refs;
+        var pendingMacroRefs = w.MacroRefs;
+        var pendingPastes = w.Pastes;
         text = SourceText.Normalize(text);   // trigraphs, names split by a backslash-newline (offsets and lines kept)
         // Finding A: some headers are #include fragments (e.g. a bare byte list pasted inside an array
         // initializer) — valid in context, invalid alone. tree-sitter's error recovery on them is
@@ -1633,24 +1741,24 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // (the parse budget still backstops a pathological one).
         if (!IsTranslationUnit(path) && LooksLikeIncludeFragment(text))
         {
-            _warnings.Add($"{path}: looks like an #include data fragment (not valid stand-alone C) — kept whole, not carved");
-            KeptWholeRefs(path, text, fileNodeByPath[path], pendingRefs);
+            w.Warnings.Add($"{path}: looks like an #include data fragment (not valid stand-alone C) — kept whole, not carved");
+            KeptWholeRefs(w, path, text, w.FileNode(path), pendingRefs);
             return;
         }
 
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var parseText = PrepareParseText(path, text, out var bareKAndR, out var blankedForParse);
-        if (blankedForParse.Length > 0) IdentifierRefs(blankedForParse, fileNodeByPath[path], pendingRefs, callShapedOnly: false);
+        if (blankedForParse.Length > 0) IdentifierRefs(blankedForParse, w.FileNode(path), pendingRefs, callShapedOnly: false);
         var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
-        using var tree = ParseWithBudget(parseText, path, out var timedOut);
-        _tPrep += t1 - t0; _tParse += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
+        using var tree = ParseWithBudget(w, parseText, path, out var timedOut);
+        w.TPrep += t1 - t0; w.TParse += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
         if (timedOut)
         {
-            _warnings.Add($"{path}: parse exceeded the {ParseBudgetMs} ms budget — kept whole, not carved");
+            w.Warnings.Add($"{path}: parse exceeded the {ParseBudgetMs} ms budget — kept whole, not carved");
             // Its definitions are unknown, so nothing could reach it: a translation unit must be force-kept like
             // one over the symbol budget, or a call into it finds no definition and the file is dropped.
-            if (IsTranslationUnit(path)) ForceKeep(path);
-            KeptWholeRefs(path, text, fileNodeByPath[path], pendingRefs);
+            if (IsTranslationUnit(path)) w.ForceKeeps.Add(path);
+            KeptWholeRefs(w, path, text, w.FileNode(path), pendingRefs);
             return;
         }
         if (tree is null) return;
@@ -1669,20 +1777,20 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var symbols = CountCaptures(_defs, root) + _globals.Execute(root).Captures.Count(c => MintedGlobal(c.Node, path, lines, out _, out _, out _) is not null);
             if (symbols > PerFileSymbolBudget)
             {
-                _symbolBudgetKeptWhole.Add((path, symbols));
+                w.BudgetSymbols = symbols;
                 var how = IsTranslationUnit(path) ? "force-rooted, kept whole" : "kept whole via #include-closure";
-                _warnings.Add($"{path}: would mint {symbols:N0} symbols (> {PerFileSymbolBudget:N0} budget) — {how}, not carved (guards graph-memory blow-up)");
-                if (IsTranslationUnit(path)) ForceKeep(path);
+                w.Warnings.Add($"{path}: would mint {symbols:N0} symbols (> {PerFileSymbolBudget:N0} budget) — {how}, not carved (guards graph-memory blow-up)");
+                if (IsTranslationUnit(path)) w.ForceKeeps.Add(path);
                 // A translation unit is emitted whole and compiled: every name counts (a handler table has no '(').
                 // A generated header over budget is mostly field/register names: its calls are what can need code.
-                KeptWholeRefs(path, text, fileNodeByPath[path], pendingRefs, callShapedOnly: !IsTranslationUnit(path));
+                KeptWholeRefs(w, path, text, w.FileNode(path), pendingRefs, callShapedOnly: !IsTranslationUnit(path));
                 return;
             }
         }
 
         // Scope ranges once per file: pass 1b and pass 4 ask "inside a function body?" per capture (see ScopeIndex).
         var scopes = new ScopeIndex(_scopes, root);
-        var fileNode = fileNodeByPath[path];
+        var fileNode = w.FileNode(path);
         var srcLines = text.Split('\n');
 
         // When configured, code in dead #ifdef branches is skipped (config-specific carve).
@@ -1715,7 +1823,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(fid, fileNode, EdgeKind.DefinedIn);
                 Add(functionsByName, name, fid);
                 funcSpans.Add((span.Value.Start, span.Value.End, fid));
-                if (IsTranslationUnit(path) && IsFileScopeStatic(node)) { _fileLocal.Add(fid); graph.AddFlag(fid, NodeFlags.FileLocal); }
+                if (IsTranslationUnit(path) && IsFileScopeStatic(node)) { w.FileLocal.Add(fid); graph.AddFlag(fid, NodeFlags.FileLocal); }
                 // `int CAT(TNAME, get)(void) { ... }`: the real name is computed (see TemplateInstances), so nothing
                 // calls this one by name. It stays whenever its file does.
                 if (_macroNamedHeaders.Contains(path) || (_funcLikeMacroNames.Contains(name) && ComputedName(node)))
@@ -1795,7 +1903,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // bare K&R head, the node is kept with its file and never carved on its own (the body's calls are already the
         // file's), so a misread costs one extra name, never a cut body.
         var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
-        if (root.HasError) _errorFiles++;
+        if (root.HasError) w.ErrorFiles++;
         var scannedData = new List<CodeCarver.Core.Reachability.EmittedLinkCheck.Definition>();
         if (root.HasError)
             foreach (var d in CodeCarver.Core.Reachability.EmittedLinkCheck.Scan(text, header: !IsTranslationUnit(path)).Definitions)
@@ -1808,10 +1916,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(fid, fileNode, EdgeKind.DefinedIn);
                 graph.AddEdge(fileNode, fid, EdgeKind.References);
                 Add(functionsByName, d.Name, fid);
-                if (d.Static && IsTranslationUnit(path)) { _fileLocal.Add(fid); graph.AddFlag(fid, NodeFlags.FileLocal); }
-                _recoveredByScan++;
+                if (d.Static && IsTranslationUnit(path)) { w.FileLocal.Add(fid); graph.AddFlag(fid, NodeFlags.FileLocal); }
+                w.Recovered++;
             }
-        _tScan += System.Diagnostics.Stopwatch.GetTimestamp() - t2;
+        w.TScan += System.Diagnostics.Stopwatch.GetTimestamp() - t2;
 
         // Pass 1c: symbols a macro use defines — `FW_DECLARE(uart, uart_init, uart_fini);` defining `uart_desc`,
         // or `DEFINE_TASK(blink) { ... }` defining `blink` (see DefinerMacros). Each defined name gets a node
@@ -1860,8 +1968,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var gid = graph.GetOrAddNode(NodeKind.Global, gname, path, new SourceSpan(span.Value.Start, span.Value.End));
             graph.AddEdge(gid, fileNode, EdgeKind.DefinedIn);
             Add(globalsByName, gname, gid);
-            if (isStatic && IsTranslationUnit(path)) { _fileLocal.Add(gid); graph.AddFlag(gid, NodeFlags.FileLocal); }
-            if (headerDefinition) _headerData.Add((gid, path, condExtern));
+            if (isStatic && IsTranslationUnit(path)) { w.FileLocal.Add(gid); graph.AddFlag(gid, NodeFlags.FileLocal); }
+            if (headerDefinition) w.HeaderData.Add((gid, path, condExtern));
             // Not removable on its own: a declaration that also defines a named type (`struct cfg {...} dead_cfg;` — the
             // type goes with it), or a C++ object whose constructor can register something at start-up. Only in a unit:
             // a header is never cut, and such an edge there would pull in every unit including it.
@@ -1898,11 +2006,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             }
         if (_condExternFlags.Count > 0 && IsTranslationUnit(path))
         {
-            if (defines is not null && _condExternFlags.Any(defines.IsDefined)) _definesExternFlag.Add(path);
+            if (defines is not null && _condExternFlags.Any(defines.IsDefined)) w.DefinesExternFlag = true;
             else
                 foreach (var l in srcLines)
                     if (l.IndexOf('#') >= 0 && DefineName.Match(l) is { Success: true } dm && _condExternFlags.Contains(dm.Groups[1].Value))
-                    { _definesExternFlag.Add(path); break; }
+                    { w.DefinesExternFlag = true; break; }
         }
 
         // Pass 2: #includes → file/header edges. Scanned from TEXT, not the parse tree: #include is a
@@ -1924,7 +2032,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             else continue;
             foreach (var tp in targets)
                 if (tp != path)
-                    graph.AddEdge(fileNode, fileNodeByPath[tp], EdgeKind.Includes);
+                    graph.AddEdge(fileNode, w.FileNode(tp), EdgeKind.Includes);
         }
 
         // Pass 2a: names a template header defines in this translation unit (`#define TNAME red` / `#include "tmpl.h"`
@@ -2105,7 +2213,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     continue;
                 }
                 var names = args.SelectMany(a => a).Distinct(StringComparer.Ordinal).ToList();
-                if (afterWords) _wordInvocations.Add((fileNode, macro, names));   // decided once every file is read
+                if (afterWords) w.WordInvocations.Add((fileNode, macro, names));   // decided once every file is read
                 else foreach (var name in names) pendingRefs.Add((fileNode, name));
             }
 
@@ -2551,7 +2659,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
     public void Dispose()
     {
-        _inlineParser?.Dispose();
+        foreach (var p in _inlineParser.Values) p.Dispose();
+        _inlineParser.Dispose();
         _locals.Dispose();
         _globals.Dispose();
         _initRefs.Dispose();
