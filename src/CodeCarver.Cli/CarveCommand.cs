@@ -279,6 +279,7 @@ public static class CarveCommand
             ["lang"] = lang,
             ["entryPoints"] = roots.Length,
             ["stagesConfigured"] = cv.Stages.Count,
+            ["mem.machineMb"] = MachineMemoryMb(),
         };
         diag.Set("closedWorld", closedWorld);
         diag.Set("stageCount", cv.Stages.Count);
@@ -312,6 +313,16 @@ public static class CarveCommand
         var _beatEvery = (int)Math.Min(15_000, Math.Max(250, _quiet.TotalMilliseconds / 4));
         var _beatGate = new object();
         var _again = TimeSpan.FromMinutes(15);
+        // The most memory the process held (private bytes) since the last step ended, as the heartbeat saw it: work saw
+        // the machine's memory run out and nothing said which step held it.
+        long _peakPrivate = 0;
+        long TakePeakMb()
+        {
+            long now;
+            try { using var p = System.Diagnostics.Process.GetCurrentProcess(); now = p.PrivateMemorySize64; }
+            catch (InvalidOperationException) { now = 0; }
+            return Math.Max(Interlocked.Exchange(ref _peakPrivate, 0), now) / (1024 * 1024);
+        }
         void Progress(string done)
         {
             var took = _stepClock.Elapsed.TotalSeconds;
@@ -338,6 +349,9 @@ public static class CarveCommand
             var io = CodeCarver.Core.Util.IoMeter.Now();
             using var self = System.Diagnostics.Process.GetCurrentProcess();
             var runAt = _run.Elapsed;
+            var priv = self.PrivateMemorySize64;
+            for (var was = Interlocked.Read(ref _peakPrivate); priv > was; was = Interlocked.Read(ref _peakPrivate))
+                if (Interlocked.CompareExchange(ref _peakPrivate, priv, was) == was) break;
             _cpu.Enqueue((runAt, self.TotalProcessorTime));
             while (_cpu.Count > 1 && runAt - _cpu.Peek().At > _quiet) _cpu.Dequeue();
             var (cpuFrom, cpuThen) = _cpu.Peek();
@@ -392,6 +406,8 @@ public static class CarveCommand
         }
         void Mark(string phase)
         {
+            var peak = TakePeakMb();
+            summary[$"mem.{phase}.peakMb"] = Math.Max(peak, summary.TryGetValue($"mem.{phase}.peakMb", out var pw) && pw is long pl ? pl : 0L);
             Progress(phase);
             if (_timing) err.WriteLine($"  timing  : {phase,-14} {_tsw.ElapsedMilliseconds,7} ms");
             diag.Event($"phase {phase}: {_tsw.ElapsedMilliseconds} ms"); // breadcrumb for the diagnostic package
@@ -2951,6 +2967,9 @@ public static class CarveCommand
             var stageClock = System.Diagnostics.Stopwatch.StartNew();
             void Step(string step)
             {
+                var peak = TakePeakMb();
+                var mkey = $"{summaryStage}.mem.{step}.peakMb";
+                summary[mkey] = Math.Max(peak, summary.TryGetValue(mkey, out var mw) && mw is long ml ? ml : 0L);
                 Progress($"{(stage.Name.Length == 0 ? "stage" : stage.Name)} {step}");
                 var key = $"{summaryStage}.time.{step}.ms";
                 summary[key] = (summary.TryGetValue(key, out var was) && was is long w ? w : 0L) + stageClock.ElapsedMilliseconds;
@@ -3184,6 +3203,12 @@ public static class CarveCommand
     /// distance ≤ 2 among names of similar length.</summary>
     /// <summary>Deletes what an earlier check round wrote that this round did not, so the stage tree is the one a fresh
     /// emit writes. A larger plan writes the same files and more, so this is rarely anything.</summary>
+    static long MachineMemoryMb()
+    {
+        try { return GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024 * 1024); }
+        catch (InvalidOperationException) { return 0; }
+    }
+
     static void RemoveStale(string outDir, IEnumerable<string> before, IReadOnlyList<string> now)
     {
         var keep = new HashSet<string>(now, CodeCarver.Core.Util.PathComparer.Default);

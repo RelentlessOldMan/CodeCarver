@@ -998,12 +998,21 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         Tree? result = null;
         Exception? failure = null;
+        var sync = new object();
+        bool done = false, abandoned = false;
+        var lease = w.Lease;
         var worker = new Thread(() =>
         {
-            // not `using`: if abandoned on timeout, let process teardown reclaim it. A managed parse error
-            // (not an AV) is captured and reported as keep-whole rather than propagated.
+            // A managed parse error (not an AV) is captured and reported as keep-whole rather than propagated.
             try { var parser = new Parser(_lang); result = parser.Parse(text); parser.Dispose(); }
             catch (Exception ex) { failure = ex; }
+            // Abandoned on timeout: the parse ran on, and its tree (gigabytes for a big file) is freed here, with its
+            // share of the parse memory. It was left for the process's end, and a run with several held them all.
+            lock (sync)
+            {
+                done = true;
+                if (abandoned) { result?.Dispose(); lease?.Release(); }
+            }
         }, WorkerStackBytes) { IsBackground = true, Name = "ts-parse-budget" };
         worker.Start();
         if (worker.Join(ParseBudgetMs)) // Join true => happens-before on `result`/`failure`
@@ -1012,7 +1021,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             return result;
         }
         timedOut = true;
-        return null; // abandon the worker; it touches no shared state
+        lock (sync)
+        {
+            abandoned = true;
+            if (done) result?.Dispose();          // finished just now: nothing left to hand over
+            else w.LeaseHandedOff = true;         // the worker gives the memory back when its parse ends
+        }
+        return null;
     }
 
     /// <summary>
@@ -1626,8 +1641,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// run's graph in file order (<see cref="MergeFile"/>), so ids and every list come out as a one-file-at-a-time
     /// parse made them.
     /// </summary>
+    /// <summary>The parses of every front-end in the process share one memory budget.</summary>
+    private static readonly Lazy<ParseMemory> s_parseMemory = new(ParseMemory.ForMachine);
+
     private sealed class FileWork
     {
+        // This file's share of the parse memory; handed to the parse thread when the parse outlives its budget.
+        public ParseMemory.Lease? Lease;
+        public bool LeaseHandedOff;
         public readonly CodeGraph Graph = new();
         public readonly Dictionary<string, List<NodeId>> Functions = new(StringComparer.Ordinal);
         public readonly Dictionary<string, List<NodeId>> Macros = new(StringComparer.Ordinal);
@@ -1671,6 +1692,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         w.TRead = System.Diagnostics.Stopwatch.GetTimestamp() - tr;
         w.Length = text.Length;
         if (text.Length == 0) return w; // oversized/empty file: File node already registered; nothing to parse
+        w.Lease = s_parseMemory.Value.Acquire(text.Length);
         var fsw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
@@ -1694,6 +1716,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             w.ForceKeeps.Add(path);
             if (fileNodeByPath.ContainsKey(path)) KeptWholeRefs(w, path, text, w.FileNode(path), w.Refs);
         }
+        finally { if (!w.LeaseHandedOff) w.Lease.Release(); }
         w.Ms = fsw.ElapsedMilliseconds;
         return w;
     }
