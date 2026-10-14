@@ -643,6 +643,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // see statically. Conservatively link the macro to every function whose name matches the literal
         // fragment, so a name-generating macro (dispatch/handler tables) keeps its generated targets.
         Phase("resolve uses");
+        PasteIndex? fnIndex = null, globalIndex = null;   // built on the first paste that needs one
         foreach (var (macro, kind, frag) in pendingPastes)
         {
             if (frag.Length == 0) continue;
@@ -652,8 +653,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 && templates.Any(t => kind == PasteKind.Suffix ? t.Prefix.Length == 0 && t.Suffix == frag
                                     : kind == PasteKind.Prefix && t.Suffix.Length == 0 && t.Prefix == frag))
                 continue;
-            LinkPaste(graph, macro, kind, frag, functionsByName, EdgeKind.Calls);
-            LinkPaste(graph, macro, kind, frag, globalsByName, EdgeKind.References);
+            LinkPaste(graph, macro, kind, frag, functionsByName, fnIndex ??= new PasteIndex(functionsByName), EdgeKind.Calls);
+            LinkPaste(graph, macro, kind, frag, globalsByName, globalIndex ??= new PasteIndex(globalsByName), EdgeKind.References);
         }
 
         _callSites = pendingCalls; // retained for the post-carve soundness self-check (--verify)
@@ -2199,7 +2200,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
     /// <summary>Link a token-paste macro to the functions/globals matching its literal fragment.</summary>
     private static void LinkPaste(CodeGraph graph, NodeId macro, PasteKind kind, string frag,
-                                  Dictionary<string, List<NodeId>> map, EdgeKind edge)
+                                  Dictionary<string, List<NodeId>> map, PasteIndex index, EdgeKind edge)
     {
         if (kind == PasteKind.Exact)
         {
@@ -2207,13 +2208,47 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 foreach (var n in exact) graph.AddEdge(macro, n, edge);
             return;
         }
-        foreach (var kv in map)
+        foreach (var key in index.Matching(frag, kind == PasteKind.Suffix))
+            foreach (var n in map[key]) graph.AddEdge(macro, n, edge);
+    }
+
+    /// <summary>
+    /// The names of a map that start or end with a fragment, without looking at every name: each paste used to scan
+    /// the whole map, and a product tree's tens of thousands of pastes over its hundreds of thousands of names took
+    /// hours on one core. Names are sorted once (and once more reversed, for suffixes); the ones with a prefix are a
+    /// contiguous run found by binary search. They come back in the map's own order, as the scan gave them.
+    /// </summary>
+    private sealed class PasteIndex
+    {
+        readonly string[] _keys;          // the map's keys, in its order
+        readonly int[] _byName, _byReversed;
+        readonly string[] _reversed;
+
+        public PasteIndex(Dictionary<string, List<NodeId>> map)
         {
-            var hit = kind == PasteKind.Suffix
-                ? kv.Key.EndsWith(frag, StringComparison.Ordinal)
-                : kv.Key.StartsWith(frag, StringComparison.Ordinal);
-            if (hit)
-                foreach (var n in kv.Value) graph.AddEdge(macro, n, edge);
+            _keys = map.Keys.ToArray();
+            _reversed = _keys.Select(Reverse).ToArray();
+            _byName = Enumerable.Range(0, _keys.Length).ToArray();
+            Array.Sort(_byName, (a, b) => string.CompareOrdinal(_keys[a], _keys[b]));
+            _byReversed = Enumerable.Range(0, _keys.Length).ToArray();
+            Array.Sort(_byReversed, (a, b) => string.CompareOrdinal(_reversed[a], _reversed[b]));
+        }
+
+        static string Reverse(string s) { var c = s.ToCharArray(); Array.Reverse(c); return new string(c); }
+
+        public IEnumerable<string> Matching(string frag, bool suffix)
+        {
+            var (order, text, want) = suffix ? (_byReversed, _reversed, Reverse(frag)) : (_byName, _keys, frag);
+            int lo = 0, hi = order.Length;   // first position whose name is >= want
+            while (lo < hi)
+            {
+                var mid = (lo + hi) >>> 1;
+                if (string.CompareOrdinal(text[order[mid]], want) < 0) lo = mid + 1; else hi = mid;
+            }
+            var hits = new List<int>();
+            for (var i = lo; i < order.Length && text[order[i]].StartsWith(want, StringComparison.Ordinal); i++) hits.Add(order[i]);
+            hits.Sort();
+            return hits.Select(h => _keys[h]);
         }
     }
 
