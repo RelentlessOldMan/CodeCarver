@@ -31,6 +31,29 @@ public sealed class CheckClosureTests
         Assert.Contains("stage0.verify.keptByCheck = 1", summary);   // the breakdown is not added to the total
     }
 
+    /// <summary>Whole files: the second round copies only the file the check added, keeps what the first round wrote,
+    /// and the tree is the one a fresh emit of the larger plan writes.</summary>
+    [Fact]
+    public void WholeFileStage_SecondRound_AddsTheFile_KeepsTheRest()
+    {
+        using var t = new TreeCarve();
+        t.W("main.c", "#define RUN_HELPER() modd_helper()\nint main(void){ return 0; }\n")
+         .W("helper.c", "int modd_helper(void){ return 1; }\n")
+         .W("dead.c", "int modd_dead(void){ return 2; }\n")
+         .W("inc/keep.h", "#define MODD_K 1\n");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        var carved = Path.Combine(t.Root, "out", "carved");
+        var files = Directory.EnumerateFiles(carved, "*", SearchOption.AllDirectories)
+            .Select(f => Path.GetRelativePath(carved, f).Replace('\\', '/')).OrderBy(f => f, StringComparer.Ordinal).ToList();
+        Assert.Contains("main.c", files);
+        Assert.Contains("helper.c", files);
+        Assert.DoesNotContain("dead.c", files);
+        Assert.Equal("int modd_helper(void){ return 1; }\n", File.ReadAllText(Path.Combine(carved, "helper.c")));
+        Assert.Contains("stage0.checkRounds = 2", t.Summary);
+        Assert.Contains("KEPT modd_helper", t.VerifyLog);
+    }
+
     /// <summary>`REGISTER_INIT(on_start);` at file scope, its macro in an SDK header outside the root: the parser reads a
     /// prototype, but it registers on_start, so the carve keeps it without the check (work eval, 1.0.196: three statics
     /// kept by the check, used atFileScope as a reference). A K&amp;R head is not such a use.</summary>

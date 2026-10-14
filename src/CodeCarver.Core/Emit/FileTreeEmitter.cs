@@ -13,6 +13,9 @@ public sealed record EmitResult(int FilesWritten, long BytesWritten, IReadOnlyLi
 {
     /// <summary>Function bodies replaced by a stub (<see cref="StubBodies"/>).</summary>
     public int StubbedFunctions { get; init; }
+
+    /// <summary>The size of each written file, by its relative path: what a later check round can keep (file-level emit).</summary>
+    public IReadOnlyDictionary<string, long>? Sizes { get; init; }
 }
 
 /// <summary>
@@ -38,7 +41,10 @@ public static class FileTreeEmitter
 
     /// <summary>File-level emit from the kept and dropped file lists alone — what <c>--emit-from</c> replays from
     /// a prior analysis-only run without re-parsing.</summary>
-    public static EmitResult Emit(IReadOnlyList<string> keptFiles, IReadOnlyList<string> droppedFiles, string sourceRoot, string outDir)
+    /// <param name="have">Files an earlier emit of a smaller plan already copied into <paramref name="outDir"/>, with their
+    /// sizes: not copied again (a check round on a network drive re-copied tens of thousands of files to add a few).</param>
+    public static EmitResult Emit(IReadOnlyList<string> keptFiles, IReadOnlyList<string> droppedFiles, string sourceRoot, string outDir,
+                                  IReadOnlyDictionary<string, long>? have = null)
     {
         var written = new List<string>();
         long bytes = 0;
@@ -50,6 +56,7 @@ public static class FileTreeEmitter
         {
             copied[i] = -1;
             var rel = keptFiles[i];
+            if (have is not null && have.TryGetValue(rel, out var had)) { copied[i] = had; return; }
             var src = Path.Combine(sourceRoot, rel);
             if (!File.Exists(src)) return; // a header/path not present on disk (e.g. synthesized) — skip
 
@@ -68,8 +75,10 @@ public static class FileTreeEmitter
         for (var i = 0; i < keptFiles.Count; i++)
             if (copied[i] >= 0) { bytes += copied[i]; written.Add(keptFiles[i]); }
 
-        CopyUnscannedIncludes(keptFiles, droppedFiles, sourceRoot, outDir, written, ref bytes);
-        return new EmitResult(written.Count, bytes, written);
+        var sizes = new Dictionary<string, long>(CodeCarver.Core.Util.PathComparer.Default);
+        for (var i = 0; i < keptFiles.Count; i++) if (copied[i] >= 0) sizes[keptFiles[i]] = copied[i];
+        CopyUnscannedIncludes(keptFiles, droppedFiles, sourceRoot, outDir, written, ref bytes, have, sizes);
+        return new EmitResult(written.Count, bytes, written) { Sizes = sizes };
     }
 
     /// <summary>
@@ -299,11 +308,17 @@ public static class FileTreeEmitter
     /// carve deliberately dropped (those are graph-known, so excluded here).
     /// </summary>
     private static void CopyUnscannedIncludes(IReadOnlyList<string> keptFiles, IReadOnlyList<string> droppedFiles, string sourceRoot, string outDir,
-                                              List<string> written, ref long bytes)
+                                              List<string> written, ref long bytes,
+                                              IReadOnlyDictionary<string, long>? have = null, Dictionary<string, long>? sizes = null)
     {
         var outRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outDir)) + Path.DirectorySeparatorChar;
         foreach (var trel in IncludeClosure(written, keptFiles, droppedFiles, sourceRoot))
         {
+            if (have is not null && have.TryGetValue(trel, out var had))
+            {
+                bytes += had; written.Add(trel); if (sizes is not null) sizes[trel] = had;
+                continue;
+            }
             var target = Path.Combine(sourceRoot, trel);
             var dst = Path.GetFullPath(Path.Combine(outDir, trel));
             if (!dst.StartsWith(outRoot, StringComparison.OrdinalIgnoreCase)) continue; // never write outside the output
@@ -312,8 +327,10 @@ public static class FileTreeEmitter
             if (!string.IsNullOrEmpty(dstDir)) Directory.CreateDirectory(dstDir);
             try { IoMeter.Copy(target, dst, overwrite: true); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { continue; }
-            bytes += new FileInfo(dst).Length;
+            var len = new FileInfo(dst).Length;
+            bytes += len;
             written.Add(trel);
+            if (sizes is not null) sizes[trel] = len;
         }
     }
 

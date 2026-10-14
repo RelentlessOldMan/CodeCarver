@@ -1545,36 +1545,41 @@ public static class CarveCommand
                     + "A build trace makes this exact; so does mapping the include dir(s) with [advanced] pathMap.");
                 summary["world.invisibleMacroNames"] = invisible.Count;
             }
-            // The big and dense headers the parser skips, streamed a window at a time: the names they #define that some
-            // #if tests, or null when one can't be read (then every tested name might come from it).
-            List<string>? DefinedTested(string rel)
-            {
-                var found = new List<string>();
-                try
-                {
-                    foreach (var line in CodeCarver.Core.Util.IoMeter.ReadLines(fullByRel[rel]))
-                    {
-                        var m = defRe.Match(line);
-                        if (m.Success && condIdents.Contains(m.Groups[1].Value)) found.Add(m.Groups[1].Value);
-                    }
-                    return found;
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
-            }
-            var unparsedToRead = skipParse.Where(r => !skipParseNotOpened.Contains(r)).ToList();
+            // The big and dense headers the parser skips: the names they #define that some #if tests, or null when one
+            // can't be read (then every tested name might come from it). A big one is read in pieces at once.
+            var definedScan = new CodeCarver.Core.Preprocess.DefinedNameScan(condIdents);
+            long SizeOf(string rel) => sizeByRel.TryGetValue(rel, out var size) ? size : 0;
+            // The biggest first: the step lasts at least as long as its biggest file, so that one starts at once.
+            var unparsedToRead = skipParse.Where(r => !skipParseNotOpened.Contains(r))
+                .OrderByDescending(SizeOf).ThenBy(r => r, StringComparer.Ordinal).ToList();
             if (skipParseNotOpened.Count > 0)
                 err.WriteLine($"  config  : {skipParseNotOpened.Count:N0} of {skipParse.Count:N0} unparsed header(s) were not opened by the traced build(s) -> not read for macro names");
             summary["world.unparsedHeadersNotOpenedSkipped"] = skipParseNotOpened.Count;
             CodeCarver.Core.Util.Activity.Begin("unparsed headers read", unparsedToRead.Count);
             // In any order (the names go into a set): in file order, one header of hundreds of MB held up every read
             // behind it, and only a few stayed in flight on the share.
+            // Handed out one at a time in that order (a list is otherwise split into ranges up front).
             CodeCarver.Core.Util.ReadAhead.EnsureThreads();
-            Parallel.ForEach(unparsedToRead, new ParallelOptions { MaxDegreeOfParallelism = CodeCarver.Core.Util.ReadAhead.Window }, rel =>
+            long slowestMs = 0, slowestBytes = 0, unreadable = 0;
+            Parallel.ForEach(System.Collections.Concurrent.Partitioner.Create(unparsedToRead, System.Collections.Concurrent.EnumerablePartitionerOptions.NoBuffering),
+                new ParallelOptions { MaxDegreeOfParallelism = CodeCarver.Core.Util.ReadAhead.Window }, rel =>
             {
-                var names = DefinedTested(rel);
-                lock (ambientMacros) ambientMacros.UnionWith(names ?? (IEnumerable<string>)condIdents);
-                CodeCarver.Core.Util.Activity.Tick(sizeByRel.TryGetValue(rel, out var size) ? size : 0);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var names = definedScan.Read(fullByRel[rel]);
+                var ms = sw.ElapsedMilliseconds;
+                lock (ambientMacros)
+                {
+                    ambientMacros.UnionWith(names ?? (IEnumerable<string>)condIdents);
+                    if (names is null) unreadable++;
+                    if (ms > slowestMs) { slowestMs = ms; slowestBytes = SizeOf(rel); }
+                }
+                CodeCarver.Core.Util.Activity.Tick(SizeOf(rel));
             });
+            summary["world.unparsedHeadersRead"] = unparsedToRead.Count;
+            summary["world.unparsedHeadersReadBytes"] = unparsedToRead.Sum(SizeOf);
+            summary["world.unparsedHeadersUnreadable"] = unreadable;
+            summary["world.unparsedHeadersSlowestMs"] = slowestMs;
+            summary["world.unparsedHeadersSlowestBytes"] = slowestBytes;
             PreParsePart("unparsedHeaders");
             err.WriteLine($"  config  : {ambientMacros.Count:N0} macro name(s) #defined in the tree stay unknown unless the build defines them");
             summary["world.ambientMacros"] = ambientMacros.Count;
@@ -2941,10 +2946,13 @@ public static class CarveCommand
                 stageClock.Restart();
             }
             var rounds = 0;
+            IReadOnlyDictionary<string, long>? emittedBefore = null;
             for (var round = 0; ; round++)
             {
                 rounds = round + 1;
-                res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir, kind == Stubbed ? StubOf : null) : FileTreeEmitter.Emit(splan, dir, stageDir);
+                res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir, kind == Stubbed ? StubOf : null)
+                            : FileTreeEmitter.Emit(splan.KeptFiles, splan.DroppedFiles, dir, stageDir, emittedBefore);
+                if (emittedBefore is not null) RemoveStale(stageDir, emittedBefore.Keys, res.Written);
                 Step("emit");
                 // The code plus the assembly files the infrastructure copy will carry (they define symbols C calls:
                 // fast_copy in a .S), read from the tree: the infrastructure is copied once, after the plan settles.
@@ -2967,9 +2975,15 @@ public static class CarveCommand
                 stagePlans.Remove(kind);
                 splan = PlanFor(kind);
                 checkedAlready = null;
-                // A fresh tree: the larger plan writes a superset, but pruned files are written differently.
-                try { Directory.Delete(stageDir, recursive: true); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
-                Directory.CreateDirectory(stageDir);
+                // Whole files: the larger plan writes the same files and more, so the next round copies only the new ones
+                // (on a network drive a round re-copied tens of thousands of files to add a few). Carved files are written
+                // differently by a larger plan: a fresh tree.
+                if (!prune) emittedBefore = res.Sizes;
+                else
+                {
+                    try { Directory.Delete(stageDir, recursive: true); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                    Directory.CreateDirectory(stageDir);
+                }
                 Step("replan");
             }
             summary[$"{summaryStage}.checkRounds"] = rounds;
@@ -3157,6 +3171,26 @@ public static class CarveCommand
 
     /// <summary>Up to three defined names close to each unresolved entry point: same name ignoring case, or edit
     /// distance ≤ 2 among names of similar length.</summary>
+    /// <summary>Deletes what an earlier check round wrote that this round did not, so the stage tree is the one a fresh
+    /// emit writes. A larger plan writes the same files and more, so this is rarely anything.</summary>
+    static void RemoveStale(string outDir, IEnumerable<string> before, IReadOnlyList<string> now)
+    {
+        var keep = new HashSet<string>(now, CodeCarver.Core.Util.PathComparer.Default);
+        foreach (var rel in before)
+        {
+            if (keep.Contains(rel)) continue;
+            try
+            {
+                File.Delete(Path.Combine(outDir, rel));
+                for (var d = Path.GetDirectoryName(Path.Combine(outDir, rel));
+                     d is not null && d.Length > outDir.Length && !Directory.EnumerateFileSystemEntries(d).Any();
+                     d = Path.GetDirectoryName(d))
+                    Directory.Delete(d);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
     static Dictionary<string, List<string>> NearMisses(CodeGraph graph, IReadOnlyList<string> wanted)
     {
         var r = wanted.ToDictionary(w => w, _ => new List<string>(), StringComparer.Ordinal);
