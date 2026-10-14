@@ -202,6 +202,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public int DefinitionsRecoveredByScan => _recoveredByScan;
     // CODECARVER_TIMING: where the per-file parse time goes (Stopwatch ticks), and how many files parsed with errors.
     private long _tPrep, _tParse, _tScan, _tRead; private int _errorFiles;
+    // Each pass of ProcessFile after the parse (see PassNames): a big file's time was nearly all outside the parse.
+    private readonly long[] _tPass = new long[PassNames.Length];
+    private static readonly string[] PassNames =
+    {
+        "symbolBudget", "scopes", "definitions", "splitHeads", "errorScan", "definerMacros", "globals", "globalsBackstop",
+        "includes", "templates", "aliases", "asmNames", "calls", "pasteUses", "bodyRefs", "fileScopeRefs", "normalize", "keepScans",
+    };
     private readonly SortedDictionary<string, long> _timing = new(StringComparer.Ordinal);
 
     /// <summary>Where the last graph build's time went, in ms, plus the slow-file counts: numbers only, for summary.txt.</summary>
@@ -499,6 +506,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var logTiming = Environment.GetEnvironmentVariable("CODECARVER_TIMING") is not null;
         _timing.Clear();
         _tPrep = _tParse = _tScan = _tRead = 0;
+        Array.Clear(_tPass);
         _errorFiles = 0;
         var phaseClock = System.Diagnostics.Stopwatch.StartNew();
         void Phase(string what)
@@ -575,6 +583,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         Phase("parse files");
         static long Ms(long ticks) => ticks * 1000 / System.Diagnostics.Stopwatch.Frequency;
         _timing["parse-files.rewrites"] = Ms(_tPrep);
+        for (var k = 0; k < PassNames.Length; k++) _timing[$"parse-files.pass.{PassNames[k]}"] = Ms(_tPass[k]);
         _timing["parse-files.tree-sitter"] = Ms(_tParse);
         _timing["parse-files.scan"] = Ms(_tScan);
         _timing["parse-files.read"] = Ms(_tRead);
@@ -1033,9 +1042,18 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
     /// <summary>`static` on a function DEFINITION at file scope (not a class member, not inside a namespace
     /// block where it could still be a member) — internal linkage.</summary>
+    /// <summary>The file being processed on this thread, when it is big enough for tree-sitter's parent step to be slow
+    /// (see ParentFinder); null otherwise, and then <see cref="Up"/> is tree-sitter's own step.</summary>
+    [ThreadStatic] private static ParentFinder? t_parents;
+
+    /// <summary>Files at least this long find parents by <see cref="ParentFinder"/>. Settable for tests.</summary>
+    internal static int ParentFinderMinChars = 64 * 1024;
+
+    private static TsNode? Up(TsNode n) => t_parents is { } f ? f.ParentOf(n) : n.Parent;
+
     /// <summary>The name heads a call-shaped declarator that is itself called: <c>CAT(TNAME, get)(void)</c>.</summary>
     private static bool ComputedName(TsNode nameNode)
-        => nameNode.Parent is { Type: "function_declarator" } p && p.Parent is { Type: "function_declarator" };
+        => Up(nameNode) is { Type: "function_declarator" } p && Up(p) is { Type: "function_declarator" };
 
     private static bool IsFileScopeStatic(TsNode nameNode)
     {
@@ -1043,12 +1061,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         for (var i = 0; i < 12 && def is not null && def.Type != "function_definition"; i++)
         {
             if (def.Type is "qualified_identifier" or "field_identifier") return false;   // Class::method
-            def = def.Parent;
+            def = Up(def);
         }
         if (def is null || def.Type != "function_definition") return false;
-        if (def.Parent?.Type is not ("translation_unit" or "preproc_if" or "preproc_ifdef" or "preproc_else" or "preproc_elif"))
+        if (Up(def)?.Type is not ("translation_unit" or "preproc_if" or "preproc_ifdef" or "preproc_else" or "preproc_elif"))
             return false;
-        foreach (var ch in def.Children)
+        foreach (var ch in NodeKids.All(def))
             if (ch.Type == "storage_class_specifier" && ch.Text == "static") return true;
         return false;
     }
@@ -1114,7 +1132,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     case "for": list.Add((n.StartIndex, n.EndIndex, For)); break;
                     case "fn": list.Add((n.StartIndex, n.EndIndex, Function)); break;
                     case "storage":
-                        if (n.Text == "extern" && n.Parent is { Type: "declaration" } d) _externs.Add((d.StartIndex, d.EndIndex));
+                        if (n.Text == "extern" && Up(n) is { Type: "declaration" } d) _externs.Add((d.StartIndex, d.EndIndex));
                         break;
                 }
             }
@@ -1212,7 +1230,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         {
             var scope = scopes.Pop();
             TsNode? prev = null;
-            foreach (var child in scope.NamedChildren)
+            foreach (var child in NodeKids.Named(scope))
             {
                 if (child.Type == "comment") continue;
                 if (child.Type is "namespace_definition" or "linkage_specification"
@@ -1235,7 +1253,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     {
         if (n.Type == "declaration")
         {
-            if (!n.Children.Any(c => c.IsMissing) || HeadName(n) is not { } name) return false;
+            if (!NodeKids.All(n).Any(c => c.IsMissing) || HeadName(n) is not { } name) return false;
             names.Add(name);
             return true;
         }
@@ -1245,7 +1263,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var alt = n.GetChildForField("alternative");
         var clean = true;
         var content = 0;
-        foreach (var c in n.NamedChildren)
+        foreach (var c in NodeKids.Named(n))
         {
             if (c.Type == "comment" || (cond is not null && c.Id == cond.Id) || (alt is not null && c.Id == alt.Id)) continue;
             content++;
@@ -1270,8 +1288,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         isStatic = false;
         condExtern = false;
         headerDefinition = false;
-        if (decl.Parent is not { Type: "declaration" } declaration || declaration.HasError) return null;
-        var storage = declaration.Children.Where(c => c.Type == "storage_class_specifier").Select(c => c.Text).ToList();
+        if (Up(decl) is not { Type: "declaration" } declaration || declaration.HasError) return null;
+        var storage = NodeKids.All(declaration).Where(c => c.Type == "storage_class_specifier").Select(c => c.Text).ToList();
         if (storage.Contains("extern") && decl.Type != "init_declarator") return null;
         isStatic = storage.Contains("static");
         headerDefinition = !isStatic && !IsTranslationUnit(path) && HeaderDefines(declaration, decl, storage, lines, out condExtern);
@@ -1288,8 +1306,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private bool HeaderDefines(TsNode declaration, TsNode decl, List<string> storage, string[] lines, out bool condExtern)
     {
         condExtern = false;
-        if (storage.Contains("extern") || storage.Contains("inline") || declaration.Parent?.Type == "template_declaration") return false;
-        if (!_cGrammar && declaration.Children.Any(c => c.Type is "type_qualifier" && c.Text is "const" or "constexpr" or "constinit")) return false;
+        if (storage.Contains("extern") || storage.Contains("inline") || Up(declaration)?.Type == "template_declaration") return false;
+        if (!_cGrammar && NodeKids.All(declaration).Any(c => c.Type is "type_qualifier" && c.Text is "const" or "constexpr" or "constinit")) return false;
         var row = declaration.StartPosition.Row;
         if (_condExternMacros.Count > 0 && row < lines.Length && LeadingWord.Match(lines[row]) is { Success: true } w
             && _condExternMacros.Contains(w.Groups[1].Value))
@@ -1387,7 +1405,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (c.Type == "call_expression"
                 && !(c.GetChildForField("function") is { Type: "identifier" } f && _callFreeMacros.Contains(f.Text)))
                 return true;
-            foreach (var k in c.NamedChildren) stack.Push(k);
+            foreach (var k in NodeKids.Named(c)) stack.Push(k);
         }
         return false;
     }
@@ -1400,8 +1418,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         {
             if (d.Type == "array_declarator") return true;
             if (d.Type is "identifier" or "function_declarator") return false;
-            d = d.Type == "parenthesized_declarator" ? d.NamedChildren.FirstOrDefault(c => c.Type != "comment")
-                : d.GetChildForField("declarator") ?? d.NamedChildren.LastOrDefault();
+            d = d.Type == "parenthesized_declarator" ? NodeKids.Named(d).FirstOrDefault(c => c.Type != "comment")
+                : d.GetChildForField("declarator") ?? NodeKids.Named(d).LastOrDefault();
         }
         return false;
     }
@@ -1419,14 +1437,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 case "init_declarator" or "array_declarator" or "attributed_declarator":
                     d = d.GetChildForField("declarator"); break;
                 case "pointer_declarator" or "reference_declarator":
-                    d = d.GetChildForField("declarator") ?? d.NamedChildren.LastOrDefault(); break;
+                    d = d.GetChildForField("declarator") ?? NodeKids.Named(d).LastOrDefault(); break;
                 case "parenthesized_declarator":
-                    d = d.NamedChildren.FirstOrDefault(c => c.Type != "comment"); break;
+                    d = NodeKids.Named(d).FirstOrDefault(c => c.Type != "comment"); break;
                 case "function_declarator":
                     // `int (*hook)(int)` is a pointer variable; `int f(void)` and `int (f)(void)` are prototypes.
                     var inner = d.GetChildForField("declarator");
                     if (inner?.Type != "parenthesized_declarator"
-                        || inner.NamedChildren.FirstOrDefault(c => c.Type != "comment")?.Type is not ("pointer_declarator" or "reference_declarator"))
+                        || NodeKids.Named(inner).FirstOrDefault(c => c.Type != "comment")?.Type is not ("pointer_declarator" or "reference_declarator"))
                         return null;
                     d = inner; break;
                 default: return null;
@@ -1443,11 +1461,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (d.Type == "function_declarator")
             {
                 var name = d.GetChildForField("declarator");
-                if (name?.Type == "parenthesized_declarator") name = name.NamedChildren.FirstOrDefault();
+                if (name?.Type == "parenthesized_declarator") name = NodeKids.Named(name).FirstOrDefault();
                 if (name?.Type == "qualified_identifier") name = name.GetChildForField("name");
                 return name?.Type is "identifier" or "field_identifier" ? name : null;
             }
-            d = d.Type is "pointer_declarator" or "reference_declarator" ? d.GetChildForField("declarator") ?? d.NamedChildren.LastOrDefault() : null;
+            d = d.Type is "pointer_declarator" or "reference_declarator" ? d.GetChildForField("declarator") ?? NodeKids.Named(d).LastOrDefault() : null;
         }
         return null;
     }
@@ -1626,6 +1644,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         public bool DefinesExternFlag, Unparsed;
         public int? BudgetSymbols;
         public long TPrep, TParse, TScan, TRead, Ms;
+        public readonly long[] Pass = new long[PassNames.Length];
+        public long Mark;
+        /// <summary>Adds the time since the last mark to pass k.</summary>
+        public void Lap(int k) { var now = System.Diagnostics.Stopwatch.GetTimestamp(); Pass[k] += now - Mark; Mark = now; }
         public int ErrorFiles, Recovered, Length;
 
         public FileWork()
@@ -1657,10 +1679,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             // omitted -> UNKNOWN -> both branches kept, sound). Falls back to the global `defines` when no
             // per-file table exists (no build log, or a file absent from it).
             var fileDefines = PerFileDefines?.Invoke(path) ?? defines;
-            ProcessFile(w, path, text, fileNodeByPath, pathsByBasename, fileDefines, closedWorldDefines);
+            w.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
+            try { ProcessFile(w, path, text, fileNodeByPath, pathsByBasename, fileDefines, closedWorldDefines); }
+            finally { t_parents = null; }
+            w.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
             foreach (var n in ScanKeepAttributes(text)) { w.KeepNames.Add(n); if (IsTranslationUnit(path)) w.KeepAt.Add((n, path)); }
             if (_keepMacroUse is not null && fileNodeByPath.ContainsKey(path))
                 ScanKeepMacroUses(w, text, w.FileNode(path));
+            w.Lap(17);
         }
         catch (Exception ex)   // never let one pathological file sink a whole-repo carve
         {
@@ -1713,6 +1739,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         if (w.Unparsed) _unparsed.Add(path);
         if (w.BudgetSymbols is { } symbols) _symbolBudgetKeptWhole.Add((path, symbols));
         _tPrep += w.TPrep; _tParse += w.TParse; _tScan += w.TScan;
+        for (var k = 0; k < PassNames.Length; k++) _tPass[k] += w.Pass[k];
         _errorFiles += w.ErrorFiles; _recoveredByScan += w.Recovered;
     }
 
@@ -1746,12 +1773,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             return;
         }
 
+        w.Lap(16);
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var parseText = PrepareParseText(path, text, out var bareKAndR, out var blankedForParse);
         if (blankedForParse.Length > 0) IdentifierRefs(blankedForParse, w.FileNode(path), pendingRefs, callShapedOnly: false);
         var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         using var tree = ParseWithBudget(w, parseText, path, out var timedOut);
         w.TPrep += t1 - t0; w.TParse += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
+        w.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
         if (timedOut)
         {
             w.Warnings.Add($"{path}: parse exceeded the {ParseBudgetMs} ms budget — kept whole, not carved");
@@ -1763,6 +1792,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
         if (tree is null) return;
         var root = tree.RootNode;
+        if (text.Length >= ParentFinderMinChars) t_parents = new ParentFinder(root);
 
         // Shape-agnostic node-explosion backstop: BEFORE minting a single node, count the definitions this
         // file would contribute (functions/macros/types + file-scope globals). A file over PerFileSymbolBudget
@@ -1787,6 +1817,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 return;
             }
         }
+        w.Lap(0);
 
         // Scope ranges once per file: pass 1b and pass 4 ask "inside a function body?" per capture (see ScopeIndex).
         var scopes = new ScopeIndex(_scopes, root);
@@ -1800,6 +1831,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         var funcSpans = new List<(int Start, int End, NodeId Id)>();
         var defNamePositions = new HashSet<(int, int)>();
+        w.Lap(1);
 
         // Pass 1: definitions. A "function" capture is any callable (free function or method); anything
         // else that isn't a macro is treated as a type (class/struct/enum/namespace/typedef).
@@ -1834,7 +1866,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 var mid = graph.GetOrAddNode(NodeKind.Macro, name, path, new SourceSpan(row, row));
                 graph.AddEdge(mid, fileNode, EdgeKind.DefinedIn);
                 Add(macrosByName, name, mid);
-                var defineText = node.Parent?.Text ?? "";
+                var defineText = Up(node)?.Text ?? "";
                 foreach (var id in MacroBodyIdentifiers(defineText))
                     pendingMacroRefs.Add((mid, id));
                 foreach (var paste in ExtractMacroPastes(defineText))
@@ -1848,6 +1880,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(tid, fileNode, EdgeKind.DefinedIn);
             }
         }
+        w.Lap(2);
 
         // Pass 1a: a function head split across #if/#else/#endif with the body's '{' after the #endif —
         //   #ifdef VARIANT_SDI / void helper_sdi(int x) / #else / void helper(int x) / #endif / { ... }
@@ -1895,6 +1928,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(fileNode, fid, EdgeKind.References);
                 Add(functionsByName, name, fid);
             }
+        w.Lap(3);
 
         // Pass 1d (backstop): a file whose parse has errors can lose ordinary definitions to error recovery — a
         // construct the grammar can't read swallows the function around or after it (work eval, 1.0.167: three plain
@@ -1920,6 +1954,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 w.Recovered++;
             }
         w.TScan += System.Diagnostics.Stopwatch.GetTimestamp() - t2;
+        w.Lap(4);
 
         // Pass 1c: symbols a macro use defines — `FW_DECLARE(uart, uart_init, uart_fini);` defining `uart_desc`,
         // or `DEFINE_TASK(blink) { ... }` defining `blink` (see DefinerMacros). Each defined name gets a node
@@ -1950,6 +1985,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                         if (a != b) graph.AddEdge(a, b, EdgeKind.Calls);
                 funcSpans.Add((use.StartLine, use.EndLine, ids[0]));   // the body's calls belong to the defined name
             }
+        w.Lap(5);
 
         // Pass 1b: file-scope variable DEFINITIONS of every shape (scalars, structs, pointers, arrays, initialized
         // or tentative), so a use keeps the file that defines them: a data-only file is otherwise dropped and the
@@ -1973,7 +2009,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             // Not removable on its own: a declaration that also defines a named type (`struct cfg {...} dead_cfg;` — the
             // type goes with it), or a C++ object whose constructor can register something at start-up. Only in a unit:
             // a header is never cut, and such an edge there would pull in every unit including it.
-            if (IsTranslationUnit(path) && decl.Parent is { } owner && (DefinesType(owner) || CppObject(owner, decl, path)))
+            if (IsTranslationUnit(path) && Up(decl) is { } owner && (DefinesType(owner) || CppObject(owner, decl, path)))
                 graph.AddEdge(fileNode, gid, EdgeKind.References);
             // What its initializer names, read from the text after the name: a section-placed entry
             // (`const fn_t e __attribute__((section("x"))) = handler;`) doesn't parse as an initializer at all, and
@@ -1990,6 +2026,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     if (id != gname) pendingRefs.Add((gid, id));
             }
         }
+        w.Lap(6);
 
         // Pass 1b (backstop): file-scope data the parse lost to an error — an attribute or SDK macro it can't read
         // (`int v __attribute__((aligned(4)));`, `__IO uint32_t v;`). The link check's scanner names it; the node is kept
@@ -2012,6 +2049,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     if (l.IndexOf('#') >= 0 && DefineName.Match(l) is { Success: true } dm && _condExternFlags.Contains(dm.Groups[1].Value))
                     { w.DefinesExternFlag = true; break; }
         }
+        w.Lap(7);
 
         // Pass 2: #includes → file/header edges. Scanned from TEXT, not the parse tree: #include is a
         // line-oriented preprocessor directive, and tree-sitter misses ones in odd positions — notably
@@ -2034,6 +2072,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 if (tp != path)
                     graph.AddEdge(fileNode, w.FileNode(tp), EdgeKind.Includes);
         }
+        w.Lap(8);
 
         // Pass 2a: names a template header defines in this translation unit (`#define TNAME red` / `#include "tmpl.h"`
         // with `int CAT(TNAME, get)(void) { ... }` inside). Each instance is a node at the instantiating line, kept
@@ -2071,6 +2110,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 Add(functionsByName, name, iid);
             }
         }
+        w.Lap(9);
 
         // Pass 2b: symbol aliases. `void NMI_Handler(void) __attribute__((alias("Default_Handler")))` is a
         // bodyless declaration tree-sitter treats as a prototype (uncaptured), yet it IS a real symbol the
@@ -2143,6 +2183,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     Add(functionsByName, wn[7..], xid);
                     pendingCalls.Add((xid, wn));
                 }
+        w.Lap(10);
 
         // Pass 2c: inline-asm symbol references. A function/global named only inside asm("...") is kept
         // via the file (attributed to fileNode, like a file-scope address-take), so it survives if this
@@ -2164,6 +2205,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             for (var r = s.Start; r <= s.End && r < byLine.Length; r++)
                 byLine[r] = s.Id;
         NodeId? Enclosing(int row) => row >= 0 && row < byLine.Length ? byLine[row] : null;
+        w.Lap(11);
 
         // Pass 3: direct calls, attributed to the enclosing function by span.
         var calleePositions = new HashSet<(int, int)>();
@@ -2183,6 +2225,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             pendingCalls.Add((from, callee));
             if (callee.Length > 7 && callee.StartsWith("__real_", StringComparison.Ordinal)) pendingCalls.Add((from, callee[7..]));   // --wrap's original
         }
+        w.Lap(12);
 
         // Pass 3b: `DESC(uart)` / `CAT(uart, _desc)`: a use of a macro that pastes its own parameters names what it
         // builds. Found in the text, not the parse, so a use in any position counts (a declarator, a parse error).
@@ -2216,6 +2259,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 if (afterWords) w.WordInvocations.Add((fileNode, macro, names));   // decided once every file is read
                 else foreach (var name in names) pendingRefs.Add((fileNode, name));
             }
+        w.Lap(13);
 
         // Pass 4: non-call references INSIDE functions (address-taken: a callback passed/assigned).
         // InsideError only matters when the file actually has a parse error somewhere; checking once
@@ -2247,6 +2291,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 // declared function). Over-approximation bounded to the misparsed region — sound.
                 pendingRefs.Add((fileNode, name));
         }
+        w.Lap(14);
 
         // Pass 5: function names used as DATA at FILE SCOPE (tables, hooks, registries). Attributed to
         // the file node so keeping the file keeps everything its initializers point at. For a whole
@@ -2287,6 +2332,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 pendingRefs.Add((fileNode, cap.Node.Text));
             }
         }
+        w.Lap(15);
     }
 
     /// <summary>Count a query's captures over the tree WITHOUT materializing them — used by the per-file
@@ -2537,7 +2583,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var n = nameNode;
         for (var i = 0; i < 12; i++)
         {
-            var parent = n.Parent;
+            var parent = Up(n);
             if (parent is null) return null;
             var t = parent.Type;
             if (t == "function_definition")
@@ -2562,8 +2608,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 // Include a leading `template<...>` (possibly several, nested) so pruning a templated
                 // function/method removes the whole thing — otherwise the `template<int N>` line is left
                 // orphaned above the deleted body: `template<int N>\n };` → "expected unqualified-id".
-                var tp = parent.Parent;
-                while (tp is not null && tp.Type == "template_declaration") { start = tp.StartPosition.Row + 1; tp = tp.Parent; }
+                var tp = Up(parent);
+                while (tp is not null && tp.Type == "template_declaration") { start = tp.StartPosition.Row + 1; tp = Up(tp); }
                 return (start, parent.EndPosition.Row + 1);
             }
             if (t is "function_declarator" or "pointer_declarator" or "reference_declarator"
@@ -2594,7 +2640,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var plist = ChildForField(decl, "parameters");
         if (plist is null) return false;
         if (plist.IsError || plist.HasError) return true;
-        foreach (var ch in plist.NamedChildren)
+        foreach (var ch in NodeKids.Named(plist))
         {
             if (ch.IsExtra) continue; // comments
             if (ch.Type is not ("parameter_declaration" or "variadic_parameter"
@@ -2617,25 +2663,25 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// Used to over-keep function references there rather than silently lose them.</summary>
     private static bool InsideError(TsNode n)
     {
-        var p = n.Parent;
+        var p = Up(n);
         for (var i = 0; i < 48 && p is not null; i++)
         {
             if (p.IsError || p.Type == "ERROR") return true;
             if (p.Type == "translation_unit") return false;
-            p = p.Parent;
+            p = Up(p);
         }
         return false;
     }
 
     private static bool InsideFunctionBody(TsNode n)
     {
-        var p = n.Parent;
+        var p = Up(n);
         for (var i = 0; i < 48 && p is not null; i++)
         {
             var t = p.Type;
             if (t is "compound_statement" or "function_definition") return true;
             if (t == "translation_unit") return false;
-            p = p.Parent;
+            p = Up(p);
         }
         return false;
     }
@@ -2648,7 +2694,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var n = nameNode;
         for (var i = 0; i < 8; i++)
         {
-            var parent = n.Parent;
+            var parent = Up(n);
             if (parent is null) return null;
             if (parent.Type == "declaration")
                 return (parent.StartPosition.Row + 1, parent.EndPosition.Row + 1);
