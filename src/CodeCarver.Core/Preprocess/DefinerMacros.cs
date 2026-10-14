@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using CodeCarver.Core.Util;
 
 namespace CodeCarver.Core.Preprocess;
 
@@ -43,12 +44,15 @@ public static class DefinerMacros
     public static readonly Regex AnyDefine = new(
         @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(\()?((?:[^\n\\]|\\\r?\n|\\.)*)", RegexOptions.Compiled | RegexOptions.Multiline);
 
-    /// <summary>The definers and a regex matching a use of any of them.</summary>
-    public sealed record Set(IReadOnlyDictionary<string, List<Template>> Definers, Regex Use);
+    /// <summary>The definers and a scan finding a use of any of them.</summary>
+    public sealed record Set(IReadOnlyDictionary<string, List<Template>> Definers, NameScan Use);
 
     public static Set? MakeSet(IReadOnlyDictionary<string, List<Template>> definers)
-        => definers.Count == 0 ? null
-         : new Set(definers, new Regex(@"\b(" + string.Join("|", definers.Keys.Select(Regex.Escape)) + @")\s*\(", RegexOptions.Compiled));
+        => definers.Count == 0 ? null : new Set(definers, UseScan(definers));
+
+    /// <summary>Finds a use (<c>NAME (</c>) of any of <paramref name="definers"/>.</summary>
+    public static NameScan UseScan(IReadOnlyDictionary<string, List<Template>> definers)
+        => new(definers.Keys, NameScan.Shape.Call);
 
     /// <summary>The definers <paramref name="text"/>'s own <c>#define</c>s make.</summary>
     public static Dictionary<string, List<Template>> FromText(string text)
@@ -186,11 +190,11 @@ public static class DefinerMacros
     /// <summary>File-scope uses of the definers in <paramref name="text"/>, matched by <paramref name="use"/>
     /// (a regex of the definer names). File scope includes namespace and <c>extern "C"</c> blocks; a use inside
     /// a function, class or initializer is not a definition we could remove whole, so it is skipped.</summary>
-    public static IEnumerable<Use> Uses(string text, Regex use, IReadOnlyDictionary<string, List<Template>> definers)
+    public static IEnumerable<Use> Uses(string text, NameScan use, IReadOnlyDictionary<string, List<Template>> definers)
     {
         if (!use.IsMatch(text)) yield break;   // cheap: most files use no definer at all
         var code = SourceText.CodeOnly(text);
-        var matches = use.Matches(code);
+        var matches = use.Matches(code).ToList();
         if (matches.Count == 0) yield break;
 
         var lineStarts = new List<int> { 0 };
@@ -198,10 +202,10 @@ public static class DefinerMacros
         int LineOf(int index) { var k = lineStarts.BinarySearch(index); return (k >= 0 ? k : ~k - 1) + 1; }
 
         var opaque = OpaqueDepth(code);
-        foreach (Match m in matches)
+        foreach (var m in matches)
         {
             if (opaque[m.Index] != 0) continue;
-            var macro = m.Groups[1].Value;
+            var macro = m.Name;
             var open = code.IndexOf('(', m.Index + macro.Length);
             var close = Matching(code, open, '(', ')');
             if (close < 0) continue;

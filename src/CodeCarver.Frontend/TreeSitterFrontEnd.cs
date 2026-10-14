@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.RegularExpressions;
+using CodeCarver.Core.Util;
 using CodeCarver.Core.Graph;
 using CodeCarver.Core.Preprocess;
 using TreeSitter;
@@ -57,7 +58,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private Regex? _aliasMacroUse;
     // Identity wrappers `#define EXPORT(n) n` / `(n)`, as used on a definition's name: `int EXPORT(f)(void) {`.
     private static readonly Regex IdentityBody = new(@"^\s*(\w+)\s*\)\s*\(?\s*\1\s*\)?\s*$", RegexOptions.Compiled);
-    private Regex? _wrapperUse;
+    private NameScan? _wrapperUse;
+    // After a wrapper's name and '(': the wrapped name, its ')', and the '(' of the parameters that follow.
+    private static readonly Regex WrapperTail = new(@"\G\s*(?<name>[A-Za-z_]\w*)\s*\)(?=\s*\()", RegexOptions.Compiled);
 
     // Keep-attributes: symbols the runtime/linker keep regardless of any call — implicit roots a
     // from-main closure would silently drop (a self-registering `constructor`, an initcall-section entry).
@@ -306,7 +309,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+((?:\\\r?\n|[^\r\n])*)",
         RegexOptions.Compiled | RegexOptions.Multiline);
     private Dictionary<string, string> _scopeMacros = new(StringComparer.Ordinal);
-    private Regex? _scopeRegex;
+    private NameScan? _scopeRegex;
 
     // Object-like macro whose body is EMPTY (`#define X` with no replacement) — an annotation/marker
     // macro that expands to nothing (calling-convention stubs, feature markers).
@@ -326,7 +329,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // PARSING only. tree-sitter can't see through them, so `foo() PUGIXML_NOEXCEPT_IF_NOT_COMPACT {`
     // mis-parses and the function (plus several after it, via error recovery) is never captured and so
     // can't be rooted — the pugixml load_file/load_string gap. Emitted output is untouched.
-    private Regex? _blankRegex;
+    private NameScan? _blankRegex;
     // The C grammar parses every file as C; the C++ grammar also reads .c files in a mixed tree. Implicit-int
     // recovery (ImplicitInt) applies to C only — C++ has no implicit int.
     private readonly bool _cGrammar;
@@ -385,13 +388,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private Dictionary<string, List<DefinerMacros.Template>> _definers = new(StringComparer.Ordinal);
     // What macros that paste their own parameters (`CAT(a, b) a##b`) build, through wrappers (see PasteMacros).
     private PasteMacros.Table _pasteTable = new();
-    private Regex? _pasteUse;
+    private NameScan? _pasteUse;
     private HashSet<string> _objectMacros = new(StringComparer.Ordinal);
     /// <summary>The tree's definer macros, for the emitted-tree check (null when there are none).</summary>
     public DefinerMacros.Set? DefinerSet { get; private set; }
-    private Regex? _definerUse;
+    private NameScan? _definerUse;
     private HashSet<string> _keepMacrosFnLike = new(StringComparer.Ordinal);
-    private Regex? _keepMacroUse;
+    private NameScan? _keepMacroUse;
     private static readonly Regex AnyDefine = new(
         @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(\()?((?:[^\n\\]|\\\r?\n|\\.)*)", RegexOptions.Compiled | RegexOptions.Multiline);
     private static readonly Regex KeepBody = new(
@@ -712,12 +715,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var graph = w.Graph;
         var keepNames = w.KeepNames;
         var pendingRefs = w.Refs;
-        foreach (Match m in _keepMacroUse!.Matches(text))
+        foreach (var m in _keepMacroUse!.Matches(text))
         {
             var lineStart = text.LastIndexOf('\n', Math.Max(0, m.Index - 1)) + 1;
             if (text.AsSpan(lineStart, m.Index - lineStart).TrimStart().StartsWith("#")) continue; // the #define itself
             var end = m.Index + m.Length;
-            if (_keepMacrosFnLike.Contains(m.Value))
+            if (_keepMacrosFnLike.Contains(m.Name))
             {
                 var i = end;
                 while (i < text.Length && char.IsWhiteSpace(text[i])) i++;
@@ -734,7 +737,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             }
             // A registration nobody names (`RITE(1)` placing a static's pointer in a walked section): the
             // translation unit stays whole.
-            if (_registerMacros.Contains(m.Value) && IsTranslationUnit(graph.GetNode(fileNode).Name))
+            if (_registerMacros.Contains(m.Name) && IsTranslationUnit(graph.GetNode(fileNode).Name))
                 w.ForceKeeps.Add(graph.GetNode(fileNode).Name);   // ForceKeep keeps each file once, at the merge
             var before = text.AsSpan(0, m.Index);
             var mb = NameBeforeAttr.Match(before.Length > 200 ? before[^200..].ToString() : before.ToString());
@@ -880,21 +883,18 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (_emptyDefineConditions.TryGetValue(kv.Key, out var flags)) _condExternFlags.UnionWith(flags);
         }
         _keepMacrosFnLike = new HashSet<string>(keep.Where(k => bodies[k].FnLike), StringComparer.Ordinal);
-        _keepMacroUse = keep.Count == 0 ? null
-            : new Regex(@"\b(?:" + string.Join("|", keep.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
+        _keepMacroUse = keep.Count == 0 ? null : new NameScan(keep, NameScan.Shape.Word);
 
         _definers = DefinerMacros.Build(bodies);
         _macroBodies = bodies;
         _objectMacros = new HashSet<string>(defs.Keys, StringComparer.Ordinal);
         _pasteTable = PasteMacros.Build(bodies, _objectMacros.Contains);
-        _pasteUse = PasteMacros.UseRegex(_pasteTable);
+        _pasteUse = PasteMacros.UseScan(_pasteTable);
         DefinerSet = DefinerMacros.MakeSet(_definers);
-        _definerUse = _definers.Count == 0 ? null
-            : new Regex(@"\b(" + string.Join("|", _definers.Keys.Select(Regex.Escape)) + @")\s*\(", RegexOptions.Compiled);
+        _definerUse = DefinerSet?.Use;
 
         _scopeMacros = map;
-        _scopeRegex = map.Count == 0 ? null
-            : new Regex(@"\b(?:" + string.Join("|", map.Keys.Select(Regex.Escape)) + @")\b", RegexOptions.Compiled);
+        _scopeRegex = map.Count == 0 ? null : new NameScan(map.Keys, NameScan.Shape.Word);
 
         // Specifier/empty object-like macros to blank for parsing (see _blankRegex docs). `defs` holds ALL
         // object-like definitions (valued + valueless) gathered above; seed the blank set with those that are
@@ -911,8 +911,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
         // Never blank an occurrence followed by "(": a valueless #define NAME in one target must not erase calls
         // to another target's real function NAME (review N1).
-        _blankRegex = blank.Count == 0 ? null
-            : new Regex(@"\b(?:" + string.Join("|", blank.Select(Regex.Escape)) + @")\b(?!\s*\()", RegexOptions.Compiled);
+        _blankRegex = blank.Count == 0 ? null : new NameScan(blank, NameScan.Shape.NotCall);
 
         _funcLikeMacroNames = fnLike;
 
@@ -922,9 +921,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                                 .Select(kv => kv.Key).ToList();
         var wrappers = bodies.Where(kv => kv.Value.FnLike && kv.Value.Bodies.Count > 0 && kv.Value.Bodies.All(b => IdentityBody.IsMatch(b)))
                              .Select(kv => kv.Key).ToList();
-        _wrapperUse = wrappers.Count == 0 ? null
-            : new Regex(@"\b(?:" + string.Join("|", wrappers.Select(Regex.Escape)) + @")\s*\(\s*(?<name>[A-Za-z_]\w*)\s*\)(?=\s*\()",
-                        RegexOptions.Compiled);
+        _wrapperUse = wrappers.Count == 0 ? null : new NameScan(wrappers, NameScan.Shape.Call);
         _aliasMacroUse = aliasMacros.Count == 0 ? null
             : new Regex(@"\b(?<name>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*(?:" + string.Join("|", aliasMacros.Select(Regex.Escape))
                         + @")\s*\(\s*(?<target>[A-Za-z_]\w*)\s*\)\s*;", RegexOptions.Compiled);
@@ -936,17 +933,20 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// Length-preserving; #define lines are left alone.</summary>
     private string UnwrapNames(string text)
     {
-        if (_wrapperUse is null || !_wrapperUse.IsMatch(text)) return text;
-        var sb = new StringBuilder(text);
-        foreach (Match m in _wrapperUse.Matches(text))
+        if (_wrapperUse is null) return text;
+        StringBuilder? sb = null;
+        foreach (var m in _wrapperUse.Matches(text))
         {
+            var tail = WrapperTail.Match(text, m.Index + m.Length);
+            if (!tail.Success) continue;
             var lineStart = text.LastIndexOf('\n', Math.Max(0, m.Index - 1)) + 1;
             if (text.AsSpan(lineStart, m.Index - lineStart).TrimStart().StartsWith("#")) continue;
-            var name = m.Groups["name"];
+            sb ??= new StringBuilder(text);
+            var name = tail.Groups["name"];
             for (var k = m.Index; k < name.Index; k++) if (sb[k] != '\n') sb[k] = ' ';
-            for (var k = name.Index + name.Length; k < m.Index + m.Length; k++) if (sb[k] != '\n') sb[k] = ' ';
+            for (var k = name.Index + name.Length; k < tail.Index + tail.Length; k++) if (sb[k] != '\n') sb[k] = ' ';
         }
-        return sb.ToString();
+        return sb?.ToString() ?? text;
     }
 
     /// <summary>Replace scope-opening macros with their (single-line) expansion, for parsing only. Skips
@@ -963,7 +963,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (!line.TrimStart().StartsWith('#'))
             {
                 if (_scopeRegex is not null)
-                    line = _scopeRegex.Replace(line, mm => _scopeMacros.TryGetValue(mm.Value, out var r) ? r : mm.Value);
+                    line = _scopeRegex.Replace(line, mm => _scopeMacros.TryGetValue(mm.Name, out var r) ? r : mm.Name);
                 // Blank specifier/empty macros with equal-length spaces so LINE and COLUMN still map to the
                 // original text the emitter reads (the token is on the same line as the function signature).
                 if (_blankRegex is not null)

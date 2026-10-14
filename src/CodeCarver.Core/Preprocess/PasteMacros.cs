@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using CodeCarver.Core.Util;
 
 namespace CodeCarver.Core.Preprocess;
 
@@ -127,10 +128,10 @@ public static class PasteMacros
     /// <summary>Uses of the macros with templates in <paramref name="code"/> (already <see cref="SourceText.CodeOnly"/>:
     /// directives blanked, so a use inside another macro's body is not one): the 1-based line, the macro, and the
     /// text inside its parentheses.</summary>
-    public static IEnumerable<(int Line, string Macro, string Args)> Uses(Table table, Regex use, string code)
+    public static IEnumerable<(int Line, string Macro, string Args)> Uses(Table table, NameScan use, string code)
     {
         List<int>? lineStarts = null;
-        foreach (Match m in use.Matches(code))
+        foreach (var m in use.Matches(code))
         {
             var open = m.Index + m.Length - 1;
             var depth = 0;
@@ -147,14 +148,13 @@ public static class PasteMacros
                 for (var k = 0; k < code.Length; k++) if (code[k] == '\n') lineStarts.Add(k + 1);
             }
             var at = lineStarts.BinarySearch(m.Index);
-            yield return ((at >= 0 ? at : ~at - 1) + 1, m.Groups[1].Value, code[(open + 1)..close]);
+            yield return ((at >= 0 ? at : ~at - 1) + 1, m.Name, code[(open + 1)..close]);
         }
     }
 
-    /// <summary>A regex finding a use of any macro with templates (<c>NAME (</c>), or null when there are none.</summary>
-    public static Regex? UseRegex(Table table)
-        => table.Templates.Count == 0 ? null
-           : new Regex(@"(?<![\w$])(" + string.Join("|", table.Templates.Keys.Select(Regex.Escape)) + @")\s*\(", RegexOptions.Compiled);
+    /// <summary>Finds a use of any macro with templates (<c>NAME (</c>), or null when there are none.</summary>
+    public static NameScan? UseScan(Table table)
+        => table.Templates.Count == 0 ? null : new NameScan(table.Templates.Keys, NameScan.Shape.PasteCall);
 
     /// <summary>Template <paramref name="t"/> with each parameter replaced by its argument: a plain name or a paste
     /// chain of names and the caller's parameters <paramref name="ps"/>; anything else is unknown, and so is an

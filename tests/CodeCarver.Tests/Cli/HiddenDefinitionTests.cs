@@ -316,7 +316,7 @@ public sealed class DefinerMacroTests
     public void Uses_InsideAFunctionOrClass_AreNotDefinitions()
     {
         var d = new Dictionary<string, List<DefinerMacros.Template>> { ["DECL"] = new() { new(1, "", "", false) } };
-        var re = new System.Text.RegularExpressions.Regex(@"\b(DECL)\s*\(");
+        var re = DefinerMacros.UseScan(d);
         var src = "DECL(int, a);\nvoid f(void) { DECL(int, b); }\nnamespace n { DECL(int, c); }\nextern \"C\" { DECL(int, e); }\n"
                   + "struct s { DECL(int, x); };\n/* DECL(int, y); */\n#define Z DECL(int, z)\n";
         var names = DefinerMacros.Uses(src, re, d).SelectMany(u => u.Defines).Select(x => x.Name).ToList();
