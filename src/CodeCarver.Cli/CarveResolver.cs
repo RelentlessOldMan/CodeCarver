@@ -37,6 +37,7 @@ public sealed class ResolvedCarve
     public bool AllowUnmatchedTraces;
     public bool PruneGarbage = true;
     public int? ParseTimeout;                      // seconds
+    public long? MemoryStopMb;                     // see CarveTomlConfig.MemoryStopMb
     public int? MaxSymbolsPerFile;
 }
 
@@ -103,6 +104,7 @@ public static class CarveResolver
         r.AllowUnmatchedTraces = cfg.AllowUnmatchedTraces;
         r.PruneGarbage = cfg.PruneGarbage;
         r.ParseTimeout = cfg.ParseTimeout;
+        r.MemoryStopMb = cfg.MemoryStopMb;
         r.MaxSymbolsPerFile = cfg.MaxSymbolsPerFile;
 
         // Selected builds/runs (UNION). Null selection = all defined.

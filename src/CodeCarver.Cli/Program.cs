@@ -31,7 +31,7 @@ switch (cmd)
               codecarver help                 this text
 
             exit codes: 0 ok, 1 runtime failure, 2 usage or configuration error,
-                        3 the emitted tree failed verify (it would not link)
+                        3 the emitted tree failed verify (it would not link), 4 stopped by memoryStopMb
             Everything else lives in the config file — run 'init' for the annotated template.
             """);
         return 0;

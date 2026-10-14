@@ -19,6 +19,7 @@ public sealed class CarveTomlConfig
     // [advanced] — rarely-needed tuning escape hatches (not in the init template). null = engine default.
     public long? MaxParseBytes;
     public int? ParseTimeout;         // seconds (0 disables)
+    public long? MemoryStopMb;        // stop the run when its private memory passes this (0 or unset: never)
     public int? MaxSymbolsPerFile;
     public List<(string From, string To)> PathMap = new();   // trace / compile-command path prefixes -> carve root
     public bool AllowUnmatchedTraces;
@@ -69,7 +70,7 @@ public static class ConfigLoader
     public sealed record Result(CarveTomlConfig? Config, IReadOnlyList<string> Errors, IReadOnlyList<string> Warnings);
 
     private static readonly string[] TopKeys = { "outputDirectory", "analysisOnly", "common", "builds", "runs", "stages", "use", "advanced" };
-    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "maxSymbolsPerFile", "pathMap", "allowUnmatchedTraces", "pruneGarbage", "skipFilesNotBuilt", "placeholderFiles" };
+    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "memoryStopMb", "maxSymbolsPerFile", "pathMap", "allowUnmatchedTraces", "pruneGarbage", "skipFilesNotBuilt", "placeholderFiles" };
     private static readonly string[] CommonKeys =
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
@@ -222,6 +223,7 @@ public static class ConfigLoader
                 }
             }
             cfg.ParseTimeout = (int?)GetLong(adv, "parseTimeout", "[advanced]", ctx, min: 0, max: int.MaxValue / 1000);
+            cfg.MemoryStopMb = GetLong(adv, "memoryStopMb", "[advanced]", ctx, min: 0, max: long.MaxValue / (1024 * 1024));
             cfg.MaxSymbolsPerFile = (int?)GetLong(adv, "maxSymbolsPerFile", "[advanced]", ctx, min: 1, max: int.MaxValue);
         }
 
@@ -244,7 +246,7 @@ public static class ConfigLoader
         # Inputs and options live here, so the command line stays short. Relative paths are relative to THIS
         # file's directory; globs (excludeDirectories, forceKeepFiles) are relative to the source dir.
         # Rarely needed: analysisOnly = true (top level: plan + reports, no carved tree) and an [advanced]
-        # section (maxParseBytes, parseTimeout, maxSymbolsPerFile, pathMap, allowUnmatchedTraces, pruneGarbage, skipFilesNotBuilt, placeholderFiles) — see USAGE.md.
+        # section (maxParseBytes, parseTimeout, memoryStopMb, maxSymbolsPerFile, pathMap, allowUnmatchedTraces, pruneGarbage, skipFilesNotBuilt, placeholderFiles) — see USAGE.md.
 
         # Where the carved project + reports go — must be OUTSIDE the source tree. CodeCarver manages a
         # carved/ + codecarver/ layout under it, and never replaces an existing directory it did not create.

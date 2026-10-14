@@ -220,6 +220,11 @@ public static class CarveCommand
             }
         }
 
+        // A stop file is this run's or none: one an earlier run left must not be read as this run's numbers.
+        var stoppedSummaryPath = Path.Combine(outputFull, "codecarver", StoppedSummaryFile);
+        try { File.Delete(stoppedSummaryPath); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+
         // Materialize a prior analysis-only run's plan without parsing (see EmitFrom).
         if (emitFrom is not null) return EmitFrom.Run(dir, cv, emitFrom, Version(), @out, err);
         // The analysis run fingerprints the source tree BEFORE reading it: a file edited during a long run must
@@ -316,11 +321,36 @@ public static class CarveCommand
         // The most memory the process held (private bytes) since the last step ended, as the heartbeat saw it: work saw
         // the machine's memory run out and nothing said which step held it.
         long _peakPrivate = 0;
+        // Memory over the whole run, on by default (summary mem.run.*, and in the minute lines): the process's own,
+        // and what the machine had left. memoryStopMb ([advanced]) stops the run when private memory passes it.
+        long _runPeakPrivate = 0, _runPeakWorkingSet = 0, _minMachineFree = long.MaxValue, _minCommitFree = long.MaxValue;
+        var _memoryNow = "";
+        var _memoryStop = (cv.MemoryStopMb ?? 0) * 1024 * 1024;
+        var _stopping = 0;
+        var _memGate = new object();
+        void NoteMemory(long priv, long workingSet, (long Total, long Free, long CommitFree)? machine)
+        {
+            lock (_memGate)
+            {
+                _runPeakPrivate = Math.Max(_runPeakPrivate, priv);
+                _runPeakWorkingSet = Math.Max(_runPeakWorkingSet, workingSet);
+                if (machine is { } m)
+                {
+                    _minMachineFree = Math.Min(_minMachineFree, m.Free);
+                    if (m.CommitFree >= 0) _minCommitFree = Math.Min(_minCommitFree, m.CommitFree);
+                }
+            }
+        }
         long TakePeakMb()
         {
             long now;
-            try { using var p = System.Diagnostics.Process.GetCurrentProcess(); now = p.PrivateMemorySize64; }
+            long ws = 0;
+            try { using var p = System.Diagnostics.Process.GetCurrentProcess(); now = p.PrivateMemorySize64; ws = p.WorkingSet64; }
             catch (InvalidOperationException) { now = 0; }
+            // Also looked at as each step ends, not only by the heartbeat: a short run is measured and stopped too.
+            NoteMemory(now, ws, CodeCarver.Core.Util.SystemMemory.Now());
+            if (_memoryStop > 0 && now > _memoryStop && Interlocked.Exchange(ref _stopping, 1) == 0)
+                StopForMemory(now, ws, CodeCarver.Core.Util.SystemMemory.Now(), _run.Elapsed);
             return Math.Max(Interlocked.Exchange(ref _peakPrivate, 0), now) / (1024 * 1024);
         }
         void Progress(string done)
@@ -352,6 +382,12 @@ public static class CarveCommand
             var priv = self.PrivateMemorySize64;
             for (var was = Interlocked.Read(ref _peakPrivate); priv > was; was = Interlocked.Read(ref _peakPrivate))
                 if (Interlocked.CompareExchange(ref _peakPrivate, priv, was) == was) break;
+            var workingSet = self.WorkingSet64;
+            var machine = CodeCarver.Core.Util.SystemMemory.Now();
+            NoteMemory(priv, workingSet, machine);
+            _memoryNow = MemoryLine(priv, workingSet, machine);
+            if (_memoryStop > 0 && priv > _memoryStop && Interlocked.Exchange(ref _stopping, 1) == 0)
+                StopForMemory(priv, workingSet, machine, runAt);
             _cpu.Enqueue((runAt, self.TotalProcessorTime));
             while (_cpu.Count > 1 && runAt - _cpu.Peek().At > _quiet) _cpu.Dequeue();
             var (cpuFrom, cpuThen) = _cpu.Peek();
@@ -378,7 +414,7 @@ public static class CarveCommand
                         $"watchdog: {why} ({Span(inStep)} into the step after '{after}', run {Clock(runAt)})",
                         $"  count   : {CodeCarver.Core.Util.Activity.Describe() ?? "nothing counted in this step"}",
                         $"  cpu     : {cpuShare:P0} of one core over the last {Span(runAt - cpuFrom)} ({Environment.ProcessorCount} cores)",
-                        $"  memory  : {self.WorkingSet64 / 1e6:N0} MB in use, {GC.GetTotalMemory(false) / 1e6:N0} MB managed",
+                        $"  memory  : {_memoryNow}; {GC.GetTotalMemory(false) / 1e6:N0} MB managed",
                         $"  threads : {self.Threads.Count} in the process; pool {ThreadPool.ThreadCount} threads, {maxWorkers - freeWorkers} busy, {ThreadPool.PendingWorkItemCount:N0} queued",
                     };
                     var waits = CodeCarver.Core.Util.IoMeter.Describe(io, _stepIo).ToList();
@@ -397,7 +433,8 @@ public static class CarveCommand
             }
             if (beat)
                 err.WriteLine($"  working : {(int)inStep.TotalMinutes} min into the step after '{after}'"
-                    + (CodeCarver.Core.Util.Activity.Describe() is { } got ? $": {got} so far" : "") + $" (run {Clock(runAt)})");
+                    + (CodeCarver.Core.Util.Activity.Describe() is { } got ? $": {got} so far" : "") + $" (run {Clock(runAt)})"
+                    + Environment.NewLine + $"  memory  : {_memoryNow}");
             if (report is not null)
             {
                 err.WriteLine(report);
@@ -2699,6 +2736,56 @@ public static class CarveCommand
         }
         @out.WriteLine($"  world   : {worldReason}");
 
+        void MemoryKeys(IDictionary<string, object?> into)
+        {
+            const long MB = 1024 * 1024;
+            into["mem.run.peakPrivateMb"] = Math.Max(_runPeakPrivate, Interlocked.Read(ref _peakPrivate)) / MB;
+            into["mem.run.peakWorkingSetMb"] = _runPeakWorkingSet / MB;
+            if (_minMachineFree != long.MaxValue) into["mem.run.minMachineFreeMb"] = _minMachineFree / MB;
+            if (_minCommitFree != long.MaxValue) into["mem.run.minCommitRoomMb"] = _minCommitFree / MB;
+            into["mem.stopMb"] = _memoryStop / MB;
+        }
+        // memoryStopMb passed: say so, write what the run counted so far where it can be found, and end the process
+        // (the run's own threads are mid-step; nothing they hold is worth finishing). Never the source or a name.
+        void StopForMemory(long priv, long workingSet, (long Total, long Free, long CommitFree)? machine, TimeSpan runAt)
+        {
+            const long MB = 1024 * 1024;
+            string step; lock (_run) step = _after;
+            SortedDictionary<string, object?>? snap = null;
+            for (var tries = 0; snap is null && tries < 50; tries++)
+                try { snap = new SortedDictionary<string, object?>(summary, StringComparer.Ordinal); }
+                catch (Exception ex) when (ex is InvalidOperationException or ArgumentException) { Thread.Sleep(20); }
+            snap ??= new SortedDictionary<string, object?>(StringComparer.Ordinal) { ["codecarverVersion"] = Version() };
+            foreach (var (key, value) in CodeCarver.Core.Util.IoMeter.Totals(CodeCarver.Core.Util.IoMeter.Now(), _runIo)) snap[key] = value;
+            snap["watchdog.reports"] = _watchdogReports;
+            MemoryKeys(snap);
+            snap["stop.reason"] = "memoryStopMb";
+            snap["stop.afterStep"] = step;
+            snap["stop.minutesInStep"] = (long)_stepClock.Elapsed.TotalMinutes;
+            snap["stop.runSeconds"] = (long)runAt.TotalSeconds;
+            snap["stop.privateMb"] = priv / MB;
+            snap["stop.workingSetMb"] = workingSet / MB;
+            snap["stop.managedMb"] = GC.GetTotalMemory(false) / MB;
+            if (machine is { } m) { snap["stop.machineFreeMb"] = m.Free / MB; if (m.CommitFree >= 0) snap["stop.commitRoomMb"] = m.CommitFree / MB; }
+            if (CodeCarver.Core.Util.Activity.Describe() is { } got) snap["stop.count"] = got;
+            snap["exitCode"] = StoppedForMemoryExit;
+            err.WriteLine($"memory  : STOPPED - private memory {priv / MB:N0} MB passed memoryStopMb = {_memoryStop / MB:N0} in the step after '{step}' (run {Clock(runAt)})");
+            err.WriteLine($"  memory  : {MemoryLine(priv, workingSet, machine)}");
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(stoppedSummaryPath)!);
+                var marker = Path.Combine(outputFull, StagedOutput.MarkerName);
+                if (!File.Exists(marker)) File.WriteAllText(marker, "CodeCarver output area.\n");
+                File.WriteAllText(stoppedSummaryPath, "# CodeCarver summary of a run STOPPED for memory - numbers only: no path, file name or symbol. Safe to send back.\n"
+                    + string.Concat(snap.Select(kv => $"{kv.Key} = {SummaryValue(kv.Value)}\n")));
+                err.WriteLine($"  summary : {stoppedSummaryPath}");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            { err.WriteLine($"  warn    : could not write the stop summary ({ex.GetType().Name}: {ex.Message})"); }
+            diag.Event($"stopped for memory: private {priv / MB} MB after '{step}'");
+            err.Flush();
+            ExitProcess(StoppedForMemoryExit);
+        }
         void WriteSummary(string ccDir)
         {
             foreach (var (cat, n) in diag.WarningCounts) summary[$"warnings.{cat}"] = n;
@@ -2709,13 +2796,14 @@ public static class CarveCommand
                     + string.Concat(warnLog.Select(w => w + "\n")), "warnings");
             foreach (var (key, value) in CodeCarver.Core.Util.IoMeter.Totals(CodeCarver.Core.Util.IoMeter.Now(), _runIo)) summary[key] = value;
             summary["watchdog.reports"] = _watchdogReports;
+            MemoryKeys(summary);
             summary["exitCode"] = verifyFailed ? 3 : 0;
             WriteArtifact(Path.Combine(ccDir, "summary.txt"),
                 "# CodeCarver summary — numbers only: no path, file name or symbol. Safe to send back.\n"
                 + string.Concat(summary.Select(kv => $"{kv.Key} = {Fmt(kv.Value)}\n")), "summary");
             WriteArtifact(Path.Combine(ccDir, "summary.json"),
                 System.Text.Json.JsonSerializer.Serialize(summary, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }), "summary");
-            static string Fmt(object? v) => v switch { bool b => b ? "true" : "false", null => "", _ => Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture) ?? "" };
+            static string Fmt(object? v) => SummaryValue(v);
         }
 
         void WriteArtifact(string path, string content, string what)
@@ -3209,6 +3297,23 @@ public static class CarveCommand
     /// distance ≤ 2 among names of similar length.</summary>
     /// <summary>Deletes what an earlier check round wrote that this round did not, so the stage tree is the one a fresh
     /// emit writes. A larger plan writes the same files and more, so this is rarely anything.</summary>
+    /// <summary>Where a run stopped by memoryStopMb leaves its numbers: under outputDirectory/codecarver/.</summary>
+    public const string StoppedSummaryFile = "stopped-summary.txt";
+
+    /// <summary>The exit code of a run stopped by memoryStopMb.</summary>
+    public const int StoppedForMemoryExit = 4;
+
+    /// <summary>Ends the process; a test swaps it so the stop can be seen without ending the test host.</summary>
+    public static Action<int> ExitProcess = Environment.Exit;
+
+    static string Gb(long bytes) => $"{bytes / 1e9:N1} GB";
+
+    static string MemoryLine(long priv, long workingSet, (long Total, long Free, long CommitFree)? machine)
+        => $"private {Gb(priv)}, working set {Gb(workingSet)}"
+           + (machine is { } m ? $", machine free {Gb(m.Free)} of {Gb(m.Total)}" + (m.CommitFree >= 0 ? $", commit room {Gb(m.CommitFree)}" : "") : "");
+
+    static string SummaryValue(object? v) => v switch { bool b => b ? "true" : "false", null => "", _ => Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture) ?? "" };
+
     static long MachineMemoryMb()
     {
         try { return GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / (1024 * 1024); }

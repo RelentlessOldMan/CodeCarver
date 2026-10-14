@@ -100,7 +100,7 @@ The command line is tiny — everything else lives in the config:
 
 **Exit codes:** `0` ok · `1` runtime failure (including unresolved entry points) · `2` usage or configuration
 error (bad config, missing input file, unusable build log or trace, unprobeable compiler, unsafe output
-directory) · `3` the emitted tree failed `verify` (it would not link).
+directory) · `3` the emitted tree failed `verify` (it would not link) · `4` stopped by `memoryStopMb`.
 
 `--stage` with a config that has no `[stages]`, or with `analysisOnly = true`, is an error.
 
@@ -168,6 +168,7 @@ A stage may also set `stubUnexecuted = true` (with `carveSourceFileContents = tr
 | `maxSymbolsPerFile` | `50000` | a file with more symbols than this is kept whole instead of exploding the graph |
 | `pathMap = [{ from = "/build/agent/repo", to = "." }]` | none | rewrites a path prefix captured elsewhere (CI agent, other drive, WSL vs Windows) onto the carve root. `to` is relative to the carve root. Applies to trace paths and to compile commands (directory, file, `-I`, response files) |
 | `allowUnmatchedTraces = true` | `false` | a file trace with no path under the carve root becomes a warning instead of exit 2 |
+| `memoryStopMb = 20000` | none | stop the run when its private memory passes this many MB: it writes `<outputDirectory>/codecarver/stopped-summary.txt` (the summary so far, plus `stop.*` keys) and exits 4. `0` or unset: never stop |
 | `pruneGarbage = false` | `true` | keep every non-input too (VCS metadata, IDE scratch, logs, editor backups, make `.d` dependency files) |
 
 Integer keys are range-checked: a negative or oversized value is a config error (exit 2).
@@ -628,6 +629,20 @@ verdict — busy computing, waiting on a slow drive, or idle on something not co
 symbol, goes into the `--diag` package too, and repeats every 15 minutes while the step stays like that; it
 never stops the run. The summary carries the run's totals: `io.<list|read|copy|launch>.count`, `.ms` (time
 spent waiting, summed over threads) and `.maxMs`, and `watchdog.reports`.
+
+Memory is measured on every run. Each `working :` line is followed by a `memory  :` line: the process's private
+memory and working set, and the machine's free memory and commit room (how much more every process together may
+commit before the machine runs out). Watch private memory, not the working set: when the machine runs short,
+Windows pages the process out and its working set looks small while its memory still grows. The summary
+carries `mem.<step>.peakMb` and `stageN.mem.<step>.peakMb` (private memory), and over the whole run
+`mem.run.peakPrivateMb`, `mem.run.peakWorkingSetMb`, `mem.run.minMachineFreeMb` and `mem.run.minCommitRoomMb`.
+
+`[advanced] memoryStopMb` stops a run whose private memory passes it, before it runs the machine out of memory.
+A `memory  : STOPPED` line names the step, and `<outputDirectory>/codecarver/stopped-summary.txt` holds every
+summary key written so far, the run's memory keys, and `stop.reason`, `stop.afterStep`, `stop.minutesInStep`,
+`stop.runSeconds`, `stop.count`, `stop.privateMb`, `stop.workingSetMb`, `stop.managedMb`, `stop.machineFreeMb`,
+`stop.commitRoomMb`; numbers only, like `summary.txt`. The exit code is 4. Every run deletes that file when it
+starts, so one that exists is the last run's.
 
 The two longest steps before the parse also say which part took the time: `rootNames built / binaries /
 unbuilt` and `pre-parse treeMacros / outsideHeaders / quotedIncludes / unparsedHeaders`, each a `progress:`

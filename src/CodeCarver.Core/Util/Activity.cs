@@ -10,17 +10,23 @@ public static class Activity
     static readonly object Gate = new();
     static string _what = "files";
     static long _done, _total = -1, _bytes;
+    static bool _summed;   // the total is what the step's loops expect, added up
 
     /// <summary>Starts counting a new step: <paramref name="what"/> names what is counted ("files copied").</summary>
     public static void Begin(string what = "files", long total = -1)
     {
-        lock (Gate) { _what = what; _total = total; Interlocked.Exchange(ref _done, 0); Interlocked.Exchange(ref _bytes, 0); }
+        lock (Gate) { _what = what; _total = total; _summed = false; Interlocked.Exchange(ref _done, 0); Interlocked.Exchange(ref _bytes, 0); }
     }
 
-    /// <summary>Raises the total when a loop knows it and nothing set one.</summary>
+    /// <summary>A loop of <paramref name=total/> items starts: the step's total is what its loops expect, added up, unless
+    /// the step set one. (Only the first loop's used to count, so a step of several loops showed 21,930 of 9,934.)</summary>
     public static void Expect(long total)
     {
-        lock (Gate) if (_total < 0 && Interlocked.Read(ref _done) == 0) _total = total;
+        lock (Gate)
+        {
+            if (_total < 0 && Interlocked.Read(ref _done) == 0) { _total = total; _summed = true; }
+            else if (_summed) _total += total;
+        }
     }
 
     /// <summary>One more item done, of <paramref name="bytes"/> bytes when known.</summary>
