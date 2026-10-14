@@ -23,6 +23,35 @@ public static class ReadAhead
     }
     static volatile bool _threadsSet;
 
+    /// <summary><paramref name="f"/> of every item, <see cref="Window"/> at once, each handed out as a thread frees up:
+    /// one slow item (a file of hundreds of MB) holds up only its own thread, where <see cref="Map"/> waits on its
+    /// oldest item before it starts another. Results by index, so the caller's order holds; for small results (all are
+    /// held at once).</summary>
+    public static R[] Each<T, R>(IReadOnlyList<T> items, Func<T, R> f)
+    {
+        Activity.Expect(items.Count);
+        var results = new R[items.Count];
+        For(items.Count, i => { results[i] = f(items[i]); Activity.Tick(); });
+        return results;
+    }
+
+    /// <summary><paramref name="body"/> for 0 to <paramref name="count"/> - 1, <see cref="Window"/> at once, each index
+    /// handed out as a thread frees up (Parallel.For hands a thread a range, so a slow item holds up the rest of it).</summary>
+    public static void For(int count, Action<int> body)
+    {
+        EnsureThreads();
+        try
+        {
+            Parallel.ForEach(System.Collections.Concurrent.Partitioner.Create(Enumerable.Range(0, count),
+                                 System.Collections.Concurrent.EnumerablePartitionerOptions.NoBuffering),
+                             new ParallelOptions { MaxDegreeOfParallelism = Window }, body);
+        }
+        catch (AggregateException ae) when (ae.InnerExceptions.Count == 1)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
+        }
+    }
+
     /// <summary>Each item with <paramref name="read"/>'s result, in order, the next <see cref="Window"/> read on the
     /// thread pool. <paramref name="read"/> must be safe to call from several threads and should catch what it expects.</summary>
     public static IEnumerable<(T Item, R Value)> Map<T, R>(IEnumerable<T> items, Func<T, R> read, int window = Window)

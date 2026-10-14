@@ -158,6 +158,27 @@ public class IntraFilePruneTests
         finally { TempDir.Delete(work); }
     }
 
+    // A run's later emits (check rounds, stages) take each file's includes from the first read: the tree is not read
+    // again (here a change after the first read goes unseen, which shows nothing was re-read).
+    [Fact]
+    public void IncludeClosure_ReadsEachFileOncePerRun()
+    {
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-inc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(work);
+        try
+        {
+            File.WriteAllText(Path.Combine(work, "a.c"), "#include \"rows.inc\"\nint a;\n");
+            File.WriteAllText(Path.Combine(work, "rows.inc"), "1, 2,\n");
+            File.WriteAllText(Path.Combine(work, "cols.inc"), "3, 4,\n");
+            var scan = new FileTreeEmitter.IncludeScan();
+            Assert.Equal(new[] { "rows.inc" }, FileTreeEmitter.IncludeClosure(new[] { "a.c" }, new[] { "a.c" }, Array.Empty<string>(), work, scan));
+            File.WriteAllText(Path.Combine(work, "a.c"), "#include \"cols.inc\"\nint a;\n");
+            Assert.Equal(new[] { "rows.inc" }, FileTreeEmitter.IncludeClosure(new[] { "a.c" }, new[] { "a.c" }, Array.Empty<string>(), work, scan));
+            Assert.Equal(new[] { "cols.inc" }, FileTreeEmitter.IncludeClosure(new[] { "a.c" }, new[] { "a.c" }, Array.Empty<string>(), work));
+        }
+        finally { TempDir.Delete(work); }
+    }
+
     [Fact]
     public void EmitPruned_DirectiveOpeningAComment_KeepsTheSpanWhole()
     {

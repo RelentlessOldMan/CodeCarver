@@ -30,9 +30,6 @@ public sealed record EmitResult(int FilesWritten, long BytesWritten, IReadOnlyLi
 /// </summary>
 public static class FileTreeEmitter
 {
-    // Files read and written at once: the work is waiting on the disk (a network drive: a round trip each), not the CPU.
-    private const int IoParallelism = CodeCarver.Core.Util.ReadAhead.Window;
-
     public static EmitResult Emit(CarvePlan plan, string sourceRoot, string outDir)
     {
         ArgumentNullException.ThrowIfNull(plan);
@@ -43,16 +40,16 @@ public static class FileTreeEmitter
     /// a prior analysis-only run without re-parsing.</summary>
     /// <param name="have">Files an earlier emit of a smaller plan already copied into <paramref name="outDir"/>, with their
     /// sizes: not copied again (a check round on a network drive re-copied tens of thousands of files to add a few).</param>
+    /// <param name="scan">What an earlier emit of this run learned of the tree's includes (see <see cref="IncludeScan"/>).</param>
     public static EmitResult Emit(IReadOnlyList<string> keptFiles, IReadOnlyList<string> droppedFiles, string sourceRoot, string outDir,
-                                  IReadOnlyDictionary<string, long>? have = null)
+                                  IReadOnlyDictionary<string, long>? have = null, IncludeScan? scan = null)
     {
         var written = new List<string>();
         long bytes = 0;
 
         // Copied in parallel (a network drive waits a round trip per file), listed in the kept order.
         var copied = new long[keptFiles.Count];
-        CodeCarver.Core.Util.ReadAhead.EnsureThreads();
-        Parallel.For(0, keptFiles.Count, new ParallelOptions { MaxDegreeOfParallelism = IoParallelism }, i =>
+        CodeCarver.Core.Util.ReadAhead.For(keptFiles.Count, i =>
         {
             copied[i] = -1;
             var rel = keptFiles[i];
@@ -77,7 +74,7 @@ public static class FileTreeEmitter
 
         var sizes = new Dictionary<string, long>(CodeCarver.Core.Util.PathComparer.Default);
         for (var i = 0; i < keptFiles.Count; i++) if (copied[i] >= 0) sizes[keptFiles[i]] = copied[i];
-        CopyUnscannedIncludes(keptFiles, droppedFiles, sourceRoot, outDir, written, ref bytes, have, sizes);
+        CopyUnscannedIncludes(keptFiles, droppedFiles, sourceRoot, outDir, written, ref bytes, have, sizes, scan);
         return new EmitResult(written.Count, bytes, written) { Sizes = sizes };
     }
 
@@ -96,7 +93,7 @@ public static class FileTreeEmitter
     /// <param name="stubOf">Optional: the stub body of a kept function whose body is replaced (<see cref="StubBodies"/>);
     /// the same answers the plan was closed with.</param>
     public static EmitResult EmitPruned(CarvePlan plan, CodeGraph graph, string sourceRoot, string outDir,
-                                        Func<NodeId, StubBodies.Body?>? stubOf = null)
+                                        Func<NodeId, StubBodies.Body?>? stubOf = null, IncludeScan? scan = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(graph);
@@ -143,8 +140,7 @@ public static class FileTreeEmitter
             cuts[i] = (ranges, stubs, removed);
         }
         var done = new (long Bytes, long Cut, int Stubs)[kept.Count];
-        CodeCarver.Core.Util.ReadAhead.EnsureThreads();
-        Parallel.For(0, kept.Count, new ParallelOptions { MaxDegreeOfParallelism = IoParallelism }, i =>
+        CodeCarver.Core.Util.ReadAhead.For(kept.Count, i =>
         {
             done[i] = (-1, 0, 0);
             var rel = kept[i];
@@ -195,7 +191,7 @@ public static class FileTreeEmitter
             if (done[i].Cut > 0) { prunedFiles++; prunedBytes += done[i].Cut; }
         }
 
-        CopyUnscannedIncludes(plan.KeptFiles, plan.DroppedFiles, sourceRoot, outDir, written, ref bytes);
+        CopyUnscannedIncludes(plan.KeptFiles, plan.DroppedFiles, sourceRoot, outDir, written, ref bytes, scan: scan);
         return new EmitResult(written.Count, bytes, written, prunedFiles, prunedBytes) { StubbedFunctions = stubbedFunctions };
     }
 
@@ -309,10 +305,11 @@ public static class FileTreeEmitter
     /// </summary>
     private static void CopyUnscannedIncludes(IReadOnlyList<string> keptFiles, IReadOnlyList<string> droppedFiles, string sourceRoot, string outDir,
                                               List<string> written, ref long bytes,
-                                              IReadOnlyDictionary<string, long>? have = null, Dictionary<string, long>? sizes = null)
+                                              IReadOnlyDictionary<string, long>? have = null, Dictionary<string, long>? sizes = null,
+                                              IncludeScan? scan = null)
     {
         var outRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outDir)) + Path.DirectorySeparatorChar;
-        foreach (var trel in IncludeClosure(written, keptFiles, droppedFiles, sourceRoot))
+        foreach (var trel in IncludeClosure(written, keptFiles, droppedFiles, sourceRoot, scan))
         {
             if (have is not null && have.TryGetValue(trel, out var had))
             {
@@ -341,8 +338,9 @@ public static class FileTreeEmitter
     /// exactly what an emit would write (review: --emit-from carried over a verify that never saw these files).
     /// </summary>
     public static List<string> IncludeClosure(IEnumerable<string> emitted, IReadOnlyList<string> keptFiles,
-                                              IReadOnlyList<string> droppedFiles, string sourceRoot)
+                                              IReadOnlyList<string> droppedFiles, string sourceRoot, IncludeScan? scan = null)
     {
+        scan ??= new IncludeScan();
         var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourceRoot)) + Path.DirectorySeparatorChar;
         var known = new HashSet<string>(keptFiles, CodeCarver.Core.Util.PathComparer.Default);
         foreach (var f in droppedFiles) known.Add(f);               // graph-known drops: leave dropped
@@ -352,14 +350,21 @@ public static class FileTreeEmitter
         var queue = new Queue<string>(emitted);                      // scan every emitted file for includes
         // Files over 8 MB (a multi-GB kept file must never become a >2GB string) and unreadable ones contribute no
         // includes. Read ahead: on a network drive each read waits a round trip.
-        static string? ReadSmall(string full)
+        // A file read once per run: its quoted includes are kept, and a later round or stage reads only new files.
+        string[] Includes(string rel)
         {
+            if (scan.Includes.TryGetValue(rel, out var known)) return known;
+            string? text;
             try
             {
+                var full = Path.Combine(sourceRoot, rel);
                 var info = new FileInfo(full);
-                return !info.Exists || info.Length > 8 * 1024 * 1024 ? null : IoMeter.ReadAllText(full);
+                text = !info.Exists || info.Length > 8 * 1024 * 1024 ? null : IoMeter.ReadAllText(full);
             }
-            catch { return null; }
+            catch { text = null; }
+            var found = text is null ? Array.Empty<string>() : LocalInclude.Matches(text).Select(m => m.Groups[1].Value).ToArray();
+            scan.Includes[rel] = found;
+            return found;
         }
 
         while (queue.Count > 0)
@@ -367,20 +372,21 @@ public static class FileTreeEmitter
             // Everything queued now, in order (what it adds is queued behind it, as one at a time would).
             var batch = new List<string>(queue);
             queue.Clear();
-            foreach (var (rel, read) in CodeCarver.Core.Util.ReadAhead.Map(batch, r => ReadSmall(Path.Combine(sourceRoot, r))))
+            var unread = batch.Where(r => !scan.Includes.ContainsKey(r)).ToList();
+            if (unread.Count > 0) CodeCarver.Core.Util.ReadAhead.Each(unread, Includes);
+            foreach (var rel in batch)
             {
-                if (read is not { } text) continue;
                 var full = Path.Combine(sourceRoot, rel);
                 var fromDir = Path.GetDirectoryName(full) ?? sourceRoot;
-                foreach (Match m in LocalInclude.Matches(text))
+                foreach (var raw in Includes(rel))
                 {
                     string target;
-                    try { target = Path.GetFullPath(Path.Combine(fromDir, m.Groups[1].Value)); } catch { continue; }
+                    try { target = Path.GetFullPath(Path.Combine(fromDir, raw)); } catch { continue; }
                     // Under the root WITH a separator: "/repo2" must not pass for root "/repo" (review RB9).
                     if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue; // outside the tree
                     var trel = Path.GetRelativePath(sourceRoot, target).Replace(Path.DirectorySeparatorChar, '/');
                     if (known.Contains(trel) || added.Contains(trel) || missing.Contains(trel)) continue;   // decided: no disk query
-                    if (!File.Exists(target)) { missing.Add(trel); continue; }   // unresolved here (system/other -I dir)
+                    if (!scan.Exists.GetOrAdd(target, File.Exists)) { missing.Add(trel); continue; }   // unresolved here (system/other -I dir)
                     added.Add(trel);
                     result.Add(trel);
                     queue.Enqueue(trel);                                 // its own includes may be needed too
@@ -388,6 +394,15 @@ public static class FileTreeEmitter
             }
         }
         return result;
+    }
+
+    /// <summary>What <see cref="IncludeClosure"/> learned of a source tree: each file's quoted includes and whether each
+    /// target exists. The tree does not change during a run, so the run's later emits (check rounds, stages) read only
+    /// the files no earlier one read: on a share each round re-read every emitted file.</summary>
+    public sealed class IncludeScan
+    {
+        internal readonly System.Collections.Concurrent.ConcurrentDictionary<string, string[]> Includes = new(CodeCarver.Core.Util.PathComparer.Default);
+        internal readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> Exists = new(CodeCarver.Core.Util.PathComparer.Default);
     }
 
     /// <summary>A C/C++ header — its definitions are API/inline/template code any translation unit may

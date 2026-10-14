@@ -2493,6 +2493,8 @@ public static class CarveCommand
         // The source tree doesn't change during the run (the output is outside it): what the check read from it in one
         // round or stage serves the next.
         var sourceRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)) + Path.DirectorySeparatorChar;
+        // The tree's quoted includes, read once for every emit of the run (check rounds, stages).
+        var includeScan = new FileTreeEmitter.IncludeScan();
         var linkCache = new LinkCheckCache(p =>
         {
             try { return Path.GetFullPath(p).StartsWith(sourceRoot, StringComparison.OrdinalIgnoreCase); }
@@ -2857,7 +2859,7 @@ public static class CarveCommand
             // Verify exactly what a file-level emit would write: the kept files plus the in-tree files they
             // #include that are not graph files (an .inc table) — --emit-from carries this result over.
             var wouldWrite = aplan.KeptFiles.Where(r => File.Exists(Path.Combine(dir, r))).ToList();
-            wouldWrite.AddRange(FileTreeEmitter.IncludeClosure(wouldWrite, aplan.KeptFiles, aplan.DroppedFiles, dir));
+            wouldWrite.AddRange(FileTreeEmitter.IncludeClosure(wouldWrite, aplan.KeptFiles, aplan.DroppedFiles, dir, includeScan));
             // ...and the assembly files the infrastructure copy would carry (they define symbols C calls).
             var droppedInfra = new HashSet<string>(InfraDropped(aplan), StringComparer.Ordinal);
             foreach (var f in asmFilesInTree)
@@ -2980,8 +2982,8 @@ public static class CarveCommand
             for (var round = 0; ; round++)
             {
                 rounds = round + 1;
-                res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir, kind == Stubbed ? StubOf : null)
-                            : FileTreeEmitter.Emit(splan.KeptFiles, splan.DroppedFiles, dir, stageDir, emittedBefore);
+                res = prune ? FileTreeEmitter.EmitPruned(splan, graph, dir, stageDir, kind == Stubbed ? StubOf : null, includeScan)
+                            : FileTreeEmitter.Emit(splan.KeptFiles, splan.DroppedFiles, dir, stageDir, emittedBefore, includeScan);
                 if (emittedBefore is not null) RemoveStale(stageDir, emittedBefore.Keys, res.Written);
                 Step("emit");
                 // The code plus the assembly files the infrastructure copy will carry (they define symbols C calls:
@@ -3141,6 +3143,10 @@ public static class CarveCommand
             summary[$"{summaryStage}.bytesAfter"] = carvedBytes;
             summary[$"{summaryStage}.emittedCodeFiles"] = res.FilesWritten;
             summary[$"{summaryStage}.infrastructureFiles"] = infra.Count;
+            summary[$"{summaryStage}.infrastructureBytes"] = infra.Bytes;
+            summary[$"{summaryStage}.infrastructureSlowestMs"] = infra.SlowestMs;
+            summary[$"{summaryStage}.infrastructureSlowestBytes"] = infra.SlowestBytes;
+            summary[$"{summaryStage}.emittedCodeBytes"] = res.BytesWritten;
             summary[$"{summaryStage}.garbageFilesExcluded"] = infra.Garbage.Count;
             @out.WriteLine($"  buckets : {buildRequiredFiles.Count:N0} required-to-build + {infra.Count:N0} infrastructure kept, "
                 + $"{splan.DroppedFiles.Count:N0} dead-code" + (infra.Garbage.Count > 0 ? $" + {infra.Garbage.Count:N0} auto-excluded" : "") + " file(s) removed");

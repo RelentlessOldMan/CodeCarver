@@ -529,23 +529,7 @@ public static class EmittedLinkCheck
     /// <summary><paramref name="f"/> over every item, up to <see cref="ReadAhead.Window"/> at once, results by position.
     /// <see cref="ReadAhead.Map"/> hands results back in order, so one slow file (a read of 11 minutes on a share) held
     /// every file after it; here the caller waits once, for all of them, and merges in its own order.</summary>
-    static R[] InParallel<T, R>(IReadOnlyList<T> items, Func<T, R> f)
-    {
-        ReadAhead.EnsureThreads();
-        Activity.Expect(items.Count);
-        var results = new R[items.Count];
-        try
-        {
-            Parallel.ForEach(Partitioner.Create(Enumerable.Range(0, items.Count), EnumerablePartitionerOptions.NoBuffering),
-                             new ParallelOptions { MaxDegreeOfParallelism = ReadAhead.Window },
-                             i => { results[i] = f(items[i]); Activity.Tick(); });
-        }
-        catch (AggregateException ae) when (ae.InnerExceptions.Count == 1)
-        {
-            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ae.InnerExceptions[0]).Throw();
-        }
-        return results;
-    }
+    static R[] InParallel<T, R>(IReadOnlyList<T> items, Func<T, R> f) => ReadAhead.Each(items, f);
 
     static string? TryRead(string path, long maxBytes)
     {

@@ -7,7 +7,12 @@ namespace CodeCarver.Core.Emit;
 /// garbage (VCS/scratch/editor/coverage — see <see cref="InfraClassifier.IsGarbage"/>) with their byte total.</summary>
 public readonly record struct InfraEmitResult(
     int Count, long Bytes, IReadOnlyList<string> Files, IReadOnlyList<string> Warnings,
-    IReadOnlyList<string> Garbage, long GarbageBytes);
+    IReadOnlyList<string> Garbage, long GarbageBytes)
+{
+    /// <summary>The longest single copy and that file's bytes: near the whole step's time, one big file held it up.</summary>
+    public long SlowestMs { get; init; }
+    public long SlowestBytes { get; init; }
+}
 
 /// <summary>
 /// The keep-by-default pass that makes <c>--out</c> a COMPLETE, buildable project rather than just the
@@ -55,10 +60,12 @@ public static class InfrastructureEmitter
         long bytes = 0;
         long garbageBytes = 0;
         var count = 0;
+        long slowestMs = 0, slowestBytes = 0;
+        var slowestLock = new object();
         CodeCarver.Core.Util.Activity.Begin("files copied");
 
-        // What to do with each file is decided in walk order; the copies run on the thread pool, a window at a time
-        // (one file after another waits a round trip per file on a share), and are taken back in order.
+        // What to do with each file is decided in walk order; the copies run on the thread pool, a window at once, each
+        // file handed out as a thread frees up (a file of hundreds of MB holds up only its own thread), taken back in order.
         (string Rel, string? Error, long Bytes, bool Garbage) CopyOne((string Rel, string Full, bool Garbage) f)
         {
             var (rel, full, isGarbage) = f;
@@ -83,6 +90,7 @@ public static class InfrastructureEmitter
             var dd = Path.GetDirectoryName(dst);
             if (!string.IsNullOrEmpty(dd)) Directory.CreateDirectory(dd);
             var from = earlier is { } e && e.Files.Contains(rel) ? Path.Combine(e.Dir, rel) : full;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             try { IoMeter.Copy(from, dst, overwrite: true); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -93,12 +101,14 @@ public static class InfrastructureEmitter
                 { return (rel, $"could not copy '{rel}' ({ex2.GetType().Name}) — skipped", -1, false); }
             }
             var copied = new FileInfo(dst).Length;
+            var ms = sw.ElapsedMilliseconds;
+            lock (slowestLock) if (ms > slowestMs) (slowestMs, slowestBytes) = (ms, copied);
             CodeCarver.Core.Util.Activity.Tick(copied);
             return (rel, null, copied, false);
         }
 
-        var selected = Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, pruneGarbage, observed, warnings, treeFiles);
-        foreach (var (_, r) in CodeCarver.Core.Util.ReadAhead.Map(selected, CopyOne))
+        var selected = Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, pruneGarbage, observed, warnings, treeFiles).ToList();
+        foreach (var r in CodeCarver.Core.Util.ReadAhead.Each(selected, CopyOne))
         {
             if (r.Garbage) { garbageBytes += r.Bytes; garbage.Add(r.Rel); continue; }
             if (r.Error is not null) { warnings.Add(r.Error); continue; }
@@ -109,7 +119,7 @@ public static class InfrastructureEmitter
         }
         files.Sort(StringComparer.Ordinal);
         garbage.Sort(StringComparer.Ordinal);
-        return new InfraEmitResult(count, bytes, files, warnings, garbage, garbageBytes);
+        return new InfraEmitResult(count, bytes, files, warnings, garbage, garbageBytes) { SlowestMs = slowestMs, SlowestBytes = slowestBytes };
     }
 
     /// <summary>The shared keep-by-default selection: every file under <paramref name="sourceRoot"/> that is
