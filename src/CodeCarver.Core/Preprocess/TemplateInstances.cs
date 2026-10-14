@@ -41,7 +41,7 @@ public static class TemplateInstances
         var macros = new Dictionary<string, List<Macro>>(StringComparer.Ordinal);
         if (initial is not null) foreach (var kv in initial) if (kv.Value.Count > 0) macros[kv.Key] = kv.Value.Select(v => new Macro(v.Params, v.Body)).ToList();
         var w = new WalkState(macros, readInclude, found);
-        Walk(unit, w, unitLine: null, depth: 0, ifBase: 0);
+        Walk(Parse(unit, false), w, unitLine: null, depth: 0, ifBase: 0);
         return found.Distinct().ToList();
     }
 
@@ -66,13 +66,69 @@ public static class TemplateInstances
     sealed record WalkState(Dictionary<string, List<Macro>> Macros, Func<string, string?> ReadInclude, List<(string, int)> Found)
     {
         public readonly HashSet<string> Walked = new(ReferenceEqualityComparer.Instance);
-        public readonly Dictionary<string, bool> IsTemplate = new(ReferenceEqualityComparer.Instance);
     }
 
-    static void Walk(string text, WalkState w, int? unitLine, int depth, int ifBase)
+    enum OpKind { Code, Other, Open, Close, Define, Undef, Include }
+
+    /// <summary>One line of a text, or one directive with its continuations (lines <c>First..Last</c>, 0-based), as
+    /// <see cref="Walk"/> reads it: the regexes run once per text, not once per unit that includes it.</summary>
+    readonly record struct Op(OpKind Kind, int First, int Last, string? Text, Macro? Macro);
+
+    /// <summary>A text split into <see cref="Op"/>s, and whether it holds a macro-named head (a template header).</summary>
+    sealed record Parsed(Op[] Ops, bool IsTemplate);
+
+    // Per header string (readInclude returns the same string for the same header): parsed once for every unit.
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<string, Parsed> s_parsed = new();
+
+    static Parsed ParseOf(string header) => s_parsed.GetValue(header, t => Parse(t, HasMacroNamedHead(t)));
+
+    static Parsed Parse(string text, bool isTemplate)
+    {
+        var lines = text.Split('\n');
+        var ops = new List<Op>(lines.Length);
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var raw = lines[i].TrimEnd('\r');
+            var first = i;
+            if (!raw.TrimStart().StartsWith('#'))
+            {
+                ops.Add(new Op(OpKind.Code, i, i, raw, null));
+                continue;
+            }
+            while (raw.EndsWith('\\') && i + 1 < lines.Length) raw = raw[..^1] + " " + lines[++i].TrimEnd('\r');
+            var d = Directive.Match(raw);
+            if (!d.Success)
+            {
+                var kind = Conditional.Match(raw) is { Success: true } c ? c.Groups[1].Value == "endif" ? OpKind.Close : OpKind.Open : OpKind.Other;
+                ops.Add(new Op(kind, first, i, null, null));
+                continue;
+            }
+            var rest = StripComment(d.Groups[2].Value).Trim();
+            switch (d.Groups[1].Value)
+            {
+                case "define":
+                    var h = DefineHead.Match(rest);
+                    ops.Add(h.Success
+                        ? new Op(OpKind.Define, first, i, h.Groups[1].Value, new Macro(
+                            h.Groups[2].Success ? h.Groups[3].Value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList() : null,
+                            h.Groups[4].Value.Trim()))
+                        : new Op(OpKind.Define, first, i, null, null));
+                    break;
+                case "undef":
+                    ops.Add(new Op(OpKind.Undef, first, i, rest.Split(' ', '\t')[0], null));
+                    break;
+                default:   // include
+                    var close = rest.Length >= 2 && rest[0] == '"' ? rest.IndexOf('"', 1) : -1;
+                    ops.Add(new Op(OpKind.Include, first, i, close < 0 ? null : rest[1..close], null));
+                    break;
+            }
+        }
+        return new Parsed(ops.ToArray(), isTemplate);
+    }
+
+    static void Walk(Parsed parsed, WalkState w, int? unitLine, int depth, int ifBase)
     {
         var macros = w.Macros;
-        var lines = text.Split('\n');
         var code = new StringBuilder();   // the non-directive text since the last define/undef/include, line for line
         var codeStartLine = 1;
         var ifDepth = ifBase;   // an #if around the #include that brought this text in counts too
@@ -82,84 +138,89 @@ public static class TemplateInstances
             var s = code.ToString();
             code.Clear();
             if (!s.Contains('(')) return;
-            List<Func<string, Macro?>>? worlds = null;
             foreach (Match m in MacroNamedHead.Matches(s))
             {
                 if (!macros.ContainsKey(m.Groups[1].Value)) continue;
-                worlds ??= Worlds(macros);
                 var line = unitLine ?? codeStartLine + s[..m.Index].Count(c => c == '\n');
-                foreach (var world in worlds)
-                {
-                    var name = Expand(m.Groups[1].Value + "(" + m.Groups[2].Value + ")", world).Trim();
-                    if (Regex.IsMatch(name, @"^[A-Za-z_]\w*$")) w.Found.Add((name, line));
-                }
+                foreach (var name in Names(m.Groups[1].Value + "(" + m.Groups[2].Value + ")", macros)) w.Found.Add((name, line));
             }
         }
-        for (var i = 0; i < lines.Length; i++)
+        foreach (var op in parsed.Ops)
         {
-            var raw = lines[i].TrimEnd('\r');
-            var first = i;
-            if (raw.TrimStart().StartsWith('#'))
+            switch (op.Kind)
             {
-                while (raw.EndsWith('\\') && i + 1 < lines.Length) raw = raw[..^1] + " " + lines[++i].TrimEnd('\r');
-                var d = Directive.Match(raw);
-                if (!d.Success)
-                {
-                    if (Conditional.Match(raw) is { Success: true } c)
-                        ifDepth = c.Groups[1].Value == "endif" ? Math.Max(ifBase, ifDepth - 1) : ifDepth + 1;
-                    // Keep the line count, so a head after this directive gets its own line.
-                    if (code.Length == 0) codeStartLine = first + 1;
-                    code.Append('\n', i - first + 1);
+                case OpKind.Code:
+                    if (code.Length == 0) codeStartLine = op.First + 1;
+                    code.Append(op.Text).Append('\n');
                     continue;
-                }
-                Flush();
-                codeStartLine = i + 2;
-                var rest = StripComment(d.Groups[2].Value).Trim();
-                switch (d.Groups[1].Value)
-                {
-                    case "define":
-                        var h = DefineHead.Match(rest);
-                        if (!h.Success) break;
-                        var mac = new Macro(
-                            h.Groups[2].Success ? h.Groups[3].Value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList() : null,
-                            h.Groups[4].Value.Trim());
-                        // Inside an #if the earlier value may still be the build's: keep both.
-                        if (ifDepth > 0 && macros.TryGetValue(h.Groups[1].Value, out var alts))
-                        {
-                            if (!alts.Any(a => a.Body == mac.Body && (a.Params is null) == (mac.Params is null))) alts.Add(mac);
-                        }
-                        else macros[h.Groups[1].Value] = new List<Macro> { mac };
-                        break;
-                    case "undef":
-                        if (ifDepth == 0) macros.Remove(rest.Split(' ', '\t')[0]);
-                        break;
-                    case "include":
-                        if (depth >= 8 || rest.Length < 2 || rest[0] != '"') break;
-                        var close = rest.IndexOf('"', 1);
-                        if (close < 0) break;
-                        var inc = w.ReadInclude(rest[1..close]);
-                        if (inc is null) break;
-                        // A template header is instantiated by every #include; any other header only adds macros, once.
-                        if (!w.IsTemplate.TryGetValue(inc, out var tmpl)) w.IsTemplate[inc] = tmpl = HasMacroNamedHead(inc);
-                        if (!tmpl && !w.Walked.Add(inc)) break;
-                        Walk(inc, w, unitLine ?? first + 1, depth + 1, ifDepth);
-                        break;
-                }
-                continue;
+                case OpKind.Other or OpKind.Open or OpKind.Close:
+                    if (op.Kind == OpKind.Open) ifDepth++;
+                    else if (op.Kind == OpKind.Close) ifDepth = Math.Max(ifBase, ifDepth - 1);
+                    // Keep the line count, so a head after this directive gets its own line.
+                    if (code.Length == 0) codeStartLine = op.First + 1;
+                    code.Append('\n', op.Last - op.First + 1);
+                    continue;
             }
-            if (code.Length == 0) codeStartLine = i + 1;
-            code.Append(raw).Append('\n');
+            Flush();
+            codeStartLine = op.Last + 2;
+            switch (op.Kind)
+            {
+                case OpKind.Define:
+                    if (op.Macro is null) break;
+                    // Inside an #if the earlier value may still be the build's: keep both.
+                    if (ifDepth > 0 && macros.TryGetValue(op.Text!, out var alts))
+                    {
+                        if (!alts.Any(a => a.Body == op.Macro.Body && (a.Params is null) == (op.Macro.Params is null))) alts.Add(op.Macro);
+                    }
+                    else macros[op.Text!] = new List<Macro> { op.Macro };
+                    break;
+                case OpKind.Undef:
+                    if (ifDepth == 0) macros.Remove(op.Text!);
+                    break;
+                case OpKind.Include:
+                    if (depth >= 8 || op.Text is null) break;
+                    var inc = w.ReadInclude(op.Text);
+                    if (inc is null) break;
+                    // A template header is instantiated by every #include; any other header only adds macros, once.
+                    var p = ParseOf(inc);
+                    if (!p.IsTemplate && !w.Walked.Add(inc)) break;
+                    Walk(p, w, unitLine ?? op.First + 1, depth + 1, ifDepth);
+                    break;
+            }
         }
         Flush();
     }
 
-    /// <summary>Lookups for every combination of the macros' alternative values (the latest values first), or past
-    /// <see cref="MaxWorlds"/>, the latest values with each alternative alone.</summary>
-    static List<Func<string, Macro?>> Worlds(Dictionary<string, List<Macro>> macros)
+    /// <summary>The names <paramref name="head"/> expands to. An expansion depends on the macros only through the
+    /// names it looks up, so the worlds vary only the macros with alternatives that some expansion looked up, grown
+    /// until none looks up another: the names of every world, without a world each for config macros the head never
+    /// reaches.</summary>
+    static List<string> Names(string head, Dictionary<string, List<Macro>> macros)
+    {
+        var vary = new HashSet<string>(StringComparer.Ordinal);
+        while (true)
+        {
+            var asked = new HashSet<string>(StringComparer.Ordinal);
+            var names = new List<string>();
+            foreach (var world in Worlds(macros, vary))
+            {
+                var name = Expand(head, n => { asked.Add(n); return world(n); }).Trim();
+                if (Regex.IsMatch(name, @"^[A-Za-z_]\w*$")) names.Add(name);
+            }
+            var before = vary.Count;
+            foreach (var n in asked) if (macros.TryGetValue(n, out var l) && l.Count > 1) vary.Add(n);
+            if (vary.Count == before) return names;
+        }
+    }
+
+    /// <summary>Lookups for every combination of the alternative values of the macros in <paramref name="vary"/> (the
+    /// latest values first), or past <see cref="MaxWorlds"/>, the latest values with each alternative alone.</summary>
+    static List<Func<string, Macro?>> Worlds(Dictionary<string, List<Macro>> macros, HashSet<string> vary)
     {
         Macro? Last(string n) => macros.TryGetValue(n, out var l) ? l[^1] : null;
         var worlds = new List<Func<string, Macro?>> { Last };
-        var multi = macros.Where(kv => kv.Value.Count > 1).ToList();
+        if (vary.Count == 0) return worlds;
+        var multi = macros.Where(kv => kv.Value.Count > 1 && vary.Contains(kv.Key)).ToList();
         if (multi.Count == 0) return worlds;
         long product = 1;
         foreach (var kv in multi) { product *= kv.Value.Count; if (product > MaxWorlds) break; }
