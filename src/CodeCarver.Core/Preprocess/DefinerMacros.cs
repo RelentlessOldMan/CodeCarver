@@ -24,7 +24,7 @@ public static class DefinerMacros
     /// <summary>One file-scope use: the defined names, the identifiers in its arguments, its 1-based line span
     /// (through the body when the macro opens a function head) and whether it has such a body.</summary>
     public readonly record struct Use(string Macro, List<(string Name, bool Function)> Defines, List<string> ArgIdentifiers,
-                                      int StartLine, int EndLine, bool HasBody);
+                                      int StartLine, int EndLine, bool HasBody, int At = 0);
 
     private static readonly Regex Token = new(@"##|[A-Za-z_]\w*|\S", RegexOptions.Compiled);
     private static readonly Regex Ident = new(@"^[A-Za-z_]\w*$", RegexOptions.Compiled);
@@ -201,10 +201,11 @@ public static class DefinerMacros
         for (var i = 0; i < code.Length; i++) if (code[i] == '\n') lineStarts.Add(i + 1);
         int LineOf(int index) { var k = lineStarts.BinarySearch(index); return (k >= 0 ? k : ~k - 1) + 1; }
 
-        var opaque = OpaqueDepth(code);
-        foreach (var m in matches)
+        var opaque = OpaqueAt(code, matches.Select(m => m.Index).ToList());
+        for (var mi = 0; mi < matches.Count; mi++)
         {
-            if (opaque[m.Index] != 0) continue;
+            var m = matches[mi];
+            if (opaque[mi]) continue;
             var macro = m.Name;
             var open = code.IndexOf('(', m.Index + macro.Length);
             var close = Matching(code, open, '(', ')');
@@ -229,7 +230,7 @@ public static class DefinerMacros
                     defines.Add((t.Prefix + args[t.Param] + t.Suffix, t.Function && (t.OwnBody || hasBody)));
             if (defines.Count == 0) continue;
             var ids = Identifiers.Matches(code.Substring(open + 1, close - open - 1)).Select(x => x.Value).Distinct().ToList();
-            yield return new Use(macro, defines.Distinct().ToList(), ids, LineOf(m.Index), LineOf(end), hasBody);
+            yield return new Use(macro, defines.Distinct().ToList(), ids, LineOf(m.Index), LineOf(end), hasBody, m.Index);
         }
     }
 
@@ -261,15 +262,18 @@ public static class DefinerMacros
     }
 
     /// <summary>Per index, how many enclosing braces are NOT namespace / extern "C" blocks.</summary>
-    private static int[] OpaqueDepth(string code)
+    /// <summary>Whether each of <paramref name=at/> (ascending positions) lies inside an opaque brace: only the asked
+    /// positions are kept, where an int per character of the file was most of a scan's garbage.</summary>
+    private static bool[] OpaqueAt(string code, List<int> at)
     {
-        var depth = new int[code.Length + 1];
+        var result = new bool[at.Count];
+        var next = 0;
         var stack = new Stack<bool>();   // true = opaque (function body, class, initializer ...)
         var opaque = 0;
         var stmtStart = 0;               // start of the text since the last ; { }
         for (var i = 0; i < code.Length; i++)
         {
-            depth[i] = opaque;
+            while (next < at.Count && at[next] <= i) { if (at[next] == i) result[next] = opaque != 0; next++; }
             var c = code[i];
             if (c == '{')
             {
@@ -286,7 +290,7 @@ public static class DefinerMacros
             }
             else if (c == ';') stmtStart = i + 1;
         }
-        depth[code.Length] = opaque;
-        return depth;
+        for (; next < at.Count; next++) result[next] = at[next] == code.Length && opaque != 0;
+        return result;
     }
 }

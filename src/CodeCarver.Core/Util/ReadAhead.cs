@@ -35,6 +35,70 @@ public static class ReadAhead
         return results;
     }
 
+    /// <summary>Each item's index and <paramref name="f"/> of it, in order, <see cref="Window"/> running at once and handed
+    /// out as a thread frees up. A result is handed back as soon as every one before it is, and let go once the caller
+    /// moves on; no item starts more than <paramref name="ahead"/> past the one the caller waits on. So one slow item
+    /// holds up only the items that many after it, and only that many results are ever held (<see cref="Each"/> held
+    /// every result of a phase at once: the link check over a big tree outgrew the machine's memory).</summary>
+    public static IEnumerable<(int Index, R Value)> Ordered<T, R>(IReadOnlyList<T> items, Func<T, R> f, int ahead = 8 * Window)
+    {
+        EnsureThreads();
+        Activity.Expect(items.Count);
+        var n = items.Count;
+        var results = new R[n];
+        var done = new bool[n];
+        var gate = new object();
+        int next = 0, cursor = 0;
+        var stop = false;
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo? failed = null;
+        void Work()
+        {
+            while (true)
+            {
+                int i;
+                lock (gate)
+                {
+                    while (!stop && next < n && next >= cursor + ahead) Monitor.Wait(gate);
+                    if (stop || next >= n) return;
+                    i = next++;
+                }
+                R r;
+                try { r = f(items[i]); }
+                catch (Exception ex)
+                {
+                    lock (gate) { failed ??= System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex); stop = true; Monitor.PulseAll(gate); }
+                    return;
+                }
+                lock (gate) { results[i] = r; done[i] = true; Monitor.PulseAll(gate); }
+            }
+        }
+        var workers = new Task[Math.Min(Window, Math.Max(1, n))];
+        for (var w = 0; w < workers.Length; w++) workers[w] = Task.Run(Work);
+        try
+        {
+            while (cursor < n)
+            {
+                R value;
+                lock (gate)
+                {
+                    while (!done[cursor] && failed is null) Monitor.Wait(gate);
+                    failed?.Throw();
+                    value = results[cursor];
+                    results[cursor] = default!;
+                    cursor++;
+                    Monitor.PulseAll(gate);
+                }
+                Activity.Tick();
+                yield return (cursor - 1, value);
+            }
+        }
+        finally
+        {
+            lock (gate) { stop = true; Monitor.PulseAll(gate); }
+            Task.WaitAll(workers);
+        }
+    }
+
     /// <summary><paramref name="body"/> for 0 to <paramref name="count"/> - 1, <see cref="Window"/> at once, each index
     /// handed out as a thread frees up (Parallel.For hands a thread a range, so a slow item holds up the rest of it).</summary>
     public static void For(int count, Action<int> body)

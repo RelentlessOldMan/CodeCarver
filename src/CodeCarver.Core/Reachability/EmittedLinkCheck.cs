@@ -173,8 +173,7 @@ public static class EmittedLinkCheck
         if (emitted.Concat(dropped).Any(f => !IsHeader(f.Rel) && !IsAssembly(f.Rel)))
         {
             var headerPaths = byBase.Values.SelectMany(ps => ps).Where(p => IsHeader(p)).ToList();
-            var prepared = InParallel(headerPaths, PrepareHeader);
-            for (var i = 0; i < headerPaths.Count; i++) StoreHeader(headerPaths[i], prepared[i]);
+            foreach (var (i, h) in ReadAhead.Ordered(headerPaths, PrepareHeader)) StoreHeader(headerPaths[i], h);
             anyTemplate = templates.Count > 0;
         }
         Lap("headers");
@@ -287,11 +286,9 @@ public static class EmittedLinkCheck
             return s;
         }
         var droppedSorted = droppedList.OrderBy(d => d.Rel, StringComparer.Ordinal).ToList();
-        var droppedScans = InParallel(droppedSorted, ScanDropped);
-        for (var di = 0; di < droppedSorted.Count; di++)
+        foreach (var (di, dscan) in ReadAhead.Ordered(droppedSorted, ScanDropped))
         {
             var rel = droppedSorted[di].Rel;
-            var dscan = droppedScans[di];
             if (dscan is null) { skipped++; continue; }
             checkedFiles++;
             var header = IsHeader(rel);
@@ -336,11 +333,9 @@ public static class EmittedLinkCheck
         Lap("dropped");
         if (original is not null)
         {
-            var goneAll = InParallel(emittedList, Pruned);
-            for (var pi = 0; pi < emittedList.Count; pi++)
+            foreach (var (pi, gone) in ReadAhead.Ordered(emittedList, Pruned))
             {
                 var rel = emittedList[pi].Rel;
-                var gone = goneAll[pi];
                 if (gone is null) continue;
                 var header = IsHeader(rel);
                 foreach (var d in gone)
@@ -373,7 +368,6 @@ public static class EmittedLinkCheck
         // it never reaches the linker, whatever a same-named function elsewhere does.
         var fileMacros = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         var fileIncludes = new Dictionary<string, List<string>>(StringComparer.Ordinal);
-        var headersByBase = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         var macroCalls = new List<(string Name, string Rel, int Line, bool Dead)>();
         var aliasMacros = new HashSet<string>(StringComparer.Ordinal);
         var macroDeclarators = new List<(string Name, string Macro, string Target, string Rel, int Line)>();
@@ -393,7 +387,7 @@ public static class EmittedLinkCheck
             s.Definitions.AddRange(Instances(f.Rel, text));
             Renamed(s);
             // A use is read below only for a name a dropped file defines, a static pruned from this file, or a wrapped
-            // symbol: the others are let go here, so every file's result can be held at once.
+            // symbol: the others are let go here, so a result waiting its turn holds little.
             var prunedHere = prunedStatics.TryGetValue(f.Rel, out var ph) ? ph : null;
             bool Wanted(string n) => droppedDefs.ContainsKey(n) || (prunedHere?.ContainsKey(n) ?? false) || (anyWrap && wrapped!.Contains(n));
             s.Uses.RemoveAll(u => !Wanted(u.Name));
@@ -401,12 +395,9 @@ public static class EmittedLinkCheck
             return (s, map);
         }
         var emittedSorted = emittedList.OrderBy(e => e.Rel, StringComparer.Ordinal).ToList();
-        var emittedScans = InParallel(emittedSorted, ScanEmitted);
-        Lap("emittedScan");
-        for (var ei = 0; ei < emittedSorted.Count; ei++)
+        foreach (var (ei, scanned) in ReadAhead.Ordered(emittedSorted, ScanEmitted))
         {
             var rel = emittedSorted[ei].Rel;
-            var scanned = emittedScans[ei];
             if (scanned is not { } got) { skipped++; continue; }
             var (scan, map) = got;
             checkedFiles++;
@@ -414,9 +405,6 @@ public static class EmittedLinkCheck
             functionMacros.UnionWith(scan.FunctionMacros);
             fileMacros[rel] = scan.FunctionMacroLines.Where(m => !IsDead(m.Line)).Select(m => m.Name).ToHashSet(StringComparer.Ordinal);
             fileIncludes[rel] = scan.Includes;
-            var b = Path.GetFileName(rel);
-            if (!headersByBase.TryGetValue(b, out var hl)) headersByBase[b] = hl = new List<string>();
-            hl.Add(rel);
             foreach (var d in scan.Definitions)
                 if (IsDead(d.Line)) continue;
                 else if (d.Inline && !d.Static && IsHeader(rel)) inlineHeaderDefs.Add(d.Name);
@@ -445,6 +433,7 @@ public static class EmittedLinkCheck
                 into.TryAdd(name, (rel, line));
             }
         }
+        Lap("emittedScan");
         // A non-static inline body in a header provides the symbol only in C++. In C it emits nothing: a translation unit
         // emits it (C99, by declaring it extern) or defines it out of line (GNU extern inline). When such a translation
         // unit was dropped, the header's body links nothing.
@@ -455,26 +444,44 @@ public static class EmittedLinkCheck
         if (linkUses is not null)
             foreach (var (name, rel, line) in linkUses)
                 if (droppedDefs.ContainsKey(name)) { live.TryAdd(name, (rel, line)); strongUse.Add(name); }
-        // Function-like macros visible in a file: its own, plus those of every emitted header it includes (by basename,
-        // transitively). Memoised; a cycle just stops.
-        var visible = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
-        HashSet<string> Visible(string rel)
+        // A function-like macro is visible in a file that #defines it or includes (by basename, transitively) an emitted
+        // file that does. Asked per macro name: the files that can see it, walking back from its definers through the
+        // files that include them. (A set of every visible macro per file was files x macros: tens of GB on a big tree.)
+        // Files by number, and for each include basename the files that include it: built on the first question.
+        Dictionary<string, int>? fileIndex = null;
+        List<string>? files = null;
+        Dictionary<string, List<int>>? includersByBase = null;
+        var seeing = new Dictionary<string, System.Collections.BitArray>(StringComparer.Ordinal);
+        bool Sees(string rel, string name)
         {
-            if (visible.TryGetValue(rel, out var v)) return v;
-            v = new HashSet<string>(StringComparer.Ordinal);
-            visible[rel] = v;   // cycle guard
-            var stack = new Stack<string>(); stack.Push(rel);
-            var seen = new HashSet<string>(StringComparer.Ordinal) { rel };
-            while (stack.Count > 0)
+            if (fileIndex is null)
             {
-                var f = stack.Pop();
-                if (fileMacros.TryGetValue(f, out var ms)) v.UnionWith(ms);
-                if (!fileIncludes.TryGetValue(f, out var incs)) continue;
-                foreach (var inc in incs)
-                    if (headersByBase.TryGetValue(Path.GetFileName(inc), out var hs))
-                        foreach (var h in hs) if (seen.Add(h)) stack.Push(h);
+                files = fileIncludes.Keys.Union(fileMacros.Keys, StringComparer.Ordinal).ToList();
+                fileIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+                for (var i = 0; i < files.Count; i++) fileIndex[files[i]] = i;
+                includersByBase = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (f, incs) in fileIncludes)
+                    foreach (var b in incs.Select(Path.GetFileName).Distinct(StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (!includersByBase.TryGetValue(b!, out var l)) includersByBase[b!] = l = new List<int>();
+                        l.Add(fileIndex[f]);
+                    }
             }
-            return v;
+            if (!seeing.TryGetValue(name, out var sees))
+            {
+                sees = new System.Collections.BitArray(files!.Count);
+                var stack = new Stack<int>();
+                foreach (var (f, ms) in fileMacros)
+                    if (ms.Contains(name)) { var i = fileIndex[f]; if (!sees[i]) { sees[i] = true; stack.Push(i); } }
+                while (stack.Count > 0)
+                {
+                    var x = stack.Pop();
+                    if (!includersByBase!.TryGetValue(Path.GetFileName(files[x]), out var by)) continue;
+                    foreach (var i in by) if (!sees[i]) { sees[i] = true; stack.Push(i); }
+                }
+                seeing[name] = sees;
+            }
+            return fileIndex.TryGetValue(rel, out var at) && sees[at];
         }
         foreach (var (name, macro, target, mrel, mline) in macroDeclarators)
             if (aliasMacros.Contains(macro))
@@ -485,7 +492,7 @@ public static class EmittedLinkCheck
         foreach (var (name, rel, line, isDead) in macroCalls)
         {
             // Only a name some file #defines as a function-like macro can be one (the include closure is the cost).
-            if (functionMacros.Contains(name) && Visible(rel).Contains(name)) continue;   // a macro invocation, not a reference
+            if (functionMacros.Contains(name) && Sees(rel, name)) continue;   // a macro invocation, not a reference
             (isDead ? dead : live).TryAdd(name, (rel, line));
         }
 
@@ -525,11 +532,6 @@ public static class EmittedLinkCheck
         foreach (var c in s) { h ^= c; h *= 1099511628211UL; }
         return h;
     }
-
-    /// <summary><paramref name="f"/> over every item, up to <see cref="ReadAhead.Window"/> at once, results by position.
-    /// <see cref="ReadAhead.Map"/> hands results back in order, so one slow file (a read of 11 minutes on a share) held
-    /// every file after it; here the caller waits once, for all of them, and merges in its own order.</summary>
-    static R[] InParallel<T, R>(IReadOnlyList<T> items, Func<T, R> f) => ReadAhead.Each(items, f);
 
     static string? TryRead(string path, long maxBytes)
     {
@@ -739,6 +741,26 @@ public static class EmittedLinkCheck
         IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? commandLineMacros = null,
         IReadOnlySet<string>? c99InlineFns = null)
     {
+        // A scan made ~11 bytes of garbage per character of its text: many big files at once outgrew the machine. One
+        // already in a scan on this thread (ScanAssembly's) is counted by the outer one.
+        if (t_scanning) return ScanText(text, header, declarators, definerMacros);
+        using var lease = s_scanMemory.Value.Acquire(text.Length);
+        t_scanning = true;
+        try { return ScanText(text, header, declarators, definerMacros); }
+        finally { t_scanning = false; }
+    }
+
+    [ThreadStatic] static bool t_scanning;
+
+    /// <summary>The scans running at once, held to an eighth of the machine's memory at a cost per character.</summary>
+    static readonly Lazy<CodeCarver.Core.Util.MemoryGate> s_scanMemory = new(() =>
+    {
+        var total = CodeCarver.Core.Util.MemoryGate.MachineBytes();
+        return new CodeCarver.Core.Util.MemoryGate(total > 0 ? total / 8 : 2L << 30, bytesPerChar: 16, minChars: 256 * 1024);
+    });
+
+    static ScanResult ScanText(string text, bool header, bool declarators, CodeCarver.Core.Preprocess.DefinerMacros.Set? definerMacros)
+    {
         // Trigraphs and names split by a backslash-newline, as the compiler reads them.
         text = CodeCarver.Core.Preprocess.SourceText.Normalize(text);
         // `#if 0` blocks are dead in every configuration and often not C (unbalanced braces): never read them.
@@ -762,7 +784,10 @@ public static class EmittedLinkCheck
         // Brace stack: 'T' transparent (namespace / extern "C"), 'F' function body, 'Q' function body whose uses
         // don't count (header inline), 'C' class body in a header, 'O' other.
         var braces = new Stack<char>();
-        bool AtFileScope() => braces.All(b => b == 'T');
+        // How many open braces of each kind: asked at every name, where walking the stack (through LINQ, an allocation
+        // per call) was most of the scan's garbage.
+        var open = new int[128];
+        bool AtFileScope() => braces.Count == open['T'];
         var fnLocals = new HashSet<string>(StringComparer.Ordinal);   // declared in the current function
         var stmtDeclared = new HashSet<string>(StringComparer.Ordinal); // declared since the last file-scope stmt
         var stmtStart = 0;
@@ -787,7 +812,7 @@ public static class EmittedLinkCheck
                         else if (header && IsClassOpen(toks, i)) kind = 'C';
                         else kind = 'O';
                         if (kind is 'F' or 'Q') { fnLocals.Clear(); fnLocals.UnionWith(stmtDeclared); }
-                        braces.Push(kind);
+                        braces.Push(kind); open[kind]++;
                         pendingBody = false;
                         if (kind == 'T') { stmtDeclared.Clear(); stmtStart = i + 1; }
                         break;
@@ -795,7 +820,7 @@ public static class EmittedLinkCheck
                     case "}":
                         if (braces.Count > 0)
                         {
-                            var k = braces.Pop();
+                            var k = braces.Pop(); open[k]--;
                             if (k is 'F' or 'Q') fnLocals.Clear();
                         }
                         if (AtFileScope()) { stmtDeclared.Clear(); stmtStart = i + 1; pendingBody = false; }
@@ -810,8 +835,8 @@ public static class EmittedLinkCheck
             var name = t.Text;
             var prev = i > 0 && !toks[i - 1].InDefine ? toks[i - 1] : default;
             var next = i + 1 < toks.Count && !toks[i + 1].InDefine ? toks[i + 1] : default;
-            var inFunction = braces.Contains('F') || braces.Contains('Q');
-            var quiet = braces.Contains('Q') || braces.Contains('C');
+            var inFunction = open['F'] + open['Q'] > 0;
+            var quiet = open['Q'] + open['C'] > 0;
 
             // Member access: obj.name / p->name are fields/methods, not free names.
             if (prev.Text is "." or "->") continue;
@@ -909,20 +934,16 @@ public static class EmittedLinkCheck
     /// <c>FW_DECLARE(uart, ...)</c> defining <c>uart_desc</c>): the tree's definers plus the ones this file #defines.</summary>
     static void DefinerDefinitions(string text, ScanResult result, CodeCarver.Core.Preprocess.DefinerMacros.Set? tree)
     {
-        var set = tree;
-        if (result.FunctionMacros.Count > 0)
-        {
-            var own = CodeCarver.Core.Preprocess.DefinerMacros.FromText(text);
-            if (own.Count > 0)
-            {
-                if (tree is not null)
-                    foreach (var kv in tree.Definers) own.TryAdd(kv.Key, kv.Value);
-                set = CodeCarver.Core.Preprocess.DefinerMacros.MakeSet(own);
-            }
-        }
-        if (set is null) return;
+        // The file's own definers win over the tree's of the same name. Each set is scanned on its own and the uses taken
+        // in text order: merging them rebuilt the tree's whole scan for every file that #defines a definer.
+        var own = result.FunctionMacros.Count > 0 ? CodeCarver.Core.Preprocess.DefinerMacros.MakeSet(CodeCarver.Core.Preprocess.DefinerMacros.FromText(text)) : null;
+        if (own is null && tree is null) return;
+        IEnumerable<CodeCarver.Core.Preprocess.DefinerMacros.Use> uses = tree is null ? [] : CodeCarver.Core.Preprocess.DefinerMacros.Uses(text, tree.Use, tree.Definers);
+        if (own is not null)
+            uses = uses.Where(u => !own.Definers.ContainsKey(u.Macro))
+                .Concat(CodeCarver.Core.Preprocess.DefinerMacros.Uses(text, own.Use, own.Definers)).OrderBy(u => u.At);
         var have = result.Definitions.Select(d => d.Name).ToHashSet(StringComparer.Ordinal);
-        foreach (var use in CodeCarver.Core.Preprocess.DefinerMacros.Uses(text, set.Use, set.Definers))
+        foreach (var use in uses)
             foreach (var (name, _) in use.Defines)
                 if (have.Add(name)) result.Definitions.Add(new Definition(name, use.StartLine, Static: false, Inline: false));
     }
@@ -1360,9 +1381,13 @@ public static class EmittedLinkCheck
     /// <summary>C/C++ tokens with comments, string/char literals (as <c>""</c>) and preprocessor lines handled.
     /// #define bodies are kept (as InDefine tokens, parameters and ## / # operands removed); every other
     /// directive line is skipped entirely.</summary>
-    internal static List<Tok> Tokenize(string s, bool directives = true)
+    /// <param name="pool">Shares one string per distinct name across the call (and its #define bodies): a token's text
+    /// is otherwise a new string each time.</param>
+    internal static List<Tok> Tokenize(string s, bool directives = true, CodeCarver.Core.Util.NamePool? pool = null)
     {
-        var toks = new List<Tok>();
+        pool ??= new CodeCarver.Core.Util.NamePool();
+        // About a token per four characters of C: sized once, where doubling as it filled copied the list over and over.
+        var toks = new List<Tok>(s.Length / 4 + 16);
         var line = 1;
         var i = 0;
         var atLineStart = true;
@@ -1403,7 +1428,7 @@ public static class EmittedLinkCheck
                     }
                     sb.Append(s[i]); i++;
                 }
-                DefineBody(sb.ToString(), start, toks);
+                DefineBody(sb.ToString(), start, toks, pool);
                 continue;
             }
             atLineStart = false;
@@ -1422,7 +1447,7 @@ public static class EmittedLinkCheck
                 while (i < s.Length && (char.IsLetterOrDigit(s[i]) || s[i] == '_' || s[i] == '$')) i++;
                 // A string-literal prefix (L"", u8"", R"") is part of the literal, not a name.
                 if (i < s.Length && s[i] is '"' or '\'' && i - st <= 2) continue;
-                toks.Add(new Tok(s[st..i], line, true, false));
+                toks.Add(new Tok(pool.Get(s, st, i), line, true, false));
                 continue;
             }
             if (char.IsDigit(c))
@@ -1433,7 +1458,7 @@ public static class EmittedLinkCheck
             }
             if (i + 1 < s.Length)
             {
-                var two = s.Substring(i, 2);
+                var two = TwoChar(c, s[i + 1]);
                 // Digraphs: <% %> <: :> are { } [ ] (but C++ `<::` before anything but : or > is < ::).
                 var di = two switch { "<%" => "{", "%>" => "}", "<:" => "[", ":>" => "]", _ => null };
                 if (di is not null && !(two == "<:" && i + 2 < s.Length && s[i + 2] == ':' && (i + 3 >= s.Length || s[i + 3] is not (':' or '>'))))
@@ -1441,14 +1466,24 @@ public static class EmittedLinkCheck
                 if (two is "->" or "::" or "&&" or "||" or "==" or "!=" or "<=" or ">=" or "##")
                 { toks.Add(new Tok(two, line, false, false)); i += 2; continue; }
             }
-            toks.Add(new Tok(c.ToString(), line, false, false));
+            toks.Add(new Tok(CodeCarver.Core.Util.NamePool.Char(c), line, false, false));
             i++;
         }
         return toks;
     }
 
+    /// <summary>The two-character token at a position, or null: the same string instances every time, where a
+    /// substring at every punctuation character was a new string each (most of them not tokens at all).</summary>
+    static string? TwoChar(char a, char b) => (a, b) switch
+    {
+        ('<', '%') => "<%", ('%', '>') => "%>", ('<', ':') => "<:", (':', '>') => ":>",
+        ('-', '>') => "->", (':', ':') => "::", ('&', '&') => "&&", ('|', '|') => "||", ('=', '=') => "==",
+        ('!', '=') => "!=", ('<', '=') => "<=", ('>', '=') => ">=", ('#', '#') => "##",
+        _ => null,
+    };
+
     // #define NAME(params) body  -> body identifiers as InDefine uses; other directives contribute nothing.
-    static void DefineBody(string directive, int line, List<Tok> toks)
+    static void DefineBody(string directive, int line, List<Tok> toks, CodeCarver.Core.Util.NamePool pool)
     {
         var d = directive.TrimStart();
         var k = 0;
@@ -1466,7 +1501,7 @@ public static class EmittedLinkCheck
             foreach (var p in body[1..close].Split(',')) parms.Add(p.Trim().TrimEnd('.').Trim());
             body = body[(close + 1)..];
         }
-        var inner = Tokenize(body, directives: false);
+        var inner = Tokenize(body, directives: false, pool);
         for (var j = 0; j < inner.Count; j++)
         {
             var t = inner[j];
