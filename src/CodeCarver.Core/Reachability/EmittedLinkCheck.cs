@@ -48,7 +48,8 @@ public sealed class LinkCheckCache
 
     internal Func<string, bool> Unchanging { get; }
     internal readonly ConcurrentDictionary<string, EmittedLinkCheck.DroppedEntry?> Dropped = new(StringComparer.Ordinal);
-    internal readonly ConcurrentDictionary<string, (string? Text, bool Template)> Headers = new(StringComparer.Ordinal);
+    // A header's text only when it is a template (see EmittedLinkCheck.HeaderInfo): the rest are what a big tree is made of.
+    internal readonly ConcurrentDictionary<string, (EmittedLinkCheck.HeaderInfo? Info, string? TemplateText)> Headers = new(StringComparer.Ordinal);
     internal readonly ConcurrentDictionary<string, EmittedLinkCheck.OriginalEntry?> Originals = new(StringComparer.Ordinal);
 
     private object?[]? _inputs;
@@ -128,53 +129,89 @@ public static class EmittedLinkCheck
         var byBase = emitted.Concat(dropped).GroupBy(f => Path.GetFileName(f.Rel), StringComparer.OrdinalIgnoreCase)
                             .ToDictionary(g => g.Key, g => g.Select(f => f.Path).ToList(), StringComparer.OrdinalIgnoreCase);
         // Files are read and scanned on several threads (ReadAhead), so these caches take a lock.
-        var templateText = new Dictionary<string, string?>(StringComparer.Ordinal);
-        var templates = new HashSet<string>(StringComparer.Ordinal);
         // A header's text as TemplateInstances reads it: whole for a template, its directive lines otherwise (a config
-        // header still carries macros a template after it uses).
-        (string? Text, bool Template) PrepareHeader(string p)
+        // header still carries macros a template after it uses). Every header is looked at once (HeaderInfo: is it a
+        // template, and what its text hashes to); the text is held for a template, and for the rest only while they fit
+        // HeaderTextBudget - a tree of register-map headers is nearly all directives, and holding all of them ran a work
+        // machine out of memory. A header not held is read again when a walk needs it.
+        var headerInfo = new Dictionary<string, HeaderInfo?>(StringComparer.Ordinal);
+        var headerText = new Dictionary<string, string>(StringComparer.Ordinal);
+        var templates = new HashSet<string>(StringComparer.Ordinal);
+        long heldChars = 0;
+        var budget = HeaderTextBudget();
+        (HeaderInfo? Info, string? Text) ReadDirectives(string p)
         {
-            var cached = Cached(p);
-            if (cached && cache!.Headers.TryGetValue(p, out var hit)) { Interlocked.Increment(ref fromCache); return hit; }
             Interlocked.Increment(ref filesRead);
             var t = TryRead(p, maxBytes);
-            (string? Text, bool Template) h = (null, false);
-            if (t is not null)
-            {
-                t = CodeCarver.Core.Preprocess.SourceText.Normalize(t);
-                h = CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(t)
-                    ? (t, true) : (CodeCarver.Core.Preprocess.TemplateInstances.DirectivesOnly(t), false);
-            }
-            return cached ? cache!.Headers.GetOrAdd(p, h) : h;
+            if (t is null) return (null, null);
+            t = CodeCarver.Core.Preprocess.SourceText.Normalize(t);
+            var template = CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(t);
+            if (!template) t = CodeCarver.Core.Preprocess.TemplateInstances.DirectivesOnly(t);
+            return (new HeaderInfo(template, t.Length, ContentHash(t)), t);
         }
-        // The same string every time: the first one stored wins.
-        string? StoreHeader(string p, (string? Text, bool Template) h)
+        (HeaderInfo? Info, string? Text) PrepareHeader(string p)
         {
-            lock (templateText)
+            var cached = Cached(p);
+            if (cached && cache!.Headers.TryGetValue(p, out var hit)) { Interlocked.Increment(ref fromCache); return (hit.Info, hit.TemplateText); }
+            var h = ReadDirectives(p);
+            if (cached) h = cache!.Headers.GetOrAdd(p, (h.Info, h.Info is { Template: true } ? h.Text : null));
+            return h;
+        }
+        // The first look at a header stays its answer for the run. Returns the text when there is one in hand.
+        string? StoreHeader(string p, (HeaderInfo? Info, string? Text) h)
+        {
+            lock (headerInfo)
             {
-                if (templateText.TryGetValue(p, out var t)) return t;
-                if (h.Template) templates.Add(p);
-                return templateText[p] = h.Text;
+                if (headerInfo.TryGetValue(p, out var had))
+                    return headerText.TryGetValue(p, out var held) ? held : had is null ? null : h.Text;
+                headerInfo[p] = h.Info;
+                if (h.Info is null || h.Text is null) return null;
+                if (h.Info.Template) templates.Add(p);
+                Hold(p, h.Text, h.Info.Template);
+                return h.Text;
             }
+        }
+        void Hold(string p, string text, bool template)
+        {
+            if (!template && heldChars + text.Length > budget) return;
+            headerText[p] = text;
+            if (!template) heldChars += text.Length;
+        }
+        HeaderInfo? Info(string p)
+        {
+            lock (headerInfo) if (headerInfo.TryGetValue(p, out var i)) return i;
+            StoreHeader(p, PrepareHeader(p));
+            lock (headerInfo) return headerInfo[p];
         }
         string? ReadHeader(string p)
         {
-            lock (templateText) if (templateText.TryGetValue(p, out var t)) return t;
-            return StoreHeader(p, PrepareHeader(p));
+            if (Info(p) is null) return null;
+            lock (headerInfo) if (headerText.TryGetValue(p, out var t)) return t;
+            var (info, text) = ReadDirectives(p);   // not held: read again (the same text: within a run a file stays as it is)
+            if (info is null || text is null) return null;
+            lock (headerInfo)
+            {
+                if (headerText.TryGetValue(p, out var t)) return t;
+                Hold(p, text, info.Template);
+            }
+            return text;
         }
-        string? ReadTemplate(string raw)
+        // The header an #include of raw reads: a template among those of its name, else the first.
+        string? Chosen(string raw)
         {
             if (!byBase.TryGetValue(Path.GetFileName(raw), out var ps)) return null;
-            foreach (var p in ps) ReadHeader(p);
-            lock (templateText) return ReadHeader(ps.FirstOrDefault(templates.Contains) ?? ps[0]);
+            foreach (var p in ps) Info(p);
+            lock (headerInfo) return ps.FirstOrDefault(templates.Contains) ?? ps[0];
         }
-        // Every header, read ahead in parallel before the scans start (a scan asks as soon as it meets an #include).
+        string? ReadTemplate(string raw) => Chosen(raw) is { } p ? ReadHeader(p) : null;
+        HeaderInfo? TemplateKey(string raw) => Chosen(raw) is { } p ? Info(p) : null;
+        // Every header, looked at in parallel before the scans start (a scan asks as soon as it meets an #include).
         var anyTemplate = false;
         if (emitted.Concat(dropped).Any(f => !IsHeader(f.Rel) && !IsAssembly(f.Rel)))
         {
             var headerPaths = byBase.Values.SelectMany(ps => ps).Where(p => IsHeader(p)).ToList();
             foreach (var (i, h) in ReadAhead.Ordered(headerPaths, PrepareHeader)) StoreHeader(headerPaths[i], h);
-            anyTemplate = templates.Count > 0;
+            lock (headerInfo) anyTemplate = templates.Count > 0;
         }
         Lap("headers");
         bool AnyTemplate() => anyTemplate;
@@ -194,12 +231,12 @@ public static class EmittedLinkCheck
         }
         bool TemplateGate(bool hasInclude, bool macroHead, bool hasDefine)
             => (hasInclude && AnyTemplate()) || (macroHead && (cmdFnMacros || hasDefine));
-        // deps: each include the walk read and the text it got, so a later run can tell whether the answer still holds.
-        List<Definition> TemplateDefs(string text, List<(string Raw, string? Text)>? deps)
+        // deps: each include the walk read and what its text hashed to, so a later run can tell whether the answer still holds.
+        List<Definition> TemplateDefs(string text, List<(string Raw, HeaderInfo? Read)>? deps)
             => CodeCarver.Core.Preprocess.TemplateInstances.Find(text, raw =>
                    {
                        var t = ReadTemplate(raw);
-                       deps?.Add((raw, t));
+                       deps?.Add((raw, TemplateKey(raw)));
                        return t;
                    }, commandLineMacros)
                    .Select(i => new Definition(i.Name, i.Line, false, false)).ToList();
@@ -262,17 +299,17 @@ public static class EmittedLinkCheck
             var templateDefs = new List<Definition>();
             if (!plain && TemplateGate(e.HasInclude, e.MacroHead, e.HasDefine))
             {
-                List<(string Raw, string? Text)>? deps;
+                List<(string Raw, HeaderInfo? Read)>? deps;
                 List<Definition>? had;
                 lock (e) { deps = e.Deps; had = e.TemplateDefs; }
-                if (deps is not null && deps.All(d => string.Equals(ReadTemplate(d.Raw), d.Text, StringComparison.Ordinal)))
+                if (deps is not null && deps.All(d => Equals(TemplateKey(d.Raw), d.Read)))
                     templateDefs = had!;
                 else
                 {
                     if (text is null) Interlocked.Increment(ref instancesRedone);
                     text ??= TryRead(f.Path, maxBytes);
                     if (text is null) return null;
-                    var nd = new List<(string Raw, string? Text)>();
+                    var nd = new List<(string Raw, HeaderInfo? Read)>();
                     templateDefs = TemplateDefs(text, nd);
                     lock (e) { e.Deps = nd; e.TemplateDefs = templateDefs; }
                 }
@@ -519,12 +556,26 @@ public static class EmittedLinkCheck
         public required bool HasInclude, MacroHead, HasDefine;
         public required List<Definition> C99;
         // The template-header names, with what the walk read to find them; under lock(this).
-        public List<(string Raw, string? Text)>? Deps;
+        public List<(string Raw, HeaderInfo? Read)>? Deps;
         public List<Definition>? TemplateDefs;
     }
 
     /// <summary>An original file of a carve inside kept files: what its emitted copy is compared with.</summary>
     internal sealed record OriginalEntry(int Length, ulong Hash, List<Definition> Definitions);
+
+    /// <summary>A header as the template walk reads it: is it a template, and the length and hash of that text (what a
+    /// cached answer is checked against, instead of holding the text).</summary>
+    internal sealed record HeaderInfo(bool Template, int Length, ulong Hash);
+
+    /// <summary>Characters of non-template header text the check holds at once: a 32nd of the machine's memory, or
+    /// CODECARVER_CHECK_HEADER_MB.</summary>
+    static long HeaderTextBudget()
+    {
+        if (long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB"), out var mb) && mb >= 0)
+            return mb * 1024 * 1024 / sizeof(char);
+        var total = CodeCarver.Core.Util.MemoryGate.MachineBytes();
+        return (total > 0 ? total / 32 : 512L << 20) / sizeof(char);
+    }
 
     static ulong ContentHash(string s)
     {

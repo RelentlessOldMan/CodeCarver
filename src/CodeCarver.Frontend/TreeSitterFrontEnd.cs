@@ -96,8 +96,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
     /// <summary>For each macro this text #defines as nothing, the identifiers of the #if conditions enclosing it
     /// (<c>#ifdef DEFINE_GLOBALS / #define EXTERN</c>: DEFINE_GLOBALS).</summary>
-    private void EmptyDefineConditions(string text)
+    private static List<(string Name, List<string> Flags)> EmptyDefineConditions(string text)
     {
+        var found = new List<(string, List<string>)>();
         var stack = new List<List<string>>();
         foreach (var line in text.Split('\n'))
         {
@@ -114,10 +115,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 continue;
             }
             if (stack.Count == 0 || EmptyDefineLine.Match(line) is not { Success: true } d) continue;
-            if (!_emptyDefineConditions.TryGetValue(d.Groups[1].Value, out var set))
-                _emptyDefineConditions[d.Groups[1].Value] = set = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var frame in stack) set.UnionWith(frame);
+            found.Add((d.Groups[1].Value, stack.SelectMany(frame => frame).ToList()));
         }
+        return found;
     }
     private static readonly Regex NameBeforeAttr = new( // trailing:  name / name(...) / name[...]  __attribute__
         @"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]|\([^()]*\))?\s*$", RegexOptions.Compiled);
@@ -785,32 +785,31 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var fnLike = new HashSet<string>(StringComparer.Ordinal);
         var bodies = new Dictionary<string, (bool FnLike, List<string> Bodies)>(StringComparer.Ordinal);
         long bytesTotal = 0; var filesTotal = 0;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        long readTicks = 0;
 
-        // Single streaming pass: read each file once and run every collector on it, so the whole tree's text
-        // is never resident at once. Also tallies the parse work totals (non-empty files/bytes) for the ETA —
-        // saving a separate pass. Each file's text is released before the next.
-        foreach (var path in paths)
+        // One streaming pass: each file is read once and every collector run on it, so the whole tree's text is never
+        // resident at once. Files are scanned on several threads (ScanMacros: text in, what it defines out) and merged
+        // here in path order, so what the pass finds - and which definition of a name comes first - is the same as
+        // scanning them one by one. Also tallies the parse work totals (non-empty files/bytes) for the ETA.
+        // Symbols the source writes under another name, wherever the label is (often a header): see SourceNamesOf.
+        void Renamed(string cname, string sym)
         {
-            var text = SourceText.Normalize(read(path));
-            if (text.Length == 0) continue;
-            bytesTotal += text.Length; filesTotal++;
-            if (!IsTranslationUnit(path) && TemplateInstances.HasMacroNamedHead(text)) _macroNamedHeaders.Add(path);
-            if (!IsTranslationUnit(path)) _c99InlineFns.UnionWith(C99Inline.HeaderDefinitions(text));
-            // Symbols the source writes under another name, wherever the label is (often a header): see SourceNamesOf.
-            void Renamed(string cname, string sym)
-            {
-                if (!_renamedFrom.TryGetValue(sym, out var from)) _renamedFrom[sym] = from = new HashSet<string>(StringComparer.Ordinal);
-                from.Add(cname);
-            }
-            if (text.Contains("asm", StringComparison.Ordinal))
-                foreach (Match m in AsmLabelDecl.Matches(text)) Renamed(m.Groups["name"].Value, m.Groups["sym"].Value);
-            if (text.Contains("redefine_extname", StringComparison.Ordinal))
-                foreach (Match m in RedefineExtname.Matches(text)) Renamed(m.Groups["name"].Value, m.Groups["sym"].Value);
+            if (!_renamedFrom.TryGetValue(sym, out var from)) _renamedFrom[sym] = from = new HashSet<string>(StringComparer.Ordinal);
+            from.Add(cname);
+        }
+        foreach (var (i, f) in CodeCarver.Core.Util.ReadAhead.Ordered(paths, p => ScanMacros(p, read), 2 * CodeCarver.Core.Util.ReadAhead.Window))
+        {
+            readTicks += f.ReadTicks;
+            if (f.Length == 0) continue;
+            var path = paths[i];
+            bytesTotal += f.Length; filesTotal++;
+            if (f.MacroNamedHead) _macroNamedHeaders.Add(path);
+            if (f.C99Inline is not null) _c99InlineFns.UnionWith(f.C99Inline);
+            foreach (var (cname, sym) in f.Renamed) Renamed(cname, sym);
 
-            foreach (Match m in ObjectLikeDefine.Matches(text))
+            foreach (var (name, repl) in f.Objects)
             {
-                var name = m.Groups[1].Value;
-                var repl = Regex.Replace(m.Groups[2].Value, @"\\\r?\n", " ").Replace("\r", " ").Replace("\n", " ").Trim();
                 if (!defs.ContainsKey(name)) defs[name] = repl;
                 if (IdentifierOnly.IsMatch(repl))
                 {
@@ -828,44 +827,65 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 if (net == 0 && !repl.Contains("namespace")) continue;
                 map[name] = repl;
             }
-            foreach (Match m in ValuelessDefine.Matches(text))
-            {
-                var n = m.Groups[1].Value;
+            foreach (var n in f.Valueless)
                 if (!defs.ContainsKey(n)) defs[n] = "";
-            }
-            foreach (Match m in FuncLikeDefine.Matches(text)) fnLike.Add(m.Groups[1].Value);
-            if (text.Contains("define", StringComparison.Ordinal))
+            fnLike.UnionWith(f.FnLike);
+            foreach (var (name, fn, body) in f.Defines)
             {
-                foreach (Match m in AnyDefine.Matches(text))
-                {
-                    var name = m.Groups[1].Value;
-                    if (!bodies.TryGetValue(name, out var b)) bodies[name] = b = (m.Groups[2].Success, new List<string>());
-                    if (b.Bodies.Count < 8) b.Bodies.Add(m.Groups[3].Value);
-                }
-                if (text.Contains("extern", StringComparison.Ordinal)) EmptyDefineConditions(text);
+                if (!bodies.TryGetValue(name, out var b)) bodies[name] = b = (fn, new List<string>());
+                if (b.Bodies.Count < 8) b.Bodies.Add(body);
+            }
+            foreach (var (name, flags) in f.EmptyDefines)
+            {
+                if (!_emptyDefineConditions.TryGetValue(name, out var set))
+                    _emptyDefineConditions[name] = set = new HashSet<string>(StringComparer.Ordinal);
+                set.UnionWith(flags);
             }
         }
 
-        // Keep macros: a keep construct in the body, or (transitively) a use of another keep macro.
+        // Summary time.build-graph.macro-pre-pass.*: reading and scanning the files (read: summed over the threads), then
+        // the tables built from what they define.
+        _timing["macro-pre-pass.files"] = clock.ElapsedMilliseconds;
+        _timing["macro-pre-pass.read"] = readTicks * 1000 / System.Diagnostics.Stopwatch.Frequency;
+        clock.Restart();
+
+        // Keep macros: a keep construct in the body, or (transitively) a use of another keep macro. Register macros the
+        // same, from a section named by an identifier. One look at every macro's bodies (on several threads) finds the
+        // seeds and the other macros each body names; the closure then walks from the seeds to the macros that use them.
+        var entries = bodies.ToList();
+        var looked = CodeCarver.Core.Util.ReadAhead.Each(entries, kv => (
+            Keep: kv.Value.Bodies.Any(b => KeepBody.IsMatch(b)),
+            Register: kv.Value.Bodies.Any(b => IdentifierSection.IsMatch(b)),
+            Uses: kv.Value.Bodies.SelectMany(b => Identifier.Matches(b).Select(m => m.Value))
+                                 .Where(id => id != kv.Key && bodies.ContainsKey(id)).Distinct(StringComparer.Ordinal).ToArray()));
         var keep = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var kv in bodies)
-            if (kv.Value.Bodies.Any(b => KeepBody.IsMatch(b))) keep.Add(kv.Key);
-        for (var changed = keep.Count > 0; changed;)
+        var register = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < entries.Count; i++)
         {
-            changed = false;
-            foreach (var kv in bodies)
-                if (!keep.Contains(kv.Key) && kv.Value.Bodies.Any(b => Identifier.Matches(b).Any(id => keep.Contains(id.Value))))
-                { keep.Add(kv.Key); changed = true; }
+            if (looked[i].Keep) keep.Add(entries[i].Key);
+            if (looked[i].Register) register.Add(entries[i].Key);
+        }
+        if (keep.Count > 0 || register.Count > 0)
+        {
+            var usedBy = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            for (var i = 0; i < entries.Count; i++)
+                foreach (var id in looked[i].Uses)
+                {
+                    if (!usedBy.TryGetValue(id, out var by)) usedBy[id] = by = new List<string>();
+                    by.Add(entries[i].Key);
+                }
+            void Close(HashSet<string> set)
+            {
+                var queue = new Queue<string>(set);
+                while (queue.TryDequeue(out var name))
+                    if (usedBy.TryGetValue(name, out var by))
+                        foreach (var user in by)
+                            if (set.Add(user)) queue.Enqueue(user);
+            }
+            Close(keep);
+            Close(register);
         }
         _keepMacros = keep;
-        var register = new HashSet<string>(bodies.Where(kv => kv.Value.Bodies.Any(b => IdentifierSection.IsMatch(b))).Select(kv => kv.Key), StringComparer.Ordinal);
-        for (var changed = register.Count > 0; changed;)
-        {
-            changed = false;
-            foreach (var kv in bodies)
-                if (!register.Contains(kv.Key) && kv.Value.Bodies.Any(b => Identifier.Matches(b).Any(id => register.Contains(id.Value))))
-                { register.Add(kv.Key); changed = true; }
-        }
         _registerMacros = register;
         // `#ifdef DEFINE_GLOBALS / #define EXTERN / #else / #define EXTERN extern`: a header's `EXTERN int g;` is a
         // definition in the unit that turns it off (see HeaderData).
@@ -885,10 +905,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _keepMacrosFnLike = new HashSet<string>(keep.Where(k => bodies[k].FnLike), StringComparer.Ordinal);
         _keepMacroUse = keep.Count == 0 ? null : new NameScan(keep, NameScan.Shape.Word);
 
-        _definers = DefinerMacros.Build(bodies);
+        var fnBodies = MacroBodies.Parse(bodies);
+        _definers = DefinerMacros.Build(fnBodies);
         _macroBodies = bodies;
         _objectMacros = new HashSet<string>(defs.Keys, StringComparer.Ordinal);
-        _pasteTable = PasteMacros.Build(bodies, _objectMacros.Contains);
+        _pasteTable = PasteMacros.Build(fnBodies, _objectMacros.Contains);
         _pasteUse = PasteMacros.UseScan(_pasteTable);
         DefinerSet = DefinerMacros.MakeSet(_definers);
         _definerUse = DefinerSet?.Use;
@@ -925,8 +946,61 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _aliasMacroUse = aliasMacros.Count == 0 ? null
             : new Regex(@"\b(?<name>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*(?:" + string.Join("|", aliasMacros.Select(Regex.Escape))
                         + @")\s*\(\s*(?<target>[A-Za-z_]\w*)\s*\)\s*;", RegexOptions.Compiled);
+        _timing["macro-pre-pass.tables"] = clock.ElapsedMilliseconds;
         return (bytesTotal, filesTotal);
     }
+
+    /// <summary>What one file adds to the macro pre-pass (BuildScopeMacros), in the order the file has it.</summary>
+    private sealed class FileMacros
+    {
+        public int Length;
+        public long ReadTicks;
+        public bool MacroNamedHead;
+        public List<string>? C99Inline;
+        public readonly List<(string Name, string Symbol)> Renamed = new();
+        public readonly List<(string Name, string Replacement)> Objects = new();   // flattened to one line
+        public readonly List<string> Valueless = new();
+        public readonly List<string> FnLike = new();
+        public readonly List<(string Name, bool FnLike, string Body)> Defines = new();
+        public List<(string Name, List<string> Flags)> EmptyDefines = new();
+    }
+
+    /// <summary>Text never shared between files: each file's scans run on their own thread. Bounded by memory like the
+    /// parse: a run of huge headers waits rather than holding them all at once.</summary>
+    private static FileMacros ScanMacros(string path, Func<string, string> read)
+    {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var text = SourceText.Normalize(read(path));
+        var f = new FileMacros { Length = text.Length, ReadTicks = System.Diagnostics.Stopwatch.GetTimestamp() - started };
+        if (text.Length == 0) return f;
+        using var lease = s_prePassMemory.Value.Acquire(text.Length);
+        if (!IsTranslationUnit(path))
+        {
+            f.MacroNamedHead = TemplateInstances.HasMacroNamedHead(text);
+            f.C99Inline = C99Inline.HeaderDefinitions(text).ToList();
+        }
+        if (text.Contains("asm", StringComparison.Ordinal))
+            foreach (Match m in AsmLabelDecl.Matches(text)) f.Renamed.Add((m.Groups["name"].Value, m.Groups["sym"].Value));
+        if (text.Contains("redefine_extname", StringComparison.Ordinal))
+            foreach (Match m in RedefineExtname.Matches(text)) f.Renamed.Add((m.Groups["name"].Value, m.Groups["sym"].Value));
+        foreach (Match m in ObjectLikeDefine.Matches(text))
+            f.Objects.Add((m.Groups[1].Value, Regex.Replace(m.Groups[2].Value, @"\\\r?\n", " ").Replace("\r", " ").Replace("\n", " ").Trim()));
+        foreach (Match m in ValuelessDefine.Matches(text)) f.Valueless.Add(m.Groups[1].Value);
+        foreach (Match m in FuncLikeDefine.Matches(text)) f.FnLike.Add(m.Groups[1].Value);
+        if (text.Contains("define", StringComparison.Ordinal))
+        {
+            foreach (Match m in AnyDefine.Matches(text)) f.Defines.Add((m.Groups[1].Value, m.Groups[2].Success, m.Groups[3].Value));
+            if (text.Contains("extern", StringComparison.Ordinal)) f.EmptyDefines = EmptyDefineConditions(text);
+        }
+        return f;
+    }
+
+    // 16 bytes a character: the text, and what the scans find in it.
+    private static readonly Lazy<CodeCarver.Core.Util.MemoryGate> s_prePassMemory = new(() =>
+    {
+        var total = CodeCarver.Core.Util.MemoryGate.MachineBytes();
+        return new CodeCarver.Core.Util.MemoryGate(total > 0 ? total / 8 : 2L << 30, 16, 256 * 1024);
+    });
 
     /// <summary>`int EXPORT(name)(params)` where <c>#define EXPORT(n) n</c> (or <c>(n)</c>): the parser sees a call-shaped
     /// head named EXPORT. For parsing only, blank the wrapper and its parentheses so the head reads <c>int name(params)</c>.

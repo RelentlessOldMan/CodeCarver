@@ -68,22 +68,12 @@ public static class DefinerMacros
     }
 
     public static Dictionary<string, List<Template>> Build(IReadOnlyDictionary<string, (bool FnLike, List<string> Bodies)> bodies)
+        => Build(MacroBodies.Parse(bodies));
+
+    /// <summary>As <see cref="Build(IReadOnlyDictionary{string, ValueTuple{bool, List{string}}})"/>, from bodies already
+    /// split (<see cref="MacroBodies.Parse"/>).</summary>
+    public static Dictionary<string, List<Template>> Build(List<(string Name, List<string> Params, List<string> Tokens)> parsed)
     {
-        var parsed = new List<(string Name, List<string> Params, List<string> Tokens)>();
-        foreach (var (name, (fnLike, list)) in bodies)
-        {
-            if (!fnLike) continue;
-            foreach (var raw in list)
-            {
-                var flat = Regex.Replace(raw, @"\\\r?\n", " ");
-                var close = flat.IndexOf(')');
-                if (close < 0) continue;
-                var ps = flat[..close].Split(',').Select(p => p.Trim()).ToList();
-                // Comments and string literals blanked: `/* protects n state */` must not read as a declarator.
-                var toks = Token.Matches(SourceText.CodeOnly(flat[(close + 1)..])).Select(m => m.Value).ToList();
-                if (toks.Count > 0) parsed.Add((name, ps, toks));
-            }
-        }
 
         var result = new Dictionary<string, List<Template>>(StringComparer.Ordinal);
         void AddT(string m, Template t)

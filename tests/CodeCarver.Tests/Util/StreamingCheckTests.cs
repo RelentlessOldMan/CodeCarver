@@ -101,4 +101,47 @@ public sealed class StreamingCheckTests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+
+    [Theory]
+    [InlineData(null)]   // headers held
+    [InlineData("0")]    // no header text held: every walk reads its headers again
+    public void LinkCheck_TemplateHeaders_SameAnswerWhetherHeldOrReadAgain_AndRedoneWhenAHeaderChanges(string? budgetMb)
+    {
+        // t.h defines a function through a macro-named head; cfg.h says what the macro makes of it. The dropped gone.c
+        // instantiates it, so main.c's call names a dropped definition. A cached answer (the second run) must follow
+        // cfg.h when it changes, though no header's text is kept from the first run.
+        var root = Path.Combine(Path.GetTempPath(), "cc-tmpl-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var was = Environment.GetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB");
+        Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", budgetMb);
+        try
+        {
+            (string, string) W(string rel, string text)
+            {
+                var p = Path.Combine(root, rel);
+                File.WriteAllText(p, text);
+                return (rel, p);
+            }
+            var cfg = W("cfg.h", "#define HIDE(n) hid_##n\n");
+            var emitted = new[]
+            {
+                cfg,
+                W("t.h", "int HIDE(den)(void) { return 0; }\n"),
+                W("main.c", "int hid_den(void);\nint vis_den(void);\nint main(void) { return hid_den() + vis_den(); }\n"),
+            };
+            var dropped = new[] { W("gone.c", "#include \"cfg.h\"\n#include \"t.h\"\n") };
+            var cache = new LinkCheckCache(p => p.EndsWith("gone.c", StringComparison.Ordinal));
+            var first = EmittedLinkCheck.Run(emitted, dropped, cache: cache);
+            Assert.Equal(new[] { "hid_den" }, first.Violations.Select(v => v.Name).ToArray());
+
+            File.WriteAllText(cfg.Item2, "#define HIDE(n) vis_##n\n");
+            var second = EmittedLinkCheck.Run(emitted, dropped, cache: cache);
+            Assert.Equal(new[] { "vis_den" }, second.Violations.Select(v => v.Name).ToArray());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", was);
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
 }

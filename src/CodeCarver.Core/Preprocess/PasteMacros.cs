@@ -42,21 +42,11 @@ public static class PasteMacros
     /// (<c>a##b</c>), and its calls of such macros with its own arguments put in. <paramref name="isObjectMacro"/>
     /// names the object-like macros: such an argument may expand before it is pasted, so it is unknown.</summary>
     public static Table Build(IReadOnlyDictionary<string, (bool FnLike, List<string> Bodies)> bodies, Func<string, bool> isObjectMacro)
+        => Build(MacroBodies.Parse(bodies), isObjectMacro);
+
+    /// <summary>As the overload taking the bodies, from bodies already split (<see cref="MacroBodies.Parse"/>).</summary>
+    public static Table Build(List<(string Name, List<string> Params, List<string> Tokens)> parsed, Func<string, bool> isObjectMacro)
     {
-        var parsed = new List<(string Name, List<string> Params, List<string> Tokens)>();
-        foreach (var (name, (fnLike, list)) in bodies)
-        {
-            if (!fnLike) continue;
-            foreach (var raw in list)
-            {
-                var flat = Regex.Replace(raw, @"\\\r?\n", " ");
-                var close = flat.IndexOf(')');
-                if (close < 0) continue;
-                var ps = flat[..close].Split(',').Select(p => p.Trim()).ToList();
-                var toks = Token.Matches(SourceText.CodeOnly(flat[(close + 1)..])).Select(m => m.Value).ToList();
-                if (toks.Count > 0) parsed.Add((name, ps, toks));
-            }
-        }
 
         var table = new Table();
         bool AddT(string m, Piece[] t)
