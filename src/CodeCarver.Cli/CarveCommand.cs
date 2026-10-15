@@ -1176,6 +1176,43 @@ public static class CarveCommand
         // from such a table (LLVM-style GenDisassemblerTables.inc) would otherwise be dropped and left dangling
         // once the emitter copies the include. Gather them (recursively) so the front-end keeps what they name.
         var refIncludes = new List<(string Rel, string Text)>();
+        // The include scan reads every parsed file; the two scans after it (a logged .c #included by another file, and
+        // the macro pre-pass) take what they need from that read rather than reading every file again (on a share each
+        // read waits a round trip, and a big tree is read whole each time). By rel, each parsed file the scan read.
+        var seeded = new Dictionary<string, (string[] SourceIncludes, string[] Quoted, int Computed)>(StringComparer.Ordinal);
+        var srcExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++" };
+        var macroFactsWanted = defines is not null && closedWorld && closureLang;
+        var seedDefined = new HashSet<string>(StringComparer.Ordinal);
+        var seedCond = new HashSet<string>(StringComparer.Ordinal);
+        // PP1 (the macro pre-pass, below): every macro name #defined/#undef'd anywhere in the tree, and every name an #if
+        // tests. Any directive spelling: #, the digraph %:, the trigraph ??=.
+        var hash = CodeCarver.Core.Preprocess.SourceText.DirectiveStart;
+        var defRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:define|undef)\s+([A-Za-z_]\w*)",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+        // The condition runs on over backslash-newline splices (`#if defined(A) && \` / `defined(B)`).
+        var condRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:if|ifdef|ifndef|elif)\b((?:\\\r?\n|[^\r\n])*)",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+        var identRe = new System.Text.RegularExpressions.Regex(@"[A-Za-z_]\w*");
+        void ScanMacroNames(string text, HashSet<string> defined, HashSet<string> tested)
+        {
+            if (!text.Contains('#')) return;
+            foreach (System.Text.RegularExpressions.Match m in defRe.Matches(text)) defined.Add(m.Groups[1].Value);
+            foreach (System.Text.RegularExpressions.Match m in condRe.Matches(text))
+                foreach (System.Text.RegularExpressions.Match id in identRe.Matches(m.Groups[1].Value)) tested.Add(id.Value);
+        }
+        // Quoted #includes, kept per file so the ones that leave the tree (or resolve nowhere) can be followed.
+        var anyIncRe = new System.Text.RegularExpressions.Regex(@"^\s*#\s*include\s*(?:""([^""]+)""|<([^>]+)>|([A-Za-z_]\w*))",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+        (string[] Quoted, int Computed) QuotedIncludes(string text)
+        {
+            if (!text.Contains("include", StringComparison.Ordinal)) return (Array.Empty<string>(), 0);
+            var q = new List<string>();
+            var computed = 0;
+            foreach (System.Text.RegularExpressions.Match m in anyIncRe.Matches(text))
+                if (m.Groups[1].Success) q.Add(m.Groups[1].Value);
+                else if (m.Groups[3].Success) computed++;
+            return (q.ToArray(), computed);
+        }
         // Directory listings shared by everything below that follows #includes (FileLookup).
         var fileLookup = new CodeCarver.Core.Util.FileLookup();
         if (closureLang && lang is "c" or "cpp")
@@ -1234,8 +1271,9 @@ public static class CarveCommand
             // released before the next, so this phase also never holds the whole tree in memory. Seeds are the
             // parsed source files (skip/keep-whole files aren't scanned for includes, matching the prior behavior).
             var queue = new Queue<string>();
+            var seedRel = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var rel in parseRels)
-                if (!skipParse.Contains(rel) && !notBuilt.Contains(rel)) queue.Enqueue(fullByRel[rel]);
+                if (!skipParse.Contains(rel) && !notBuilt.Contains(rel)) { queue.Enqueue(fullByRel[rel]); seedRel.TryAdd(fullByRel[rel], rel); }
             // An included file was read when it was found (its text is kept in refIncludes): scanned from that text.
             var foundText = new System.Collections.Concurrent.ConcurrentDictionary<string, string>(StringComparer.Ordinal);
             string? TryRead(string full)
@@ -1252,6 +1290,15 @@ public static class CarveCommand
                 {
                     if (read is not { } text) continue;
                     var fromDir = Path.GetDirectoryName(fromFull) ?? dir;
+                    if (seedRel.Remove(fromFull, out var seedOf))
+                    {
+                        var sourceIncludes = perFileSpecs.Count == 0 || !text.Contains("#include", StringComparison.Ordinal) ? Array.Empty<string>()
+                            : incRe.Matches(text).Select(m => Path.GetFileName(m.Groups[1].Value))
+                                .Where(b => srcExts.Any(e => b.EndsWith(e, StringComparison.OrdinalIgnoreCase))).ToArray();
+                        var (q, computed) = macroFactsWanted ? QuotedIncludes(text) : (Array.Empty<string>(), 0);
+                        if (macroFactsWanted) ScanMacroNames(text, seedDefined, seedCond);
+                        seeded[seedOf] = (sourceIncludes, q, computed);
+                    }
                     foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
                     {
                         var inc = m.Groups[1].Value;
@@ -1320,7 +1367,6 @@ public static class CarveCommand
         // universal set via includedCFiles. Over-approximate by basename = sound (universal keeps both branches).
         if (perFileSpecs.Count > 0)
         {
-            var srcExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++" };
             var keysByBase = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
             foreach (var k in perFileSpecs.Keys)
             {
@@ -1333,12 +1379,17 @@ public static class CarveCommand
             CodeCarver.Core.Util.Activity.Begin("tree files scanned", parseRels.Count);
             foreach (var rel in parseRels)
             {
-                var text = ReadRel(rel);
                 CodeCarver.Core.Util.Activity.Tick();
-                if (text.Length == 0 || !text.Contains("#include", StringComparison.Ordinal)) continue;
-                foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
+                IEnumerable<string> bases;
+                if (seeded.TryGetValue(rel, out var facts)) bases = facts.SourceIncludes;
+                else
                 {
-                    var incBase = Path.GetFileName(m.Groups[1].Value);
+                    var text = ReadRel(rel);
+                    if (text.Length == 0 || !text.Contains("#include", StringComparison.Ordinal)) continue;
+                    bases = incRe.Matches(text).Select(m => Path.GetFileName(m.Groups[1].Value));
+                }
+                foreach (var incBase in bases)
+                {
                     if (!srcExts.Any(e => incBase.EndsWith(e, StringComparison.OrdinalIgnoreCase))) continue;
                     if (keysByBase.TryGetValue(incBase, out var keys))
                         foreach (var k in keys) if (!string.Equals(k, rel, StringComparison.OrdinalIgnoreCase)) includedCFiles.Add(k);
@@ -1455,44 +1506,36 @@ public static class CarveCommand
             // pre-parse is often the longest phase on a product tree: say which part.
             var ppSw = System.Diagnostics.Stopwatch.StartNew();
             void PreParsePart(string part) { summary[$"time.pre-parse.{part}.ms"] = ppSw.ElapsedMilliseconds; ppSw.Restart(); Progress($"pre-parse {part}"); }
-            // PP1: every macro name #defined/#undef'd anywhere in the tree. Parsed files are read in full; the
-            // big/dense headers the parser skips are streamed, keeping only names some #if actually tests.
-            // Any directive spelling: #, the digraph %:, the trigraph ??=.
-            var hash = CodeCarver.Core.Preprocess.SourceText.DirectiveStart;
-            var defRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:define|undef)\s+([A-Za-z_]\w*)",
-                System.Text.RegularExpressions.RegexOptions.Multiline);
-            // The condition runs on over backslash-newline splices (`#if defined(A) && \` / `defined(B)`).
-            var condRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:if|ifdef|ifndef|elif)\b((?:\\\r?\n|[^\r\n])*)",
-                System.Text.RegularExpressions.RegexOptions.Multiline);
-            var identRe = new System.Text.RegularExpressions.Regex(@"[A-Za-z_]\w*");
+            // PP1 (patterns above): every macro name #defined/#undef'd anywhere in the tree. Parsed files were scanned as
+            // the include scan read them; the big/dense headers the parser skips are streamed, keeping only names some
+            // #if actually tests.
             var condIdents = new HashSet<string>(StringComparer.Ordinal);
-            void ScanText(string text)
-            {
-                if (!text.Contains('#')) return;
-                foreach (System.Text.RegularExpressions.Match m in defRe.Matches(text)) ambientMacros.Add(m.Groups[1].Value);
-                foreach (System.Text.RegularExpressions.Match m in condRe.Matches(text))
-                    foreach (System.Text.RegularExpressions.Match id in identRe.Matches(m.Groups[1].Value)) condIdents.Add(id.Value);
-            }
-            // Quoted #includes, kept per file so the ones that leave the tree (or resolve nowhere) can be followed below.
-            var incRe = new System.Text.RegularExpressions.Regex(@"^\s*#\s*include\s*(?:""([^""]+)""|<([^>]+)>|([A-Za-z_]\w*))",
-                System.Text.RegularExpressions.RegexOptions.Multiline);
+            void ScanText(string text) => ScanMacroNames(text, ambientMacros, condIdents);
             var quoted = new List<(string FromDir, string Raw)>();
             var computedIncludes = 0;
             void Includes(string fromDir, string text)
             {
-                if (!text.Contains("include", StringComparison.Ordinal)) return;
-                foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
-                    if (m.Groups[1].Success) quoted.Add((fromDir, m.Groups[1].Value));
-                    else if (m.Groups[3].Success) computedIncludes++;
+                var (q, computed) = QuotedIncludes(text);
+                foreach (var raw in q) quoted.Add((fromDir, raw));
+                computedIncludes += computed;
             }
             CodeCarver.Core.Util.Activity.Begin("tree files scanned for macros", parseRels.Count);
             foreach (var rel in parseRels)
             {
-                var text = ReadRel(rel);
                 CodeCarver.Core.Util.Activity.Tick();
-                ScanText(text);
-                Includes(Path.GetDirectoryName(fullByRel[rel]) ?? dir, text);
+                var fromDir = Path.GetDirectoryName(fullByRel[rel]) ?? dir;
+                if (!seeded.TryGetValue(rel, out var facts))
+                {
+                    var text = ReadRel(rel);
+                    ScanText(text);
+                    Includes(fromDir, text);
+                    continue;
+                }
+                foreach (var raw in facts.Quoted) quoted.Add((fromDir, raw));
+                computedIncludes += facts.Computed;
             }
+            ambientMacros.UnionWith(seedDefined);
+            condIdents.UnionWith(seedCond);
             foreach (var (_, text) in refIncludes) ScanText(text);
             PreParsePart("treeMacros");
 
