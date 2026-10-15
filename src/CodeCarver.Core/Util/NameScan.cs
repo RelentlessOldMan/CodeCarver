@@ -43,6 +43,7 @@ public sealed class NameScan
 
     private readonly Shape _shape;
     private readonly HashSet<string> _names;
+    private readonly NameSet _set;       // looks a word up without making a string of it
     private readonly bool[] _lengths;
     private readonly Regex? _regex;      // only for a set the one-pass search can't answer exactly
 
@@ -52,6 +53,7 @@ public sealed class NameScan
         _names = new HashSet<string>(names, StringComparer.Ordinal);
         _lengths = new bool[(_names.Count == 0 ? 0 : _names.Max(n => n.Length)) + 1];
         foreach (var n in _names) _lengths[n.Length] = true;
+        _set = new NameSet(_names);
         if (_names.Any(n => n.Length == 0 || !n.All(InRun)))
             _regex = new Regex(Pattern(_names, shape), RegexOptions.Compiled);
     }
@@ -75,37 +77,57 @@ public sealed class NameScan
 
     public bool IsMatch(string text) => Matches(text).Any();
 
-    public IEnumerable<NameMatch> Matches(string text)
+    public IEnumerable<NameMatch> Matches(string text) => Matches(text, 0, text.Length);
+
+    /// <summary>The matches in <paramref name="text"/>[<paramref name="start"/>..<paramref name="end"/>], found as if
+    /// that range were the whole text.</summary>
+    public IEnumerable<NameMatch> Matches(string text, int start, int end)
     {
         if (_regex is not null)
         {
-            foreach (Match m in _regex.Matches(text))
-                yield return new NameMatch(m.Index, m.Length, m.Groups.Count > 1 && m.Groups[1].Success ? m.Groups[1].Value : m.Value);
+            foreach (Match m in _regex.Matches(text.Substring(start, end - start)))
+                yield return new NameMatch(start + m.Index, m.Length, m.Groups.Count > 1 && m.Groups[1].Success ? m.Groups[1].Value : m.Value);
             yield break;
         }
-        var i = 0;
-        while (i < text.Length)
+        for (var i = start; Next(text, ref i, end, out var m);) yield return m;
+    }
+
+    /// <summary>Whether <paramref name="text"/>[<paramref name="start"/>..<paramref name="end"/>] holds a match, as
+    /// <see cref="Matches(string, int, int)"/> finds them. Allocates nothing: for asking of many short ranges.</summary>
+    public bool IsMatch(string text, int start, int end)
+    {
+        if (_regex is not null) return _regex.IsMatch(text.AsSpan(start, end - start));
+        var i = start;
+        return Next(text, ref i, end, out _);
+    }
+
+    // The next match from i, stopping at end; i moves past it.
+    private bool Next(string text, ref int i, int end, out NameMatch match)
+    {
+        while (i < end)
         {
             if (!InRun(text[i])) { i++; continue; }
             var start = i;
-            while (i < text.Length && InRun(text[i])) i++;
+            while (i < end && InRun(text[i])) i++;
             var len = i - start;
             if (len >= _lengths.Length || !_lengths[len]) continue;
-            var name = text.Substring(start, len);
-            if (!_names.Contains(name)) continue;
-            if (_shape == Shape.Word) { yield return new NameMatch(start, len, name); continue; }
+            if (_set.Find(text.AsSpan(start, len)) is not { } name) continue;
+            if (_shape == Shape.Word) { match = new NameMatch(start, len, name); return true; }
             var k = i;
-            while (k < text.Length && Space[text[k]]) k++;
-            var call = k < text.Length && text[k] == '(';
+            while (k < end && Space[text[k]]) k++;
+            var call = k < end && text[k] == '(';
             if (_shape == Shape.NotCall)
             {
-                if (!call) yield return new NameMatch(start, len, name);
+                if (!call) { match = new NameMatch(start, len, name); return true; }
                 continue;
             }
             if (!call) continue;
-            yield return new NameMatch(start, k + 1 - start, name);
+            match = new NameMatch(start, k + 1 - start, name);
             i = k + 1;
+            return true;
         }
+        match = default;
+        return false;
     }
 
     public string Replace(string text, Func<NameMatch, string> with)

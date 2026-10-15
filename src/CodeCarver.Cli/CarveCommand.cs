@@ -341,6 +341,15 @@ public static class CarveCommand
                 }
             }
         }
+        // Managed memory allocated since the last step ended (MB). The GC keeps much of what a step churns through
+        // committed long after it is garbage, so a step that allocates far more than it keeps raises the run's peak.
+        long allocatedAt = GC.GetTotalAllocatedBytes();
+        long TakeAllocatedMb()
+        {
+            var now = GC.GetTotalAllocatedBytes();
+            var mb = (now - Interlocked.Exchange(ref allocatedAt, now)) / (1024 * 1024);
+            return mb;
+        }
         long TakePeakMb()
         {
             long now;
@@ -445,6 +454,7 @@ public static class CarveCommand
         {
             var peak = TakePeakMb();
             summary[$"mem.{phase}.peakMb"] = Math.Max(peak, summary.TryGetValue($"mem.{phase}.peakMb", out var pw) && pw is long pl ? pl : 0L);
+            summary[$"mem.{phase}.allocatedMb"] = TakeAllocatedMb() + (summary.TryGetValue($"mem.{phase}.allocatedMb", out var aw) && aw is long al ? al : 0L);
             Progress(phase);
             if (_timing) err.WriteLine($"  timing  : {phase,-14} {_tsw.ElapsedMilliseconds,7} ms");
             diag.Event($"phase {phase}: {_tsw.ElapsedMilliseconds} ms"); // breadcrumb for the diagnostic package
@@ -3060,6 +3070,8 @@ public static class CarveCommand
                 var peak = TakePeakMb();
                 var mkey = $"{summaryStage}.mem.{step}.peakMb";
                 summary[mkey] = Math.Max(peak, summary.TryGetValue(mkey, out var mw) && mw is long ml ? ml : 0L);
+                var akey = $"{summaryStage}.mem.{step}.allocatedMb";
+                summary[akey] = TakeAllocatedMb() + (summary.TryGetValue(akey, out var aw) && aw is long al ? al : 0L);
                 Progress($"{(stage.Name.Length == 0 ? "stage" : stage.Name)} {step}");
                 var key = $"{summaryStage}.time.{step}.ms";
                 summary[key] = (summary.TryGetValue(key, out var was) && was is long w ? w : 0L) + stageClock.ElapsedMilliseconds;

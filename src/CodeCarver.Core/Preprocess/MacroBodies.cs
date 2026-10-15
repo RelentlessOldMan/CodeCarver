@@ -10,7 +10,6 @@ namespace CodeCarver.Core.Preprocess;
 /// </summary>
 public static class MacroBodies
 {
-    private static readonly Regex Token = new(@"##|[A-Za-z_]\w*|\S", RegexOptions.Compiled);
 
     public static List<(string Name, List<string> Params, List<string> Tokens)> Parse(
         IReadOnlyDictionary<string, (bool FnLike, List<string> Bodies)> bodies)
@@ -32,7 +31,7 @@ public static class MacroBodies
         if (close < 0) return null;
         var ps = flat[..close].Split(',').Select(p => p.Trim()).ToList();
         // Comments and string literals blanked: `/* protects n state */` must not read as a declarator.
-        var toks = Token.Matches(SourceText.CodeOnly(flat[(close + 1)..])).Select(m => m.Value).ToList();
+        var toks = Util.CodeTokens.MacroTokens(SourceText.CodeOnly(flat[(close + 1)..]));
         return toks.Count > 0 ? (ps, toks) : null;
     }
 }

@@ -1,5 +1,6 @@
 using System.Collections;
 using CodeCarver.Core.Graph;
+using CodeCarver.Core.Util;
 
 namespace CodeCarver.Frontend;
 
@@ -14,15 +15,19 @@ public sealed class UseList : IReadOnlyList<(NodeId From, string Name)>
 {
     readonly List<(NodeId From, string Name)> _items = new();
     readonly HashSet<(int, string)> _seen = new();
-    readonly Dictionary<string, string> _names;
+    readonly NamePool _names;
 
-    public UseList(Dictionary<string, string> namePool) => _names = namePool;
+    public UseList(NamePool namePool) => _names = namePool;
 
     public void Add((NodeId From, string Name) use) => Add(use.From, use.Name);
 
-    public void Add(NodeId from, string name)
+    public void Add(NodeId from, string name) => Add(from, name, 0, name.Length);
+
+    /// <summary>A use of the name <paramref name="text"/>[<paramref name="start"/>..<paramref name="end"/>]: no string
+    /// is made for it when the name is already in the pool.</summary>
+    public void Add(NodeId from, string text, int start, int end)
     {
-        if (!_names.TryGetValue(name, out var pooled)) _names[name] = pooled = name;
+        var pooled = _names.Get(text, start, end);
         if (_seen.Add((from.Value, pooled))) _items.Add((from, pooled));
     }
 

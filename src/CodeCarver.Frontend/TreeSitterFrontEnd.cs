@@ -305,16 +305,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // is captured — the C++ library carve can't even find its roots. We expand ONLY these (not value
     // macros) and ONLY for parsing, on a single line so every node's LINE number still maps to the
     // original text the emitter prunes. Built once across all inputs (the #define is often in a header).
-    private static readonly Regex ObjectLikeDefine = new(
-        @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+((?:\\\r?\n|[^\r\n])*)",
-        RegexOptions.Compiled | RegexOptions.Multiline);
     private Dictionary<string, string> _scopeMacros = new(StringComparer.Ordinal);
     private NameScan? _scopeRegex;
 
-    // Object-like macro whose body is EMPTY (`#define X` with no replacement) — an annotation/marker
-    // macro that expands to nothing (calling-convention stubs, feature markers).
-    private static readonly Regex ValuelessDefine = new(
-        @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]*\r?$", RegexOptions.Compiled | RegexOptions.Multiline);
     // A macro body that is PURELY function specifier(s) — a LEADING slot (`inline`/`static` before the
     // return type, e.g. pugixml's PUGI_IMPL_FN -> inline) or a TRAILING slot (`) <here> {`, e.g.
     // PUGIXML_NOEXCEPT_IF_NOT_COMPACT -> noexcept). tree-sitter can't tell an UNDEFINED-looking macro
@@ -395,12 +388,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private NameScan? _definerUse;
     private HashSet<string> _keepMacrosFnLike = new(StringComparer.Ordinal);
     private NameScan? _keepMacroUse;
-    private static readonly Regex AnyDefine = new(
-        @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(\()?((?:[^\n\\]|\\\r?\n|\\.)*)", RegexOptions.Compiled | RegexOptions.Multiline);
     private static readonly Regex KeepBody = new(
         @"\bsection\s*\(|\b(?:used|retain|constructor|destructor|__root)\b|#\s*pragma\s+location|_Pragma\s*\(\s*""location"
         + @"|gnu::(?:used|section|retain|constructor|destructor)|__declspec\s*\(\s*allocate", RegexOptions.Compiled);
-    private static readonly Regex FuncLikeDefine = new(@"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(", RegexOptions.Compiled | RegexOptions.Multiline);
 
     /// <summary>
     /// Local <c>#include</c>d files with a non-source extension (<c>.inc</c>/<c>.def</c>/generated tables)
@@ -536,7 +526,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var functionsByName = new Dictionary<string, List<NodeId>>(StringComparer.Ordinal);
         var macrosByName = new Dictionary<string, List<NodeId>>(StringComparer.Ordinal);
         var globalsByName = new Dictionary<string, List<NodeId>>(StringComparer.Ordinal);
-        var namePool = new Dictionary<string, string>(StringComparer.Ordinal);   // one string per distinct name (RB2)
+        var namePool = new CodeCarver.Core.Util.NamePool();   // one string per distinct name (RB2)
         var pendingCalls = new UseList(namePool);
         var pendingRefs = new UseList(namePool);
         var pendingMacroRefs = new UseList(namePool);
@@ -853,11 +843,21 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // same, from a section named by an identifier. One look at every macro's bodies (on several threads) finds the
         // seeds and the other macros each body names; the closure then walks from the seeds to the macros that use them.
         var entries = bodies.ToList();
+        var macroNames = new CodeCarver.Core.Util.NameSet(bodies.Keys);
+        string[] UsesOf(string name, List<string> list)
+        {
+            List<string>? uses = null;
+            foreach (var b in list)
+                foreach (var (start, end) in CodeCarver.Core.Util.CodeTokens.Names(b))
+                    // Most bodies name few macros: a list is the cheaper set, until it isn't.
+                    if (macroNames.Find(b.AsSpan(start, end - start)) is { } id && id != name && !(uses?.Count <= 16 && uses.Contains(id)))
+                        (uses ??= new List<string>()).Add(id);
+            return uses is null ? Array.Empty<string>() : uses.Count <= 16 ? uses.ToArray() : uses.Distinct(StringComparer.Ordinal).ToArray();
+        }
         var looked = CodeCarver.Core.Util.ReadAhead.Each(entries, kv => (
             Keep: kv.Value.Bodies.Any(b => KeepBody.IsMatch(b)),
             Register: kv.Value.Bodies.Any(b => IdentifierSection.IsMatch(b)),
-            Uses: kv.Value.Bodies.SelectMany(b => Identifier.Matches(b).Select(m => m.Value))
-                                 .Where(id => id != kv.Key && bodies.ContainsKey(id)).Distinct(StringComparer.Ordinal).ToArray()));
+            Uses: UsesOf(kv.Key, kv.Value.Bodies)));
         var keep = new HashSet<string>(StringComparer.Ordinal);
         var register = new HashSet<string>(StringComparer.Ordinal);
         for (var i = 0; i < entries.Count; i++)
@@ -897,6 +897,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 if (kv.Value.Bodies.All(b => !CallInBody.IsMatch(b))) _callFreeMacros.Add(kv.Key);
                 continue;
             }
+            if (kv.Value.Bodies.Count < 2) continue;   // needs a body that is `extern` and one that is empty
             var forms = kv.Value.Bodies.Select(b => CommentOrSpace.Replace(b, "")).ToList();
             if (!forms.Contains("extern") || !forms.Contains("")) continue;
             _condExternMacros.Add(kv.Key);
@@ -983,15 +984,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             foreach (Match m in AsmLabelDecl.Matches(text)) f.Renamed.Add((m.Groups["name"].Value, m.Groups["sym"].Value));
         if (text.Contains("redefine_extname", StringComparison.Ordinal))
             foreach (Match m in RedefineExtname.Matches(text)) f.Renamed.Add((m.Groups["name"].Value, m.Groups["sym"].Value));
-        foreach (Match m in ObjectLikeDefine.Matches(text))
-            f.Objects.Add((m.Groups[1].Value, Regex.Replace(m.Groups[2].Value, @"\\\r?\n", " ").Replace("\r", " ").Replace("\n", " ").Trim()));
-        foreach (Match m in ValuelessDefine.Matches(text)) f.Valueless.Add(m.Groups[1].Value);
-        foreach (Match m in FuncLikeDefine.Matches(text)) f.FnLike.Add(m.Groups[1].Value);
-        if (text.Contains("define", StringComparison.Ordinal))
-        {
-            foreach (Match m in AnyDefine.Matches(text)) f.Defines.Add((m.Groups[1].Value, m.Groups[2].Success, m.Groups[3].Value));
-            if (text.Contains("extern", StringComparison.Ordinal)) f.EmptyDefines = EmptyDefineConditions(text);
-        }
+        var defines = text.Contains("define", StringComparison.Ordinal);
+        DefineLines.Scan(text, f.Objects, f.Valueless, f.FnLike, defines ? f.Defines : null);
+        if (defines && text.Contains("extern", StringComparison.Ordinal)) f.EmptyDefines = EmptyDefineConditions(text);
         return f;
     }
 
@@ -1029,24 +1024,35 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private string ExpandScopeMacros(string text)
     {
         if (_scopeRegex is null && _blankRegex is null) return text;
-        var lines = text.Split('\n');
-        var sb = new StringBuilder(text.Length + 128);
-        for (var i = 0; i < lines.Length; i++)
+        // Line by line, each line's text copied only when it changes: most lines don't, and a copy of every file
+        // (its lines, then the whole again) was the bulk of what this allocated.
+        StringBuilder? sb = null;
+        var copied = 0;   // text before here is in sb
+        for (var start = 0; ; )
         {
-            var line = lines[i];
-            if (!line.TrimStart().StartsWith('#'))
+            var end = text.IndexOf('\n', start);
+            if (end < 0) end = text.Length;
+            var k = start;
+            while (k < end && char.IsWhiteSpace(text[k])) k++;
+            if (k == end || text[k] != '#')
             {
-                if (_scopeRegex is not null)
-                    line = _scopeRegex.Replace(line, mm => _scopeMacros.TryGetValue(mm.Name, out var r) ? r : mm.Name);
+                string? line = null;
+                if (_scopeRegex is not null && _scopeRegex.IsMatch(text, start, end))
+                    line = _scopeRegex.Replace(text.Substring(start, end - start), mm => _scopeMacros.TryGetValue(mm.Name, out var r) ? r : mm.Name);
                 // Blank specifier/empty macros with equal-length spaces so LINE and COLUMN still map to the
                 // original text the emitter reads (the token is on the same line as the function signature).
-                if (_blankRegex is not null)
-                    line = _blankRegex.Replace(line, mm => new string(' ', mm.Length));
+                if (_blankRegex is not null && (line is not null || _blankRegex.IsMatch(text, start, end)))
+                    line = _blankRegex.Replace(line ?? text.Substring(start, end - start), mm => new string(' ', mm.Length));
+                if (line is not null)
+                {
+                    (sb ??= new StringBuilder(text.Length + 128)).Append(text, copied, start - copied).Append(line);
+                    copied = end;
+                }
             }
-            sb.Append(line);
-            if (i < lines.Length - 1) sb.Append('\n');
+            if (end == text.Length) break;
+            start = end + 1;
         }
-        return sb.ToString();
+        return sb is null ? text : sb.Append(text, copied, text.Length - copied).ToString();
     }
 
     // Worker stack for the budgeted parse. A `new Thread(start)` gets .NET's DEFAULT ~1MB stack — much
@@ -1747,7 +1753,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         public FileWork()
         {
-            var pool = new Dictionary<string, string>(StringComparer.Ordinal);
+            var pool = new CodeCarver.Core.Util.NamePool();
             Calls = new UseList(pool); Refs = new UseList(pool); MacroRefs = new UseList(pool);
         }
 
@@ -1964,8 +1970,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(mid, fileNode, EdgeKind.DefinedIn);
                 Add(macrosByName, name, mid);
                 var defineText = Up(node)?.Text ?? "";
-                foreach (var id in MacroBodyIdentifiers(defineText))
-                    pendingMacroRefs.Add((mid, id));
+                foreach (var (start, end) in MacroBodyIdentifiers(defineText))
+                    pendingMacroRefs.Add(mid, defineText, start, end);
                 foreach (var paste in ExtractMacroPastes(defineText))
                     pendingPastes.Add((mid, paste.Kind, paste.Frag));
                 foreach (var built in PasteMacros.BodyNames(_pasteTable, name))
@@ -2551,7 +2557,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <summary>The identifiers appearing in a macro's replacement body — used to reach functions/macros
     /// invoked only through the macro. Skips the <c>#define</c>, the macro name, and (for function-like
     /// macros) the parameter list; parameter names and unrelated tokens simply resolve to nothing.</summary>
-    private static IEnumerable<string> MacroBodyIdentifiers(string defineText)
+    private static IEnumerable<(int Start, int End)> MacroBodyIdentifiers(string defineText)
     {
         var s = defineText;
         var i = s.IndexOf('#');
@@ -2577,7 +2583,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             {
                 var start = i;
                 while (i < s.Length && (char.IsLetterOrDigit(s[i]) || s[i] == '_')) i++;
-                yield return s[start..i];
+                yield return (start, i);
             }
             else i++;
         }
@@ -2594,7 +2600,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     {
         var s = defineText;
         var i = s.IndexOf('#');
-        if (i < 0) yield break;
+        if (i < 0 || s.IndexOf("##", i, StringComparison.Ordinal) < 0) yield break;   // no paste: nearly every define
         i++;
         while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
         while (i < s.Length && !char.IsWhiteSpace(s[i])) i++;   // skip "define"

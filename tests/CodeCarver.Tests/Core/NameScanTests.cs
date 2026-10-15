@@ -50,6 +50,25 @@ public sealed class NameScanTests
         }
     }
 
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public void RangeMatches_AreTheSubstrings(NameScan.Shape shape, string[] names)
+    {
+        var scan = new NameScan(names, shape);
+        var r = new Random(11);
+        for (var t = 0; t < 3000; t++)
+        {
+            var text = RandomText(r, r.Next(1, 40));
+            var start = r.Next(text.Length + 1);
+            var end = start + r.Next(text.Length - start + 1);
+            var part = text[start..end];
+            var want = scan.Matches(part).Select(m => (start + m.Index, m.Length, m.Name)).ToList();
+            var got = scan.Matches(text, start, end).Select(m => (m.Index, m.Length, m.Name)).ToList();
+            Assert.True(want.SequenceEqual(got), $"{shape} on [{Regex.Escape(text)}] {start}..{end}");
+            Assert.Equal(scan.IsMatch(part), scan.IsMatch(text, start, end));
+        }
+    }
+
     [Fact]
     public void ManyNames_TakeOnePass()
     {
