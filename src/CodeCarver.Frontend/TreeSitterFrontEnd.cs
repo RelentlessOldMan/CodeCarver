@@ -1212,7 +1212,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         public ScopeIndex(Query query, TsNode root)
         {
             var list = new List<(int S, int E, byte K)>();
-            foreach (var cap in query.Execute(root).Captures)
+            using (var qc = query.Execute(root)) foreach (var cap in qc.Captures)
             {
                 var n = cap.Node;
                 switch (cap.Name)
@@ -1272,7 +1272,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private Dictionary<string, List<(int From, int To)>> CollectLocals(TsNode root, ScopeIndex scopes)
     {
         var r = new Dictionary<string, List<(int, int)>>(StringComparer.Ordinal);
-        foreach (var cap in _locals.Execute(root).Captures)
+        using (var qc = _locals.Execute(root)) foreach (var cap in qc.Captures)
         {
             var n = cap.Node;
             var at = n.StartIndex;
@@ -1901,7 +1901,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         if (PerFileSymbolBudget > 0 && text.Length >= (long)PerFileSymbolBudget * 2)
         {
             var lines = text.Split('\n');
-            var symbols = CountCaptures(_defs, root) + _globals.Execute(root).Captures.Count(c => MintedGlobal(c.Node, path, lines, out _, out _, out _) is not null);
+            var symbols = CountCaptures(_defs, root) + CountCaptures(_globals, root, c => MintedGlobal(c.Node, path, lines, out _, out _, out _) is not null);
             if (symbols > PerFileSymbolBudget)
             {
                 w.BudgetSymbols = symbols;
@@ -1932,7 +1932,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         // Pass 1: definitions. A "function" capture is any callable (free function or method); anything
         // else that isn't a macro is treated as a type (class/struct/enum/namespace/typedef).
-        foreach (var cap in _defs.Execute(root).Captures)
+        using (var qc = _defs.Execute(root)) foreach (var cap in qc.Captures)
         {
             var node = cap.Node;
             if (IsDead(node)) continue;
@@ -2089,7 +2089,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // carved tree fails to link. Span = the whole declaration, so a big lookup table can be removed wholesale
         // when nothing reachable references it. An `extern` without initializer only declares; a file-scope
         // `static` is its translation unit's own.
-        foreach (var cap in _globals.Execute(root).Captures)
+        using (var qc = _globals.Execute(root)) foreach (var cap in qc.Captures)
         {
             var decl = cap.Node;
             if (IsDead(decl)) continue;
@@ -2306,7 +2306,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         // Pass 3: direct calls, attributed to the enclosing function by span.
         var calleePositions = new HashSet<(int, int)>();
-        foreach (var cap in _calls.Execute(root).Captures)
+        using (var qc = _calls.Execute(root)) foreach (var cap in qc.Captures)
         {
             // Each Node property is a native call: read position and text once (millions of captures on a big tree).
             var node = cap.Node;
@@ -2363,7 +2363,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // avoids a costly ancestor walk per file-scope identifier in the common (clean-parse) case.
         var treeHasError = root.HasError;
         var locals = CollectLocals(root, scopes);
-        foreach (var cap in _idents.Execute(root).Captures)
+        using (var qc = _idents.Execute(root)) foreach (var cap in qc.Captures)
         {
             var node = cap.Node;
             var sp = node.StartPosition;
@@ -2394,7 +2394,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // the file node so keeping the file keeps everything its initializers point at. For a whole
         // initializer_list we scan its span (catching #if-split entries); single `= fn` values match
         // the @ref patterns directly.
-        foreach (var cap in _initRefs.Execute(root).Captures)
+        using (var qc = _initRefs.Execute(root)) foreach (var cap in qc.Captures)
         {
             if (IsDead(cap.Node)) continue;
             var startRow = cap.Node.StartPosition.Row + 1;
@@ -2435,10 +2435,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <summary>Count a query's captures over the tree WITHOUT materializing them — used by the per-file
     /// symbol budget to decide keep-whole before any node is allocated. Enumeration only (no list), so the
     /// gate never itself allocates the explosion it exists to prevent.</summary>
-    private static int CountCaptures(Query q, TsNode root)
+    // Every QueryCursor is disposed when its captures are read: one left to the finalizer holds its native buffers
+    // until the finalizer thread gets to it, and over a big tree they piled up by the thousand.
+    private static int CountCaptures(Query q, TsNode root, Func<QueryCapture, bool>? which = null)
     {
         var n = 0;
-        foreach (var _ in q.Execute(root).Captures) n++;
+        using (var qc = q.Execute(root)) foreach (var c in qc.Captures) if (which is null || which(c)) n++;
         return n;
     }
 

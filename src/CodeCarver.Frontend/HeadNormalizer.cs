@@ -26,6 +26,9 @@ namespace CodeCarver.Frontend;
 public static class HeadNormalizer
 {
     private static readonly Regex Tok = new(@"[A-Za-z_]\w*|\d\w*|\S", RegexOptions.CultureInvariant);
+
+    // A one-character token's text, shared: most tokens are punctuation.
+    private static readonly string[] OneChar = Enumerable.Range(0, 128).Select(c => ((char)c).ToString()).ToArray();
     private static readonly Regex AllCaps = new(@"^[A-Z][A-Z0-9_]*$", RegexOptions.CultureInvariant);
     private static readonly Regex Wrapper = new(@"^_*[A-Z][A-Z0-9_]*$", RegexOptions.CultureInvariant);
 
@@ -53,8 +56,11 @@ public static class HeadNormalizer
         removed = "";
         if (text.IndexOf('(') < 0 || text.IndexOf('{') < 0) return text;
         var code = ImplicitInt.CodeOnly(text);
+        // Every token of the file: matched without a Match object each (MatchCollection keeps them all, with their
+        // group arrays - ~600 bytes a token, gigabytes on a big file), and punctuation not copied.
         var toks = new List<(int Pos, string S)>();
-        foreach (Match m in Tok.Matches(code)) toks.Add((m.Index, m.Value));
+        foreach (var m in Tok.EnumerateMatches(code))
+            toks.Add((m.Index, m.Length == 1 && code[m.Index] < 128 ? OneChar[code[m.Index]] : code.Substring(m.Index, m.Length)));
         if (toks.Count == 0) return text;
 
         var blank = new List<(int Start, int End)>();   // [Start, End) ranges of the ORIGINAL text to blank

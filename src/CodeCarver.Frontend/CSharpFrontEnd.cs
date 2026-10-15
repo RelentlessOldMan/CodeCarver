@@ -108,7 +108,7 @@ public sealed class CSharpFrontEnd : ICarveFrontEnd
 
         var methodSpans = new List<(int Start, int End, NodeId Id)>();
 
-        foreach (var cap in _defs.Execute(root).Captures)
+        using (var qc = _defs.Execute(root)) foreach (var cap in qc.Captures)
         {
             var node = cap.Node;
             var row = node.StartPosition.Row + 1;
@@ -134,14 +134,14 @@ public sealed class CSharpFrontEnd : ICarveFrontEnd
 
         // Everything this file names, wherever it appears — the file compiles whole.
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var cap in _idents.Execute(root).Captures)
+        using (var qc = _idents.Execute(root)) foreach (var cap in qc.Captures)
             if (seen.Add(cap.Node.Text)) fileRefs.Add((fileNode, cap.Node.Text));
 
         // Top-level statements (C# 9 program without Main): the file is the entry point.
         foreach (var child in root.NamedChildren)
             if (child.Type == "global_statement") { graph.AddFlag(fileNode, NodeFlags.Keep); break; }
 
-        foreach (var cap in _calls.Execute(root).Captures)
+        using (var qc = _calls.Execute(root)) foreach (var cap in qc.Captures)
         {
             var from = Enclosing(methodSpans, cap.Node.StartPosition.Row + 1);
             if (from is { } f)
