@@ -147,11 +147,13 @@ public static class EmittedLinkCheck
                 if (stats.TryGetValue(k, out var v)) report?.Invoke(k, v);
         }
         long filesRead = 0, fromCache = 0, instancesRedone = 0;
+        var scanGate = new CodeCarver.Core.Util.ByteGate(ScanBudget());   // see Gated
         LinkCheckResult Done(IReadOnlyList<LinkViolation> v)
         {
             Lap("rest");
             stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["instancesRedone"] = instancesRedone;
-            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone" }) report?.Invoke(k, stats[k]);
+            stats["scanWaits"] = scanGate.Waits;
+            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits" }) report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
         if (cache is not null && !cache.Matches(maxBytes, definerMacros, commandLineMacros, c99InlineFns)) cache = null;
@@ -170,6 +172,16 @@ public static class EmittedLinkCheck
         var headerText = new Dictionary<string, string>(StringComparer.Ordinal);
         var templates = new HashSet<string>(StringComparer.Ordinal);
         var budget = HeaderTextBudget();
+        // The loops below scan up to ReadAhead.Window files at once (on a network drive each read waits a round trip), and
+        // a scan holds about 30 times its file's size while it runs: 64 register headers of a few MB each held over 7 GB.
+        // So a file waits until the bytes being scanned fit ScanBudget (scanGate); small files never wait.
+        R Gated<R>(string path, Func<R> scan)
+        {
+            long size;
+            try { size = new FileInfo(path).Length; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { size = 0; }
+            using (scanGate.Take(size)) return scan();
+        }
         (HeaderInfo? Info, string? Text) ReadDirectives(string p)
         {
             Interlocked.Increment(ref filesRead);
@@ -243,7 +255,7 @@ public static class EmittedLinkCheck
             var headerPaths = byBase.Values.SelectMany(ps => ps).Where(p => IsHeader(p)).ToList();
             // Each loop counts on its own, named (the heartbeat and a stop say which one a run is in).
             Activity.Begin("check: headers read", headerPaths.Count);
-            foreach (var (i, h) in ReadAhead.Ordered(headerPaths, PrepareHeader)) StoreHeader(headerPaths[i], h);
+            foreach (var (i, h) in ReadAhead.Ordered(headerPaths, p => Gated(p, () => PrepareHeader(p)))) StoreHeader(headerPaths[i], h);
             lock (headerInfo) anyTemplate = templates.Count > 0;
         }
         Lap("headers");
@@ -356,7 +368,7 @@ public static class EmittedLinkCheck
         }
         var droppedSorted = droppedList.OrderBy(d => d.Rel, StringComparer.Ordinal).ToList();
         Activity.Begin("check: dropped files scanned", droppedSorted.Count);
-        foreach (var (di, dscan) in ReadAhead.Ordered(droppedSorted, ScanDropped))
+        foreach (var (di, dscan) in ReadAhead.Ordered(droppedSorted, d => Gated(d.Path, () => ScanDropped(d))))
         {
             var rel = droppedSorted[di].Rel;
             if (dscan is null) { skipped++; continue; }
@@ -404,7 +416,7 @@ public static class EmittedLinkCheck
         if (original is not null)
         {
             Activity.Begin("check: emitted files compared with their originals", emittedList.Count);
-            foreach (var (pi, gone) in ReadAhead.Ordered(emittedList, Pruned))
+            foreach (var (pi, gone) in ReadAhead.Ordered(emittedList, e => Gated(e.Path, () => Pruned(e))))
             {
                 var rel = emittedList[pi].Rel;
                 if (gone is null) continue;
@@ -465,7 +477,7 @@ public static class EmittedLinkCheck
         }
         var emittedSorted = emittedList.OrderBy(e => e.Rel, StringComparer.Ordinal).ToList();
         Activity.Begin("check: emitted files scanned", emittedSorted.Count);
-        foreach (var (ei, scanned) in ReadAhead.Ordered(emittedSorted, ScanEmitted))
+        foreach (var (ei, scanned) in ReadAhead.Ordered(emittedSorted, e => Gated(e.Path, () => ScanEmitted(e))))
         {
             var rel = emittedSorted[ei].Rel;
             if (scanned is not { } got) { skipped++; continue; }
@@ -612,6 +624,16 @@ public static class EmittedLinkCheck
             return mb * 1024 * 1024 / sizeof(char);
         var total = CodeCarver.Core.Util.MemoryGate.MachineBytes();
         return (total > 0 ? total / 32 : 512L << 20) / sizeof(char);
+    }
+
+    /// <summary>Bytes of files the check scans at once: a 512th of the machine's memory (64 MB of 32 GB, about 2 GB while
+    /// scanning), at least 16 MB, or CODECARVER_CHECK_SCAN_MB.</summary>
+    static long ScanBudget()
+    {
+        if (long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_CHECK_SCAN_MB"), out var mb) && mb > 0)
+            return mb * 1024 * 1024;
+        var total = CodeCarver.Core.Util.MemoryGate.MachineBytes();
+        return Math.Max(16L << 20, total > 0 ? total / 512 : 64L << 20);
     }
 
     static ulong ContentHash(string s)

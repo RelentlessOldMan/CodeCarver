@@ -17,7 +17,9 @@ public static class MacroBodies
         var raw = new List<(string Name, string Body)>();
         foreach (var (name, (fnLike, list)) in bodies)
             if (fnLike) foreach (var b in list) raw.Add((name, b));
-        var split = Util.ReadAhead.Each(raw, r => Split(r.Body));
+        // Not a file loop: counted files would count every macro (a link check showed 1,420,390 of 4,655 files).
+        var split = new (List<string> Params, List<string> Tokens)?[raw.Count];
+        Util.ReadAhead.For(raw.Count, i => split[i] = Split(raw[i].Body));
         var parsed = new List<(string, List<string>, List<string>)>(raw.Count);
         for (var i = 0; i < raw.Count; i++)
             if (split[i] is { } s) parsed.Add((raw[i].Name, s.Params, s.Tokens));
