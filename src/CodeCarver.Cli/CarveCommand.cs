@@ -1623,15 +1623,30 @@ public static class CarveCommand
             // behind it, and only a few stayed in flight on the share.
             // Handed out one at a time in that order (a list is otherwise split into ranges up front).
             CodeCarver.Core.Util.ReadAhead.EnsureThreads();
-            long slowestMs = 0, slowestBytes = 0, unreadable = 0;
+            long slowestMs = 0, slowestBytes = 0, unreadable = 0, fromCache = 0, fromCacheBytes = 0;
+            // What the last run read from these headers, for the ones unchanged since (size and last-write time): a
+            // rerun over the same tree reads none of them again. Kept beside the stage outputs, which a run replaces.
+            var cachePath = Path.Combine(outputFull, CacheDirName, "unparsed-headers.bin");
+            var cache = cv.UnparsedHeaderCache && unparsedToRead.Count > 0 ? new CodeCarver.Core.Preprocess.DefinedNameCache(cachePath, condIdents) : null;
             Parallel.ForEach(System.Collections.Concurrent.Partitioner.Create(unparsedToRead, System.Collections.Concurrent.EnumerablePartitionerOptions.NoBuffering),
                 new ParallelOptions { MaxDegreeOfParallelism = CodeCarver.Core.Util.ReadAhead.Window }, rel =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var names = definedScan.Read(fullByRel[rel]);
+                long size = -1, ticks = -1;
+                if (cache is not null)
+                    try { var fi = new FileInfo(fullByRel[rel]); size = fi.Length; ticks = fi.LastWriteTimeUtc.Ticks; }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { size = -1; }
+                var names = size >= 0 ? cache!.TryGet(rel, size, ticks) : null;
+                var cached = names is not null;
+                if (!cached)
+                {
+                    names = definedScan.Read(fullByRel[rel]);
+                    if (names is not null && size >= 0) cache!.Put(rel, size, ticks, names);
+                }
                 var ms = sw.ElapsedMilliseconds;
                 lock (ambientMacros)
                 {
+                    if (cached) { fromCache++; fromCacheBytes += SizeOf(rel); }
                     ambientMacros.UnionWith(names ?? (IEnumerable<string>)condIdents);
                     if (names is null) unreadable++;
                     if (ms > slowestMs) { slowestMs = ms; slowestBytes = SizeOf(rel); }
@@ -1643,6 +1658,12 @@ public static class CarveCommand
             summary["world.unparsedHeadersUnreadable"] = unreadable;
             summary["world.unparsedHeadersSlowestMs"] = slowestMs;
             summary["world.unparsedHeadersSlowestBytes"] = slowestBytes;
+            summary["world.unparsedHeadersFromCache"] = fromCache;
+            summary["world.unparsedHeadersFromCacheBytes"] = fromCacheBytes;
+            if (fromCache > 0)
+                err.WriteLine($"  config  : {fromCache:N0} of {unparsedToRead.Count:N0} unparsed header(s) unchanged since the last run -> names reused, not read ({fromCacheBytes / (1024 * 1024):N0} MB)");
+            if (cache is not null && !cache.Save(cachePath))
+                err.WriteLine($"  warn    : could not write the unparsed-header cache '{cachePath}' (the next run reads them all again)");
             PreParsePart("unparsedHeaders");
             err.WriteLine($"  config  : {ambientMacros.Count:N0} macro name(s) #defined in the tree stay unknown unless the build defines them");
             summary["world.ambientMacros"] = ambientMacros.Count;
@@ -3312,6 +3333,9 @@ public static class CarveCommand
     /// distance ≤ 2 among names of similar length.</summary>
     /// <summary>Deletes what an earlier check round wrote that this round did not, so the stage tree is the one a fresh
     /// emit writes. A larger plan writes the same files and more, so this is rarely anything.</summary>
+    /// <summary>Under outputDirectory: what one run keeps for the next (see [advanced] unparsedHeaderCache).</summary>
+    internal const string CacheDirName = ".codecarver-cache";
+
     /// <summary>Where a run stopped by memoryStopMb leaves its numbers: under outputDirectory/codecarver/.</summary>
     public const string StoppedSummaryFile = "stopped-summary.txt";
 

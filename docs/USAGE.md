@@ -169,6 +169,7 @@ A stage may also set `stubUnexecuted = true` (with `carveSourceFileContents = tr
 | `pathMap = [{ from = "/build/agent/repo", to = "." }]` | none | rewrites a path prefix captured elsewhere (CI agent, other drive, WSL vs Windows) onto the carve root. `to` is relative to the carve root. Applies to trace paths and to compile commands (directory, file, `-I`, response files) |
 | `allowUnmatchedTraces = true` | `false` | a file trace with no path under the carve root becomes a warning instead of exit 2 |
 | `memoryStopMb = 20000` | none | stop the run when its private memory passes this many MB: it writes `<outputDirectory>/codecarver/stopped-summary.txt` (the summary so far, plus `stop.*` keys) and exits 4. `0` or unset: never stop |
+| `unparsedHeaderCache = false` | `true` | read the big and dense headers the parser skips on every run. By default a run keeps the `#if`-tested names each one defines in `<outputDirectory>/.codecarver-cache/`, and the next run reuses them for every such header whose size and last-write time are unchanged (`world.unparsedHeadersFromCache`, `world.unparsedHeadersFromCacheBytes`) instead of reading it again |
 | `pruneGarbage = false` | `true` | keep every non-input too (VCS metadata, IDE scratch, logs, editor backups, make `.d` dependency files) |
 
 Integer keys are range-checked: a negative or oversized value is a config error (exit 2).
@@ -214,6 +215,7 @@ typo'd path can't silently carve with less config than intended.
     warnings.txt           every repeated warning in full (the console shows the first 20 per category); names paths
     summary.txt / .json    numbers only — no path, file name or symbol
   .codecarver-output       marker: this directory was written by CodeCarver
+  .codecarver-cache/       what one run keeps for the next (see [advanced] unparsedHeaderCache); safe to delete
 ```
 
 With `analysisOnly = true` there is no `carved/` and no `resolved-config.toml`; the other reports are written
