@@ -27,6 +27,12 @@
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <GarbageCollectionAdaptationMode>1</GarbageCollectionAdaptationMode>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- Most of a run's peak was room the GC kept, not data (one compaction after the graph build: 2.0 -> 1.08 GB).
+         ConserveMemory has it compact the old generation sooner: a macro-heavy tree's peak 2.0 -> 1.7 GB. Written into
+         the runtimeconfig, so every run has it; DOTNET_GCConserveMemory still overrides (0 = off). -->
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="7" />
+  </ItemGroup>
 
   <!-- The git version stamp (1.0.<count>+<sha>[-dirty]) is the StampGitSha target in Directory.Build.targets,
        so Core and Frontend carry the same version as this CLI. -->
