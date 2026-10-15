@@ -144,4 +144,41 @@ public sealed class StreamingCheckTests
             try { Directory.Delete(root, true); } catch { }
         }
     }
+
+    [Fact]
+    public void LinkCheck_TemplateWalk_SkippedOnlyWhereItCanFindNothing()
+    {
+        // gone.c reaches the template t.h only round an include cycle (a.h <-> b.h, b.h -> t.h); split.c has its own
+        // head, split from its brace by an #if, with the macro from cfg.h; plain.c includes only cfg.h, so its walk
+        // could find nothing and is skipped.
+        var root = Path.Combine(Path.GetTempPath(), "cc-reach-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            (string, string) W(string rel, string text)
+            {
+                var p = Path.Combine(root, rel);
+                File.WriteAllText(p, text);
+                return (rel, p);
+            }
+            var emitted = new[]
+            {
+                W("cfg.h", "#define HIDE(n) hid_##n\n"),
+                W("t.h", "int HIDE(den)(void) { return 0; }\n"),
+                W("main.c", "int hid_den(void);\nint hid_cut(void);\nint main(void) { return hid_den() + hid_cut(); }\n"),
+            };
+            var dropped = new[]
+            {
+                W("a.h", "#include \"cfg.h\"\n#include \"b.h\"\n"),
+                W("b.h", "#include \"a.h\"\n#include \"t.h\"\n"),
+                W("gone.c", "#include \"a.h\"\n"),
+                W("split.c", "#include \"cfg.h\"\nint HIDE(cut)(void)\n#if 1\n#endif\n{ return 0; }\n"),
+                W("plain.c", "#include \"cfg.h\"\nint plain(void) { return 0; }\n"),
+            };
+            var r = EmittedLinkCheck.Run(emitted, dropped);
+            Assert.Equal(new[] { "hid_cut", "hid_den" }, r.Violations.Select(v => v.Name).OrderBy(n => n, StringComparer.Ordinal).ToArray());
+            Assert.Equal(1, r.Stats["templateWalksSkipped"]);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
 }

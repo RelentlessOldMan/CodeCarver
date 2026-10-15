@@ -51,6 +51,8 @@ public sealed class LinkCheckCache
     // A header's text only when it is a template (see EmittedLinkCheck.HeaderInfo): the rest are what a big tree is made of.
     internal readonly ConcurrentDictionary<string, (EmittedLinkCheck.HeaderInfo? Info, string? TemplateText)> Headers = new(StringComparer.Ordinal);
     internal readonly ConcurrentDictionary<string, EmittedLinkCheck.OriginalEntry?> Originals = new(StringComparer.Ordinal);
+    // The quoted #include names in each header (TemplateInstances.QuotedIncludeNames).
+    internal readonly ConcurrentDictionary<string, string[]> HeaderIncludes = new(StringComparer.Ordinal);
 
     private object?[]? _inputs;
 
@@ -146,14 +148,16 @@ public static class EmittedLinkCheck
                          .Concat(stats.Keys.Where(k => k.StartsWith("held.", StringComparison.Ordinal))).ToList())
                 if (stats.TryGetValue(k, out var v)) report?.Invoke(k, v);
         }
-        long filesRead = 0, fromCache = 0, instancesRedone = 0;
+        long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0;
         var scanGate = new CodeCarver.Core.Util.ByteGate(ScanBudget());   // see Gated
         LinkCheckResult Done(IReadOnlyList<LinkViolation> v)
         {
             Lap("rest");
             stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["instancesRedone"] = instancesRedone;
             stats["scanWaits"] = scanGate.Waits;
-            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits" }) report?.Invoke(k, stats[k]);
+            stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped;
+            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "templateWalks", "templateWalksSkipped" })
+                report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
         if (cache is not null && !cache.Matches(maxBytes, definerMacros, commandLineMacros, c99InlineFns)) cache = null;
@@ -192,12 +196,25 @@ public static class EmittedLinkCheck
             if (!template) t = CodeCarver.Core.Preprocess.TemplateInstances.DirectivesOnly(t);
             return (new HeaderInfo(template, t.Length, ContentHash(t)), t);
         }
+        // The quoted #include names in each header looked at: which headers can bring a template in (reachTemplate).
+        var headerIncludes = new ConcurrentDictionary<string, string[]>(StringComparer.Ordinal);
         (HeaderInfo? Info, string? Text) PrepareHeader(string p)
         {
             var cached = Cached(p);
-            if (cached && cache!.Headers.TryGetValue(p, out var hit)) { Interlocked.Increment(ref fromCache); return (hit.Info, hit.TemplateText); }
+            if (cached && cache!.Headers.TryGetValue(p, out var hit) && cache.HeaderIncludes.TryGetValue(p, out var had))
+            {
+                Interlocked.Increment(ref fromCache);
+                headerIncludes[p] = had;
+                return (hit.Info, hit.TemplateText);
+            }
             var h = ReadDirectives(p);
-            if (cached) h = cache!.Headers.GetOrAdd(p, (h.Info, h.Info is { Template: true } ? h.Text : null));
+            var includes = h.Text is null ? Array.Empty<string>() : CodeCarver.Core.Preprocess.TemplateInstances.QuotedIncludeNames(h.Text);
+            headerIncludes[p] = includes;
+            if (cached)
+            {
+                h = cache!.Headers.GetOrAdd(p, (h.Info, h.Info is { Template: true } ? h.Text : null));
+                cache.HeaderIncludes.TryAdd(p, includes);
+            }
             return h;
         }
         // The first look at a header stays its answer for the run. Returns the text when there is one in hand.
@@ -258,6 +275,37 @@ public static class EmittedLinkCheck
             foreach (var (i, h) in ReadAhead.Ordered(headerPaths, p => Gated(p, () => PrepareHeader(p)))) StoreHeader(headerPaths[i], h);
             lock (headerInfo) anyTemplate = templates.Count > 0;
         }
+        // The headers whose #include closure (as the walk follows it: quoted names, each to its Chosen header) holds a
+        // template: walked back from the templates, so a cycle of includes is no trouble. A unit with no head of its own
+        // that includes none of them finds nothing in a walk (any other header gives the walk only directives).
+        var reachTemplate = new HashSet<string>(StringComparer.Ordinal);
+        if (anyTemplate)
+        {
+            var includedBy = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            var seen = new HashSet<string>(headerIncludes.Keys, StringComparer.Ordinal);
+            var todo = new Queue<string>(seen);
+            while (todo.TryDequeue(out var p))
+                foreach (var raw in headerIncludes.TryGetValue(p, out var incs) ? incs : Array.Empty<string>())
+                    if (Chosen(raw) is { } q)   // a file not looked at yet (an included .inc) is looked at here
+                    {
+                        if (!includedBy.TryGetValue(q, out var by)) includedBy[q] = by = new List<string>();
+                        by.Add(p);
+                        if (seen.Add(q)) todo.Enqueue(q);
+                    }
+            List<string> seeds;
+            lock (headerInfo) seeds = templates.ToList();
+            var back = new Queue<string>(seeds);
+            reachTemplate.UnionWith(seeds);
+            while (back.TryDequeue(out var q))
+                if (includedBy.TryGetValue(q, out var by))
+                    foreach (var p in by)
+                        if (reachTemplate.Add(p)) back.Enqueue(p);
+        }
+        bool ReachesTemplate(string[] includes)
+        {
+            foreach (var raw in includes) if (Chosen(raw) is { } q && reachTemplate.Contains(q)) return true;
+            return false;
+        }
         Lap("headers");
         bool AnyTemplate() => anyTemplate;
         var cmdFnMacros = CodeCarver.Core.Preprocess.CommandLineMacros.AnyFunctionLike(commandLineMacros);
@@ -269,22 +317,34 @@ public static class EmittedLinkCheck
             var r = new List<Definition>();
             if (TemplateGate(text.Contains("include", StringComparison.Ordinal),
                              CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(text),
-                             text.Contains("define", StringComparison.Ordinal)))
+                             text.Contains("define", StringComparison.Ordinal),
+                             () => CodeCarver.Core.Preprocess.TemplateInstances.MayHaveMacroNamedHead(text),
+                             () => CodeCarver.Core.Preprocess.TemplateInstances.QuotedIncludeNames(text)))
                 r.AddRange(TemplateDefs(text, null));
             r.AddRange(C99Defs(text));
             return r;
         }
-        bool TemplateGate(bool hasInclude, bool macroHead, bool hasDefine)
-            => (hasInclude && AnyTemplate()) || (macroHead && (cmdFnMacros || hasDefine));
+        // An include walk is skipped when it can find nothing: no head in the unit, no template its includes bring in.
+        bool TemplateGate(bool hasInclude, bool macroHead, bool hasDefine, Func<bool> mayHead, Func<string[]> includes)
+        {
+            if (macroHead && (cmdFnMacros || hasDefine)) return true;
+            if (!hasInclude || !AnyTemplate()) return false;
+            if (mayHead() || ReachesTemplate(includes())) return true;
+            Interlocked.Increment(ref templateWalksSkipped);
+            return false;
+        }
         // deps: each include the walk read and what its text hashed to, so a later run can tell whether the answer still holds.
         List<Definition> TemplateDefs(string text, List<(string Raw, HeaderInfo? Read)>? deps)
-            => CodeCarver.Core.Preprocess.TemplateInstances.Find(text, raw =>
+        {
+            Interlocked.Increment(ref templateWalks);
+            return CodeCarver.Core.Preprocess.TemplateInstances.Find(text, raw =>
                    {
                        var t = ReadTemplate(raw);
                        deps?.Add((raw, TemplateKey(raw)));
                        return t;
                    }, commandLineMacros)
                    .Select(i => new Definition(i.Name, i.Line, false, false)).ToList();
+        }
         List<Definition> C99Defs(string text)
         {
             if (c99InlineFns is not { Count: > 0 }) return new List<Definition>();
@@ -334,6 +394,8 @@ public static class EmittedLinkCheck
                         HasInclude = text.Contains("include", StringComparison.Ordinal),
                         MacroHead = CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(text),
                         HasDefine = text.Contains("define", StringComparison.Ordinal),
+                        MayHead = CodeCarver.Core.Preprocess.TemplateInstances.MayHaveMacroNamedHead(text),
+                        Includes = CodeCarver.Core.Preprocess.TemplateInstances.QuotedIncludeNames(text),
                         C99 = plain ? new List<Definition>() : C99Defs(text),
                     };
                 }
@@ -341,7 +403,7 @@ public static class EmittedLinkCheck
             }
             if (e is null) return null;
             var templateDefs = new List<Definition>();
-            if (!plain && TemplateGate(e.HasInclude, e.MacroHead, e.HasDefine))
+            if (!plain && TemplateGate(e.HasInclude, e.MacroHead, e.HasDefine, () => e.MayHead, () => e.Includes))
             {
                 List<(string Raw, HeaderInfo? Read)>? deps;
                 List<Definition>? had;
@@ -602,7 +664,8 @@ public static class EmittedLinkCheck
     {
         public required List<Definition> Definitions;
         public required HashSet<string> FunctionMacros;
-        public required bool HasInclude, MacroHead, HasDefine;
+        public required bool HasInclude, MacroHead, HasDefine, MayHead;
+        public required string[] Includes;
         public required List<Definition> C99;
         // The template-header names, with what the walk read to find them; under lock(this).
         public List<(string Raw, HeaderInfo? Read)>? Deps;
