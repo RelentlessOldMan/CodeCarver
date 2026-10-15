@@ -23,6 +23,15 @@ public sealed class CodeGraph
     private readonly Dictionary<int, HashSet<(int, EdgeKind)>> _edgeSets = new();
 
     public int NodeCount => _nodes.Count;
+
+    /// <summary>Room for <paramref name="nodes"/> nodes without growing: a table that doubles its way to millions of
+    /// nodes leaves every smaller copy behind on the large-object heap, which is not compacted.</summary>
+    public void EnsureCapacity(int nodes)
+    {
+        _nodes.EnsureCapacity(nodes);
+        _out.EnsureCapacity(nodes);
+        _intern.EnsureCapacity(nodes);
+    }
     public IEnumerable<Node> Nodes => _nodes;
 
     /// <summary>Interns a node by identity (kind+name+file+line). Repeated calls with the same identity

@@ -74,8 +74,59 @@ public static class IoMeter
     public static string ReadAllText(string path, Encoding? encoding)
     {
         using (Start(Kind.Read))
-        using (var r = Open(path, encoding))
-            return r.ReadToEnd();
+        {
+            var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 0, FileOptions.SequentialScan);
+            try
+            {
+                // Most of a tree is small files: they are read whole into a pooled buffer (in reads of up to 1 MB) and
+                // decoded once into the string, where a StreamReader allocates a byte buffer, a char buffer and the
+                // text twice over for every file. A large file reads through the reader as before (a pooled buffer of
+                // hundreds of MB would stay held).
+                if (fs.Length > PooledMax) return ReadToEnd(fs, encoding);
+                var buf = System.Buffers.ArrayPool<byte>.Shared.Rent((int)Math.Max(fs.Length, 1));
+                try
+                {
+                    var n = 0;
+                    for (int got; (got = fs.Read(buf, n, Math.Min(buf.Length - n, Buffer))) > 0; )
+                        if ((n += got) == buf.Length)
+                        {
+                            // The file grew since its length was taken: the reader reads the rest.
+                            if (n >= PooledMax) { fs.Position = 0; return ReadToEnd(fs, encoding); }
+                            var bigger = System.Buffers.ArrayPool<byte>.Shared.Rent(buf.Length * 2);
+                            Array.Copy(buf, bigger, n);
+                            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+                            buf = bigger;
+                        }
+                    return Decode(buf.AsSpan(0, n), encoding ?? Encoding.UTF8);
+                }
+                finally { System.Buffers.ArrayPool<byte>.Shared.Return(buf); }
+            }
+            finally { fs.Dispose(); }
+        }
+    }
+    const int PooledMax = 4 << 20;
+    static string ReadToEnd(FileStream fs, Encoding? encoding)
+    {
+        var size = (int)Math.Clamp(fs.Length, 4096, Buffer);
+        using var r = new StreamReader(fs, encoding ?? Encoding.UTF8, detectEncodingFromByteOrderMarks: true, size, leaveOpen: true);
+        return r.ReadToEnd();
+    }
+    /// <summary>The text of <paramref name="bytes"/> as a StreamReader with byte-order-mark detection reads it: a UTF-8,
+    /// UTF-16 or UTF-32 mark picks that encoding (and is not part of the text); otherwise <paramref name="fallback"/>.</summary>
+    internal static string Decode(ReadOnlySpan<byte> bytes, Encoding fallback)
+    {
+        Encoding enc; int skip;
+        // The fallback's own mark is taken first, and then nothing else is looked for (a UTF-16 mark followed by two
+        // zero bytes is UTF-16 text starting with a NUL when UTF-16 was asked for).
+        var own = fallback.Preamble;
+        if (own.Length > 0 && bytes.StartsWith(own)) (enc, skip) = (fallback, own.Length);
+        else if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) (enc, skip) = (Encoding.BigEndianUnicode, 2);
+        else if (bytes.Length >= 4 && bytes[0] == 0xFF && bytes[1] == 0xFE && bytes[2] == 0 && bytes[3] == 0) (enc, skip) = (Encoding.UTF32, 4);
+        else if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) (enc, skip) = (Encoding.Unicode, 2);
+        else if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) (enc, skip) = (Encoding.UTF8, 3);
+        else if (bytes.Length >= 4 && bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0xFE && bytes[3] == 0xFF) (enc, skip) = (new UTF32Encoding(bigEndian: true, byteOrderMark: true), 4);
+        else (enc, skip) = (fallback, 0);
+        return enc.GetString(bytes[skip..]);
     }
     public static byte[] ReadAllBytes(string path) { using (Start(Kind.Read)) return File.ReadAllBytes(path); }
     /// <summary>File.ReadLines, timed as one read from the open until the last line is taken (or the loop stops). The

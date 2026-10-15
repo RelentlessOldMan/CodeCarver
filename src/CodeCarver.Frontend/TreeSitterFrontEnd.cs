@@ -337,8 +337,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private readonly Dictionary<string, HashSet<string>> _renamedFrom = new(StringComparer.Ordinal);
     // File-scope `words NAME(args);` statements: a registration when NAME is no function or macro (decided after the parse).
     private readonly List<(NodeId File, string Macro, List<string> Names)> _wordInvocations = new();
-    // Every #define's body by name (function-like: "params) body"), at most 8 per name.
+    // Every function-like #define's "params) body" by name, at most 8 per name.
     private Dictionary<string, (bool FnLike, List<string> Bodies)> _macroBodies = new(StringComparer.Ordinal);
+    // How many #define lines the pre-pass found (to size the graph before the parse).
+    private long _defineSites;
 
     /// <summary>The definitions in the tree of function-like macro <paramref name="name"/>: parameters and body (comments
     /// blanked), or null when the tree does not define it so. For diagnostics (UseShape).</summary>
@@ -510,6 +512,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
         var (bytesTotal, filesTotal) = BuildScopeMacros(paths, read); // pre-pass: scope macros + parse work totals
         Phase("macro pre-pass");
+        // Every #define becomes a node and every file one: the graph is sized for those before the parse adds them.
+        graph.EnsureCapacity((int)Math.Min(int.MaxValue / 2, _defineSites + (long)filesTotal));
 
         var fileNodeByPath = new Dictionary<string, NodeId>(StringComparer.Ordinal);
         var pathsByBasename = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
@@ -775,6 +779,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var fnLike = new HashSet<string>(StringComparer.Ordinal);
         var bodies = new Dictionary<string, (bool FnLike, List<string> Bodies)>(StringComparer.Ordinal);
         long bytesTotal = 0; var filesTotal = 0;
+        _defineSites = 0;
         var clock = System.Diagnostics.Stopwatch.StartNew();
         long readTicks = 0;
 
@@ -820,6 +825,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             foreach (var n in f.Valueless)
                 if (!defs.ContainsKey(n)) defs[n] = "";
             fnLike.UnionWith(f.FnLike);
+            _defineSites += f.Defines.Count;
             foreach (var (name, fn, body) in f.Defines)
             {
                 if (!bodies.TryGetValue(name, out var b)) bodies[name] = b = (fn, new List<string>());
@@ -908,7 +914,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         var fnBodies = MacroBodies.Parse(bodies);
         _definers = DefinerMacros.Build(fnBodies);
-        _macroBodies = bodies;
+        // Held for the run only for FunctionMacro, which answers function-like macros alone: the object-like ones (nearly
+        // every #define of a register-map tree) are let go here.
+        _macroBodies = bodies.Where(kv => kv.Value.FnLike).ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
         _objectMacros = new HashSet<string>(defs.Keys, StringComparer.Ordinal);
         _pasteTable = PasteMacros.Build(fnBodies, _objectMacros.Contains);
         _pasteUse = PasteMacros.UseScan(_pasteTable);
