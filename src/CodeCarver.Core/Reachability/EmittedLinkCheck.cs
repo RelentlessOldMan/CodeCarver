@@ -1572,12 +1572,19 @@ public static class EmittedLinkCheck
     /// <param name="pool">Shares one string per distinct name across the call (and its #define bodies): a token's text
     /// is otherwise a new string each time.</param>
     internal static List<Tok> Tokenize(string s, bool directives = true, CodeCarver.Core.Util.NamePool? pool = null)
+        => Tokenize(s, directives, pool ?? new CodeCarver.Core.Util.NamePool(), 0, null);
+
+    /// <summary>As <see cref="Tokenize(string, bool, CodeCarver.Core.Util.NamePool?)"/>, from <paramref name="from"/>,
+    /// adding to <paramref name="into"/> when given.</summary>
+    static List<Tok> Tokenize(string s, bool directives, CodeCarver.Core.Util.NamePool pool, int from, List<Tok>? into)
     {
-        pool ??= new CodeCarver.Core.Util.NamePool();
         // About a token per four characters of C: sized once, where doubling as it filled copied the list over and over.
-        var toks = new List<Tok>(s.Length / 4 + 16);
+        var toks = into ?? new List<Tok>(s.Length / 4 + 16);
+        // A register header is mostly #define lines: one builder, body token list and parameter set serve them all.
+        System.Text.StringBuilder? sb = null;
+        DefineScratch? scratch = null;
         var line = 1;
-        var i = 0;
+        var i = from;
         var atLineStart = true;
         while (i < s.Length)
         {
@@ -1600,7 +1607,7 @@ public static class EmittedLinkCheck
             {
                 // Collect the logical directive line (with continuations), stripped of comments. `%:` is the # digraph.
                 var start = line;
-                var sb = new System.Text.StringBuilder();
+                (sb ??= new System.Text.StringBuilder()).Clear();
                 i += c == '%' ? 2 : 1;
                 while (i < s.Length && s[i] != '\n')
                 {
@@ -1616,7 +1623,7 @@ public static class EmittedLinkCheck
                     }
                     sb.Append(s[i]); i++;
                 }
-                DefineBody(sb.ToString(), start, toks, pool);
+                if (IsDefine(sb)) DefineBody(sb.ToString(), start, toks, pool, scratch ??= new DefineScratch());
                 continue;
             }
             atLineStart = false;
@@ -1670,26 +1677,45 @@ public static class EmittedLinkCheck
         _ => null,
     };
 
-    // #define NAME(params) body  -> body identifiers as InDefine uses; other directives contribute nothing.
-    static void DefineBody(string directive, int line, List<Tok> toks, CodeCarver.Core.Util.NamePool pool)
+    sealed class DefineScratch
     {
-        var d = directive.TrimStart();
+        public readonly List<Tok> Inner = new();
+        public readonly HashSet<string> Parms = new(StringComparer.Ordinal);
+    }
+
+    /// <summary>Whether a directive line (after its '#') is a #define: the only kind <see cref="DefineBody"/> reads.</summary>
+    static bool IsDefine(System.Text.StringBuilder sb)
+    {
         var k = 0;
+        while (k < sb.Length && char.IsWhiteSpace(sb[k])) k++;
+        const string define = "define";
+        for (var j = 0; j < define.Length; j++, k++)
+            if (k >= sb.Length || sb[k] != define[j]) return false;
+        return k >= sb.Length || !(char.IsLetter(sb[k]) || sb[k] == '_');
+    }
+
+    // #define NAME(params) body  -> body identifiers as InDefine uses; other directives contribute nothing.
+    static void DefineBody(string d, int line, List<Tok> toks, CodeCarver.Core.Util.NamePool pool, DefineScratch scratch)
+    {
+        var k = 0;
+        while (k < d.Length && char.IsWhiteSpace(d[k])) k++;
+        var w = k;
         while (k < d.Length && (char.IsLetter(d[k]) || d[k] == '_')) k++;
-        if (d[..k] != "define") return;
-        var rest = d[k..].TrimStart();
-        var n = 0;
-        while (n < rest.Length && (char.IsLetterOrDigit(rest[n]) || rest[n] == '_')) n++;
-        var body = rest[n..];
-        var parms = new HashSet<string>(StringComparer.Ordinal);
-        if (body.StartsWith('('))
+        if (!d.AsSpan(w, k - w).SequenceEqual("define")) return;
+        while (k < d.Length && char.IsWhiteSpace(d[k])) k++;
+        while (k < d.Length && (char.IsLetterOrDigit(d[k]) || d[k] == '_')) k++;
+        var parms = scratch.Parms;
+        parms.Clear();
+        if (k < d.Length && d[k] == '(')
         {
-            var close = body.IndexOf(')');
+            var close = d.IndexOf(')', k);
             if (close < 0) return;
-            foreach (var p in body[1..close].Split(',')) parms.Add(p.Trim().TrimEnd('.').Trim());
-            body = body[(close + 1)..];
+            foreach (var p in d[(k + 1)..close].Split(',')) parms.Add(p.Trim().TrimEnd('.').Trim());
+            k = close + 1;
         }
-        var inner = Tokenize(body, directives: false, pool);
+        var inner = scratch.Inner;
+        inner.Clear();
+        Tokenize(d, directives: false, pool, k, inner);
         for (var j = 0; j < inner.Count; j++)
         {
             var t = inner[j];

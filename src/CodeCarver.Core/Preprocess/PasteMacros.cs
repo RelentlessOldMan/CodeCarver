@@ -35,7 +35,6 @@ public static class PasteMacros
     }
 
     private static readonly Regex Token = new(@"##|[A-Za-z_]\w*|\S", RegexOptions.Compiled);
-    private static readonly Regex Ident = new(@"^[A-Za-z_]\w*$", RegexOptions.Compiled);
     const int MaxPerMacro = 32;
 
     /// <summary>The templates of each macro: a <c>##</c> chain in its body with two or more parameters
@@ -182,9 +181,9 @@ public static class PasteMacros
     {
         parts = new List<string>();
         end = i;
-        if (!Ident.IsMatch(toks[i])) return false;
+        if (!DefinerMacros.IsIdent(toks[i])) return false;
         parts.Add(toks[i]);
-        while (end + 2 < toks.Count && toks[end + 1] == "##" && Ident.IsMatch(toks[end + 2])) { parts.Add(toks[end + 2]); end += 2; }
+        while (end + 2 < toks.Count && toks[end + 1] == "##" && DefinerMacros.IsIdent(toks[end + 2])) { parts.Add(toks[end + 2]); end += 2; }
         return true;
     }
 

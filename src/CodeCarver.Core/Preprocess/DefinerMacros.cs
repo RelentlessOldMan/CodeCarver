@@ -27,7 +27,7 @@ public static class DefinerMacros
                                       int StartLine, int EndLine, bool HasBody, int At = 0);
 
     private static readonly Regex Token = new(@"##|[A-Za-z_]\w*|\S", RegexOptions.Compiled);
-    private static readonly Regex Ident = new(@"^[A-Za-z_]\w*$", RegexOptions.Compiled);
+    private static readonly Regex WordChar = new(@"^\w$", RegexOptions.Compiled);
     private static readonly Regex Identifiers = new(@"[A-Za-z_]\w*", RegexOptions.Compiled);
 
     // A token before the name that makes it something other than a declared symbol.
@@ -58,14 +58,71 @@ public static class DefinerMacros
     public static Dictionary<string, List<Template>> FromText(string text)
     {
         var bodies = new Dictionary<string, (bool FnLike, List<string> Bodies)>(StringComparer.Ordinal);
-        foreach (Match m in AnyDefine.Matches(text))
+        foreach (var (name, body) in FunctionLikeDefines(text))
         {
-            if (!m.Groups[2].Success) continue;
-            if (!bodies.TryGetValue(m.Groups[1].Value, out var b)) bodies[m.Groups[1].Value] = b = (true, new List<string>());
-            b.Bodies.Add(m.Groups[3].Value);
+            if (!bodies.TryGetValue(name, out var b)) bodies[name] = b = (true, new List<string>());
+            b.Bodies.Add(body);
         }
         return Build(bodies);
     }
+
+    /// <summary>The function-like <c>#define</c>s of <paramref name="text"/> as <see cref="AnyDefine"/> matches them: the
+    /// name and the raw rest after its '('. By hand: a register header holds tens of thousands of object-like defines,
+    /// and the regex built a match for each only to drop it, on every thread at once (work run C18's dropped files).</summary>
+    public static IEnumerable<(string Name, string Body)> FunctionLikeDefines(string text)
+    {
+        if (!text.Contains("define", StringComparison.Ordinal)) yield break;
+        for (var p = 0; p < text.Length; )
+        {
+            var i = p;
+            while (i < text.Length && text[i] is ' ' or '\t') i++;
+            var j = i;
+            if (j < text.Length && text[j] == '#')
+            {
+                j++;
+                while (j < text.Length && text[j] is ' ' or '\t') j++;
+                if (string.CompareOrdinal(text, j, "define", 0, 6) == 0)
+                {
+                    j += 6;
+                    var k = j;
+                    while (k < text.Length && text[k] is ' ' or '\t') k++;
+                    if (k > j && k < text.Length && (char.IsAsciiLetter(text[k]) || text[k] == '_'))
+                    {
+                        var nameAt = k++;
+                        while (k < text.Length && IsWordChar(text[k])) k++;
+                        var nameEnd = k;
+                        var fn = k < text.Length && text[k] == '(';
+                        if (fn) k++;
+                        var restAt = k;
+                        while (k < text.Length && text[k] != '\n')
+                        {
+                            if (text[k] != '\\') { k++; continue; }
+                            if (k + 1 < text.Length && text[k + 1] == '\n') k += 2;
+                            else if (k + 2 < text.Length && text[k + 1] == '\r' && text[k + 2] == '\n') k += 3;
+                            else if (k + 1 < text.Length) k += 2;
+                            else break;   // a backslash ending the text is not part of the rest
+                        }
+                        if (fn) yield return (text[nameAt..nameEnd], text[restAt..k]);
+                        p = k;
+                    }
+                }
+            }
+            var nl = text.IndexOf('\n', p);
+            if (nl < 0) break;
+            p = nl + 1;
+        }
+    }
+
+    /// <summary>As <c>^[A-Za-z_]\w*$</c>, without a regex: called per token, where a shared regex made a runner
+    /// for every thread that found it busy.</summary>
+    public static bool IsIdent(string s)
+    {
+        if (s.Length == 0 || !(char.IsAsciiLetter(s[0]) || s[0] == '_')) return false;
+        for (var i = 1; i < s.Length; i++) if (!IsWordChar(s[i])) return false;
+        return true;
+    }
+
+    static bool IsWordChar(char c) => c < 128 ? char.IsAsciiLetterOrDigit(c) || c == '_' : WordChar.IsMatch(c.ToString());
 
     public static Dictionary<string, List<Template>> Build(IReadOnlyDictionary<string, (bool FnLike, List<string> Bodies)> bodies)
         => Build(MacroBodies.Parse(bodies));
@@ -94,8 +151,8 @@ public static class DefinerMacros
                 if (!Chain(toks, i, ps, out var param, out var pre, out var suf, out var end)) continue;
                 var prev = i > 0 ? toks[i - 1] : null;
                 var next = end + 1 < toks.Count ? toks[end + 1] : null;
-                var declPrev = prev == "*" || (prev is not null && Ident.IsMatch(prev) && !NotDeclaratorPrefix.Contains(prev));
-                var declNext = next is null || DeclaratorFollow.Contains(next) || Ident.IsMatch(next);
+                var declPrev = prev == "*" || (prev is not null && IsIdent(prev) && !NotDeclaratorPrefix.Contains(prev));
+                var declNext = next is null || DeclaratorFollow.Contains(next) || IsIdent(next);
                 if (declPrev && declNext)
                 {
                     // `name(...)` is a function only when a body follows: in the macro (`{` after the ')'), or at the
@@ -143,10 +200,10 @@ public static class DefinerMacros
     private static bool Chain(List<string> toks, int i, List<string> ps, out int param, out string pre, out string suf, out int end)
     {
         param = -1; pre = suf = ""; end = i;
-        if (!Ident.IsMatch(toks[i]) || (i > 0 && toks[i - 1] == "#")) return false;
+        if (!IsIdent(toks[i]) || (i > 0 && toks[i - 1] == "#")) return false;
         var parts = new List<string> { toks[i] };
         var j = i;
-        while (j + 2 < toks.Count && toks[j + 1] == "##" && Ident.IsMatch(toks[j + 2])) { parts.Add(toks[j + 2]); j += 2; }
+        while (j + 2 < toks.Count && toks[j + 1] == "##" && IsIdent(toks[j + 2])) { parts.Add(toks[j + 2]); j += 2; }
         end = j;
         var at = -1;
         for (var k = 0; k < parts.Count; k++)
@@ -216,7 +273,7 @@ public static class DefinerMacros
             // A head macro's name is a function only when this use supplies the body.
             var defines = new List<(string, bool)>();
             foreach (var t in definers[macro])
-                if (t.Param < args.Count && Ident.IsMatch(args[t.Param]))
+                if (t.Param < args.Count && IsIdent(args[t.Param]))
                     defines.Add((t.Prefix + args[t.Param] + t.Suffix, t.Function && (t.OwnBody || hasBody)));
             if (defines.Count == 0) continue;
             var ids = Identifiers.Matches(code.Substring(open + 1, close - open - 1)).Select(x => x.Value).Distinct().ToList();
