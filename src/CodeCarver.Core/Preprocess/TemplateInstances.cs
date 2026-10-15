@@ -49,16 +49,39 @@ public static class TemplateInstances
     /// reads in a header with no macro-named head.</summary>
     public static string DirectivesOnly(string text)
     {
+        // One pass, each piece appended once: a directive continued over many lines was copied again for each line it
+        // took in (gigabytes for a tree of register-map headers).
         var sb = new StringBuilder();
-        var lines = text.Split('\n');
-        for (var i = 0; i < lines.Length; i++)
+        for (var start = 0; start <= text.Length; )
         {
-            var raw = lines[i].TrimEnd('\r');
-            if (!raw.TrimStart().StartsWith('#')) continue;
-            while (raw.EndsWith('\\') && i + 1 < lines.Length) raw = raw[..^1] + " " + lines[++i].TrimEnd('\r');
-            sb.Append(raw).Append('\n');
+            var (end, next) = Line(text, start);
+            var k = start;
+            while (k < end && char.IsWhiteSpace(text[k])) k++;
+            if (k < end && text[k] == '#')
+            {
+                // A line ending in a backslash takes in the next one, the backslash becoming a space.
+                while (end > start && text[end - 1] == '\\' && next <= text.Length)
+                {
+                    sb.Append(text, start, end - 1 - start).Append(' ');
+                    start = next;
+                    (end, next) = Line(text, start);
+                }
+                sb.Append(text, start, end - start).Append('\n');
+            }
+            start = next;
         }
         return sb.ToString();
+    }
+
+    // The line from start: where its text ends (before the '\n' and the '\r's before it), and where the next line
+    // starts (past the end of the text for the last line).
+    static (int End, int Next) Line(string text, int start)
+    {
+        var nl = text.IndexOf('\n', start);
+        var end = nl < 0 ? text.Length : nl;
+        var next = nl < 0 ? text.Length + 1 : nl + 1;
+        while (end > start && text[end - 1] == '\r') end--;
+        return (end, next);
     }
 
     sealed record Macro(List<string>? Params, string Body);

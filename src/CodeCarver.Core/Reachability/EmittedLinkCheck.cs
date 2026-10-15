@@ -104,7 +104,8 @@ public static class EmittedLinkCheck
         IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? commandLineMacros = null,
         IReadOnlySet<string>? c99InlineFns = null,
         IReadOnlySet<string>? wrapped = null,
-        LinkCheckCache? cache = null)
+        LinkCheckCache? cache = null,
+        Action<string, long>? report = null)
     {
         var emittedList = emitted.ToList();
         var droppedList = dropped.ToList();
@@ -114,12 +115,43 @@ public static class EmittedLinkCheck
         var checkedFiles = 0;
         var stats = new Dictionary<string, long>(StringComparer.Ordinal);
         var phase = System.Diagnostics.Stopwatch.StartNew();
-        void Lap(string key) { stats[key + "Ms"] = phase.ElapsedMilliseconds; phase.Restart(); }
+        var droppedDefs = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
+        var macroCalls = new List<(string Name, string Rel, int Line, bool Dead)>();
+        var live = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
+        var dead = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
+        long heldChars = 0;
+        // Each loop's time, and memory as it ends: the process's private bytes, the managed heap the last GC left, and
+        // managed bytes allocated in the loop (MB). A "Max" key is kept at its largest over a stage's rounds.
+        var allocatedAt = GC.GetTotalAllocatedBytes();
+        void Lap(string key)
+        {
+            stats[key + "Ms"] = phase.ElapsedMilliseconds;
+            try { using var self = System.Diagnostics.Process.GetCurrentProcess(); stats[key + ".privateMaxMb"] = self.PrivateMemorySize64 >> 20; }
+            catch (InvalidOperationException) { }
+            stats[key + ".heapMaxMb"] = GC.GetGCMemoryInfo().HeapSizeBytes >> 20;
+            var now = GC.GetTotalAllocatedBytes();
+            stats[key + ".allocatedMb"] = (now - allocatedAt) >> 20;
+            allocatedAt = now;
+            // What the check holds (the largest over its loops and rounds): its tables, and the cache kept for later rounds.
+            stats["held.headerTextMaxMb"] = heldChars * 2 >> 20;
+            stats["held.cacheDroppedMax"] = cache?.Dropped.Count ?? 0;
+            stats["held.cacheDefinitionsMax"] = cache?.Dropped.Values.Sum(e => (long)(e?.Definitions.Count ?? 0)) ?? 0;
+            stats["held.cacheOriginalsMax"] = cache?.Originals.Count ?? 0;
+            stats["held.droppedDefsMax"] = droppedDefs.Count;
+            stats["held.macroCallsMax"] = macroCalls.Count;
+            stats["held.usesMax"] = live.Count + dead.Count;
+            phase.Restart();
+            // Handed out as each loop ends, so a run stopped inside the check still has the loops before.
+            foreach (var k in new[] { key + "Ms", key + ".privateMaxMb", key + ".heapMaxMb", key + ".allocatedMb" }
+                         .Concat(stats.Keys.Where(k => k.StartsWith("held.", StringComparison.Ordinal))).ToList())
+                if (stats.TryGetValue(k, out var v)) report?.Invoke(k, v);
+        }
         long filesRead = 0, fromCache = 0, instancesRedone = 0;
         LinkCheckResult Done(IReadOnlyList<LinkViolation> v)
         {
             Lap("rest");
             stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["instancesRedone"] = instancesRedone;
+            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone" }) report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
         if (cache is not null && !cache.Matches(maxBytes, definerMacros, commandLineMacros, c99InlineFns)) cache = null;
@@ -137,7 +169,6 @@ public static class EmittedLinkCheck
         var headerInfo = new Dictionary<string, HeaderInfo?>(StringComparer.Ordinal);
         var headerText = new Dictionary<string, string>(StringComparer.Ordinal);
         var templates = new HashSet<string>(StringComparer.Ordinal);
-        long heldChars = 0;
         var budget = HeaderTextBudget();
         (HeaderInfo? Info, string? Text) ReadDirectives(string p)
         {
@@ -210,6 +241,8 @@ public static class EmittedLinkCheck
         if (emitted.Concat(dropped).Any(f => !IsHeader(f.Rel) && !IsAssembly(f.Rel)))
         {
             var headerPaths = byBase.Values.SelectMany(ps => ps).Where(p => IsHeader(p)).ToList();
+            // Each loop counts on its own, named (the heartbeat and a stop say which one a run is in).
+            Activity.Begin("check: headers read", headerPaths.Count);
             foreach (var (i, h) in ReadAhead.Ordered(headerPaths, PrepareHeader)) StoreHeader(headerPaths[i], h);
             lock (headerInfo) anyTemplate = templates.Count > 0;
         }
@@ -256,7 +289,6 @@ public static class EmittedLinkCheck
         }
 
         // 1. Candidate definitions from dropped files (name -> first defining file).
-        var droppedDefs = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
         // A file-scope `MACRO(a, b, c)` with no ';' reads as a definition when the next function's '{' follows.
         // A name with only such bare "definitions" that the tree #defines as a function-like macro is a macro use,
         // not a link symbol (work eval, 1.0.162: a registration macro invoked in two modules was reported as
@@ -323,6 +355,7 @@ public static class EmittedLinkCheck
             return s;
         }
         var droppedSorted = droppedList.OrderBy(d => d.Rel, StringComparer.Ordinal).ToList();
+        Activity.Begin("check: dropped files scanned", droppedSorted.Count);
         foreach (var (di, dscan) in ReadAhead.Ordered(droppedSorted, ScanDropped))
         {
             var rel = droppedSorted[di].Rel;
@@ -370,6 +403,7 @@ public static class EmittedLinkCheck
         Lap("dropped");
         if (original is not null)
         {
+            Activity.Begin("check: emitted files compared with their originals", emittedList.Count);
             foreach (var (pi, gone) in ReadAhead.Ordered(emittedList, Pruned))
             {
                 var rel = emittedList[pi].Rel;
@@ -398,14 +432,12 @@ public static class EmittedLinkCheck
         // 2+3. Definitions and uses in the emitted files.
         var emittedDefs = new HashSet<string>(StringComparer.Ordinal);
         var inlineHeaderDefs = new HashSet<string>(StringComparer.Ordinal);
-        var live = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
-        var dead = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
         // Per file: the function-like macros it #defines on live lines, and what it #includes. A call `name(...)` where
         // a function-like macro `name` is visible (this file or a header it includes) is expanded by the preprocessor:
         // it never reaches the linker, whatever a same-named function elsewhere does.
         var fileMacros = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
-        var fileIncludes = new Dictionary<string, List<string>>(StringComparer.Ordinal);
-        var macroCalls = new List<(string Name, string Rel, int Line, bool Dead)>();
+        var fileIncludes = new Dictionary<string, List<string>>(StringComparer.Ordinal);   // include basenames
+        var keptNames = new CodeCarver.Core.Util.NamePool();
         var aliasMacros = new HashSet<string>(StringComparer.Ordinal);
         var macroDeclarators = new List<(string Name, string Macro, string Target, string Rel, int Line)>();
         // Weak: declared weak in a header (it may be included anywhere), or every use sits in a file that declares it weak
@@ -432,6 +464,7 @@ public static class EmittedLinkCheck
             return (s, map);
         }
         var emittedSorted = emittedList.OrderBy(e => e.Rel, StringComparer.Ordinal).ToList();
+        Activity.Begin("check: emitted files scanned", emittedSorted.Count);
         foreach (var (ei, scanned) in ReadAhead.Ordered(emittedSorted, ScanEmitted))
         {
             var rel = emittedSorted[ei].Rel;
@@ -440,8 +473,12 @@ public static class EmittedLinkCheck
             checkedFiles++;
             bool IsDead(int line) => map is not null && line < map.Length && map[line];
             functionMacros.UnionWith(scan.FunctionMacros);
-            fileMacros[rel] = scan.FunctionMacroLines.Where(m => !IsDead(m.Line)).Select(m => m.Name).ToHashSet(StringComparer.Ordinal);
-            fileIncludes[rel] = scan.Includes;
+            // Held for every emitted file until the end: only what Sees reads (a file with neither sees no macro), each
+            // name one string for the run.
+            var liveMacros = scan.FunctionMacroLines.Where(m => !IsDead(m.Line)).Select(m => keptNames.Get(m.Name, 0, m.Name.Length)).ToHashSet(StringComparer.Ordinal);
+            if (liveMacros.Count > 0) fileMacros[rel] = liveMacros;
+            if (scan.Includes.Count > 0)
+                fileIncludes[rel] = scan.Includes.Select(i => keptNames.Get(i, i.Length - Path.GetFileName(i.AsSpan()).Length, i.Length)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             foreach (var d in scan.Definitions)
                 if (IsDead(d.Line)) continue;
                 else if (d.Inline && !d.Static && IsHeader(rel)) inlineHeaderDefs.Add(d.Name);

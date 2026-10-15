@@ -2555,10 +2555,13 @@ public static class CarveCommand
                                          original: pruned ? rel => Path.Combine(dir, rel) : null,
                                          definerMacros: (fe as TreeSitterFrontEnd)?.DefinerSet, linkUses: linkUses,
                                          commandLineMacros: commandLineMacros, c99InlineFns: (fe as TreeSitterFrontEnd)?.C99InlineFunctions,
-                                         wrapped: wrapped, cache: linkCache);
-            // Summed over the stage's rounds.
-            foreach (var (k, v) in r.Stats)
-                summary[$"{summaryStage}.check.{k}"] = (summary.TryGetValue($"{summaryStage}.check.{k}", out var was) && was is long l ? l : 0L) + v;
+                                         wrapped: wrapped, cache: linkCache,
+                                         // Summed over the stage's rounds; a "Max" key keeps its largest.
+                                         report: (k, v) =>
+                                         {
+                                             var had = summary.TryGetValue($"{summaryStage}.check.{k}", out var was) && was is long l ? l : 0L;
+                                             summary[$"{summaryStage}.check.{k}"] = k.Contains("Max", StringComparison.Ordinal) ? Math.Max(had, v) : had + v;
+                                         });
             var hard = r.Hard.ToList();
             // Defined only in files the traced build never compiled, with the build log confirming the trace is
             // complete: the real build linked without those files, so dropping them can't break it. The name comes
