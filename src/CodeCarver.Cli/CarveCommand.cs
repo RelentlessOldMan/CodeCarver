@@ -1236,7 +1236,13 @@ public static class CarveCommand
             var queue = new Queue<string>();
             foreach (var rel in parseRels)
                 if (!skipParse.Contains(rel) && !notBuilt.Contains(rel)) queue.Enqueue(fullByRel[rel]);
-            static string? TryRead(string full) { try { return CodeCarver.Core.Util.IoMeter.ReadAllText(full); } catch { return null; } }
+            // An included file was read when it was found (its text is kept in refIncludes): scanned from that text.
+            var foundText = new System.Collections.Concurrent.ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+            string? TryRead(string full)
+            {
+                if (foundText.TryRemove(full, out var known)) return known;
+                try { return CodeCarver.Core.Util.IoMeter.ReadAllText(full); } catch { return null; }
+            }
             while (queue.Count > 0)
             {
                 // Everything queued now, read ahead in order (what it adds is queued behind it, as one at a time would).
@@ -1291,7 +1297,8 @@ public static class CarveCommand
                                 continue;
                             }
                             refIncludes.Add((Path.GetRelativePath(dir, target).Replace('\\', '/'), itext));
-                            queue.Enqueue(target); // an .inc may include another — re-read on dequeue (cache-hot)
+                            foundText[target] = itext;
+                            queue.Enqueue(target); // an .inc may include another
                         }
                     }
                 }

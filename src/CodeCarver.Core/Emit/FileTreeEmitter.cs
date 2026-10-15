@@ -46,6 +46,7 @@ public static class FileTreeEmitter
     {
         var written = new List<string>();
         long bytes = 0;
+        scan ??= new IncludeScan();
 
         // Copied in parallel (a network drive waits a round trip per file), listed in the kept order.
         var copied = new long[keptFiles.Count];
@@ -67,7 +68,10 @@ public static class FileTreeEmitter
             // Perforce sync, a file kept-whole precisely because it was unreadable) must not crash the whole
             // emit. Skip it (it just won't be in the output); the read-time warning already flagged it.
             try { IoMeter.Copy(src, dst, overwrite: true); copied[i] = new FileInfo(dst).Length; }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return; }
+            // Its includes, from the copy just written (the same bytes, in the OS cache and on the output's disk): the
+            // include pass below would otherwise read every kept file from the source again.
+            if (!scan.Includes.ContainsKey(rel)) scan.Includes[rel] = IncludesIn(dst);
         });
         for (var i = 0; i < keptFiles.Count; i++)
             if (copied[i] >= 0) { bytes += copied[i]; written.Add(keptFiles[i]); }
@@ -354,15 +358,7 @@ public static class FileTreeEmitter
         string[] Includes(string rel)
         {
             if (scan.Includes.TryGetValue(rel, out var known)) return known;
-            string? text;
-            try
-            {
-                var full = Path.Combine(sourceRoot, rel);
-                var info = new FileInfo(full);
-                text = !info.Exists || info.Length > 8 * 1024 * 1024 ? null : IoMeter.ReadAllText(full);
-            }
-            catch { text = null; }
-            var found = text is null ? Array.Empty<string>() : LocalInclude.Matches(text).Select(m => m.Groups[1].Value).ToArray();
+            var found = IncludesIn(Path.Combine(sourceRoot, rel));
             scan.Includes[rel] = found;
             return found;
         }
@@ -394,6 +390,19 @@ public static class FileTreeEmitter
             }
         }
         return result;
+    }
+
+    /// <summary>The quoted includes of the file at <paramref name="full"/>; none for a file over 8 MB or unreadable.</summary>
+    static string[] IncludesIn(string full)
+    {
+        string? text;
+        try
+        {
+            var info = new FileInfo(full);
+            text = !info.Exists || info.Length > 8 * 1024 * 1024 ? null : IoMeter.ReadAllText(full);
+        }
+        catch { text = null; }
+        return text is null ? Array.Empty<string>() : LocalInclude.Matches(text).Select(m => m.Groups[1].Value).ToArray();
     }
 
     /// <summary>What <see cref="IncludeClosure"/> learned of a source tree: each file's quoted includes and whether each
