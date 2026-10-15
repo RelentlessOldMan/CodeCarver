@@ -96,10 +96,10 @@ public sealed class CodeGraph
         return _nodes[id.Value];
     }
 
-    public IReadOnlyList<Edge> OutEdges(NodeId id)
+    public EdgeList OutEdges(NodeId id)
     {
         Validate(id);
-        return _out[id.Value];
+        return new EdgeList(_out[id.Value]);
     }
 
     /// <summary>All distinct file paths any node lives in, sorted — the universe a carve prunes from.</summary>
@@ -120,4 +120,19 @@ public sealed class CodeGraph
 
     private static (NodeKind, string, string?, int) Key(NodeKind kind, string name, string? file, int line)
         => (kind, name, file, line);
+}
+
+/// <summary>A node's out-edges, read-only. A foreach over it makes no enumerator object, as one over an
+/// <see cref="IReadOnlyList{T}"/> did (one per node visited, on every walk of the graph).</summary>
+public readonly struct EdgeList : IReadOnlyList<Edge>
+{
+    private readonly List<Edge> _edges;
+
+    internal EdgeList(List<Edge> edges) => _edges = edges;
+
+    public int Count => _edges.Count;
+    public Edge this[int index] => _edges[index];
+    public List<Edge>.Enumerator GetEnumerator() => _edges.GetEnumerator();
+    IEnumerator<Edge> IEnumerable<Edge>.GetEnumerator() => _edges.GetEnumerator();
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => _edges.GetEnumerator();
 }

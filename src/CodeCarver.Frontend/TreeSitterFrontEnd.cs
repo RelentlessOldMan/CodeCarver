@@ -393,6 +393,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private static readonly Regex KeepBody = new(
         @"\bsection\s*\(|\b(?:used|retain|constructor|destructor|__root)\b|#\s*pragma\s+location|_Pragma\s*\(\s*""location"
         + @"|gnu::(?:used|section|retain|constructor|destructor)|__declspec\s*\(\s*allocate", RegexOptions.Compiled);
+    /// <summary>The text has a word every <see cref="KeepBody"/> match contains ("structor": constructor, destructor).</summary>
+    private static bool MayKeep(string s)
+        => s.Contains("section", StringComparison.Ordinal) || s.Contains("used", StringComparison.Ordinal)
+        || s.Contains("retain", StringComparison.Ordinal) || s.Contains("structor", StringComparison.Ordinal)
+        || s.Contains("__root", StringComparison.Ordinal) || s.Contains("location", StringComparison.Ordinal)
+        || s.Contains("allocate", StringComparison.Ordinal);
 
     /// <summary>
     /// Local <c>#include</c>d files with a non-source extension (<c>.inc</c>/<c>.def</c>/generated tables)
@@ -860,9 +866,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                         (uses ??= new List<string>()).Add(id);
             return uses is null ? Array.Empty<string>() : uses.Count <= 16 ? uses.ToArray() : uses.Distinct(StringComparer.Ordinal).ToArray();
         }
+        // A word each pattern needs comes first: one Regex object on many threads makes a new matcher (and its stacks)
+        // for nearly every call, and almost no body has the word.
+        static bool AnyMatch(List<string> bodies, Regex re, Func<string, bool> may)
+        {
+            foreach (var b in bodies) if (may(b) && re.IsMatch(b)) return true;
+            return false;
+        }
         var looked = CodeCarver.Core.Util.ReadAhead.Each(entries, kv => (
-            Keep: kv.Value.Bodies.Any(b => KeepBody.IsMatch(b)),
-            Register: kv.Value.Bodies.Any(b => IdentifierSection.IsMatch(b)),
+            Keep: AnyMatch(kv.Value.Bodies, KeepBody, MayKeep),
+            Register: AnyMatch(kv.Value.Bodies, IdentifierSection, b => b.Contains("section", StringComparison.Ordinal)),
             Uses: UsesOf(kv.Key, kv.Value.Bodies)));
         var keep = new HashSet<string>(StringComparer.Ordinal);
         var register = new HashSet<string>(StringComparer.Ordinal);
@@ -1286,27 +1299,29 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private Dictionary<string, List<(int From, int To)>> CollectLocals(TsNode root, ScopeIndex scopes)
     {
         var r = new Dictionary<string, List<(int, int)>>(StringComparer.Ordinal);
-        using (var qc = _locals.Execute(root)) foreach (var cap in qc.Captures)
+        if (!LeanCaptures.Usable(_locals)) using (var qc = _locals.Execute(root)) foreach (var cap in qc.Captures)
+            Local(cap.Node.StartIndex, cap.Node.EndIndex);
+        else foreach (var c in LeanCaptures.Of(_locals, root.Tree)) Local(c.Start, c.End);
+        return r;
+
+        void Local(int at, int endAt)
         {
-            var n = cap.Node;
-            var at = n.StartIndex;
             int? scopeEnd;
             if (scopes.InBody(at))
             {
                 // A block-scope `extern int g;` names the GLOBAL g — its uses are references, not locals.
-                if (scopes.InExternDeclaration(at)) continue;
+                if (scopes.InExternDeclaration(at)) return;
                 scopeEnd = scopes.ScopeEnd(at);
             }
             else
                 // A parameter of a function DEFINITION: in scope for that function's body (a prototype's parameter
                 // is in no function definition).
                 scopeEnd = scopes.FunctionEnd(at);
-            if (scopeEnd is not { } end) continue;
-            var name = n.Text;
+            if (scopeEnd is not { } end) return;
+            var name = root.Tree.GetText(at, endAt);
             if (!r.TryGetValue(name, out var l)) r[name] = l = new List<(int, int)>();
             l.Add((at, end));
         }
-        return r;
     }
 
     private static bool IsLocalUse(Dictionary<string, List<(int From, int To)>> locals, string name, int pos)
@@ -1386,7 +1401,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// spliced <c>*\</c>+<c>/</c> read as <c>this comment ends at ...</c>): it mints nothing.
     /// </summary>
     /// <param name="headerDefinition">A header variable every including unit defines (see <see cref="HeaderData"/>).</param>
-    private TsNode? MintedGlobal(TsNode decl, string path, string[] lines, out bool isStatic, out bool condExtern, out bool headerDefinition)
+    private TsNode? MintedGlobal(TsNode decl, string path, TextLines lines, out bool isStatic, out bool condExtern, out bool headerDefinition)
     {
         isStatic = false;
         condExtern = false;
@@ -1406,7 +1421,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <summary>A header scalar that is a definition in every unit including it: initialized and not extern, or
     /// introduced by an EXTERN-style macro (see <see cref="HeaderData"/>). C++ <c>const</c>/<c>constexpr</c>/<c>inline</c>
     /// variables and template members are each unit's own (or merged), so not.</summary>
-    private bool HeaderDefines(TsNode declaration, TsNode decl, List<string> storage, string[] lines, out bool condExtern)
+    private bool HeaderDefines(TsNode declaration, TsNode decl, List<string> storage, TextLines lines, out bool condExtern)
     {
         condExtern = false;
         if (storage.Contains("extern") || storage.Contains("inline") || Up(declaration)?.Type == "template_declaration") return false;
@@ -1914,7 +1929,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // counted (a captured symbol needs >=2 bytes), so the overwhelming majority of small files pay nothing.
         if (PerFileSymbolBudget > 0 && text.Length >= (long)PerFileSymbolBudget * 2)
         {
-            var lines = text.Split('\n');
+            var lines = new TextLines(text);
             var symbols = CountCaptures(_defs, root) + CountCaptures(_globals, root, c => MintedGlobal(c.Node, path, lines, out _, out _, out _) is not null);
             if (symbols > PerFileSymbolBudget)
             {
@@ -1933,7 +1948,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // Scope ranges once per file: pass 1b and pass 4 ask "inside a function body?" per capture (see ScopeIndex).
         var scopes = new ScopeIndex(_scopes, root);
         var fileNode = w.FileNode(path);
-        var srcLines = text.Split('\n');
+        var srcLines = new TextLines(text);
 
         // When configured, code in dead #ifdef branches is skipped (config-specific carve).
         var dead = ExactDeadLines?.Invoke(path, text)
@@ -1977,11 +1992,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 var mid = graph.GetOrAddNode(NodeKind.Macro, name, path, new SourceSpan(row, row));
                 graph.AddEdge(mid, fileNode, EdgeKind.DefinedIn);
                 Add(macrosByName, name, mid);
-                var defineText = Up(node)?.Text ?? "";
-                foreach (var (start, end) in MacroBodyIdentifiers(defineText))
-                    pendingMacroRefs.Add(mid, defineText, start, end);
-                foreach (var paste in ExtractMacroPastes(defineText))
-                    pendingPastes.Add((mid, paste.Kind, paste.Frag));
+                // The #define is read where it stands in the source: copying each one's text made a string per macro.
+                var (defFrom, defTo) = Up(node) is { } def ? (def.StartIndex, def.EndIndex) : (0, 0);
+                var source = tree.Source;
+                foreach (var (start, end) in MacroBodyIdentifiers(source, defFrom, defTo))
+                    pendingMacroRefs.Add(mid, source, start, end);
+                if (source.AsSpan(defFrom, defTo - defFrom).IndexOf("##", StringComparison.Ordinal) >= 0)   // else no paste
+                    foreach (var paste in ExtractMacroPastes(source.Substring(defFrom, defTo - defFrom)))
+                        pendingPastes.Add((mid, paste.Kind, paste.Frag));
                 foreach (var built in PasteMacros.BodyNames(_pasteTable, name))
                     pendingPastes.Add((mid, PasteKind.Exact, built));
             }
@@ -2156,8 +2174,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         {
             if (defines is not null && _condExternFlags.Any(defines.IsDefined)) w.DefinesExternFlag = true;
             else
-                foreach (var l in srcLines)
-                    if (l.IndexOf('#') >= 0 && DefineName.Match(l) is { Success: true } dm && _condExternFlags.Contains(dm.Groups[1].Value))
+                for (var li = 0; li < srcLines.Length; li++)
+                    if (srcLines.Span(li).IndexOf('#') >= 0 && DefineName.Match(srcLines[li]) is { Success: true } dm && _condExternFlags.Contains(dm.Groups[1].Value))
                     { w.DefinesExternFlag = true; break; }
         }
         w.Lap(7);
@@ -2169,6 +2187,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         for (var li = 0; li < srcLines.Length; li++)
         {
             if (dead is not null && li + 1 < dead.Length && dead[li + 1]) continue;
+            if (!IncludeShaped(srcLines.Span(li))) continue;   // no line string made for every other line
             var m = IncludeLine.Match(srcLines[li]);
             if (!m.Success) continue;
             var raw = m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value;
@@ -2320,19 +2339,23 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         // Pass 3: direct calls, attributed to the enclosing function by span.
         var calleePositions = new HashSet<(int, int)>();
-        using (var qc = _calls.Execute(root)) foreach (var cap in qc.Captures)
+        // Read straight from the library (LeanCaptures): millions of captures on a big tree.
+        if (!LeanCaptures.Usable(_calls)) using (var qc = _calls.Execute(root)) foreach (var cap in qc.Captures)
         {
-            // Each Node property is a native call: read position and text once (millions of captures on a big tree).
             var node = cap.Node;
-            var sp = node.StartPosition;
-            if (dead is not null && sp.Row + 1 < dead.Length && dead[sp.Row + 1]) continue;
-            calleePositions.Add((sp.Row, sp.Column));
+            Call(node.StartPosition.Row, node.StartPosition.Column, node.StartIndex, node.EndIndex);
+        }
+        else foreach (var c in LeanCaptures.Of(_calls, tree)) Call(c.Row, c.Column, c.Start, c.End);
+        void Call(int row, int column, int start, int end)
+        {
+            if (dead is not null && row + 1 < dead.Length && dead[row + 1]) return;
+            calleePositions.Add((row, column));
             // A call not inside any captured function is inside a function we failed to parse (e.g. an
             // unusual macro-prefixed / bare-typedef-return declaration like zlib's `local gzFile gz_open`
             // or `void ZLIB_INTERNAL _tr_flush_block`). That function stays in the emitted file, so keep
             // its callees whenever the file is kept — attribute the call to the file node.
-            var from = Enclosing(sp.Row + 1) ?? fileNode;
-            var callee = node.Text;
+            var from = Enclosing(row + 1) ?? fileNode;
+            var callee = tree.GetText(start, end);
             pendingCalls.Add((from, callee));
             if (callee.Length > 7 && callee.StartsWith("__real_", StringComparison.Ordinal)) pendingCalls.Add((from, callee[7..]));   // --wrap's original
         }
@@ -2377,20 +2400,24 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // avoids a costly ancestor walk per file-scope identifier in the common (clean-parse) case.
         var treeHasError = root.HasError;
         var locals = CollectLocals(root, scopes);
-        using (var qc = _idents.Execute(root)) foreach (var cap in qc.Captures)
+        // Read straight from the library (LeanCaptures) unless a parse error needs the node itself (InsideError).
+        if (treeHasError || !LeanCaptures.Usable(_idents)) using (var qc = _idents.Execute(root)) foreach (var cap in qc.Captures)
         {
             var node = cap.Node;
-            var sp = node.StartPosition;
-            if (dead is not null && sp.Row + 1 < dead.Length && dead[sp.Row + 1]) continue;
-            var pos = (sp.Row, sp.Column);
-            if (defNamePositions.Contains(pos) || calleePositions.Contains(pos)) continue;
-            var name = node.Text;
-            var at = node.StartIndex;
-            if (IsLocalUse(locals, name, at)) continue;
-            var from = Enclosing(sp.Row + 1);
+            Ident(node.StartPosition.Row, node.StartPosition.Column, node.StartIndex, node.EndIndex, node);
+        }
+        else foreach (var id in LeanCaptures.Of(_idents, tree)) Ident(id.Row, id.Column, id.Start, id.End, null);
+        void Ident(int row, int column, int at, int end, TsNode? node)
+        {
+            if (dead is not null && row + 1 < dead.Length && dead[row + 1]) return;
+            var pos = (row, column);
+            if (defNamePositions.Contains(pos) || calleePositions.Contains(pos)) return;
+            var name = tree.GetText(at, end);
+            if (IsLocalUse(locals, name, at)) return;
+            var from = Enclosing(row + 1);
             if (from is { } f)
                 pendingRefs.Add((f, name));
-            else if (scopes.InBody(at) || (treeHasError && InsideError(node)))
+            else if (scopes.InBody(at) || (node is not null && InsideError(node)))
                 // Attribute to the file (kept while the file is), same fallback as pass 3's calls, in two
                 // cases the enclosing-function lookup can't see: (a) inside a function body whose signature we couldn't
                 // capture — a macro-defined header like janet's `JANET_CORE_FN(os_shell, ...)`, so a
@@ -2453,6 +2480,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // until the finalizer thread gets to it, and over a big tree they piled up by the thousand.
     private static int CountCaptures(Query q, TsNode root, Func<QueryCapture, bool>? which = null)
     {
+        if (which is null && LeanCaptures.Usable(q)) return LeanCaptures.Of(q, root.Tree).Count();
         var n = 0;
         using (var qc = q.Execute(root)) foreach (var c in qc.Captures) if (which is null || which(c)) n++;
         return n;
@@ -2565,32 +2593,39 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <summary>The identifiers appearing in a macro's replacement body — used to reach functions/macros
     /// invoked only through the macro. Skips the <c>#define</c>, the macro name, and (for function-like
     /// macros) the parameter list; parameter names and unrelated tokens simply resolve to nothing.</summary>
-    private static IEnumerable<(int Start, int End)> MacroBodyIdentifiers(string defineText)
+    /// <summary>The line starts like <see cref="IncludeLine"/>: `#` then `include`, after any whitespace (char.IsWhiteSpace is
+    /// the regex's \s).</summary>
+    private static bool IncludeShaped(ReadOnlySpan<char> line)
     {
-        var s = defineText;
-        var i = s.IndexOf('#');
+        line = line.TrimStart();
+        return line.Length > 0 && line[0] == '#' && line[1..].TrimStart().StartsWith("include", StringComparison.Ordinal);
+    }
+
+    private static IEnumerable<(int Start, int End)> MacroBodyIdentifiers(string s, int from, int to)
+    {
+        var i = from < to ? s.IndexOf('#', from, to - from) : -1;
         if (i < 0) yield break;
         i++;
-        while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
-        while (i < s.Length && !char.IsWhiteSpace(s[i])) i++;   // skip "define"
-        while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
-        while (i < s.Length && (char.IsLetterOrDigit(s[i]) || s[i] == '_')) i++; // skip macro name
-        if (i < s.Length && s[i] == '(')                        // function-like: skip balanced params
+        while (i < to && char.IsWhiteSpace(s[i])) i++;
+        while (i < to && !char.IsWhiteSpace(s[i])) i++;   // skip "define"
+        while (i < to && char.IsWhiteSpace(s[i])) i++;
+        while (i < to && (char.IsLetterOrDigit(s[i]) || s[i] == '_')) i++; // skip macro name
+        if (i < to && s[i] == '(')                        // function-like: skip balanced params
         {
             var depth = 0;
-            while (i < s.Length)
+            while (i < to)
             {
                 if (s[i] == '(') depth++;
                 else if (s[i] == ')') { depth--; if (depth == 0) { i++; break; } }
                 i++;
             }
         }
-        while (i < s.Length)
+        while (i < to)
         {
             if (char.IsLetter(s[i]) || s[i] == '_')
             {
                 var start = i;
-                while (i < s.Length && (char.IsLetterOrDigit(s[i]) || s[i] == '_')) i++;
+                while (i < to && (char.IsLetterOrDigit(s[i]) || s[i] == '_')) i++;
                 yield return (start, i);
             }
             else i++;
