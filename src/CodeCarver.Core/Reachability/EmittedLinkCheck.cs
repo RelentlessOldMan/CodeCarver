@@ -150,13 +150,14 @@ public static class EmittedLinkCheck
         }
         long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0;
         var scanGate = new CodeCarver.Core.Util.ByteGate(ScanBudget());   // see Gated
+        var readGate = new CodeCarver.Core.Util.ByteGate(ReadBudget());
         LinkCheckResult Done(IReadOnlyList<LinkViolation> v)
         {
             Lap("rest");
             stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["instancesRedone"] = instancesRedone;
-            stats["scanWaits"] = scanGate.Waits;
+            stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits;
             stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped;
-            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "templateWalks", "templateWalksSkipped" })
+            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "templateWalks", "templateWalksSkipped" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -179,12 +180,12 @@ public static class EmittedLinkCheck
         // The loops below scan up to ReadAhead.Window files at once (on a network drive each read waits a round trip), and
         // a scan holds about 30 times its file's size while it runs: 64 register headers of a few MB each held over 7 GB.
         // So a file waits until the bytes being scanned fit ScanBudget (scanGate); small files never wait.
-        R Gated<R>(string path, Func<R> scan)
+        R Gated<R>(string path, Func<R> scan, CodeCarver.Core.Util.ByteGate? gate = null)
         {
             long size;
             try { size = new FileInfo(path).Length; }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { size = 0; }
-            using (scanGate.Take(size)) return scan();
+            using ((gate ?? scanGate).Take(size)) return scan();
         }
         (HeaderInfo? Info, string? Text) ReadDirectives(string p)
         {
@@ -272,7 +273,10 @@ public static class EmittedLinkCheck
             var headerPaths = byBase.Values.SelectMany(ps => ps).Where(p => IsHeader(p)).ToList();
             // Each loop counts on its own, named (the heartbeat and a stop say which one a run is in).
             Activity.Begin("check: headers read", headerPaths.Count);
-            foreach (var (i, h) in ReadAhead.Ordered(headerPaths, p => Gated(p, () => PrepareHeader(p)))) StoreHeader(headerPaths[i], h);
+            // A header's look is light (its directive lines and a hash), and the loop waits mostly on reads: under the scan
+            // budget it ran few at once and took 3.3 times as long (work run C18) for little less memory. The read budget,
+            // far larger, keeps only a run of huge headers from piling up.
+            foreach (var (i, h) in ReadAhead.Ordered(headerPaths, p => Gated(p, () => PrepareHeader(p), readGate))) StoreHeader(headerPaths[i], h);
             lock (headerInfo) anyTemplate = templates.Count > 0;
         }
         // The headers whose #include closure (as the walk follows it: quoted names, each to its Chosen header) holds a
@@ -394,8 +398,9 @@ public static class EmittedLinkCheck
                         HasInclude = text.Contains("include", StringComparison.Ordinal),
                         MacroHead = CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(text),
                         HasDefine = text.Contains("define", StringComparison.Ordinal),
-                        MayHead = CodeCarver.Core.Preprocess.TemplateInstances.MayHaveMacroNamedHead(text),
-                        Includes = CodeCarver.Core.Preprocess.TemplateInstances.QuotedIncludeNames(text),
+                        // Only a tree with a template asks (TemplateGate); an entry made without one says "may" (walk).
+                        MayHead = !anyTemplate || CodeCarver.Core.Preprocess.TemplateInstances.MayHaveMacroNamedHead(text),
+                        Includes = anyTemplate ? CodeCarver.Core.Preprocess.TemplateInstances.QuotedIncludeNames(text) : Array.Empty<string>(),
                         C99 = plain ? new List<Definition>() : C99Defs(text),
                     };
                 }
@@ -691,6 +696,16 @@ public static class EmittedLinkCheck
 
     /// <summary>Bytes of files the check scans at once: a 512th of the machine's memory (64 MB of 32 GB, about 2 GB while
     /// scanning), at least 16 MB, or CODECARVER_CHECK_SCAN_MB.</summary>
+    /// <summary>Bytes of headers the check reads at once in its first loop: a 32nd of the machine's memory (1 GB of
+    /// 32 GB), or CODECARVER_CHECK_READ_MB.</summary>
+    static long ReadBudget()
+    {
+        if (long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_CHECK_READ_MB"), out var mb) && mb > 0)
+            return mb * 1024 * 1024;
+        var total = CodeCarver.Core.Util.MemoryGate.MachineBytes();
+        return Math.Max(64L << 20, total > 0 ? total / 32 : 1L << 30);
+    }
+
     static long ScanBudget()
     {
         if (long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_CHECK_SCAN_MB"), out var mb) && mb > 0)

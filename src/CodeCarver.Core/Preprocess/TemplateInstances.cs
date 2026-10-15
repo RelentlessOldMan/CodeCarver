@@ -27,9 +27,10 @@ public static class TemplateInstances
     public static bool HasMacroNamedHead(string text) => text.Contains(')') && MacroNamedHead.IsMatch(text);
 
     // Looser than MacroNamedHead: `NAME(args)` then `(`, with directive lines (and their continuations) allowed in the
-    // gaps - Find reads code with its directive lines blanked, so a head split by an #if is one there.
+    // gaps - Find reads code with its directive lines blanked, so a head split by an #if is one there. The gaps are atomic
+    // (no gap can hold a '(' to give back), so a long run of directive lines is not tried every way it splits.
     static readonly Regex LooseHead = new(
-        @"\b[A-Za-z_]\w*(?:\s|#[^\n]*(?:\\\r?\n[^\n]*)*)*\((?:[^()\n]|\([^()\n]*\))*\)(?:\s|#[^\n]*(?:\\\r?\n[^\n]*)*)*\(", RegexOptions.Compiled);
+        @"\b[A-Za-z_]\w*(?>(?:\s+|#(?:[^\\\n]|\\(?:\r?\n|.))*)*)\((?:[^()\n]|\([^()\n]*\))*\)(?>(?:\s+|#(?:[^\\\n]|\\(?:\r?\n|.))*)*)\(", RegexOptions.Compiled);
 
     /// <summary>False only when <see cref="Find"/> can find no head in this text itself (its includes aside).</summary>
     public static bool MayHaveMacroNamedHead(string text) => text.Contains(')') && LooseHead.IsMatch(text);
