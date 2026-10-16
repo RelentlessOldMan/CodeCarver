@@ -86,6 +86,24 @@ public sealed class OutputSafetyTests
         finally { try { Directory.Delete(work, true); } catch { } }
     }
 
+    // Review E11: an empty entry point, or an exclude naming no directory, was silently accepted.
+    [Theory]
+    [InlineData("entryPoints=[\"main\", \"\"]\n", "'entryPoints' has an empty entry")]
+    [InlineData("entryPoints=[\"main\"]\nexcludeDirectories=[\" \"]\n", "'excludeDirectories' has an empty entry")]
+    [InlineData("entryPoints=[\"main\"]\nexcludeDirectories=[\"/\"]\n", "names no directory")]
+    [InlineData("entryPoints=[\"main\"]\nexcludeDirectories=[\"./\"]\n", "names no directory")]
+    public void EmptyEntryPointOrExclude_IsAConfigError(string common, string message)
+    {
+        var work = NewWork();
+        try
+        {
+            var (code, err) = Carve(work, $"outputDirectory = \"{Path.Combine(work, "out").Replace('\\', '/')}\"\n[common]\n" + common);
+            Assert.Equal(2, code);
+            Assert.Contains(message, err);
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
     [Fact]
     public void Carve_UnexpectedFailure_WritesDiagZip_WithNoSourceNames()
     {

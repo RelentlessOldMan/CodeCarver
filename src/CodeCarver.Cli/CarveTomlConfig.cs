@@ -147,6 +147,9 @@ public static class ConfigLoader
             cfg.Common.EntryPointsFile = GetString(common, "entryPointsFile", "[common]", ctx);
             cfg.Common.Languages = GetStringList(common, "languages", "[common]", ctx);
             cfg.Common.ExcludeDirectories = GetStringList(common, "excludeDirectories", "[common]", ctx);
+            foreach (var x in cfg.Common.ExcludeDirectories)
+                if (x.Replace('\\', '/').Trim('/') is "" or "." or "..")
+                    ctx.Errors.Add($"[common]: excludeDirectories entry '{x}' names no directory (it would exclude nothing).");
             cfg.Common.ForceKeepFiles = GetStringList(common, "forceKeepFiles", "[common]", ctx);
             cfg.Common.CarveSourceFileContents = GetBool(common, "carveSourceFileContents", "[common]", ctx) ?? false;
             cfg.Common.CarveHeaderFileContents = GetBool(common, "carveHeaderFileContents", "[common]", ctx) ?? false;
@@ -367,7 +370,8 @@ public static class ConfigLoader
         if (v is not TomlArray arr) { ctx.Errors.Add($"{where}: '{key}' must be an array of strings, e.g. [\"a\",\"b\"]."); return result; }
         foreach (var item in arr)
         {
-            if (item is string s) { if (!string.IsNullOrWhiteSpace(s)) result.Add(s.Trim()); }
+            // An empty item is a typo, never "nothing": silently skipping it hid it (review E11).
+            if (item is string s) { if (!string.IsNullOrWhiteSpace(s)) result.Add(s.Trim()); else ctx.Errors.Add($"{where}: '{key}' has an empty entry."); }
             else ctx.Errors.Add($"{where}: '{key}' must contain only strings (got {item?.GetType().Name ?? "null"}).");
         }
         return result;
