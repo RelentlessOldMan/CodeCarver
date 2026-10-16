@@ -685,6 +685,34 @@ public static class FileTreeEmitter
         return true;
     }
 
+    /// <summary>True when the span's first `{` (code only, lines <paramref name="s"/>..<paramref name="e"/>) opens a
+    /// `struct`/`union`/`enum` body before any `(` or `=`, and a name it defines (the tag, or an enumerator) appears in
+    /// the file outside the span: removing the span would remove a type the rest of the file uses.</summary>
+    private static bool HeadDefinesType(string[] lines, bool[] inComment, bool[] inLineComment, int s, int e)
+    {
+        var span = new StringBuilder();
+        for (var i = s; i <= e && i <= lines.Length && span.Length < 1 << 16; i++)
+            if (DirectiveBody(lines[i - 1]) is null || inComment[i]) span.Append(LineCode(lines, inComment, inLineComment, i)).Append(' ');
+        var text = span.ToString();
+        var stop = text.IndexOfAny(HeadStops);
+        if (stop < 0 || text[stop] != '{' || TypeBodyOpens.Match(text, 0, stop) is not { Success: true } head) return false;
+        var names = new List<string>();
+        if (head.Groups["tag"].Success) names.Add(head.Groups["tag"].Value);
+        if (head.Groups["kind"].Value == "enum")
+        {
+            var close = text.IndexOf('}', stop);
+            foreach (Match m in Enumerator.Matches(close < 0 ? text[(stop + 1)..] : text[(stop + 1)..close])) names.Add(m.Groups[1].Value);
+        }
+        if (names.Count == 0) return false;
+        var use = new Regex(@"\b(?:" + string.Join("|", names.Select(Regex.Escape)) + @")\b", RegexOptions.CultureInvariant);
+        for (var i = 1; i <= lines.Length; i++)
+            if ((i < s || i > e) && use.IsMatch(lines[i - 1])) return true;
+        return false;
+    }
+    private static readonly char[] HeadStops = { '{', '(', '=', ';' };
+    private static readonly Regex TypeBodyOpens = new(@"\b(?<kind>struct|union|enum)\b(?:\s+(?<tag>[A-Za-z_]\w*))?\s*$", RegexOptions.Compiled);
+    private static readonly Regex Enumerator = new(@"(?:^|,)\s*([A-Za-z_]\w*)", RegexOptions.Compiled);
+
     /// <summary>True when the #if structure in lines <paramref name="s"/>..<paramref name="e"/> balances, counting the
     /// directives just above and below the span that only directives, blanks and comments separate from it: removing
     /// the span's code then removes whole branches, never half of one.</summary>
@@ -943,6 +971,10 @@ public static class FileTreeEmitter
             // span. Removing the span alone strands it on whatever follows (a compile error, or the next
             // definition silently weak). Keep the definition whole (sound; EmitClosure sees it written).
             if (UnterminatedAbove(lines, start)) continue;
+
+            // `struct pt { int x; } make_pt(void) {...}`: the return type defines a type (or enumerators) the rest of the
+            // file may use; a `{` before the parameter list's `(` says so (review R2). Keep the definition whole.
+            if (HeadDefinesType(lines, inComment, inLineComment, s, e)) continue;
 
             // The directives stay, so the removed lines must hold every branch of each #if they touch (review R1): a
             // span holding `{ return 1; }` of `#ifdef ALT / { return 1; } / #else / { return 2; } / #endif` leaves the

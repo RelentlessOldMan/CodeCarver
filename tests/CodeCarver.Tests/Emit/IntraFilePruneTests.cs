@@ -453,4 +453,15 @@ public class IntraFilePruneTests
         AssertCompiles(carved);
         AssertCompiles("#define ALT 1\n" + carved);
     }
+
+    // Review R2: the return type of a dead function defines a type later code uses; removing the function removed it.
+    [Theory]
+    [InlineData("struct pt { int x; } make_dead_pt(void) { struct pt p = { 1 }; return p; }\n", "struct pt q = { 2 }; return q.x;")]
+    [InlineData("struct pt {\n    int x;\n}\nmake_dead_pt(void)\n{\n    struct pt p = { 1 };\n    return p;\n}\n", "struct pt q = { 2 }; return q.x;")]
+    [InlineData("enum mode { M_A, M_B } dead_mode(void) { return M_A; }\n", "return M_B;")]
+    public void DeadFunction_WhoseReturnTypeDefinesAType_Stays(string dead, string use)
+    {
+        var carved = Prune(dead + "int reader(void) { " + use + " }\n");
+        AssertCompiles(carved);
+    }
 }
