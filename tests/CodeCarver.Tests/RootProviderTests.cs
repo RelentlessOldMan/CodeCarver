@@ -96,6 +96,28 @@ public class RootProviderTests
             Assert.Contains(id, rooted);
     }
 
+    // Review S4: a section walked between two symbols the script defines around it is a table, KEEP or not: linked
+    // without --gc-sections nothing removes its entries, and nothing names them.
+    [Theory]
+    [InlineData("__drv_start = .;\n    *(.drivers)\n    __drv_end = .;")]
+    [InlineData("PROVIDE(__drv_start = .);\n    *(SORT(.drivers*))\n    PROVIDE(__drv_end = .);")]
+    [InlineData("__drv_start = . ;\n    main.o(.drivers) *(.drivers)\n    __drv_end = . ;")]
+    public void LinkerSectionRoots_SectionBracketedBySymbols(string body)
+    {
+        var b = new GraphBuilder();
+        var drv = b.Global("uart_drv", "drv.c");
+        var ram = b.Global("buf", "ram.c");
+        var sources = new[]
+        {
+            "__attribute__((section(\".drivers\"))) const struct drv uart_drv = { 0 };",
+            "__attribute__((section(\".data.ram\"))) int buf;",
+        };
+        var linker = "SECTIONS {\n  .data : {\n    " + body + "\n    *(.data.ram)\n  }\n}\n";
+        var rooted = new LinkerSectionRootProvider(sources, new[] { linker }).Discover(b.Graph).Select(r => r.Node).ToHashSet();
+        Assert.Contains(drv, rooted);
+        Assert.DoesNotContain(ram, rooted);
+    }
+
     [Fact]
     public void ExplicitRootProvider_ResolvesOnlyRealNames_TypoAmongValidIsDetectable()
     {

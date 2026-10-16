@@ -175,12 +175,27 @@ public sealed class LinkerSectionRootProvider : IRootProvider
         var matchers = new List<Regex>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var text in linkerScriptTexts)
+        {
             foreach (Match keep in KeepDirective.Matches(text))
                 foreach (Match tok in SectionToken.Matches(keep.Groups["body"].Value))
                     if (seen.Add(tok.Value))
                         matchers.Add(GlobToRegex(tok.Value));
+            // Review S4: input sections right after a `sym = .;` (a table's start symbol) are walked by address: kept
+            // whatever the KEEP, since a link without --gc-sections removes none of their entries either.
+            foreach (Match bracketed in BracketedInput.Matches(text))
+                foreach (Capture spec in bracketed.Groups["body"].Captures)
+                    foreach (Match tok in SectionToken.Matches(spec.Value))
+                        if (seen.Add(tok.Value))
+                            matchers.Add(GlobToRegex(tok.Value));
+        }
         return matchers;
     }
+
+    // `sym = .;` or `PROVIDE(sym = .);`, then the input-section statements that follow it (`*(.x)`, `file.o(.x)`,
+    // `*(SORT(.x*))`), each body captured, then the end symbol's `sym = .`.
+    private static readonly Regex BracketedInput = new(
+        @"[A-Za-z_.$][\w.$]*\s*=\s*\.\s*\)?\s*;\s*(?:(?!PROVIDE)[\w.*?\-\[\]]*\s*\(\s*(?<body>(?:[^()=]|\([^()=]*\))*)\)\s*)+"
+        + @"(?=(?:PROVIDE(?:_HIDDEN)?\s*\(\s*)?[A-Za-z_.$][\w.$]*\s*=\s*\.)", RegexOptions.Compiled);
 
     private static Regex GlobToRegex(string glob)
     {
