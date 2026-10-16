@@ -147,6 +147,33 @@ public sealed class MacroWorldTests
     }
 
     [Theory]
+    [InlineData("#include <fcntl.h>\n", "#ifdef O_BINARY", "")]
+    [InlineData("#include \"port.h\"\n", "#if defined(SIGPIPE)", "#include <signal.h>\n")]
+    [InlineData("", "#ifdef WIN32", "")]
+    [InlineData("#include <inttypes.h>\n", "#ifdef PRIu64", "")]
+    public void SystemHeaderMacros_AreNotAssumedAbsent(string prefix, string cond, string portH)
+    {
+        // Review W1: no trace, so the system headers are not read; the name may come from one.
+        using var t = new TreeCarve()
+            .W("main.c", prefix + $"void feat(void); void plain(void);\nint main(void){{\n{cond}\n  feat();\n#else\n  plain();\n#endif\n  return 0;\n}}\n")
+            .W("port.h", portH)
+            .W("feat.c", "void feat(void){}\n")
+            .W("plain.c", "void plain(void){}\n");
+        t.Compile("main.c").Compile("feat.c").Compile("plain.c");
+        AssertFeatKept(t, t.Carve());
+    }
+
+    [Fact]
+    public void ListedStandardHeader_KeepsTheWorldClosed()
+    {
+        using var t = Tree("#include <stdint.h>\n#include <string.h>\n");
+        t.Compile("main.c").Compile("feat.c").Compile("plain.c");
+        var r = t.Carve();
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.False(t.Kept("feat.c"), r.Out + r.Err);
+    }
+
+    [Theory]
     [InlineData("-DFEAT")]
     [InlineData("-D FEAT")]
     [InlineData("-DFEAT=1")]

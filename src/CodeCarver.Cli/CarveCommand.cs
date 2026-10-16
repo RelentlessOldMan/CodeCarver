@@ -1242,7 +1242,14 @@ public static class CarveCommand
         var condRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:if|ifdef|ifndef|elif|elifdef|elifndef)\b((?:\\\r?\n|[^\r\n])*)",
             System.Text.RegularExpressions.RegexOptions.Multiline);
         var identRe = new System.Text.RegularExpressions.Regex(@"[A-Za-z_]\w*");
-        void ScanMacroNames(string text, HashSet<string> defined, HashSet<string> tested)
+        // Review W1: by rel, what each scanned file's #ifs test and the basenames it #includes ("..." and <...>), so the
+        // names a system header the tree lacks may define can be found per translation unit.
+        var includeFacts = new Dictionary<string, (string[] Tested, string[] Quoted, string[] Angled)>(StringComparer.Ordinal);
+        var incNameRe = new System.Text.RegularExpressions.Regex(@"^\s*#\s*include(?:_next)?\s*(?:""([^""]+)""|<([^>]+)>)",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+        var interned = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        string Intern(string s) => interned.TryGetValue(s, out var i) ? i : interned[s] = s;
+        void ScanMacroNames(string text, HashSet<string> defined, HashSet<string> tested, string? rel = null)
         {
             if (!text.Contains('#')) return;
             foreach (System.Text.RegularExpressions.Match m in defRe.Matches(text))
@@ -1250,8 +1257,20 @@ public static class CarveCommand
                 defined.Add(m.Groups[1].Value);
                 if (m.ValueSpan.Contains("undef", StringComparison.Ordinal)) undefinedSomewhere.Add(m.Groups[1].Value);
             }
+            var mine = rel is null ? null : new HashSet<string>(StringComparer.Ordinal);
             foreach (System.Text.RegularExpressions.Match m in condRe.Matches(text))
-                foreach (System.Text.RegularExpressions.Match id in identRe.Matches(m.Groups[1].Value)) tested.Add(id.Value);
+                foreach (System.Text.RegularExpressions.Match id in identRe.Matches(m.Groups[1].Value))
+                {
+                    tested.Add(id.Value);
+                    mine?.Add(tested.TryGetValue(id.Value, out var t) ? t : id.Value);
+                }
+            if (rel is null || !text.Contains("include", StringComparison.Ordinal) && mine!.Count == 0) return;
+            List<string> quotedNames = new(), angledNames = new();
+            foreach (System.Text.RegularExpressions.Match m in incNameRe.Matches(text))
+                if (m.Groups[1].Success) quotedNames.Add(Intern(Path.GetFileName(m.Groups[1].Value)));
+                else angledNames.Add(Intern(m.Groups[2].Value.Trim()));
+            if (mine!.Count > 0 || quotedNames.Count > 0 || angledNames.Count > 0)
+                includeFacts[rel] = (mine.ToArray(), quotedNames.ToArray(), angledNames.ToArray());
         }
         // Quoted #includes, kept per file so the ones that leave the tree (or resolve nowhere) can be followed.
         var anyIncRe = new System.Text.RegularExpressions.Regex(@"^\s*#\s*include\s*(?:""([^""]+)""|<([^>]+)>|([A-Za-z_]\w*))",
@@ -1349,7 +1368,7 @@ public static class CarveCommand
                             : incRe.Matches(text).Select(m => Path.GetFileName(m.Groups[1].Value))
                                 .Where(b => srcExts.Any(e => b.EndsWith(e, StringComparison.OrdinalIgnoreCase))).ToArray();
                         var (q, computed) = macroFactsWanted ? QuotedIncludes(text) : (Array.Empty<string>(), 0);
-                        if (macroFactsWanted) ScanMacroNames(text, seedDefined, seedCond);
+                        if (macroFactsWanted) ScanMacroNames(text, seedDefined, seedCond, seedOf);
                         seeded[seedOf] = (sourceIncludes, q, computed);
                     }
                     foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
@@ -1563,7 +1582,7 @@ public static class CarveCommand
             // the include scan read them; the big/dense headers the parser skips are streamed, keeping only names some
             // #if actually tests.
             var condIdents = new HashSet<string>(StringComparer.Ordinal);
-            void ScanText(string text) => ScanMacroNames(text, ambientMacros, condIdents);
+            void ScanText(string text, string? rel = null) => ScanMacroNames(text, ambientMacros, condIdents, rel);
             var quoted = new List<(string FromDir, string Raw)>();
             var computedIncludes = 0;
             void Includes(string fromDir, string text)
@@ -1580,7 +1599,7 @@ public static class CarveCommand
                 if (!seeded.TryGetValue(rel, out var facts))
                 {
                     var text = ReadRel(rel);
-                    ScanText(text);
+                    ScanText(text, rel);
                     Includes(fromDir, text);
                     continue;
                 }
@@ -1589,7 +1608,7 @@ public static class CarveCommand
             }
             ambientMacros.UnionWith(seedDefined);
             condIdents.UnionWith(seedCond);
-            foreach (var (_, text) in refIncludes) ScanText(text);
+            foreach (var (refRel, text) in refIncludes) ScanText(text, refRel);
             PreParsePart("treeMacros");
 
             // Headers the build reads that the walk didn't: outside the root (an SDK, generated config) or in an
@@ -1714,6 +1733,58 @@ public static class CarveCommand
                     err.WriteLine($"  config  : {invisible.Count:N0} #if name(s) defined nowhere visible stay unknown ({string.Join("; ", unseen.Distinct())}). "
                     + "A build trace makes this exact; so does mapping the include dir(s) with [advanced] pathMap.");
                 summary["world.invisibleMacroNames"] = invisible.Count;
+            }
+            // Review W1: an angled #include that neither the tree nor an -I dir has is a system header nothing here read
+            // (no trace names it). Unless it is a standard header whose macros are all listed, it may define any name:
+            // the names its translation units test that nothing visible defines stay unknown. Every file of such a
+            // unit: the includers of the file that names it, up to the TU, and everything those include.
+            if (buildOpenedOutside is null && includeFacts.Count > 0)
+            {
+                var hiddenByName = new Dictionary<string, bool>(StringComparer.Ordinal);
+                bool Hidden(string raw)
+                {
+                    if (!hiddenByName.TryGetValue(raw, out var h))
+                        hiddenByName[raw] = h = !CodeCarver.Core.Preprocess.MacroTable.IsListedStandardHeader(raw)
+                            && !basenames.Contains(Path.GetFileName(raw))
+                            && !incDirs.Any(d => { try { return scannedFull.Contains(Path.GetFullPath(Path.Combine(d, raw))); } catch { return false; } });
+                    return h;
+                }
+                var includers = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);   // basename -> rels
+                var relsByBase = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                var reach = new Queue<string>();
+                var unit = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var (rel, facts) in includeFacts)
+                {
+                    var bn = Path.GetFileName(rel);
+                    if (!relsByBase.TryGetValue(bn, out var rl)) relsByBase[bn] = rl = new List<string>();
+                    rl.Add(rel);
+                    foreach (var inc in facts.Quoted.Concat(facts.Angled.Select(a => Path.GetFileName(a))))
+                    {
+                        if (!includers.TryGetValue(inc, out var il)) includers[inc] = il = new List<string>();
+                        il.Add(rel);
+                    }
+                    if (facts.Angled.Any(Hidden) && unit.Add(rel)) reach.Enqueue(rel);
+                }
+                var systemFiles = unit.Count;
+                while (reach.Count > 0)   // up: whoever includes it
+                    if (includers.TryGetValue(Path.GetFileName(reach.Dequeue()), out var il))
+                        foreach (var r in il) if (unit.Add(r)) reach.Enqueue(r);
+                foreach (var r in unit) reach.Enqueue(r);
+                while (reach.Count > 0)   // down: what those include
+                {
+                    var f = includeFacts[reach.Dequeue()];
+                    foreach (var inc in f.Quoted.Concat(f.Angled.Select(a => Path.GetFileName(a))))
+                        if (relsByBase.TryGetValue(inc, out var rl))
+                            foreach (var r in rl) if (unit.Add(r)) reach.Enqueue(r);
+                }
+                var dashD = new HashSet<string>(buildCmds.SelectMany(c => c.Defines).Select(SpecName).Concat(manualDefines.Select(SpecName)), StringComparer.Ordinal);
+                var mayBeSystem = unit.SelectMany(r => includeFacts[r].Tested).Where(n => !ambientMacros.Contains(n) && !dashD.Contains(n))
+                                      .Distinct(StringComparer.Ordinal).ToList();
+                ambientMacros.UnionWith(mayBeSystem);
+                if (mayBeSystem.Count > 0)
+                    err.WriteLine($"  config  : {mayBeSystem.Count:N0} #if name(s) tested by {unit.Count:N0} file(s) that reach a system header not read here "
+                        + $"({systemFiles:N0} file(s) include one) stay unknown. A build trace makes this exact.");
+                summary["world.systemHeaderMacroNames"] = mayBeSystem.Count;
             }
             // The big and dense headers the parser skips: the names they #define that some #if tests, or null when one
             // can't be read (then every tested name might come from it). A big one is read in pieces at once.

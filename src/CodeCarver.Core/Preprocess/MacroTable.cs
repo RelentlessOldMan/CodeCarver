@@ -134,7 +134,7 @@ public sealed class MacroTable
         if (_unknown.Contains(name)) return true;
         if (_undefined.Contains(name)) return false;
         return OpenWorld || IsReserved(name) || name is "true" or "false" || NotFromTheBuild.Contains(name)
-               || (Ambient?.Contains(name) ?? false);
+               || InttypesMacro.IsMatch(name) || (Ambient?.Contains(name) ?? false);
     }
 
     /// <summary>Macros a file gets from the compiler or the C library, not from the build's flags or the tree:
@@ -146,6 +146,7 @@ public sealed class MacroTable
         // non-reserved compiler built-ins
         "linux", "unix", "i386", "i486", "i586", "i686", "sun", "sparc", "mips", "vax", "hppa", "m68k", "mc68000",
         "ns32000", "pyr", "sequent", "u3b2", "MIPSEB", "MIPSEL", "arm", "thumb", "ppc", "powerpc",
+        "WIN32", "WIN64", "WINNT",   // MinGW (review W1)
         // <limits.h>
         "CHAR_BIT", "SCHAR_MIN", "SCHAR_MAX", "UCHAR_MAX", "CHAR_MIN", "CHAR_MAX", "MB_LEN_MAX", "SHRT_MIN", "SHRT_MAX",
         "USHRT_MAX", "INT_MIN", "INT_MAX", "UINT_MAX", "LONG_MIN", "LONG_MAX", "ULONG_MAX", "LLONG_MIN", "LLONG_MAX",
@@ -172,6 +173,39 @@ public sealed class MacroTable
         "static_assert", "bool", "alignas", "alignof", "noreturn", "complex", "imaginary", "I",
         "HUGE_VAL", "HUGE_VALF", "INFINITY", "NAN", "FP_NAN", "FP_INFINITE", "FP_ZERO", "FP_NORMAL", "FP_SUBNORMAL",
         "MATH_ERRNO", "MATH_ERREXCEPT", "math_errhandling", "M_PI", "M_E",
+    };
+
+    /// <summary>
+    /// Standard headers whose non-reserved macros are all in <see cref="NotFromTheBuild"/> (or that define none): a
+    /// file that includes one from outside the tree is not hiding a macro. Any other angled header the tree doesn't
+    /// have (<c>&lt;fcntl.h&gt;</c>, <c>&lt;signal.h&gt;</c>, <c>&lt;windows.h&gt;</c>) may define any name (review W1).
+    /// </summary>
+    public static bool IsListedStandardHeader(string include)
+    {
+        var name = include.Replace('\\', '/');
+        if (name.StartsWith('c') && !name.Contains('.') && ListedStandardHeaders.Contains(name[1..] + ".h")) return true;
+        return ListedStandardHeaders.Contains(name);
+    }
+
+    /// <summary><c>&lt;inttypes.h&gt;</c>'s format macros (<c>PRIu32</c>, <c>SCNxFAST16</c>).</summary>
+    private static readonly System.Text.RegularExpressions.Regex InttypesMacro =
+        new(@"^(?:PRI|SCN)[diouxX](?:8|16|32|64|LEAST(?:8|16|32|64)|FAST(?:8|16|32|64)|MAX|PTR)$",
+            System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    private static readonly HashSet<string> ListedStandardHeaders = new(StringComparer.Ordinal)
+    {
+        "assert.h", "complex.h", "ctype.h", "float.h", "inttypes.h", "iso646.h", "limits.h",
+        "setjmp.h", "stdalign.h", "stdarg.h", "stdbool.h", "stddef.h", "stdint.h", "stdio.h", "stdlib.h",
+        "stdnoreturn.h", "string.h", "uchar.h", "wchar.h", "wctype.h",
+        // C++ library headers
+        "algorithm", "any", "array", "atomic", "bit", "bitset", "chrono", "codecvt", "compare", "concepts",
+        "condition_variable", "deque", "exception", "execution", "expected", "filesystem", "format", "forward_list",
+        "fstream", "functional", "future", "initializer_list", "iomanip", "ios", "iosfwd", "iostream", "istream",
+        "iterator", "limits", "list", "map", "memory", "memory_resource", "mutex", "new", "numbers", "numeric",
+        "optional", "ostream", "queue", "random", "ranges", "ratio", "regex", "scoped_allocator", "set",
+        "shared_mutex", "source_location", "span", "sstream", "stack", "stdexcept", "streambuf", "string",
+        "string_view", "system_error", "thread", "tuple", "type_traits", "typeindex", "typeinfo", "unordered_map",
+        "unordered_set", "utility", "valarray", "variant", "vector", "version",
     };
 
     /// <summary>Reserved to the implementation: <c>__x</c> or <c>_</c> + uppercase — compiler built-ins.</summary>
