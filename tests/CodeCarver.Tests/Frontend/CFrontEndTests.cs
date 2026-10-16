@@ -690,4 +690,25 @@ public class CFrontEndTests
         Assert.False(plan.IsKept(Find(graph, "reset")));
         Assert.False(plan.IsKept(Find(graph, "probe")));
     }
+
+    // Review CPU C5: a use is local when it sits in a same-name declaration's scope, found by one search over the name's
+    // scopes. Each body below names `tick` in parameters, nested blocks and sibling functions; only `uses_global`
+    // names the function, after an inner block's `tick` has gone out of scope.
+    [Theory]
+    [InlineData(false, "a(1) + c(2) + d(3)")]
+    [InlineData(true, "a(1) + c(2) + d(3) + (uses_global() != 0)")]
+    public void SameNameLocals_HideTheFunctionOnlyInTheirScopes(bool kept, string mainBody)
+    {
+        var src =
+            "void tick(void) {}\ntypedef void (*fn)(void);\n" +
+            "int a(int tick) { return tick; }\n" +
+            "int c(int tick) { { int tick = 2; (void)tick; } { int tick = 3; (void)tick; } return tick; }\n" +
+            "int d(int n) { int tick = n; { int tick = 4; { int tick = 5; (void)tick; } (void)tick; } return tick; }\n" +
+            "fn uses_global(void) { { int tick = 1; (void)tick; } { int tick = 6; { int tick = 7; (void)tick; } } return tick; }\n" +
+            "int main(void) { return " + mainBody + "; }\n";
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("main.c", src) });
+        var plan = ReachabilityEngine.Compute(graph, new ExplicitRootProvider(symbols: new[] { "main" }).Discover(graph).ToList());
+        Assert.Equal(kept, plan.IsKept(Find(graph, "tick")));
+    }
 }

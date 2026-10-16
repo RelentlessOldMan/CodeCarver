@@ -1466,6 +1466,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         if (!LeanCaptures.Usable(_locals)) using (var qc = _locals.Execute(root)) foreach (var cap in qc.Captures)
             Local(cap.Node.StartIndex, cap.Node.EndIndex);
         else foreach (var c in LeanCaptures.Of(_locals, root.Tree)) Local(c.Start, c.End);
+        // For IsLocalUse's binary search: by start, each end raised to the furthest end so far (review CPU C5).
+        foreach (var l in r.Values)
+        {
+            l.Sort((a, b) => a.Item1.CompareTo(b.Item1));
+            for (var i = 1; i < l.Count; i++) if (l[i].Item2 < l[i - 1].Item2) l[i] = (l[i].Item1, l[i - 1].Item2);
+        }
         return r;
 
         void Local(int at, int endAt)
@@ -1491,10 +1497,17 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
     private static bool IsLocalUse(Dictionary<string, List<(int From, int To)>> locals, string name, int pos)
     {
+        // In a scope from a declaration (the declaration itself, and every use after it) to its scope's end. The list is
+        // sorted by start with each end the furthest so far, so the last start at or before pos answers: one search
+        // where every same-name declaration in the file was tried per use (review CPU C5).
         if (!locals.TryGetValue(name, out var l)) return false;
-        foreach (var (from, to) in l)
-            if (pos >= from && pos < to) return true;   // the declaration itself, and every use after it
-        return false;
+        int lo = 0, hi = l.Count - 1, last = -1;
+        while (lo <= hi)
+        {
+            var mid = (lo + hi) >> 1;
+            if (l[mid].From <= pos) { last = mid; lo = mid + 1; } else hi = mid - 1;
+        }
+        return last >= 0 && pos < l[last].To;
     }
 
     /// <summary>
@@ -2365,7 +2378,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         if (root.HasError) w.ErrorFiles++;
         var scannedData = new List<CodeCarver.Core.Reachability.EmittedLinkCheck.Definition>();
         if (root.HasError)
-            foreach (var d in CodeCarver.Core.Reachability.EmittedLinkCheck.Scan(text, header: !IsTranslationUnit(path)).Definitions)
+            foreach (var d in CodeCarver.Core.Reachability.EmittedLinkCheck.Scan(text, header: !IsTranslationUnit(path), declarators: false).Definitions)
             {
                 if (d.Data) { scannedData.Add(d); continue; }   // after pass 1b, which mints what parsed
                 if (Keywords.Contains(d.Name) || _funcLikeMacroNames.Contains(d.Name)) continue;
