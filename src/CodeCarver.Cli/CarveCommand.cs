@@ -1571,6 +1571,19 @@ public static class CarveCommand
             };
         }
         var outsideNames = new HashSet<string>(StringComparer.Ordinal);   // identifiers in headers read outside the root
+        // Review M1: their #define lines that may make a keep or register macro (function-like, or not a plain value).
+        var outsideDefines = new System.Text.StringBuilder();
+        var outsideDefineRe = new System.Text.RegularExpressions.Regex(@"^[ \t]*#[ \t]*define[ \t]+[A-Za-z_]\w*(?<fn>\()?(?:\\r?\n|[^\r\n])*",
+            System.Text.RegularExpressions.RegexOptions.Multiline);
+        void OutsideDefines(string text)
+        {
+            if (!text.Contains("define", StringComparison.Ordinal)) return;
+            foreach (System.Text.RegularExpressions.Match m in outsideDefineRe.Matches(text))
+                if (m.Groups["fn"].Success || !m.ValueSpan.ContainsAny("0123456789") || m.ValueSpan.Contains("__attribute__", StringComparison.Ordinal)
+                    || m.ValueSpan.Contains("__declspec", StringComparison.Ordinal) || m.ValueSpan.Contains("[[", StringComparison.Ordinal)
+                    || m.ValueSpan.Contains("ragma", StringComparison.Ordinal))
+                    outsideDefines.Append(m.ValueSpan).Append('\n');
+        }
         // What ExternalIncluders reads of each outside header the macro scan already read: not read a second time.
         var outsideIncludeLines = new Dictionary<string, List<string>>(CodeCarver.Core.Util.PathComparer.Default);
         if (defines is not null && closedWorld && closureLang)
@@ -1654,6 +1667,7 @@ public static class CarveCommand
                     // What it names may be a macro a carved big header defines (an SDK header testing a config
                     // macro): header carving must keep those.
                     foreach (var m in Identifier.EnumerateMatches(text)) outsideNames.Add(text.Substring(m.Index, m.Length));
+                    OutsideDefines(text);
                     foreach (System.Text.RegularExpressions.Match m in defRe.Matches(text))
                         if (condIdents.Contains(m.Groups[1].Value))
                         {
@@ -1848,6 +1862,15 @@ public static class CarveCommand
         }
         // Everything before the parse (file walk, build logs, traces, macro scans) is its own phase.
         Mark("pre-parse");
+        if (fe is TreeSitterFrontEnd tsKeep)
+        {
+            // Review M1: -D specs as #define lines ("F(a)=body" -> "#define F(a) body"), then the outside headers'.
+            foreach (var spec in buildCmds.SelectMany(c => c.Defines).Concat(manualDefines).Distinct(StringComparer.Ordinal))
+                if (spec.IndexOf('=') is var eq and > 0)
+                    outsideDefines.Append("#define ").Append(spec.AsSpan(0, eq)).Append(' ').Append(spec.AsSpan(eq + 1)).Append('\n');
+            if (outsideDefines.Length > 0) tsKeep.ExternalMacroText = outsideDefines.ToString();
+            outsideDefines.Clear();
+        }
         var graph = fe.BuildGraph(parseRels, ReadRel, defines, closedWorld);
         if (fe is TreeSitterFrontEnd tsTiming)
             foreach (var (k, v) in tsTiming.Timing)

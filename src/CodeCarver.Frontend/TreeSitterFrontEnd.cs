@@ -877,8 +877,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // Keep macros: a keep construct in the body, or (transitively) a use of another keep macro. Register macros the
         // same, from a section named by an identifier. One look at every macro's bodies (on several threads) finds the
         // seeds and the other macros each body names; the closure then walks from the seeds to the macros that use them.
-        var entries = bodies.ToList();
-        var macroNames = new CodeCarver.Core.Util.NameSet(bodies.Keys);
+        var keepBodies = WithExternalMacros(bodies);
+        var entries = keepBodies.ToList();
+        var macroNames = new CodeCarver.Core.Util.NameSet(keepBodies.Keys);
         string[] UsesOf(string name, List<string> list)
         {
             List<string>? uses = null;
@@ -945,7 +946,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             _condExternMacros.Add(kv.Key);
             if (_emptyDefineConditions.TryGetValue(kv.Key, out var flags)) _condExternFlags.UnionWith(flags);
         }
-        _keepMacrosFnLike = new HashSet<string>(keep.Where(k => bodies[k].FnLike), StringComparer.Ordinal);
+        _keepMacrosFnLike = new HashSet<string>(keep.Where(k => keepBodies[k].FnLike), StringComparer.Ordinal);
         _keepMacroUse = keep.Count == 0 ? null : new NameScan(keep, NameScan.Shape.Word);
 
         var fnBodies = MacroBodies.Parse(bodies);
@@ -1012,6 +1013,26 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
     /// <summary>Text never shared between files: each file's scans run on their own thread. Bounded by memory like the
     /// parse: a run of huge headers waits rather than holding them all at once.</summary>
+    /// <summary><c>#define</c> lines from outside the tree: the build's <c>-D</c> specs and the headers outside the root the
+    /// carve read. Looked at only to find keep and register macros (review M1).</summary>
+    public string? ExternalMacroText { get; set; }
+
+    /// <summary>The tree's macro bodies plus those of <see cref="ExternalMacroText"/> the tree doesn't define.</summary>
+    private Dictionary<string, (bool FnLike, List<string> Bodies)> WithExternalMacros(Dictionary<string, (bool FnLike, List<string> Bodies)> bodies)
+    {
+        if (ExternalMacroText is not { Length: > 0 } ext) return bodies;
+        var x = new FileMacros();
+        DefineLines.Scan(SourceText.Normalize(ext), x.Objects, x.Valueless, x.FnLike, x.Defines);
+        var all = new Dictionary<string, (bool FnLike, List<string> Bodies)>(bodies, StringComparer.Ordinal);
+        foreach (var (name, fn, body) in x.Defines)
+        {
+            if (bodies.ContainsKey(name)) continue;
+            if (!all.TryGetValue(name, out var b)) all[name] = b = (fn, new List<string>());
+            if (b.Bodies.Count < 8) b.Bodies.Add(body);
+        }
+        return all;
+    }
+
     private static FileMacros ScanMacros(string path, Func<string, string> read)
     {
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
