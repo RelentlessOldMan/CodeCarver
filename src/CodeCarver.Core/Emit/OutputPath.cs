@@ -23,11 +23,36 @@ public static class OutputPath
     {
         ArgumentNullException.ThrowIfNull(sourceRoot);
         ArgumentNullException.ThrowIfNull(outDir);
-        var a = Normalize(sourceRoot);
-        var b = Normalize(outDir);
         var cmp = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS()
             ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
-        return a.Equals(b, cmp) || a.StartsWith(b, cmp) || b.StartsWith(a, cmp);
+        static bool Nested(string a, string b, StringComparison cmp) => a.StartsWith(b, cmp) || b.StartsWith(a, cmp);
+        // As written, and with every junction/symlink resolved: a link to (or into) the other tree is the same tree (review O1).
+        return Nested(Normalize(sourceRoot), Normalize(outDir), cmp)
+               || Nested(Normalize(Resolve(sourceRoot)), Normalize(Resolve(outDir)), cmp);
+    }
+
+    /// <summary>The path with each existing directory on it that is a junction or symlink replaced by its final target.
+    /// The part that doesn't exist yet is kept as written.</summary>
+    private static string Resolve(string path)
+    {
+        var full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        var root = Path.GetPathRoot(full) ?? "";
+        var current = root;
+        var parts = full[root.Length..].Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+        for (var i = 0; i < parts.Length; i++)
+        {
+            var next = Path.Combine(current, parts[i]);
+            try
+            {
+                var info = new DirectoryInfo(next);
+                if (!info.Exists) return Path.Combine(new[] { next }.Concat(parts[(i + 1)..]).ToArray());
+                if (info.LinkTarget is not null && info.ResolveLinkTarget(returnFinalTarget: true) is { } target)
+                    next = Path.TrimEndingDirectorySeparator(Path.GetFullPath(target.FullName));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
+            current = next;
+        }
+        return current;
     }
 
     /// <summary>Full path, no trailing separator, then exactly one appended — so prefix comparison is a

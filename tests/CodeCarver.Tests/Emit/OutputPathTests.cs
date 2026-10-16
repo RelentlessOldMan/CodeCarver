@@ -55,4 +55,38 @@ public sealed class OutputPathTests
         Assert.Equal(expected, OutputPath.Overlaps(J("Proj", "SRC"), J("proj", "src")));
         Assert.Equal(expected, OutputPath.Overlaps(J("src"), J("SRC", "carved")));
     }
+    [Fact]
+    public void Overlap_ThroughAJunctionOrSymlink_IsCaught()
+    {
+        // Review O1: the output directory is a link to an earlier output whose carved/ is now the source.
+        var tmp = Path.Combine(Path.GetTempPath(), "codecarver-o1-" + Guid.NewGuid().ToString("N"));
+        var earlier = Path.Combine(tmp, "out-old");
+        var source = Path.Combine(earlier, "carved");
+        var link = Path.Combine(tmp, "out-link");
+        Directory.CreateDirectory(source);
+        try
+        {
+            if (!MakeDirectoryLink(link, earlier)) return;   // no way to make a link here
+            Assert.True(OutputPath.Overlaps(source, link));
+            Assert.False(OutputPath.Overlaps(source, Path.Combine(link, "new")));   // out-old/new: a sibling
+            Assert.True(OutputPath.Overlaps(Path.Combine(link, "carved"), earlier));
+            Assert.False(OutputPath.Overlaps(source, Path.Combine(tmp, "elsewhere")));
+        }
+        finally
+        {
+            try { Directory.Delete(link); } catch (IOException) { }
+            Directory.Delete(tmp, true);
+        }
+    }
+
+    private static bool MakeDirectoryLink(string link, string target)
+    {
+        try { Directory.CreateSymbolicLink(link, target); return true; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        if (!OperatingSystem.IsWindows()) return false;
+        using var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe", $"/c mklink /J \"{link}\" \"{target}\"")
+            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true });
+        p!.WaitForExit();
+        return p.ExitCode == 0 && Directory.Exists(link);
+    }
 }
