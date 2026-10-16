@@ -122,7 +122,8 @@ public static class DefinerMacros
         return true;
     }
 
-    static bool IsWordChar(char c) => c < 128 ? char.IsAsciiLetterOrDigit(c) || c == '_' : WordChar.IsMatch(c.ToString());
+    /// <summary>The regex <c>\w</c>.</summary>
+    public static bool IsWordChar(char c) => c < 128 ? char.IsAsciiLetterOrDigit(c) || c == '_' : WordChar.IsMatch(c.ToString());
 
     public static Dictionary<string, List<Template>> Build(IReadOnlyDictionary<string, (bool FnLike, List<string> Bodies)> bodies)
         => Build(MacroBodies.Parse(bodies));

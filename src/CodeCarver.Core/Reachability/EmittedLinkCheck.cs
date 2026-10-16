@@ -815,9 +815,31 @@ public static class EmittedLinkCheck
 
     static int[] LineStarts(string text)
     {
-        var l = new List<int> { 0 };
-        for (var i = 0; i < text.Length; i++) if (text[i] == '\n') l.Add(i + 1);
-        return l.ToArray();
+        // Counted first and filled at size: a list grown line by line, then copied, was the scan's largest int garbage.
+        var starts = new int[text.AsSpan().Count('\n') + 1];
+        var n = 1;
+        for (var i = text.IndexOf('\n'); i >= 0; i = text.IndexOf('\n', i + 1)) starts[n++] = i + 1;
+        return starts;
+    }
+
+    /// <summary>The name of the function-like #define starting the line at <paramref name="p"/>, as
+    /// <see cref="FuncLikeDefine"/> matches there, or null: read by hand, where the regex built a match, its groups and
+    /// strings for every function-like macro of a register header.</summary>
+    static string? FuncLikeDefineAt(string text, int p)
+    {
+        var i = p;
+        while (i < text.Length && text[i] is ' ' or '\t') i++;
+        if (i >= text.Length || text[i] != '#') return null;
+        i++;
+        while (i < text.Length && text[i] is ' ' or '\t') i++;
+        if (string.CompareOrdinal(text, i, "define", 0, 6) != 0) return null;
+        i += 6;
+        var k = i;
+        while (k < text.Length && text[k] is ' ' or '\t') k++;
+        if (k == i || k >= text.Length || !(char.IsAsciiLetter(text[k]) || text[k] == '_')) return null;
+        var at = k++;
+        while (k < text.Length && CodeCarver.Core.Preprocess.DefinerMacros.IsWordChar(text[k])) k++;
+        return k < text.Length && text[k] == '(' ? text[at..k] : null;
     }
     static int LineOf(int[] starts, int index)
     {
@@ -959,11 +981,12 @@ public static class EmittedLinkCheck
         {
             var starts = LineStarts(text);
             if (text.Contains("define", StringComparison.Ordinal))
-                foreach (System.Text.RegularExpressions.Match m in FuncLikeDefine.Matches(text))
-                {
-                    result.FunctionMacros.Add(m.Groups[1].Value);
-                    result.FunctionMacroLines.Add((m.Groups[1].Value, LineOf(starts, m.Index)));
-                }
+                for (var ln = 0; ln < starts.Length; ln++)
+                    if (FuncLikeDefineAt(text, starts[ln]) is { } name)
+                    {
+                        result.FunctionMacros.Add(name);
+                        result.FunctionMacroLines.Add((name, ln + 1));
+                    }
             if (text.Contains("include", StringComparison.Ordinal))
                 foreach (System.Text.RegularExpressions.Match m in IncludeLine.Matches(text)) result.Includes.Add(m.Groups[1].Value);
         }
