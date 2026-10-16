@@ -271,6 +271,27 @@ public sealed class CarveTomlRunTests
         finally { Cleanup(work); }
     }
 
+    // Review E9: with several stages, --why answered for the first one only and didn't say which.
+    [Fact]
+    public void Carve_Why_AnswersEachStage_Labeled()
+    {
+        var (work, src, outDir) = NewWork();
+        File.WriteAllText(Path.Combine(src, "main.c"), "int spare(void) { return 1; }\nint main(void) { return 0; }\n");
+        try
+        {
+            var cfg = Config(work, outDir, "[common]\nentryPoints = [\"main\"]\n[stages.safe]\ncarveSourceFileContents = false\n"
+                + "[stages.aggressive]\ncarveSourceFileContents = true\n");
+            var (code, o, e) = Run("carve", src, "--config", cfg, "--why", "spare");
+            Assert.True(code == 0, o + e);
+            var safe = o.IndexOf("stage safe:", StringComparison.Ordinal);
+            var aggressive = o.IndexOf("stage aggressive:", StringComparison.Ordinal);
+            Assert.True(safe >= 0 && aggressive > safe, o);
+            Assert.DoesNotContain("CARVED", o[safe..aggressive]);   // main.c is written whole at safe
+            Assert.Contains("CARVED", o[aggressive..]);
+        }
+        finally { Cleanup(work); }
+    }
+
     [Fact]
     public void Carve_Why_CarvedSymbol_SaysCarved()
     {

@@ -2732,8 +2732,14 @@ public static class CarveCommand
                               + "(a verify failure for it reports definitionNotRecognized)");
                 return 1;
             }
+            // Each stage keeps differently: answer for every one, labeled (review E9).
+            var whyStages = !cv.AnalysisOnly && cv.Stages.Count > 1 ? cv.Stages.Select(s => (Label: $"stage {s.Name}: ", Plan: PlanFor(KindOf(s)))).ToList()
+                                                                    : new() { (Label: "", Plan: whyPlan) };
             foreach (var n in matches.OrderBy(n => n.FilePath, StringComparer.Ordinal).ThenBy(n => n.Span.StartLine))
-                @out.WriteLine($"  {n.Kind} {n.Name} @ {n.FilePath}:{n.Span}\n    {whyPlan.Explain(n.Id)}");
+            {
+                @out.WriteLine($"  {n.Kind} {n.Name} @ {n.FilePath}:{n.Span}");
+                foreach (var (label, p) in whyStages) @out.WriteLine($"    {label}{p.Explain(n.Id)}");
+            }
             return 0;
         }
 
