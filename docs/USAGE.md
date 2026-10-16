@@ -170,6 +170,7 @@ A stage may also set `stubUnexecuted = true` (with `carveSourceFileContents = tr
 | `allowUnmatchedTraces = true` | `false` | a file trace with no path under the carve root becomes a warning instead of exit 2 |
 | `memoryStopMb = 20000` | none | stop the run when its private memory passes this many MB: it writes `<outputDirectory>/codecarver/stopped-summary.txt` (the summary so far, plus `stop.*` keys) and exits 4. `0` or unset: never stop |
 | `unparsedHeaderCache = false` | `true` | read the big and dense headers the parser skips on every run. By default a run keeps the `#if`-tested names each one defines in `<outputDirectory>/.codecarver-cache/`, and the next run reuses them for every such header whose size and last-write time are unchanged (`world.unparsedHeadersFromCache`, `world.unparsedHeadersFromCacheBytes`) instead of reading it again |
+| `mirrorOf = "//server/share/tree"` | none | the carve root is a local copy of this tree: the run first compares the two by listing and stops (exit 2) if any file is missing, extra, or differs in size or last-write time. See [Carving a local copy](#carving-a-local-copy-of-a-tree-on-a-share) |
 | `pruneGarbage = false` | `true` | keep every non-input too (VCS metadata, IDE scratch, logs, editor backups, make `.d` dependency files) |
 
 Integer keys are range-checked: a negative or oversized value is a config error (exit 2).
@@ -649,6 +650,42 @@ starts, so one that exists is the last run's.
 The two longest steps before the parse also say which part took the time: `rootNames built / binaries /
 unbuilt` and `pre-parse treeMacros / outsideHeaders / quotedIncludes / unparsedHeaders`, each a `progress:`
 line and a `time.<step>.<part>.ms` summary key.
+
+### Carving a local copy of a tree on a share
+
+A tree on a network share costs a long run much of its time in waits: compare `io.<phase>.read.ms` (time
+waiting on files, summed over threads) with `cpu.<phase>.ms` (computing, summed over cores) and
+`time.<phase>.ms` (wall) in the summary. Carving a local copy instead takes those waits away, and
+`tools/mirror/mirror.ps1` (Windows, robocopy) or `tools/mirror/mirror.sh` (rsync) keeps the copy up to date by
+copying only what changed:
+
+```
+# 1. copy the tree in: everything the first time, then only files whose size or last-write time changed
+powershell -ExecutionPolicy Bypass -File tools\mirror\mirror.ps1 -From \\server\share\tree -To D:\local\tree
+# 2. carve the copy
+codecarver carve D:\local\tree --config carve.toml
+# 3. if the output must live on the share: copy it back, again only what changed
+powershell -ExecutionPolicy Bypass -File tools\mirror\mirror.ps1 -From D:\local\out -To \\server\share\out
+```
+
+A carve of a copy is only right if the copy is right, so name the original in the config:
+
+```toml
+[advanced]
+mirrorOf = "//server/share/tree"
+pathMap  = [{ from = "//server/share/tree", to = "." }]   # when the build log or traces name the share's paths
+```
+
+The run then lists both trees before any other work (nothing is read, so this is far cheaper than the carve's own
+reads) and stops with exit 2 if a file is missing from the copy, only in the copy, or differs in size or last-write
+time (times within 2 s count as the same, as some shares keep them that coarsely). The first differences are
+printed; run the copy again and rerun. `excludeDirectories` are left out of the comparison. The summary says
+what the check covered and cost: `mirror.files`, `mirror.differences`, `mirror.localListMs`,
+`mirror.sourceListMs`.
+
+The script makes its target an exact copy, deleting files the source no longer has, so it refuses a non-empty
+target it did not make (`-Force` overrides); it leaves `<target>.mirror-of.txt` beside the target. Keep the
+output's `.codecarver-cache/` (it travels with the output) so the next run reuses it.
 
 ## Diagnostics
 

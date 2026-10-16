@@ -220,6 +220,27 @@ public static class CarveCommand
             }
         }
 
+        // [advanced] mirrorOf: the carve root is a local copy of that tree (often a share, slow to read). Carving a copy
+        // that has drifted would give a carve of the wrong tree with nothing to show it, so the two are compared by
+        // listing first (size + last-write time, nothing read) and any difference stops the run before the work.
+        CodeCarver.Core.Util.MirrorCheck.Result? mirror = null;
+        if (cv.MirrorOf is { } mirrorOf)
+        {
+            if (!Directory.Exists(mirrorOf)) { err.WriteLine($"mirrorOf: '{mirrorOf}' is not a directory (or can't be reached)."); return 2; }
+            if (OutputPath.Overlaps(dir, mirrorOf)) { err.WriteLine($"mirrorOf: '{mirrorOf}' overlaps the carve root '{Path.GetFullPath(dir)}'; it names the tree the carve root was copied FROM."); return 2; }
+            var segs = excludeDirs.Select(x => "/" + x.Replace('\\', '/').Trim('/') + "/").ToList();
+            mirror = CodeCarver.Core.Util.MirrorCheck.Compare(dir, mirrorOf, segs);
+            if (mirror.Differences > 0)
+            {
+                err.WriteLine($"mirrorOf: the carve root does not match '{mirrorOf}': {mirror.Missing.Count} missing, {mirror.Extra.Count} extra, "
+                    + $"{mirror.Changed.Count} changed (size or last-write time) of {mirror.Files} file(s). Copy it again (only the "
+                    + "differences are copied, see USAGE.md) and rerun. First ones:");
+                foreach (var (what, list) in new[] { ("missing", mirror.Missing), ("extra", mirror.Extra), ("changed", mirror.Changed) })
+                    foreach (var p in list.Take(10)) err.WriteLine($"  {what}: {p}");
+                return 2;
+            }
+        }
+
         // A stop file is this run's or none: one an earlier run left must not be read as this run's numbers.
         var stoppedSummaryPath = Path.Combine(outputFull, "codecarver", StoppedSummaryFile);
         try { File.Delete(stoppedSummaryPath); }
@@ -286,6 +307,13 @@ public static class CarveCommand
             ["stagesConfigured"] = cv.Stages.Count,
             ["mem.machineMb"] = MachineMemoryMb(),
         };
+        if (mirror is not null)
+        {
+            summary["mirror.files"] = mirror.Files;
+            summary["mirror.differences"] = mirror.Differences;
+            summary["mirror.localListMs"] = mirror.LocalMs;
+            summary["mirror.sourceListMs"] = mirror.SourceMs;
+        }
         diag.Set("closedWorld", closedWorld);
         diag.Set("stageCount", cv.Stages.Count);
         diag.Event("args parsed");
@@ -3110,6 +3138,7 @@ public static class CarveCommand
             if (maxSymbolsPerFile is { } msf) sb.AppendLine($"maxSymbolsPerFile = {msf}");
             sb.AppendLine($"allowUnmatchedTraces = {(cv.AllowUnmatchedTraces ? "true" : "false")}");
             sb.AppendLine($"pruneGarbage = {(pruneGarbage ? "true" : "false")}");
+            if (cv.MirrorOf is { } mo) sb.AppendLine($"mirrorOf = {Q(mo)}");
             if (cv.PathMap.Count > 0)
                 sb.AppendLine("pathMap = [" + string.Join(", ", cv.PathMap.Select(m => $"{{ from = {Q(m.From)}, to = {Q(m.To)} }}")) + "]");
             return sb.ToString();
