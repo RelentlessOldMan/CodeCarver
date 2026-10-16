@@ -2474,7 +2474,20 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             pendingCalls.Add((lid, target));
         }
         if (text.Contains("asm", StringComparison.Ordinal))
+        {
             foreach (Match m in AsmLabelDecl.Matches(text)) LinkerName(m.Groups["name"].Value, m.Groups["sym"].Value, m.Index);
+            // Top-level asm defining a symbol: `.globl name` and `name:` (review S2). A call to it reaches this file.
+            foreach (var (name, index) in CodeCarver.Core.Frontend.AsmSymbols.DefinedLabels(text))
+            {
+                if (Keywords.Contains(name) || (functionsByName.TryGetValue(name, out var have) && have.Any(h => graph.GetNode(h).FilePath == path))) continue;
+                var ln = 1;
+                for (var k = 0; k < index && k < text.Length; k++) if (text[k] == '\n') ln++;
+                if (dead is not null && ln < dead.Length && dead[ln]) continue;
+                var aid = graph.GetOrAddNode(NodeKind.Function, name, path, new SourceSpan(ln, ln));
+                graph.AddEdge(aid, fileNode, EdgeKind.DefinedIn);
+                Add(functionsByName, name, aid);
+            }
+        }
         if (text.Contains("redefine_extname", StringComparison.Ordinal))
             foreach (Match m in RedefineExtname.Matches(text)) LinkerName(m.Groups["name"].Value, m.Groups["sym"].Value, m.Index);
         // A command-line rename (-Dsecret_rite=true_rite): a function defined here as secret_rite is the symbol true_rite.

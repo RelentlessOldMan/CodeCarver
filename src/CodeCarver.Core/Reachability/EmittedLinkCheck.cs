@@ -896,10 +896,7 @@ public static class EmittedLinkCheck
                 result.AsmLabels.Add((m.Groups[1].Value, m.Groups[2].Value, LineOf(starts, m.Groups[2].Index)));
             }
             // .globl name together with a `name:` label in the same text.
-            foreach (System.Text.RegularExpressions.Match m in AsmGlobal.Matches(text))
-                foreach (var n in m.Groups[1].Value.Split(',', StringSplitOptions.TrimEntries))
-                    if (System.Text.RegularExpressions.Regex.IsMatch(text, @"(?:^|[\s""])" + System.Text.RegularExpressions.Regex.Escape(n) + @"\s*:"))
-                        Add(n, m.Groups[1].Index);
+            foreach (var (n, index) in CodeCarver.Core.Frontend.AsmSymbols.DefinedLabels(text)) Add(n, index);
         }
     }
 

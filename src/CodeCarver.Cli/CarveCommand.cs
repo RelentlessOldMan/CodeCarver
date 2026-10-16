@@ -2390,7 +2390,53 @@ public static class CarveCommand
                     err.WriteLine($"  asm     : {asmPaths.Count} of {before} assembly file(s) used for roots (the others are not in the build log/trace)");
             }
             if (asmPaths.Count > 0)
-                asmRoots = new AsmReferenceRootProvider(asmPaths.Select(SafeRead)).Discover(graph).ToList();
+            {
+                // What the startup code includes names handlers too; a C header's prototypes would root everything it
+                // declares, so only its assembler directives count.
+                var asmTexts = asmPaths.Select(SafeRead).ToList();
+                foreach (var inc in AsmIncludes(asmPaths))
+                    asmTexts.Add(Path.GetExtension(inc).ToLowerInvariant() is ".h" or ".hh" or ".hpp" or ".hxx"
+                        ? string.Join('\n', SafeRead(inc).Split('\n').Where(l => l.TrimStart().StartsWith('.')))
+                        : SafeRead(inc));
+                asmRoots = new AsmReferenceRootProvider(asmTexts).Discover(graph).ToList();
+            }
+            // Every assembly file is copied whole, so the headers it includes are kept whole (review S1, D10).
+            var asmIncludedFiles = AsmIncludes(asmFilesInTree.Where(p => SafeLength(p) <= maxParseBytes))
+                .Select(p => Path.GetRelativePath(dir, p).Replace('\\', '/')).Where(r => fullByRel.ContainsKey(r)).ToList();
+            if (asmIncludedFiles.Count > 0)
+            {
+                asmRoots.AddRange(new ExplicitRootProvider(files: asmIncludedFiles).Discover(graph));
+                summary["roots.assemblyIncludedFiles"] = asmIncludedFiles.Count;
+            }
+        }
+
+        // Review S1: what assembly pulls in with `.include "x"` or `#include "x"` (a vector table in a .inc, a register
+        // header), transitively. Resolved beside the includer, else by path suffix anywhere in the tree (over-approximate).
+        List<string> AsmIncludes(IEnumerable<string> asmPaths)
+        {
+            var includeRe = new System.Text.RegularExpressions.Regex(@"^[ \t]*(?:#[ \t]*include|\.include)[ \t]*[""<]([^"">\r\n]+)["">]",
+                System.Text.RegularExpressions.RegexOptions.Multiline);
+            var seen = new HashSet<string>(asmPaths, StringComparer.OrdinalIgnoreCase);
+            var queue = new Queue<string>(seen);
+            var found = new List<string>();
+            while (queue.Count > 0)
+            {
+                var path = queue.Dequeue();
+                if (SafeLength(path) > maxParseBytes) continue;
+                foreach (System.Text.RegularExpressions.Match m in includeRe.Matches(SafeRead(path)))
+                {
+                    var raw = m.Groups[1].Value.Trim().Replace('\\', '/');
+                    string? beside = null;
+                    try { beside = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(path) ?? dir, raw)); } catch { }
+                    var inTree = beside is not null && !Path.GetRelativePath(dir, beside).StartsWith("..", StringComparison.Ordinal);
+                    var hits = inTree && File.Exists(beside) && !Excluded(beside!)
+                        ? new List<string> { beside! }
+                        : treeFiles.Where(p => !Excluded(p) && ("/" + p.Replace('\\', '/')).EndsWith("/" + raw.TrimStart('.', '/'), StringComparison.OrdinalIgnoreCase)).ToList();
+                    foreach (var hit in hits)
+                        if (seen.Add(hit)) { queue.Enqueue(hit); found.Add(hit); }
+                }
+            }
+            return found;
         }
 
         // forceKeepFiles (review K1): resolve each glob once. A forced code file is an ExplicitFile root, so its
