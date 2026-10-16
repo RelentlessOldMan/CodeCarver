@@ -255,6 +255,20 @@ public sealed class MacroWorldTests
         AssertFeatKept(t, t.Carve());
     }
 
+    // Review CPU C4: forced includes are looked up once per (directory, -I list, name). One name under two -I lists is
+    // two lookups: here main.c's -I has no force.h, so main.c's define set is incomplete and FEAT may be defined.
+    [Fact]
+    public void ForcedInclude_SameNameUnderAnotherIncludeDir_IsItsOwnLookup()
+    {
+        using var t = Tree("");
+        t.W("cfg/a/force.h", "#define OTHER 1\n");
+        Directory.CreateDirectory(t.S("cfg/b"));
+        t.Compile("feat.c", $"-I{t.S("cfg/a")} -include force.h")
+         .Compile("plain.c", $"-I{t.S("cfg/a")} -include force.h")
+         .Compile("main.c", $"-I{t.S("cfg/b")} -include force.h");
+        AssertFeatKept(t, t.Carve());
+    }
+
     [Fact]
     public void FileCompiledTwice_WithAndWithoutTheDefine_KeepsBoth()
     {

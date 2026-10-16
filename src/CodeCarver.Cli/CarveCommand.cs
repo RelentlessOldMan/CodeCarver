@@ -674,27 +674,45 @@ public static class CarveCommand
             }
             // Forced includes (-include/-imacros//FI) define macros for their TU; an unreadable one, or an
             // unreadable @response file, leaves the file's define set incomplete -> open-world (BL2).
+            // A forced include is usually shared by thousands of commands: each (directory, -I list, name) is searched
+            // once and each file read once (review CPU C4). Null: not found or unreadable.
+            var forcedFound = new Dictionary<(string, string, string), string?>();
+            var forcedNames = new Dictionary<string, string[]?>(StringComparer.Ordinal);
+            var directive = new System.Text.RegularExpressions.Regex(@"^\s*#\s*(?:define|undef)\s+([A-Za-z_]\w*)",
+                System.Text.RegularExpressions.RegexOptions.Multiline | System.Text.RegularExpressions.RegexOptions.Compiled);
             foreach (var kv in byFile)
                 foreach (var cc in kv.Value)
                 {
                     if (cc.Incomplete) openWorldFiles.Add(kv.Key);
+                    var incKey = cc.ForcedIncludes.Count > 0 ? string.Join("\n", cc.Includes) : "";
                     foreach (var fi in cc.ForcedIncludes)
                     {
-                        string? text = null;
-                        try
+                        if (!forcedFound.TryGetValue((cc.Directory, incKey, fi), out var full))
                         {
-                            // Searched like #include "...": the command's directory, then each -I dir in order.
-                            var bd = Path.IsPathFullyQualified(cc.Directory) ? cc.Directory : Path.Combine(dir, cc.Directory);
-                            var full = (Path.IsPathFullyQualified(fi) ? new[] { fi }
+                            try
+                            {
+                                // Searched like #include "...": the command's directory, then each -I dir in order.
+                                var bd = Path.IsPathFullyQualified(cc.Directory) ? cc.Directory : Path.Combine(dir, cc.Directory);
+                                full = (Path.IsPathFullyQualified(fi) ? new[] { fi }
                                         : new[] { Path.Combine(bd, fi) }.Concat(cc.Includes.Select(i => Path.Combine(Path.IsPathFullyQualified(i) ? i : Path.Combine(bd, i), fi))))
                                        .FirstOrDefault(File.Exists);
-                            if (full is not null) text = CodeCarver.Core.Util.IoMeter.ReadAllText(full);
+                            }
+                            catch (ArgumentException) { full = null; }
+                            forcedFound[(cc.Directory, incKey, fi)] = full;
                         }
-                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
-                        if (text is null) { openWorldFiles.Add(kv.Key); continue; }
-                        foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(text,
-                                     @"^\s*#\s*(?:define|undef)\s+([A-Za-z_]\w*)", System.Text.RegularExpressions.RegexOptions.Multiline))
-                            ambientMacros.Add(m.Groups[1].Value);
+                        string[]? names = null;
+                        if (full is not null && !forcedNames.TryGetValue(full, out names))
+                        {
+                            try
+                            {
+                                var text = CodeCarver.Core.Util.IoMeter.ReadAllText(full);
+                                names = directive.Matches(text).Select(m => m.Groups[1].Value).ToArray();
+                            }
+                            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
+                            forcedNames[full] = names;
+                        }
+                        if (names is null) { openWorldFiles.Add(kv.Key); continue; }
+                        foreach (var n in names) ambientMacros.Add(n);
                     }
                 }
         }
