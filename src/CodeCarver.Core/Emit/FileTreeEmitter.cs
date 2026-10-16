@@ -685,6 +685,51 @@ public static class FileTreeEmitter
         return true;
     }
 
+    /// <summary>True when the #if structure in lines <paramref name="s"/>..<paramref name="e"/> balances, counting the
+    /// directives just above and below the span that only directives, blanks and comments separate from it: removing
+    /// the span's code then removes whole branches, never half of one.</summary>
+    private static bool IfStructureClosed(string[] lines, bool[] inComment, bool[] inLineComment, int s, int e)
+    {
+        int? Word(int i)   // +1 opens, 0 is #else/#elif, -1 closes; null for no conditional directive
+        {
+            if (inComment[i] || DirectiveBody(lines[i - 1]) is not { } d) return null;
+            var w = new string(d.TrimStart().TakeWhile(char.IsAsciiLetter).ToArray());
+            return w switch
+            {
+                "if" or "ifdef" or "ifndef" => 1,
+                "elif" or "elifdef" or "elifndef" or "else" => 0,
+                "endif" => -1,
+                _ => null,
+            };
+        }
+        bool Blank(int i) => LineCode(lines, inComment, inLineComment, i).Trim().Length == 0;
+        bool Balanced(int from, int to)
+        {
+            var depth = 0;
+            for (var i = from; i <= to; i++)
+            {
+                switch (Word(i))
+                {
+                    case 1: depth++; break;
+                    case 0: if (depth == 0) return false; break;
+                    case -1: if (--depth < 0) return false; break;
+                }
+            }
+            return depth == 0;
+        }
+        if (Balanced(s, e)) return true;
+        // Widen over the directive-only lines around the span, one line at a time, until it balances.
+        int lo = s, hi = e;
+        while (true)
+        {
+            var grew = false;
+            if (lo > 1 && (Word(lo - 1) is not null || Blank(lo - 1) && DirectiveBody(lines[lo - 2]) is null)) { lo--; grew = true; }
+            if (hi < lines.Length && (Word(hi + 1) is not null || Blank(hi + 1) && DirectiveBody(lines[hi]) is null)) { hi++; grew = true; }
+            if (Balanced(lo, hi)) return true;
+            if (!grew) return false;
+        }
+    }
+
     /// <summary>Remove the given 1-based inclusive line ranges from text, preserving the rest verbatim.</summary>
     private static string RemoveLineRanges(string text, List<(int Start, int End)> ranges,
                                            IReadOnlyList<(int Start, string Name)>? droppedFunctions = null)
@@ -898,6 +943,12 @@ public static class FileTreeEmitter
             // span. Removing the span alone strands it on whatever follows (a compile error, or the next
             // definition silently weak). Keep the definition whole (sound; EmitClosure sees it written).
             if (UnterminatedAbove(lines, start)) continue;
+
+            // The directives stay, so the removed lines must hold every branch of each #if they touch (review R1): a
+            // span holding `{ return 1; }` of `#ifdef ALT / { return 1; } / #else / { return 2; } / #endif` leaves the
+            // #else body orphaned at file scope. Directly adjacent #if / #endif lines (nothing but directives, blanks or
+            // comments between) close the region; otherwise an unbalanced span is kept whole (sound).
+            if (!IfStructureClosed(lines, inComment, inLineComment, start, e)) continue;
             for (var i = Math.Max(1, start); i <= e && i <= lines.Length; i++)
                 drop[i] = true;
             applied?.Add((s, e));

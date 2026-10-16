@@ -439,4 +439,18 @@ public class IntraFilePruneTests
             TempDir.Delete(work);
         }
     }
+
+    // Review R1: a dropped span whose #if structure doesn't balance inside it leaves the other branch's half behind.
+    [Theory]
+    [InlineData("static int dead_alt(void)\n#ifdef ALT\n{ return 1; }\n#else\n{ return 2; }\n#endif\n")]
+    [InlineData("#ifdef ALT\nstatic int dead_fast(int x)\n#else\nstatic int dead_slow(int x)\n#endif\n{\n    return x;\n}\n")]
+    [InlineData("#ifdef ALT\nstatic int dead_fast(int x)\n{\n#else\nstatic int dead_slow(int x)\n{\n#endif\n    return x + 1;\n}\n")]
+    [InlineData("#ifdef ALT\nstatic int dead_one(void) { return 1; }\n#else\nstatic int dead_one(void) { return 2; }\n#endif\n")]
+    public void DroppedSpan_UnderAnUnbalancedIf_LeavesNoHalfBehind(string dead)
+    {
+        var carved = Prune(dead + "int reader(void) { return 0; }\n");
+        Assert.Contains("int reader(void)", carved);
+        AssertCompiles(carved);
+        AssertCompiles("#define ALT 1\n" + carved);
+    }
 }
