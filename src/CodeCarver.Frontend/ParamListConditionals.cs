@@ -80,7 +80,7 @@ public static class ParamListConditionals
                     blankThis = inParams || Blanking();   // the C++ grammar takes no directive inside a parameter list
                     frames.Push((inParams, false, parens, -1));
                 }
-                else if (word is "elif" or "else" && frames.Count > 0)
+                else if (word is "elif" or "elifdef" or "elifndef" or "else" && frames.Count > 0)
                 {
                     var f = frames.Pop();
                     if (f.InParams) f.Blanking = true;

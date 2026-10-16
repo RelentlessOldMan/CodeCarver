@@ -45,6 +45,27 @@ public sealed class MacroTable
     /// includes may define it.</summary>
     public IReadOnlySet<string>? Ambient { get; set; }
 
+    /// <summary>Macro names some file in the tree <c>#undef</c>s (shared, read-only; a subset of <see cref="Ambient"/>).</summary>
+    public IReadOnlySet<string>? UndefinedSomewhere { get; set; }
+
+    /// <summary>
+    /// An <c>#include</c> was just passed (review W2). The included file may <c>#undef</c> what this one defined, or
+    /// define what it <c>#undef</c>'d: such a name is unknown from here on. Names no file undefines, or that no file
+    /// defines, keep their value.
+    /// </summary>
+    public void AfterInclude()
+    {
+        if (_undefined.Count > 0 && Ambient is { Count: > 0 } ambient)
+            _undefined.RemoveWhere(ambient.Contains);   // absent again: IsUnknown sees the ambient name
+        if (_macros.Count == 0 || UndefinedSomewhere is not { Count: > 0 } undefs) return;
+        if (undefs.Count < _macros.Count)
+        {
+            foreach (var n in undefs) if (_macros.Remove(n)) _unknown.Add(n);
+        }
+        else
+            foreach (var n in _macros.Keys.Where(undefs.Contains).ToList()) { _macros.Remove(n); _unknown.Add(n); }
+    }
+
     /// <summary>Every absent name is unknown (the build log does not cover this file, or its define set may be
     /// incomplete) — closed-world resolution never applies to such a file (owner decision D-B).</summary>
     public bool OpenWorld { get; set; }
@@ -164,5 +185,5 @@ public sealed class MacroTable
 
     public MacroTable Clone() => new(new Dictionary<string, string>(_macros, StringComparer.Ordinal),
                                      new HashSet<string>(_unknown, StringComparer.Ordinal),
-                                     new HashSet<string>(_undefined, StringComparer.Ordinal), Ambient) { OpenWorld = OpenWorld };
+                                     new HashSet<string>(_undefined, StringComparer.Ordinal), Ambient) { OpenWorld = OpenWorld, UndefinedSomewhere = UndefinedSomewhere };
 }

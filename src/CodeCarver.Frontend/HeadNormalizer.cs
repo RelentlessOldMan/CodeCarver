@@ -270,7 +270,7 @@ public static class HeadNormalizer
             var word = WordOf(text, d);
             if (word is "if" or "ifdef" or "ifndef") { if (depth++ == 0) cur = new List<(int, int)>(); }
             if (cur is null) continue;
-            if (word is "if" or "ifdef" or "ifndef" or "elif" or "else" or "endif") cur.Add(d);
+            if (word is "if" or "ifdef" or "ifndef" or "elif" or "elifdef" or "elifndef" or "else" or "endif") cur.Add(d);
             if (word == "endif" && --depth == 0) { groups.Add((cur[0].Item1, d.End, cur)); cur = null; }
         }
         return groups;
@@ -285,7 +285,7 @@ public static class HeadNormalizer
         {
             var word = WordOf(text, (s, e));
             if (word is "if" or "ifdef" or "ifndef") depth++;
-            else if (word is "elif" or "else" && depth == 1 && skipFrom < 0) skipFrom = s;
+            else if (word is "elif" or "elifdef" or "elifndef" or "else" && depth == 1 && skipFrom < 0) skipFrom = s;
             else if (word == "endif")
             {
                 if (depth == 1 && skipFrom >= 0) { blank.Add((skipFrom, s)); skipFrom = -1; }

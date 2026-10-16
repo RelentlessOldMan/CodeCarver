@@ -162,6 +162,12 @@ public static class PreprocessorScanner
             case "elif":
                 Elif(stack, EvaluateCondition(rest, table, closedWorld));
                 break;
+            case "elifdef":   // C23 / C++23
+                Elif(stack, DefinedTri(table, FirstToken(rest), closedWorld, whenDefined: Tri.True, whenAbsent: Tri.False));
+                break;
+            case "elifndef":
+                Elif(stack, DefinedTri(table, FirstToken(rest), closedWorld, whenDefined: Tri.False, whenAbsent: Tri.True));
+                break;
             case "else":
                 Else(stack);
                 break;
@@ -177,6 +183,9 @@ public static class PreprocessorScanner
                 else table.ForceUnknown(name);
                 break;
             }
+            case "include" or "include_next" or "import" when active:
+                table.AfterInclude();
+                break;
             case "undef" when active:
                 if (certain) table.UndefCertain(FirstToken(rest));
                 else table.ForceUnknown(FirstToken(rest));

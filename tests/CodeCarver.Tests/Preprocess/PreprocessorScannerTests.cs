@@ -37,6 +37,36 @@ public class PreprocessorScannerTests
     }
 
     [Fact]
+    public void Include_MayUndoWhatTheFileDefinedOrUndefined()
+    {
+        // Review W2: X is #defined here and #undef'd by some header; Y is #undef'd here and #defined by some header. After
+        // an #include either may have changed. Z is #undef'd by no file, so it keeps its value.
+        var t = new MacroTable
+        {
+            Ambient = new HashSet<string> { "X", "Y", "Z" },
+            UndefinedSomewhere = new HashSet<string> { "X" },
+        };
+        const string text = "#define X 1\n#undef Y\n#define Z 1\n#include \"h.h\"\n"
+            + "#ifndef X\nA\n#endif\n#ifdef Y\nB\n#endif\n#ifdef Z\nC\n#else\nD\n#endif\n";
+        var dead = PreprocessorScanner.DeadLineMap(text, t, closedWorld: true);
+        Assert.False(dead[6]);   // A: X may be gone
+        Assert.False(dead[9]);   // B: Y may be back
+        Assert.False(dead[12]);  // C
+        Assert.True(dead[14]);   // D: Z is still defined
+    }
+
+    [Fact]
+    public void ElifdefAndElifndef_PickTheirBranch()
+    {
+        // Review W4 (C23/C++23): unhandled, both lines were ignored and the #else branch ran too.
+        var t = new MacroTable(); t.Set("BOARD_B", "1");
+        const string text = "#ifdef BOARD_A\nA\n#elifdef BOARD_B\nB\n#else\nC\n#endif\n#ifdef BOARD_A\nD\n#elifndef BOARD_C\nE\n#else\nF\n#endif\n";
+        var dead = PreprocessorScanner.DeadLineMap(text, t, closedWorld: true);
+        Assert.Equal(new[] { true, false, true }, new[] { dead[2], dead[4], dead[6] });
+        Assert.Equal(new[] { true, false, true }, new[] { dead[9], dead[11], dead[13] });
+    }
+
+    [Fact]
     public void ClosedWorld_UnknownMacro_InIfExpression_IsUnknown()
     {
         var t = new MacroTable(); t.MarkUnknown("VER");

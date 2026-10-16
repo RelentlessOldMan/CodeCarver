@@ -231,4 +231,16 @@ public sealed class MacroWorldTests
         t.Compile("main.c", inc).Compile("feat.c", inc);
         AssertFeatKept(t, t.Carve());
     }
+
+    [Fact]
+    public void DefinesOfSeveralBuilds_ThatDisagree_AreUnknown()
+    {
+        // Review W3: [builds.a] defines FEAT, [builds.b] does not. The union applied FEAT as certain and dropped plain.c,
+        // which build b links.
+        using var t = Tree("");
+        var r = t.Carve(log: false, common: "",
+            extraToml: "[builds.a]\ndefines = [\"FEAT\", \"LEVEL=1\"]\n[builds.b]\ndefines = [\"LEVEL=1\"]\n");
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.True(t.Kept("feat.c") && t.Kept("plain.c"), r.Out + r.Err);
+    }
 }

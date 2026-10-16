@@ -20,6 +20,8 @@ public sealed class ResolvedCarve
     public bool DropUnobservedCmm;                  // every selected run with a file trace opted in (D-C)    // extra driver names for text build logs
     public List<string> Compilers = new();        // from each selected build that named one
     public List<string> Defines = new();
+    /// <summary>Names the selected builds define differently or not at all (review W3): unknown, not defined.</summary>
+    public List<string> VaryingDefines = new();
     public List<string> BuildTraceFiles = new();
     public bool EveryBuildTraced;                  // every selected build has a build trace: its opens cover the whole build
     public bool UnparsedHeaderCache = true;        // [advanced] reuse the last run's names from unchanged big headers
@@ -137,6 +139,19 @@ public static class CarveResolver
         }
         r.BuildLogs = r.BuildLogs.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.Defines = r.Defines.Distinct(StringComparer.Ordinal).ToList();
+        // Review W3: several builds' defines are not one configuration. A name every selected build defines the
+        // same way is certain; one they define differently, or that some build leaves out, is unknown (both
+        // branches of its #ifdef stay), never the union applied as certain.
+        var withDefines = selectedBuilds.Select(b => cfg.Builds[b].Defines).ToList();
+        if (withDefines.Count > 1)
+        {
+            static string Name(string spec) { var eq = spec.IndexOf('='); var p = spec.IndexOf('('); var end = new[] { eq, p }.Where(i => i >= 0).DefaultIfEmpty(spec.Length).Min(); return spec[..end].Trim(); }
+            string Key(List<string> specs, string name) =>
+                string.Join("\n", specs.Where(s => Name(s) == name).Distinct(StringComparer.Ordinal).OrderBy(s => s, StringComparer.Ordinal));
+            var names = r.Defines.Select(Name).Distinct(StringComparer.Ordinal).ToList();
+            r.VaryingDefines = names.Where(n => withDefines.Select(d => Key(d, n)).Distinct(StringComparer.Ordinal).Count() > 1).ToList();
+            r.Defines = r.Defines.Where(s => !r.VaryingDefines.Contains(Name(s))).ToList();
+        }
         r.BuildTraceFiles = r.BuildTraceFiles.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.RunTraceFiles = r.RunTraceFiles.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.RunTraceLogs = r.RunTraceLogs.Distinct(StringComparer.OrdinalIgnoreCase).ToList();

@@ -101,7 +101,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private readonly HashSet<string> _condExternFlags = new(StringComparer.Ordinal);
     // Translation units that #define one of those flags themselves, or get it from their compile command.
     private readonly HashSet<string> _definesExternFlag = new(StringComparer.Ordinal);
-    private static readonly Regex ConditionalLine = new(@"^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$", RegexOptions.Compiled);
+    private static readonly Regex ConditionalLine = new(@"^\s*#\s*(if|ifdef|ifndef|elif|elifdef|elifndef|else|endif)\b(.*)$", RegexOptions.Compiled);
     private static readonly Regex EmptyDefineLine = new(@"^\s*#\s*define\s+([A-Za-z_]\w*)\s*(?:/[*/].*)?$", RegexOptions.Compiled);
     private static readonly Regex DefineName = new(@"^\s*#\s*define\s+([A-Za-z_]\w*)", RegexOptions.Compiled);
 
@@ -120,7 +120,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 switch (c.Groups[1].Value)
                 {
                     case "if" or "ifdef" or "ifndef": stack.Add(ids); break;
-                    case "elif" when stack.Count > 0: stack[^1].AddRange(ids); break;
+                    case "elif" or "elifdef" or "elifndef" when stack.Count > 0: stack[^1].AddRange(ids); break;
                     case "endif" when stack.Count > 0: stack.RemoveAt(stack.Count - 1); break;
                 }
                 continue;

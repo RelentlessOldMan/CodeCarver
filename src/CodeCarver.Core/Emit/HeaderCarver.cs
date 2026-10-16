@@ -283,7 +283,8 @@ public static class HeaderCarver
 
     private static bool IsConditionalDirective(string trimmed) =>
         StartsWithHash(trimmed, "if") || StartsWithHash(trimmed, "ifdef") ||
-        StartsWithHash(trimmed, "ifndef") || StartsWithHash(trimmed, "elif");
+        StartsWithHash(trimmed, "ifndef") || StartsWithHash(trimmed, "elif") ||
+        StartsWithHash(trimmed, "elifdef") || StartsWithHash(trimmed, "elifndef");
 
     /// <summary>Matches <c>#</c> (optional spaces) then the keyword as a whole word — e.g. <c>#  define</c>.</summary>
     private static bool StartsWithHash(string trimmed, string keyword)

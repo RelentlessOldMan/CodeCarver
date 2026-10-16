@@ -513,6 +513,7 @@ public static class CarveCommand
         // Macro names #defined/#undef'd anywhere in the tree (filled after the file scan, before parsing). Shared
         // by every table: such a name is UNKNOWN unless the table defines it (review PP1).
         var ambientMacros = new HashSet<string>(StringComparer.Ordinal);
+        var undefinedSomewhere = new HashSet<string>(StringComparer.Ordinal);   // filled with ambientMacros (review W2)
         var buildCmds = new List<CompileCommand>();
         var scrape = new BuildLogScraper.ScrapeOptions
         {
@@ -726,8 +727,10 @@ public static class CarveCommand
         {
             var t = probeBase is not null ? probeBase.Clone() : MacroTable.FromDefines(manualDefines);
             t.Ambient = ambientMacros;
+            t.UndefinedSomewhere = undefinedSomewhere;
             foreach (var s in consistent) t.Define(s);
             foreach (var n in varying) t.MarkUnknown(n);
+            foreach (var n in cv.VaryingDefines) t.MarkUnknown(n);   // defined differently by the selected builds
             return t;
         }
 
@@ -737,7 +740,7 @@ public static class CarveCommand
         // text); consulted by the closure below.
         var includedCFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        var haveDefines = manualDefines.Count > 0 || probeBase is not null
+        var haveDefines = manualDefines.Count > 0 || cv.VaryingDefines.Count > 0 || probeBase is not null
                           || universalConsistent.Count > 0 || universalVarying.Count > 0
                           || perFileSpecs.Values.Any(v => v.Consistent.Count > 0 || v.Varying.Count > 0);
         // A compile command with no -D at all still pins its file's define set (FEATURE is undefined for it), so
@@ -1236,13 +1239,17 @@ public static class CarveCommand
         var defRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:define|undef)\s+([A-Za-z_]\w*)",
             System.Text.RegularExpressions.RegexOptions.Multiline);
         // The condition runs on over backslash-newline splices (`#if defined(A) && \` / `defined(B)`).
-        var condRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:if|ifdef|ifndef|elif)\b((?:\\\r?\n|[^\r\n])*)",
+        var condRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:if|ifdef|ifndef|elif|elifdef|elifndef)\b((?:\\\r?\n|[^\r\n])*)",
             System.Text.RegularExpressions.RegexOptions.Multiline);
         var identRe = new System.Text.RegularExpressions.Regex(@"[A-Za-z_]\w*");
         void ScanMacroNames(string text, HashSet<string> defined, HashSet<string> tested)
         {
             if (!text.Contains('#')) return;
-            foreach (System.Text.RegularExpressions.Match m in defRe.Matches(text)) defined.Add(m.Groups[1].Value);
+            foreach (System.Text.RegularExpressions.Match m in defRe.Matches(text))
+            {
+                defined.Add(m.Groups[1].Value);
+                if (m.ValueSpan.Contains("undef", StringComparison.Ordinal)) undefinedSomewhere.Add(m.Groups[1].Value);
+            }
             foreach (System.Text.RegularExpressions.Match m in condRe.Matches(text))
                 foreach (System.Text.RegularExpressions.Match id in identRe.Matches(m.Groups[1].Value)) tested.Add(id.Value);
         }
@@ -1629,7 +1636,11 @@ public static class CarveCommand
                     // macro): header carving must keep those.
                     foreach (var m in Identifier.EnumerateMatches(text)) outsideNames.Add(text.Substring(m.Index, m.Length));
                     foreach (System.Text.RegularExpressions.Match m in defRe.Matches(text))
-                        if (condIdents.Contains(m.Groups[1].Value)) ambientMacros.Add(m.Groups[1].Value);
+                        if (condIdents.Contains(m.Groups[1].Value))
+                        {
+                            ambientMacros.Add(m.Groups[1].Value);
+                            if (m.ValueSpan.Contains("undef", StringComparison.Ordinal)) undefinedSomewhere.Add(m.Groups[1].Value);
+                        }
                     Includes(Path.GetDirectoryName(full) ?? dir, text);
                 }
             }

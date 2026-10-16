@@ -39,7 +39,8 @@ public sealed class CarveResolverTests
         Assert.Empty(res.Errors);
         var c = res.Carve!;
         Assert.Equal(new[] { "a.log", "b.log" }, c.BuildLogs);          // unioned
-        Assert.Equal(new[] { "X=1", "Y=2" }, c.Defines);
+        Assert.Empty(c.Defines);                                         // X and Y each set by one build only
+        Assert.Equal(new[] { "X", "Y" }, c.VaryingDefines);              // so unknown (review W3)
         Assert.Contains("arm-none-eabi-gcc", c.Compilers);
         Assert.Contains("f1.csv", c.RunTraceFiles);
         Assert.Contains("r2.log", c.RunTraceLogs);
