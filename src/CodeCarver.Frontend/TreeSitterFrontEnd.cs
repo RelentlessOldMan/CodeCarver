@@ -64,9 +64,6 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
     // Keep-attributes: symbols the runtime/linker keep regardless of any call — implicit roots a
     // from-main closure would silently drop (a self-registering `constructor`, an initcall-section entry).
-    private static readonly Regex AttrBlock = new(
-        @"__attribute(?:__)?\s*\(\((?<body>(?:[^()]|\([^()]*\))*)\)\)|\[\[\s*(?<body>gnu::(?:[^\[\]]|\[[^\]]*\])*)\]\]",
-        RegexOptions.Compiled);
     private static readonly Regex KeepKeyword = new(
         @"\b(?:constructor|destructor|used|retain)\b|section\s*\(\s*""\.(?:init_array|preinit_array|fini_array)"
         // A section named like a C identifier: the linker defines __start_/__stop_ for it, so code can walk every entry
@@ -74,7 +71,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         + @"|section\s*\(\s*""[A-Za-z_]\w*""\s*\)",
         RegexOptions.Compiled);
     // A macro placing what it defines in such a section: a file using it registers something nobody names.
-    private static readonly Regex IdentifierSection = new(@"section\s*\(\s*""[A-Za-z_]\w*""\s*\)", RegexOptions.Compiled);
+    private static readonly Regex IdentifierSection = new(@"section(?:__)?\s*\(\s*""[A-Za-z_]\w*""\s*\)", RegexOptions.Compiled);
     private HashSet<string> _registerMacros = new(StringComparer.Ordinal);
     private static readonly Regex CommentOrSpace = new(@"/\*.*?\*/|//.*|\s+", RegexOptions.Compiled | RegexOptions.Singleline);
     // Object-like macros defined as `extern` in one place and as nothing in another (the EXTERN-header idiom).
@@ -119,10 +116,6 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
         return found;
     }
-    private static readonly Regex NameBeforeAttr = new( // trailing:  name / name(...) / name[...]  __attribute__
-        @"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]|\([^()]*\))?\s*$", RegexOptions.Compiled);
-    private static readonly Regex NameAfterAttr = new(  // leading:   __attribute__ ... name( / name[ / name =
-        @"^\s*(?:[A-Za-z_][\w*]*[\s*]+)*?([A-Za-z_]\w*)\s*(?:[\(\[=;,]|$)", RegexOptions.Compiled);
 
     private static readonly Regex AsmLabelDecl = new(
         @"\b(?<name>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*(?:__asm__|__asm|asm)\s*\(\s*""(?<sym>[A-Za-z_.$][\w.$]*)""\s*\)", RegexOptions.Compiled);
@@ -391,7 +384,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private HashSet<string> _keepMacrosFnLike = new(StringComparer.Ordinal);
     private NameScan? _keepMacroUse;
     private static readonly Regex KeepBody = new(
-        @"\bsection\s*\(|\b(?:used|retain|constructor|destructor|__root)\b|#\s*pragma\s+location|_Pragma\s*\(\s*""location"
+        @"(?:\b|__)section(?:__)?\s*\(|(?:\b|__)(?:used|retain|constructor|destructor)(?:__)?\b|\b__root\b|#\s*pragma\s+location|_Pragma\s*\(\s*""location"
         + @"|gnu::(?:used|section|retain|constructor|destructor)|__declspec\s*\(\s*allocate", RegexOptions.Compiled);
     /// <summary>The text has a word every <see cref="KeepBody"/> match contains ("structor": constructor, destructor).</summary>
     private static bool MayKeep(string s)
@@ -740,11 +733,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (_registerMacros.Contains(m.Name) && IsTranslationUnit(graph.GetNode(fileNode).Name))
                 w.ForceKeeps.Add(graph.GetNode(fileNode).Name);   // ForceKeep keeps each file once, at the merge
             var before = text.AsSpan(0, m.Index);
-            var mb = NameBeforeAttr.Match(before.Length > 200 ? before[^200..].ToString() : before.ToString());
-            if (mb.Success && mb.Groups[1].Value is var bn && !_keepMacros.Contains(bn)) keepNames.Add(bn);
+            if (CodeCarver.Core.Frontend.Attributes.NameBeforeAt((before.Length > 200 ? before[^200..] : before).ToString()) is { } bn && !_keepMacros.Contains(bn))
+                keepNames.Add(bn);
             var after = text.AsSpan(end);
-            var ma = NameAfterAttr.Match(after.Length > 200 ? after[..200].ToString() : after.ToString());
-            if (ma.Success) keepNames.Add(ma.Groups[1].Value);
+            if (CodeCarver.Core.Frontend.Attributes.NameAfterAt((after.Length > 200 ? after[..200] : after).ToString()) is { } an) keepNames.Add(an);
         }
     }
 
@@ -753,17 +745,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private static IEnumerable<string> ScanKeepAttributes(string text)
     {
         if (!text.Contains("__attribute") && !text.Contains("[[")) yield break; // cheap guard: no attributes -> skip the regex
-        foreach (Match m in AttrBlock.Matches(text))
-        {
-            if (!KeepKeyword.IsMatch(m.Groups["body"].Value)) continue;
-            var before = text.AsSpan(0, m.Index);
-            var mb = NameBeforeAttr.Match(before.Length > 200 ? before[^200..].ToString() : before.ToString());
-            if (mb.Success) { yield return mb.Groups[1].Value; continue; }
-            var afterStart = m.Index + m.Length;
-            var after = text.AsSpan(afterStart);
-            var ma = NameAfterAttr.Match(after.Length > 200 ? after[..200].ToString() : after.ToString());
-            if (ma.Success) yield return ma.Groups[1].Value;
-        }
+        foreach (var b in CodeCarver.Core.Frontend.Attributes.Blocks(text))
+            if (KeepKeyword.IsMatch(b.Body) && CodeCarver.Core.Frontend.Attributes.DecoratedName(text, b.Index, b.Index + b.Length) is { } name)
+                yield return name;
     }
 
     /// <summary>

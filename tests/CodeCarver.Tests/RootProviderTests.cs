@@ -68,6 +68,35 @@ public class RootProviderTests
     }
 
     [Fact]
+    public void LinkerSectionRoots_OtherSpellingsAndFunctionPointerTables()
+    {
+        var b = new GraphBuilder();
+        var vectors = b.Global("vectors", "vec.c");     // leading attribute on a function-pointer array
+        var hooks = b.Global("hook_tab", "hook.c");     // trailing attribute on a function-pointer array
+        var cmd = b.Global("cmd_a", "cmd.c");           // __section__ spelling
+        var cmd2 = b.Global("cmd_b", "cmd.c");          // [[gnu::section]]
+        var ent = b.Global("ent_a", "reg.c");           // KEEP body with nested parentheses
+        var sources = new[]
+        {
+            "__attribute__((section(\".isr_vector\"))) void (* const vectors[])(void) = { 0 };",
+            "void (* const hook_tab[])(void) __attribute__((section(\".hooks\"))) = { 0 };",
+            "const int cmd_a __attribute__((__section__(\".hooks\"))) = 1;",
+            "[[gnu::section(\".hooks\")]] const int cmd_b = 2;",
+            "const int ent_a __attribute__((section(\".mytab.a\"))) = 3;",
+        };
+        const string linker = """
+            SECTIONS {
+              .vec : { KEEP(*(.isr_vector)) }
+              .h : { KEEP(*(.hooks)) }
+              .t : { KEEP(*(EXCLUDE_FILE(*crt0.o) .mytab.*)) }
+            }
+            """;
+        var rooted = new LinkerSectionRootProvider(sources, new[] { linker }).Discover(b.Graph).Select(r => r.Node).ToHashSet();
+        foreach (var id in new[] { vectors, hooks, cmd, cmd2, ent })
+            Assert.Contains(id, rooted);
+    }
+
+    [Fact]
     public void ExplicitRootProvider_ResolvesOnlyRealNames_TypoAmongValidIsDetectable()
     {
         // A firmware root set is a long hand-maintained list of ISRs/exported API. A SINGLE typo among

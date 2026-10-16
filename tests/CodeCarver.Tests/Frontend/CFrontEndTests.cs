@@ -281,6 +281,42 @@ public class CFrontEndTests
     }
 
     [Fact]
+    public void KeepAttributes_OtherSpellings_AreRoots()
+    {
+        // The reserved-name spellings (__constructor__), __attribute without the trailing underscores, [[gnu::..]],
+        // attribute arguments nested two deep, and attributes on function-pointer declarators (vector tables,
+        // .init_array entries) keep their symbol just like the plain forms.
+        const string src = """
+            __attribute__((__constructor__)) static void c1(void) { }
+            static void d1(void) __attribute__((__destructor__));
+            static void d1(void) { }
+            __attribute((used)) static int u1(void) { return 1; }
+            __attribute__((__used__)) static int u2(void) { return 2; }
+            __attribute__((used, aligned(sizeof(void *)))) static int u3(void) { return 3; }
+            __attribute__((constructor(101 + (0)))) static void c2(void) { }
+            [[gnu::constructor]] static void c3(void) { }
+            static void early_a(void) { }
+            static void (*const ia)(void) __attribute__((used, section(".init_array"))) = early_a;
+            void tick(void) { }
+            __attribute__((section(".isr_vector"))) void (* const vectors[])(void) = { tick };
+            void tock(void) { }
+            void (* const table2[])(void) __attribute__((__section__(".init_array"))) = { tock };
+            static int dead(void) { return 0; }
+            int main(void) { return 0; }
+            """;
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("m.c", src) });
+        var roots = new CompositeRootProvider(
+            new ExplicitRootProvider(symbols: new[] { "main" }),
+            new AttributeRootProvider()).Discover(graph).ToList();
+        var plan = ReachabilityEngine.Compute(graph, roots);
+
+        foreach (var name in new[] { "c1", "d1", "u1", "u2", "u3", "c2", "c3", "early_a", "tock" })
+            Assert.True(plan.IsKept(Find(graph, name)), name);
+        Assert.False(plan.IsKept(Find(graph, "dead")));
+    }
+
+    [Fact]
     public void VectorTableAndWeakAlias_KeepIsrsAndAliasTarget_DropUnused()
     {
         // The embedded shape: ISRs reached only through the vector table, and unused handlers declared as

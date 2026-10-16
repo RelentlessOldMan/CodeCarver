@@ -126,20 +126,14 @@ public sealed class AsmReferenceRootProvider : IRootProvider
 /// </summary>
 public sealed class LinkerSectionRootProvider : IRootProvider
 {
-    // Grab the input-section pattern(s) inside a KEEP(...): everything up to the first ')' after KEEP(
-    // — for KEEP(*(.foo)) that's "*(.foo", for KEEP(*(SORT(.foo.*))) that's "*(SORT(.foo.*", from which
-    // the dotted section tokens are then extracted. Robust to the usual nesting without balancing parens.
-    private static readonly Regex KeepDirective = new(@"KEEP\s*\((?<body>[^)]*)", RegexOptions.Compiled);
+    // The input-section pattern(s) inside a KEEP(...), parentheses balanced three deep - KEEP(*(SORT(.foo.*))),
+    // KEEP(*(EXCLUDE_FILE(*crt0.o) .tab.*)) - from which the dotted section tokens are then extracted.
+    private static readonly Regex KeepDirective = new(
+        @"KEEP\s*\((?<body>(?:[^()]|\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))*)\)", RegexOptions.Compiled);
     private static readonly Regex SectionToken = new(@"\.[A-Za-z_][\w.*?\[\]\-]*", RegexOptions.Compiled);
 
-    private static readonly Regex AttrBlock = new(
-        @"__attribute__\s*\(\((?<body>(?:[^()]|\([^()]*\))*)\)\)", RegexOptions.Compiled);
     private static readonly Regex SectionAttr = new(
         @"section\s*\(\s*""(?<s>[^""]+)""", RegexOptions.Compiled);
-    private static readonly Regex NameBeforeAttr = new(  // trailing:  name / name[...]  __attribute__
-        @"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]|\([^()]*\))?\s*$", RegexOptions.Compiled);
-    private static readonly Regex NameAfterAttr = new(   // leading:   __attribute__ ... [type] name
-        @"^\s*(?:[A-Za-z_][\w*]*[\s*]+)*?([A-Za-z_]\w*)\s*(?:[\(\[=;,]|$)", RegexOptions.Compiled);
 
     private readonly IEnumerable<string> _sourceTexts;
     private readonly IReadOnlyList<string> _linkerScriptTexts;
@@ -198,20 +192,10 @@ public sealed class LinkerSectionRootProvider : IRootProvider
     /// decorated symbol whether the attribute leads or trails the declaration.</summary>
     private static IEnumerable<(string Symbol, string Section)> SectionPlacements(string text)
     {
-        foreach (Match m in AttrBlock.Matches(text))
-        {
-            var sm = SectionAttr.Match(m.Groups["body"].Value);
-            if (!sm.Success) continue;
-            var section = sm.Groups["s"].Value;
-
-            var before = text.AsSpan(0, m.Index);
-            var mb = NameBeforeAttr.Match(before.Length > 200 ? before[^200..].ToString() : before.ToString());
-            if (mb.Success) { yield return (mb.Groups[1].Value, section); continue; }
-
-            var after = text.AsSpan(m.Index + m.Length);
-            var ma = NameAfterAttr.Match(after.Length > 200 ? after[..200].ToString() : after.ToString());
-            if (ma.Success) yield return (ma.Groups[1].Value, section);
-        }
+        if (!text.Contains("__attribute", StringComparison.Ordinal) && !text.Contains("[[", StringComparison.Ordinal)) yield break;
+        foreach (var b in Attributes.Blocks(text))
+            if (SectionAttr.Match(b.Body) is { Success: true } sm && Attributes.DecoratedName(text, b.Index, b.Index + b.Length) is { } name)
+                yield return (name, sm.Groups["s"].Value);
     }
 }
 
