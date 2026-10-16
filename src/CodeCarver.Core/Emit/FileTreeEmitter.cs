@@ -206,7 +206,7 @@ public static class FileTreeEmitter
     /// functions and initialized globals whose span overlaps no other definition. Null when the file must be
     /// written whole (a dropped span overlaps a kept one — a mis-parse; see below).
     /// </summary>
-    static List<(int Start, int End)>? DropRangesFor(IReadOnlyList<Node> defs, Func<NodeId, bool> isKept)
+    internal static List<(int Start, int End)>? DropRangesFor(IReadOnlyList<Node> defs, Func<NodeId, bool> isKept)
     {
         var list = defs.Where(n => n.Span.IsKnown)
                        .Select(n => (Start: n.Span.StartLine, End: n.Span.EndLine, Drop: !isKept(n.Id))).ToList();
@@ -229,8 +229,20 @@ public static class FileTreeEmitter
         // (real tinyxml2 xmltest.cpp: a visitor class inside main() is reached via Accept, main is kept,
         // and its helper example_1() was wrongly pruned -> "example_1 was not declared"). We can't tell
         // what the kept-whole function references, so keep the WHOLE FILE (sound over-approximation).
-        var kept = list.Where(x => !x.Drop).ToList();
-        if (list.Any(d => d.Drop && kept.Any(k => k.Start <= d.End && d.Start <= k.End))) return null;
+        // Kept spans in start order (list is sorted) with the furthest end so far: a dropped span overlaps one when the
+        // furthest end among the kept starting at or before its end reaches its start. One search per dropped span
+        // where every pair was tried (review CPU C13).
+        var keptStart = new List<int>();
+        var keptMaxEnd = new List<int>();
+        foreach (var x in list)
+            if (!x.Drop) { keptStart.Add(x.Start); keptMaxEnd.Add(keptMaxEnd.Count == 0 ? x.End : Math.Max(keptMaxEnd[^1], x.End)); }
+        foreach (var d in list)
+        {
+            if (!d.Drop || keptStart.Count == 0) continue;
+            int lo = 0, hi = keptStart.Count - 1, last = -1;
+            while (lo <= hi) { var mid = (lo + hi) >> 1; if (keptStart[mid] <= d.End) { last = mid; lo = mid + 1; } else hi = mid - 1; }
+            if (last >= 0 && keptMaxEnd[last] >= d.Start) return null;
+        }
 
         // A dropped function is only safe to remove if its span does not overlap another function's.
         // Overlapping spans mean a mis-parse (unusual macro-prefixed or heavily #ifdef'd declarations);

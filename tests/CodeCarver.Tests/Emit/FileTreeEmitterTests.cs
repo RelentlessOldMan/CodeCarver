@@ -487,4 +487,30 @@ public class FileTreeEmitterTests
             TempDir.Delete(srcDir);
         }
     }
+
+    // Review CPU C13: the whole-file fallback (null) when a dropped span overlaps a kept one, now a sweep, against the
+    // pairwise rule it replaced, over random spans; identical spans are one definition, kept when any name is.
+    [Fact]
+    public void DropRanges_OverlapFallback_MatchesPairwiseRule()
+    {
+        var rng = new Random(13);
+        for (var trial = 0; trial < 3000; trial++)
+        {
+            var n = rng.Next(1, 9);
+            var defs = new List<Node>();
+            var kept = new HashSet<NodeId>();
+            for (var i = 0; i < n; i++)
+            {
+                var start = rng.Next(1, 30);
+                var node = new Node { Id = new NodeId(i), Kind = NodeKind.Function, Name = "f" + i, File = "a.c",
+                                      Span = new SourceSpan(start, start + rng.Next(0, 8)) };
+                defs.Add(node);
+                if (rng.Next(2) == 0) kept.Add(node.Id);
+            }
+            var spans = defs.GroupBy(d => d.Span)
+                            .Select(g => (g.Key.StartLine, g.Key.EndLine, Drop: g.All(d => !kept.Contains(d.Id)))).ToList();
+            var expected = spans.Any(d => d.Drop && spans.Any(k => !k.Drop && k.StartLine <= d.EndLine && d.StartLine <= k.EndLine));
+            Assert.Equal(expected, FileTreeEmitter.DropRangesFor(defs, kept.Contains) is null);
+        }
+    }
 }
