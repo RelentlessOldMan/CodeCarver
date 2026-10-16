@@ -55,6 +55,21 @@ public sealed class MacroTable
     /// </summary>
     public void AfterInclude()
     {
+        // After one full pass no defined name is undefined somewhere and no certain #undef is ambient; only Set and
+        // UndefCertain break that, so later includes check just the names they touched since (review CPU C22: every
+        // include walked the -D table or the tree's #undef set).
+        if (_settled && ReferenceEquals(_settledAmbient, Ambient) && ReferenceEquals(_settledUndefs, UndefinedSomewhere))
+        {
+            foreach (var n in _touched)
+            {
+                if (Ambient is { } amb && _undefined.Contains(n) && amb.Contains(n)) _undefined.Remove(n);
+                if (UndefinedSomewhere is { } und && und.Contains(n) && _macros.Remove(n)) _unknown.Add(n);
+            }
+            _touched.Clear();
+            return;
+        }
+        _touched.Clear();
+        (_settled, _settledAmbient, _settledUndefs) = (true, Ambient, UndefinedSomewhere);
         if (_undefined.Count > 0 && Ambient is { Count: > 0 } ambient)
             _undefined.RemoveWhere(ambient.Contains);   // absent again: IsUnknown sees the ambient name
         if (_macros.Count == 0 || UndefinedSomewhere is not { Count: > 0 } undefs) return;
@@ -65,6 +80,11 @@ public sealed class MacroTable
         else
             foreach (var n in _macros.Keys.Where(undefs.Contains).ToList()) { _macros.Remove(n); _unknown.Add(n); }
     }
+
+    // AfterInclude's state: a full pass was made against these sets, and the names Set or UndefCertain touched since.
+    bool _settled;
+    IReadOnlySet<string>? _settledAmbient, _settledUndefs;
+    readonly List<string> _touched = new();
 
     /// <summary>Every absent name is unknown (the build log does not cover this file, or its define set may be
     /// incomplete) — closed-world resolution never applies to such a file (owner decision D-B).</summary>
@@ -93,6 +113,7 @@ public sealed class MacroTable
     {
         if (name.Length == 0) return;
         _macros[name] = value;
+        if (_settled) _touched.Add(name);
         _unknown.Remove(name); // a concrete definition wins over "unknown"
         _undefined.Remove(name);
     }
@@ -107,6 +128,7 @@ public sealed class MacroTable
         _macros.Remove(name);
         _unknown.Remove(name);
         _undefined.Add(name);
+        if (_settled) _touched.Add(name);
     }
 
     /// <summary>Mark a name as UNKNOWN (varies / can't be resolved) so its branches are kept even under
