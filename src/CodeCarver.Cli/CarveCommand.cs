@@ -603,13 +603,19 @@ public static class CarveCommand
         {
             var specsByName = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
             var defCount = new Dictionary<string, int>(StringComparer.Ordinal);
+            // One pass per command: rescanning its defines for each name was quadratic in a long -D list (review CPU C2).
+            var inThis = new HashSet<string>(StringComparer.Ordinal);
             foreach (var cc in cmds)
-                foreach (var name in cc.Defines.Select(SpecName).Distinct())
+            {
+                inThis.Clear();
+                foreach (var d in cc.Defines)
                 {
-                    defCount[name] = defCount.GetValueOrDefault(name) + 1;
+                    var name = SpecName(d);
+                    if (inThis.Add(name)) defCount[name] = defCount.GetValueOrDefault(name) + 1;
                     if (!specsByName.TryGetValue(name, out var set)) specsByName[name] = set = new(StringComparer.Ordinal);
-                    foreach (var d in cc.Defines) if (SpecName(d) == name) set.Add(d);
+                    set.Add(d);
                 }
+            }
             var consistent = new List<string>();
             var varying = new List<string>();
             foreach (var kv in specsByName)
