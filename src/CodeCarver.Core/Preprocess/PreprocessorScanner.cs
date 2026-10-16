@@ -535,6 +535,10 @@ public static class PreprocessorScanner
     private static bool TryParseNumber(string tok, out long value)
     {
         value = 0;
+        // An identifier, '(' or a char literal is never a number: answer before a parse that throws for each one
+        // (a caught exception per identifier in every #if; review CPU C1).
+        var first = tok.AsSpan().TrimStart();
+        if (first.Length == 0 || char.IsLetter(first[0]) || first[0] is '_' or '(' or '\'') return false;
         // An unsigned literal changes comparison semantics (-1 < 0u is false in C); don't evaluate it.
         if (tok.Length > 0 && char.IsDigit(tok[0]) && (tok.Contains('u') || tok.Contains('U'))) return false;
         var s = tok.TrimEnd('l', 'L');

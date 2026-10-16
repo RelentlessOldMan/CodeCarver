@@ -323,4 +323,26 @@ public class PreprocessorScannerTests
         Assert.False(dead[6]);  // #elif defined(UNK) kept (unknown)
         Assert.False(dead[8]);  // #else kept
     }
+    // Review CPU C1: which spellings evaluate as numbers, directly and through a macro's value. Pins the set the
+    // evaluator accepts while the number parse stops throwing on identifiers.
+    [Theory]
+    [InlineData("0x10 == 16", "True")]
+    [InlineData("010 == 8", "True")]
+    [InlineData("08", "Unknown")]                 // not octal: unparsable
+    [InlineData("5L == 5", "True")]
+    [InlineData("1u", "Unknown")]                 // unsigned: not evaluated
+    [InlineData("0xFFFFFFFFFFFFFFFF", "Unknown")] // past long: unsigned in C
+    [InlineData("NEG == -1", "True")]
+    [InlineData("PAR == 4", "True")]
+    [InlineData("HEX == 16", "True")]
+    [InlineData("IND == 16", "True")]             // value is another macro
+    [InlineData("SUF", "Unknown")]
+    [InlineData("ABSENT", "False")]
+    [InlineData("FN(1)", "Unknown")]
+    [InlineData("'a'", "Unknown")]
+    public void EvaluateCondition_NumberSpellings(string expr, string expected)
+    {
+        var t = Defines("NEG=-1", "PAR=(4)", "HEX=0x10", "IND=HEX", "SUF=2u", "FN(x)=x");
+        Assert.Equal(expected, PreprocessorScanner.EvaluateCondition(expr, t, closedWorld: true).ToString());
+    }
 }
