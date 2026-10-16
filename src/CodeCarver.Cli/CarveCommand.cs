@@ -840,6 +840,19 @@ public static class CarveCommand
             .Where(p => exts.Any(e => p.EndsWith(e, StringComparison.OrdinalIgnoreCase)))
             .Where(p => !Excluded(p))
             .ToList();
+        // A file the build log compiles is part of the image: excluding it drops code the image links, and kept code that
+        // calls into it then fails to link with no word here (review E10).
+        if (excludeSegs.Count > 0 && buildCmds.Count > 0)
+        {
+            var excludedCompiled = buildCmds.Select(CmdRel).Where(r => r is not null).Select(r => r!)
+                                            .Distinct(StringComparer.OrdinalIgnoreCase)
+                                            .Where(r => Excluded(Path.Combine(dir, r)) && File.Exists(Path.Combine(dir, r))).ToList();
+            summary["build.excludedCompiledFiles"] = excludedCompiled.Count;
+            if (excludedCompiled.Count > 0)
+                err.WriteLine($"  warn    : excludeDirectories excludes {excludedCompiled.Count:N0} source file(s) the build log compiles, e.g. "
+                    + $"{excludedCompiled[0]}: they are part of the image, so kept code that calls into them will not link. "
+                    + "Exclude only what the image does not build.");
+        }
         // Directory junctions/symlinks are not followed (loops, double emit) — say so once (review RB7): code
         // reached only through one is not carved and not copied.
         skippedLinks.RemoveAll(Excluded);
