@@ -29,6 +29,18 @@ public class MemoryGate
         catch (InvalidOperationException) { return 0; }
     }
 
+    /// <summary>The most the run may hold (memoryStopMb), or 0 for no limit: set once, before any budget is taken.</summary>
+    public static long RunLimitBytes { get; set; }
+
+    /// <summary>What the budgets are fractions of: the machine's memory, or the run's limit when that is less. A run
+    /// told to stop at 20 GB on a 128 GB machine had its scans sized for 128 (C19: stopped in the check).</summary>
+    public static long BudgetBytes()
+    {
+        var machine = MachineBytes();
+        var limit = RunLimitBytes;
+        return limit <= 0 ? machine : machine <= 0 ? limit : Math.Min(machine, limit);
+    }
+
     public long Budget => _budget;
 
     /// <summary>Waits for room for a piece of <paramref name="chars"/> characters; the lease gives it back.</summary>

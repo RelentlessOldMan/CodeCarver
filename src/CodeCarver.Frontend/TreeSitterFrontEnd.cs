@@ -1137,7 +1137,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // 16 bytes a character: the text, and what the scans find in it.
     private static readonly Lazy<CodeCarver.Core.Util.MemoryGate> s_prePassMemory = new(() =>
     {
-        var total = CodeCarver.Core.Util.MemoryGate.MachineBytes();
+        var total = CodeCarver.Core.Util.MemoryGate.BudgetBytes();
         return new CodeCarver.Core.Util.MemoryGate(total > 0 ? total / 8 : 2L << 30, 16, 256 * 1024);
     });
 

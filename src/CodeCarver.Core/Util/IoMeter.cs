@@ -107,8 +107,44 @@ public static class IoMeter
     const int PooledMax = 4 << 20;
     static string ReadToEnd(FileStream fs, Encoding? encoding)
     {
+        // Latin-1 is a character per byte: the text is decoded straight into its string, where the reader holds it
+        // twice (its builder and the string) - a register header of hundreds of MB, a few at once.
+        if (encoding?.CodePage == 28591 && fs.Length is > 4 and < int.MaxValue / 2 && !HasMark(fs)) return ReadLatin1(fs);
         var size = (int)Math.Clamp(fs.Length, 4096, Buffer);
         using var r = new StreamReader(fs, encoding ?? Encoding.UTF8, detectEncodingFromByteOrderMarks: true, size, leaveOpen: true);
+        return r.ReadToEnd();
+    }
+    /// <summary>A byte-order mark the reader would decode by (see <see cref="Decode"/>); the stream is left at its start.</summary>
+    static bool HasMark(FileStream fs)
+    {
+        Span<byte> b = stackalloc byte[4];
+        var n = fs.ReadAtLeast(b, 4, throwOnEndOfStream: false);
+        fs.Position = 0;
+        return (n >= 2 && ((b[0] == 0xFE && b[1] == 0xFF) || (b[0] == 0xFF && b[1] == 0xFE)))
+               || (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF)
+               || (n >= 4 && b[0] == 0 && b[1] == 0 && b[2] == 0xFE && b[3] == 0xFF);
+    }
+    static string ReadLatin1(FileStream fs)
+    {
+        var buf = System.Buffers.ArrayPool<byte>.Shared.Rent(Buffer);
+        try
+        {
+            var text = string.Create((int)fs.Length, (fs, buf), static (span, st) =>
+            {
+                for (var pos = 0; pos < span.Length; )
+                {
+                    var got = st.fs.Read(st.buf, 0, Math.Min(st.buf.Length, span.Length - pos));
+                    if (got == 0) throw new EndOfStreamException();
+                    pos += Encoding.Latin1.GetChars(st.buf.AsSpan(0, got), span[pos..]);
+                }
+            });
+            if (fs.Read(buf, 0, 1) == 0) return text;
+        }
+        catch (EndOfStreamException) { }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(buf); }
+        // The file changed size while it was read: the reader reads it as it is now.
+        fs.Position = 0;
+        using var r = new StreamReader(fs, Encoding.Latin1, detectEncodingFromByteOrderMarks: true, Buffer, leaveOpen: true);
         return r.ReadToEnd();
     }
     /// <summary>The text of <paramref name="bytes"/> as a StreamReader with byte-order-mark detection reads it: a UTF-8,

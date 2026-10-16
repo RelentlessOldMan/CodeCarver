@@ -692,7 +692,7 @@ public static class EmittedLinkCheck
     {
         if (long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB"), out var mb) && mb >= 0)
             return mb * 1024 * 1024 / sizeof(char);
-        var total = CodeCarver.Core.Util.MemoryGate.MachineBytes();
+        var total = CodeCarver.Core.Util.MemoryGate.BudgetBytes();
         return (total > 0 ? total / 32 : 512L << 20) / sizeof(char);
     }
 
@@ -704,7 +704,7 @@ public static class EmittedLinkCheck
     {
         if (long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_CHECK_READ_MB"), out var mb) && mb > 0)
             return mb * 1024 * 1024;
-        var total = CodeCarver.Core.Util.MemoryGate.MachineBytes();
+        var total = CodeCarver.Core.Util.MemoryGate.BudgetBytes();
         return Math.Max(64L << 20, total > 0 ? total / 32 : 1L << 30);
     }
 
@@ -712,7 +712,7 @@ public static class EmittedLinkCheck
     {
         if (long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_CHECK_SCAN_MB"), out var mb) && mb > 0)
             return mb * 1024 * 1024;
-        var total = CodeCarver.Core.Util.MemoryGate.MachineBytes();
+        var total = CodeCarver.Core.Util.MemoryGate.BudgetBytes();
         return Math.Max(16L << 20, total > 0 ? total / 512 : 64L << 20);
     }
 
@@ -728,11 +728,14 @@ public static class EmittedLinkCheck
         try
         {
             // Metered (io.read, and per step in the summary): the check reads the sources too, often on a share.
-            using var op = CodeCarver.Core.Util.IoMeter.Start(CodeCarver.Core.Util.IoMeter.Kind.Read);
-            var fi = new FileInfo(path);
-            if (!fi.Exists || fi.Length > maxBytes) return null;
-            // Latin-1 is byte-transparent: identifiers are ASCII, and no byte sequence can fail to decode.
-            return File.ReadAllText(path, System.Text.Encoding.Latin1);
+            using (CodeCarver.Core.Util.IoMeter.Start(CodeCarver.Core.Util.IoMeter.Kind.Read))
+            {
+                var fi = new FileInfo(path);
+                if (!fi.Exists || fi.Length > maxBytes) return null;
+            }
+            // Latin-1 is byte-transparent: identifiers are ASCII, and no byte sequence can fail to decode. IoMeter's
+            // read decodes once into the string (File.ReadAllText held it twice, in 4 KB reads).
+            return CodeCarver.Core.Util.IoMeter.ReadAllText(path, System.Text.Encoding.Latin1);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
     }
@@ -963,10 +966,10 @@ public static class EmittedLinkCheck
 
     [ThreadStatic] static bool t_scanning;
 
-    /// <summary>The scans running at once, held to an eighth of the machine's memory at a cost per character.</summary>
+    /// <summary>The scans running at once, held to an eighth of the machine's memory (BudgetBytes) at a cost per character.</summary>
     static readonly Lazy<CodeCarver.Core.Util.MemoryGate> s_scanMemory = new(() =>
     {
-        var total = CodeCarver.Core.Util.MemoryGate.MachineBytes();
+        var total = CodeCarver.Core.Util.MemoryGate.BudgetBytes();
         return new CodeCarver.Core.Util.MemoryGate(total > 0 ? total / 8 : 2L << 30, bytesPerChar: 16, minChars: 256 * 1024);
     });
 
@@ -1602,8 +1605,9 @@ public static class EmittedLinkCheck
     /// adding to <paramref name="into"/> when given.</summary>
     static List<Tok> Tokenize(string s, bool directives, CodeCarver.Core.Util.NamePool pool, int from, List<Tok>? into)
     {
-        // About a token per four characters of C: sized once, where doubling as it filled copied the list over and over.
-        var toks = into ?? new List<Tok>(s.Length / 4 + 16);
+        // Sized for a small file and grown by doubling: a token per four characters held a register header's list at
+        // twice the size of its text, where its #define lines are next to no tokens (227 MB of them made 10).
+        var toks = into ?? new List<Tok>(Math.Min(s.Length / 8, 1 << 16) + 16);
         // A register header is mostly #define lines: one builder, body token list and parameter set serve them all.
         System.Text.StringBuilder? sb = null;
         DefineScratch? scratch = null;

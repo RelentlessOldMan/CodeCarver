@@ -371,6 +371,8 @@ public static class CarveCommand
         long _runPeakPrivate = 0, _runPeakWorkingSet = 0, _minMachineFree = long.MaxValue, _minCommitFree = long.MaxValue;
         var _memoryNow = "";
         var _memoryStop = (cv.MemoryStopMb ?? 0) * 1024 * 1024;
+        // The parse, pre-pass and check budgets are fractions of this when it is less than the machine.
+        CodeCarver.Core.Util.MemoryGate.RunLimitBytes = _memoryStop;
         var _stopping = 0;
         var _memGate = new object();
         void NoteMemory(long priv, long workingSet, (long Total, long Free, long CommitFree)? machine)

@@ -74,6 +74,30 @@ public sealed class IoMeterTests
     }
 
     [Fact]
+    public void LargeLatin1Reads_DecodeExactlyAsFileDoes()
+    {
+        var dir = Directory.CreateTempSubdirectory("iometer-");
+        try
+        {
+            // Over the 4 MB pooled read: decoded straight into the string, unless a byte-order mark says otherwise.
+            var body = Enumerable.Range(0, 5_000_000).Select(i => (byte)(i % 7 == 0 ? 0xE9 : i % 50 == 0 ? '\n' : 'a' + i % 26)).ToArray();
+            var cases = new (string Name, byte[] Bytes)[]
+            {
+                ("plain.h", body),
+                ("bom8.h", System.Text.Encoding.UTF8.GetPreamble().Concat(body).ToArray()),
+                ("utf16.h", System.Text.Encoding.Unicode.GetPreamble().Concat(body).ToArray()),
+            };
+            foreach (var (name, bytes) in cases)
+            {
+                var p = Path.Combine(dir.FullName, name);
+                File.WriteAllBytes(p, bytes);
+                Assert.Equal(File.ReadAllText(p, System.Text.Encoding.Latin1), IoMeter.ReadAllText(p, System.Text.Encoding.Latin1));
+            }
+        }
+        finally { dir.Delete(recursive: true); }
+    }
+
+    [Fact]
     public void Reads_AreCounted_AndDescribedWithoutTheirPaths()
     {
         var dir = Directory.CreateTempSubdirectory("iometer-");

@@ -56,6 +56,23 @@ public sealed class StreamingCheckTests
     }
 
     [Fact]
+    public void Budgets_AreFractionsOfTheRunLimit_WhenItIsLessThanTheMachine()
+    {
+        var machine = MemoryGate.MachineBytes();
+        var before = MemoryGate.RunLimitBytes;
+        try
+        {
+            MemoryGate.RunLimitBytes = 0;
+            Assert.Equal(machine, MemoryGate.BudgetBytes());
+            MemoryGate.RunLimitBytes = 4000L << 20;
+            Assert.Equal(machine > 0 ? Math.Min(machine, 4000L << 20) : 4000L << 20, MemoryGate.BudgetBytes());
+            MemoryGate.RunLimitBytes = long.MaxValue;
+            Assert.Equal(machine > 0 ? machine : long.MaxValue, MemoryGate.BudgetBytes());
+        }
+        finally { MemoryGate.RunLimitBytes = before; }
+    }
+
+    [Fact]
     public void MemoryGate_PiecesOverTheBudget_WaitForEachOther_AndOneBiggerThanItRunsAlone()
     {
         var gate = new MemoryGate(budgetBytes: 1000, bytesPerChar: 10, minChars: 10);

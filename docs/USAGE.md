@@ -648,6 +648,11 @@ summary key written so far, the run's memory keys, and `stop.reason`, `stop.afte
 and the largest the step had started); numbers only, like `summary.txt`. The exit code is 4. Every run deletes that file when it
 starts, so one that exists is the last run's.
 
+`memoryStopMb` also sizes the run: the parse, the macro pre-pass and the link check hold work in flight to fractions
+of the machine's memory, or of `memoryStopMb` when that is less. A lower stop makes the run hold less at once (and can
+make the parse slower); it never changes what is kept. Most of a run's peak is the .NET heap's headroom over its live
+data: `DOTNET_GCConserveMemory=9` (default 7) trades about 15% of the peak for a slower graph build.
+
 The two longest steps before the parse also say which part took the time: `rootNames built / binaries /
 unbuilt` and `pre-parse treeMacros / outsideHeaders / quotedIncludes / unparsedHeaders`, each a `progress:`
 line and a `time.<step>.<part>.ms` summary key.

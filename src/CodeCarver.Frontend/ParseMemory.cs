@@ -18,14 +18,14 @@ internal sealed class ParseMemory : MemoryGate
 
     public ParseMemory(long budgetBytes) : base(budgetBytes, BytesPerChar, MinChars) { }
 
-    /// <summary>A quarter of the memory the machine has, or CODECARVER_PARSE_MEMORY_MB. Not more: what a tree frees stays
+    /// <summary>A quarter of the memory the machine has (or the run's memoryStopMb, when less), or CODECARVER_PARSE_MEMORY_MB. Not more: what a tree frees stays
     /// with the process (the native heap keeps it for the next parse), so the most the parses ever held is held for
     /// the rest of the run, and the graph and the check need the rest.</summary>
     public static ParseMemory ForMachine()
     {
         if (long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_PARSE_MEMORY_MB"), out var mb) && mb > 0)
             return new ParseMemory(mb * 1024 * 1024);
-        var total = MachineBytes();
+        var total = BudgetBytes();
         return new ParseMemory(total > 0 ? total / 4 : 4L << 30);
     }
 }
