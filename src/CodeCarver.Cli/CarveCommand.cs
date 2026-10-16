@@ -1596,6 +1596,11 @@ public static class CarveCommand
             {
                 var incByFile = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
                 var incUnion = new List<string>();
+                // Sets beside the ordered lists, and each (directory, -I) resolved once: thousands of commands repeat one
+                // -I list, and Contains on the union list was a scan per include (review CPU C3).
+                var inUnion = new HashSet<string>(StringComparer.Ordinal);
+                var mineSets = new Dictionary<List<string>, HashSet<string>>(ReferenceEqualityComparer.Instance);
+                var resolved = new Dictionary<(string, string), string?>();
                 var rootFullI = Path.GetFullPath(dir);
                 foreach (var cc in buildCmds)
                 {
@@ -1603,16 +1608,24 @@ public static class CarveCommand
                     string baseDir;
                     try { baseDir = Path.IsPathFullyQualified(cc.Directory) ? cc.Directory : Path.GetFullPath(Path.Combine(dir, cc.Directory)); }
                     catch { continue; }
-                    if (!incByFile.TryGetValue(rel, out var mine)) incByFile[rel] = mine = new List<string>();
+                    if (!incByFile.TryGetValue(rel, out var mine)) { incByFile[rel] = mine = new List<string>(); mineSets[mine] = new(StringComparer.Ordinal); }
+                    var mineSet = mineSets[mine];
                     foreach (var inc in cc.Includes)
                     {
-                        string relDir;
-                        try { relDir = Path.GetRelativePath(rootFullI, Path.GetFullPath(Path.Combine(baseDir, inc))).Replace('\\', '/'); }
-                        catch { continue; }
-                        if (relDir == ".") relDir = "";
-                        if (relDir.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relDir)) continue;
-                        if (!mine.Contains(relDir)) mine.Add(relDir);
-                        if (!incUnion.Contains(relDir)) incUnion.Add(relDir);
+                        if (!resolved.TryGetValue((baseDir, inc), out var relDir))
+                        {
+                            try
+                            {
+                                relDir = Path.GetRelativePath(rootFullI, Path.GetFullPath(Path.Combine(baseDir, inc))).Replace('\\', '/');
+                                if (relDir == ".") relDir = "";
+                                if (relDir.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relDir)) relDir = null;
+                            }
+                            catch { relDir = null; }
+                            resolved[(baseDir, inc)] = relDir;
+                        }
+                        if (relDir is null) continue;
+                        if (mineSet.Add(relDir)) mine.Add(relDir);
+                        if (inUnion.Add(relDir)) incUnion.Add(relDir);
                     }
                 }
                 // A file compiled by several commands with different -I lists gets the union, not "exact".
