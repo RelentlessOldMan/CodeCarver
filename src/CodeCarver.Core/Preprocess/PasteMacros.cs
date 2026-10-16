@@ -43,8 +43,10 @@ public static class PasteMacros
     public static Table Build(IReadOnlyDictionary<string, (bool FnLike, List<string> Bodies)> bodies, Func<string, bool> isObjectMacro)
         => Build(MacroBodies.Parse(bodies), isObjectMacro);
 
-    /// <summary>As the overload taking the bodies, from bodies already split (<see cref="MacroBodies.Parse"/>).</summary>
-    public static Table Build(List<(string Name, List<string> Params, List<string> Tokens)> parsed, Func<string, bool> isObjectMacro)
+    /// <summary>As the overload taking the bodies, from bodies already split (<see cref="MacroBodies.Parse"/>). With
+    /// <paramref name="minParams"/> 1, also `drv_##n`: for naming a definition's head, where only an exact name is used.</summary>
+    public static Table Build(List<(string Name, List<string> Params, List<string> Tokens)> parsed, Func<string, bool> isObjectMacro,
+                              int minParams = 2)
     {
 
         var table = new Table();
@@ -63,7 +65,7 @@ public static class PasteMacros
                 if (!ChainAt(toks, i, out var parts, out var end)) continue;
                 if (i > 0 && toks[i - 1] == "#") { i = end; continue; }   // `#a ## b`: a string, not a name
                 var t = Pieces(parts, ps);
-                if (t.Count(p => !p.IsText) >= 2) AddT(name, t);
+                if (t.Count(p => !p.IsText) >= minParams) AddT(name, t);
                 i = end;
             }
 

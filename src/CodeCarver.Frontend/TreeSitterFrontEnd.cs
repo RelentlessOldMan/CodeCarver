@@ -369,6 +369,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         return list;
     }
     private static readonly Regex IdentifierOnly = new(@"^[A-Za-z_$][\w$]*$", RegexOptions.Compiled);
+    // Spelled name -> the symbols it is renamed to (the inverse of _renamedFrom, chains followed).
+    private readonly Dictionary<string, List<string>> _renamesTo = new(StringComparer.Ordinal);
+    // `NAME(args)(params) {`: a head whose declarator is a function-like macro use (review B9).
+    private static readonly Regex MacroDeclaratorHead = new(
+        @"(?<![\w.>$])(?<m>[A-Za-z_]\w*)\s*\((?<a>[^()]*)\)\s*\((?:[^(){};]|\([^(){};]*\))*\)\s*\{", RegexOptions.Compiled);
 
     /// <summary>The names the source may write for linker symbol <paramref name="symbol"/>: through asm labels,
     /// <c>#pragma redefine_extname</c> and object-like rename
@@ -394,6 +399,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private Dictionary<string, List<DefinerMacros.Template>> _definers = new(StringComparer.Ordinal);
     // What macros that paste their own parameters (`CAT(a, b) a##b`) build, through wrappers (see PasteMacros).
     private PasteMacros.Table _pasteTable = new();
+    // The same with one-parameter pastes (`drv_##n`), for heads only (Pass 1d), and its use scan.
+    private PasteMacros.Table _headPasteTable = new();
+    private NameScan? _headPasteUse;
     private NameScan? _pasteUse;
     private HashSet<string> _objectMacros = new(StringComparer.Ordinal);
     /// <summary>The tree's definer macros, for the emitted-tree check (null when there are none).</summary>
@@ -960,6 +968,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _macroBodies = bodies.Where(kv => kv.Value.FnLike).ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
         _objectMacros = new HashSet<string>(defs.Keys, StringComparer.Ordinal);
         _pasteTable = PasteMacros.Build(fnBodies, _objectMacros.Contains);
+        _headPasteTable = PasteMacros.Build(fnBodies, _objectMacros.Contains, minParams: 1);
+        _headPasteUse = PasteMacros.UseScan(_headPasteTable);
         _pasteUse = PasteMacros.UseScan(_pasteTable);
         DefinerSet = DefinerMacros.MakeSet(_definers);
         _definerUse = DefinerSet?.Use;
@@ -996,6 +1006,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _aliasMacroUse = aliasMacros.Count == 0 ? null
             : new Regex(@"\b(?<name>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*(?:" + string.Join("|", aliasMacros.Select(Regex.Escape))
                         + @")\s*\(\s*(?<target>[A-Za-z_]\w*)\s*\)\s*;", RegexOptions.Compiled);
+        // The other way round, through chains: the symbols a definition spelled `summon_fn` really defines (review B9).
+        _renamesTo.Clear();
+        foreach (var real in _renamedFrom.Keys)
+            foreach (var spelled in SourceNamesOf(real))
+            {
+                if (!_renamesTo.TryGetValue(spelled, out var to)) _renamesTo[spelled] = to = new List<string>();
+                to.Add(real);
+            }
         _timing["macro-pre-pass.tables"] = clock.ElapsedMilliseconds;
         return (bytesTotal, filesTotal);
     }
@@ -2310,6 +2328,46 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                         if (a != b) graph.AddEdge(a, b, EdgeKind.Calls);
                 funcSpans.Add((use.StartLine, use.EndLine, ids[0]));   // the body's calls belong to the defined name
             }
+
+        // Pass 1d: a head whose name a pasting macro builds, `int DRV_NAME(uart)(void) { ... }` defining drv_uart
+        // (review B9). The parse names no function there (the macro's name is no function), so the body is found
+        // in the text: a file-scope head through its matching `}`.
+        if (_headPasteUse is { } pu && pu.IsMatch(text))
+        {
+            var code = SourceText.CodeOnly(text);
+            var depth = 0;
+            var at = 0;
+            List<int>? lineStarts = null;
+            foreach (Match m in MacroDeclaratorHead.Matches(code))
+            {
+                if (!_headPasteTable.Templates.ContainsKey(m.Groups["m"].Value)) continue;
+                for (; at < m.Index; at++) depth += code[at] == '{' ? 1 : code[at] == '}' && depth > 0 ? -1 : 0;
+                if (depth != 0) continue;   // inside a body: a call, not a head
+                var names = PasteMacros.UseFragments(_headPasteTable, m.Groups["m"].Value, m.Groups["a"].Value, _objectMacros.Contains)
+                                       .Where(f => f.Kind == PasteMacros.Kind.Exact).Select(f => f.Frag).Distinct().ToList();
+                if (names.Count == 0) continue;
+                var end = m.Index + m.Length;   // just past the `{`
+                for (var d = 1; end < code.Length && d > 0; end++) d += code[end] == '{' ? 1 : code[end] == '}' ? -1 : 0;
+                if (lineStarts is null)
+                {
+                    lineStarts = new List<int> { 0 };
+                    for (var q = 0; q < text.Length; q++) if (text[q] == '\n') lineStarts.Add(q + 1);
+                }
+                int LineAt(int k) { var b = lineStarts.BinarySearch(k); return b >= 0 ? b + 1 : ~b; }
+                var first = LineAt(m.Index);
+                if (dead is not null && first < dead.Length && dead[first]) continue;
+                var last = LineAt(end - 1);
+                NodeId? owner = null;
+                foreach (var name in names)
+                {
+                    var id = graph.GetOrAddNode(NodeKind.Function, name, path, new SourceSpan(first, last));
+                    graph.AddEdge(id, fileNode, EdgeKind.DefinedIn);
+                    Add(functionsByName, name, id);
+                    owner ??= id;
+                }
+                funcSpans.Add((first, last, owner!.Value));   // the body's calls belong to the defined name
+            }
+        }
         w.Lap(5);
 
         // Pass 1b: file-scope variable DEFINITIONS of every shape (scalars, structs, pointers, arrays, initialized
@@ -2523,6 +2581,20 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     Add(functionsByName, to, rid);
                     pendingCalls.Add((rid, graph.GetNode(id).Name));
                 }
+        // A rename in the tree (`#define spi_xfer spi1_xfer`): a function defined here as spi_xfer is the symbol spi1_xfer,
+        // which a caller without the header names directly (review B9).
+        if (_renamesTo.Count > 0)
+            foreach (var (s, e, id) in funcSpans.ToList())
+                if (_renamesTo.TryGetValue(graph.GetNode(id).Name, out var reals))
+                    foreach (var to in reals)
+                    {
+                        if (functionsByName.TryGetValue(to, out var have) && have.Any(h => graph.GetNode(h).FilePath == path)) continue;
+                        var rid = graph.GetOrAddNode(NodeKind.Function, to, path, new SourceSpan(s, e));
+                        graph.AddEdge(rid, fileNode, EdgeKind.DefinedIn);
+                        graph.AddFlag(rid, NodeFlags.Alias);
+                        Add(functionsByName, to, rid);
+                        pendingCalls.Add((rid, graph.GetNode(id).Name));
+                    }
         // C99 inline: the header holds the body, this translation unit (declaring it extern, or without inline) emits it.
         if (_c99InlineFns.Count > 0 && IsTranslationUnit(path))
             foreach (var (name, index) in C99Inline.Emitters(text, _c99InlineFns)) LinkerName(name, name, index);
