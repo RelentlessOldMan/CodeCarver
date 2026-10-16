@@ -192,6 +192,37 @@ public sealed class MacroWorldTests
     }
 
     [Fact]
+    public void HeaderOfAFileTheLogLacks_IsOpenWorld()
+    {
+        // Review W7: extra.c has no compile command, so its command line (and WITH_HOOK) is unknown; feat.h, which
+        // only it includes, was still read closed-world and feat_hook's file dropped.
+        using var t = new TreeCarve()
+            .W("main.c", "void extra(void);\nint main(void){ extra(); return 0; }\n")
+            .W("extra.c", "#include \"feat.h\"\nvoid extra(void){ maybe_hook(); }\n")
+            .W("feat.h", "#ifndef FEAT_H\n#define FEAT_H\nvoid feat_hook(void);\nstatic inline void maybe_hook(void) {\n#ifdef WITH_HOOK\n  feat_hook();\n#endif\n}\n#endif\n")
+            .W("hook.c", "void feat_hook(void){}\n");
+        t.Compile("main.c", "").Compile("hook.c", "");
+        var r = t.Carve();
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.True(t.Kept("hook.c"), r.Out + r.Err);
+    }
+
+    [Fact]
+    public void DashU_OfABuiltin_Undefines()
+    {
+        // Review W6: a reserved name may be a compiler built-in (unknown); every command -Us it, so it is undefined.
+        using var t = new TreeCarve()
+            .W("main.c", "void feat(void); void plain(void);\nint main(void){\n#ifdef __STRICT_ANSI__\n  feat();\n#else\n  plain();\n#endif\n  return 0;\n}\n")
+            .W("feat.c", "void feat(void){}\n")
+            .W("plain.c", "void plain(void){}\n");
+        t.Compile("main.c", "-U__STRICT_ANSI__").Compile("feat.c", "-U__STRICT_ANSI__").Compile("plain.c", "-U__STRICT_ANSI__");
+        var r = t.Carve();
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.False(t.Kept("feat.c"), r.Out + r.Err);
+        Assert.True(t.Kept("plain.c"), r.Out + r.Err);
+    }
+
+    [Fact]
     public void DashDAfterTheSourceFile_StillDefines()
     {
         using var t = Tree("");

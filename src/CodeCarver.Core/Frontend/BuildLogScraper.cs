@@ -146,7 +146,7 @@ public static class BuildLogScraper
         args = ExpandResponseFiles(args, dir, options, ref incomplete, depth: 0);
         var sources = file is not null ? new List<string> { file } : args.Where(IsSourceFile).ToList();
         if (sources.Count == 0) return; // link-only or non-compile invocation
-        var (defines, includes, forced) = ExtractFlags(args, IsMsvcDriver(driver));
+        var (defines, undefines, includes, forced) = ExtractFlags(args, IsMsvcDriver(driver));
         foreach (var src in sources)
             results.Add(new CompileCommand
             {
@@ -155,6 +155,7 @@ public static class BuildLogScraper
                 Driver = driver,
                 Arguments = args,
                 Defines = defines,
+                Undefines = undefines,
                 Includes = includes,
                 ForcedIncludes = forced,
                 Incomplete = incomplete,
@@ -323,23 +324,28 @@ public static class BuildLogScraper
     private static string? GetString(JsonElement obj, string name)
         => obj.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
 
-    private static (IReadOnlyList<string> Defines, IReadOnlyList<string> Includes, IReadOnlyList<string> Forced)
+    private static (IReadOnlyList<string> Defines, IReadOnlyList<string> Undefines, IReadOnlyList<string> Includes, IReadOnlyList<string> Forced)
         ExtractFlags(List<string> args, bool msvc)
     {
         // Effective defines with LAST-WINS semantics: the compiler applies -D/-U left to right, so
         // `-DFEATURE -UFEATURE` leaves FEATURE UNDEFINED (and `-UX -DX=1` leaves it defined). Model it with a
         // name-keyed map: -D sets, -U removes; the map holds the net state. Ignoring -U (the old behavior)
         // wrongly kept the #ifdef branch of a macro the build explicitly undefined (eval-#9).
-        var eff = new Dictionary<string, string?>(StringComparer.Ordinal);
+        // By macro name: the spec as written. `-DTRACE(x)=x` is TRACE, so `-UTRACE` removes it (review W6).
+        var eff = new Dictionary<string, string>(StringComparer.Ordinal);
+        var undefs = new HashSet<string>(StringComparer.Ordinal);
         var includes = new List<string>();
         var forced = new List<string>();
         void Define(string spec)
         {
             if (spec.Length == 0) return;
             var eq = spec.IndexOf('=');
-            if (eq < 0) eff[spec] = null; else eff[spec[..eq]] = spec[(eq + 1)..];
+            var name = eq < 0 ? spec : spec[..eq];
+            if (name.IndexOf('(') is var paren and >= 0) name = name[..paren];
+            eff[name] = spec;
+            undefs.Remove(name);
         }
-        void Undef(string name) { if (name.Length > 0) eff.Remove(name); }
+        void Undef(string name) { if (name.Length > 0) { eff.Remove(name); undefs.Add(name); } }
         // MSVC-style /D /U /I only for an MSVC driver: for gcc, /Users/x/a.c or /Include/... are paths (BL3).
         bool Flag(string a, char f) => a.Length >= 2 && (a[0] == '-' || (msvc && a[0] == '/')) && a[1] == f;
         for (var i = 0; i < args.Count; i++)
@@ -388,8 +394,7 @@ public static class BuildLogScraper
             else if (JoinedIncludeDir(a, msvc) is { } joined) includes.Add(SysrootRelative(joined));
             else if (Flag(a, 'I')) includes.Add(SysrootRelative(a[2..]));
         }
-        var defines = eff.Select(kv => kv.Value is null ? kv.Key : $"{kv.Key}={kv.Value}").ToList();
-        return (defines, includes, forced);
+        return (eff.Values.ToList(), undefs.ToList(), includes, forced);
     }
 
     /// <summary>The dir of an include flag written joined: <c>-isystemDIR</c>, <c>-iquoteDIR</c>, <c>-idirafterDIR</c>,

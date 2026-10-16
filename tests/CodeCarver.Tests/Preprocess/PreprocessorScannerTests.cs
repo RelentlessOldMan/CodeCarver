@@ -56,6 +56,27 @@ public class PreprocessorScannerTests
     }
 
     [Fact]
+    public void DirectiveAfterAComment_IsADirective()
+    {
+        // Review W5: `/* old */ #if 0` was text, so its #else/#endif closed the enclosing #ifdef.
+        var t = new MacroTable(); t.Set("ON", "1");
+        const string text = "#ifdef ON\n/* old */ #if 0\nA\n#else\nB\n#endif\nC\n#endif\n";
+        var dead = PreprocessorScanner.DeadLineMap(text, t, closedWorld: true);
+        Assert.Equal(new[] { true, false, false }, new[] { dead[3], dead[5], dead[7] });
+    }
+
+    [Fact]
+    public void CommentOpenAtTheEndOfAnIf_ContinuesTheCondition()
+    {
+        // Review W5: the condition ran on past the comment: `defined(A) && defined(B)` with B absent is false, not true.
+        var t = new MacroTable(); t.Set("A", "1");
+        const string text = "#if defined(A) /* needs\n   both */ && defined(B)\nX\n#else\nY\n#endif\n";
+        var dead = PreprocessorScanner.DeadLineMap(text, t, closedWorld: true);
+        Assert.True(dead[3]);
+        Assert.False(dead[5]);
+    }
+
+    [Fact]
     public void ElifdefAndElifndef_PickTheirBranch()
     {
         // Review W4 (C23/C++23): unhandled, both lines were ignored and the #else branch ran too.

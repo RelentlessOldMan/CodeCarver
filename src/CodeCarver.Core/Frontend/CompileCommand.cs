@@ -15,6 +15,10 @@ public sealed record CompileCommand
     /// <summary>Macro definitions, without the <c>-D</c> (e.g. "LUA_USE_LINUX", "FOO=1").</summary>
     public IReadOnlyList<string> Defines { get; init; } = Array.Empty<string>();
 
+    /// <summary>Macros the command line <c>-U</c>s and no later <c>-D</c> defines again: undefined for this TU even when
+    /// the compiler predefines them (review W6).</summary>
+    public IReadOnlyList<string> Undefines { get; init; } = Array.Empty<string>();
+
     /// <summary>Include search paths, without the <c>-I</c>.</summary>
     public IReadOnlyList<string> Includes { get; init; } = Array.Empty<string>();
 

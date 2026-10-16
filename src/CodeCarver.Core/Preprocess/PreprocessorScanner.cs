@@ -100,16 +100,26 @@ public static class PreprocessorScanner
                 if (!inComment && line.IndexOf("R\"", StringComparison.Ordinal) >= 0) rawEnd = OpenRawString(line.ToString());
             }
 
+            // `/* old */ #if 0` is a directive: a comment before the # is a space (review W5).
+            while (!startsInComment && trimmed.StartsWith("/*") && trimmed[2..].IndexOf("*/") is var close and >= 0)
+                trimmed = trimmed[(close + 4)..].TrimStart();
             if (!startsInComment && !startsInRaw && trimmed.Length > 0 && trimmed[0] == '#')
             {
                 var last = idx;
                 // Joined in one buffer: re-copying the directive per continued line costs the square of its length,
-                // gigabytes for a generated #define of thousands of lines.
-                var sb = new System.Text.StringBuilder().Append(line.TrimEnd('\r'));
-                for (var end = TrimmedLength(sb); end > 0 && sb[end - 1] == '\\' && last + 1 < lineCount; end = TrimmedLength(sb))
+                // gigabytes for a generated #define of thousands of lines. A comment open at the end of a line goes on
+                // to the next, and so does the directive: `#if defined(A) /* ... \n ... */ && defined(B)` (review W5).
+                var first = trimmed.TrimEnd('\r');
+                var sb = new System.Text.StringBuilder().Append(first);
+                var open = EndsInComment(first, false);
+                while (last + 1 < lineCount)
                 {
-                    sb.Length = end - 1;
-                    sb.Append(' ').Append(LineAt(text, starts, ++last).TrimEnd('\r'));
+                    var end = TrimmedLength(sb);
+                    if (!open && !(end > 0 && sb[end - 1] == '\\')) break;
+                    if (!open) sb.Length = end - 1;
+                    var next = LineAt(text, starts, ++last).TrimEnd('\r');
+                    sb.Append(' ').Append(next);
+                    open = EndsInComment(next, open);
                 }
                 var joined = sb.ToString();
                 for (var k = idx; k <= last; k++) dead[k + 1] = !active;

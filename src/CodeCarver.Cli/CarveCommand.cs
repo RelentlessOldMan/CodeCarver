@@ -583,9 +583,18 @@ public static class CarveCommand
         // are global user assertions applied to every file.
         var manualDefines = defineSpecs.Distinct().ToList();
         Func<string, MacroTable?>? perFileDefines = null;
+        // Review W7: what a translation unit the log does not cover (open-world) #includes, transitively. Those
+        // headers are configured by an unknown command line, so they take the open table too.
+        Func<string, bool>? openTU = null;
+        HashSet<string>? openHeaders = null;
         MacroTable? defines;
 
-        static string SpecName(string spec) { var eq = spec.IndexOf('='); return eq < 0 ? spec : spec[..eq]; }
+        static string SpecName(string spec)
+        {
+            var eq = spec.IndexOf('=');
+            var lhs = eq < 0 ? spec : spec[..eq];
+            return lhs.IndexOf('(') is var paren and >= 0 ? lhs[..paren] : lhs;   // F(x)=x is F (review W6)
+        }
         // Split a group of compile commands into: CONSISTENT (defined in EVERY command with one value -> definitely
         // defined) and VARYING (defined in some-but-not-all, or with conflicting values -> UNKNOWN, keep both
         // branches even under closed-world). A name never mentioned in the group stays absent (closed-world =
@@ -607,6 +616,14 @@ public static class CarveCommand
             {
                 if (defCount[kv.Key] == cmds.Count && kv.Value.Count == 1) consistent.Add(kv.Value.First());
                 else varying.Add(kv.Key);   // some-but-not-all, or conflicting values
+            }
+            // -U (review W6): undefined by every command -> "!NAME", a certain #undef (of a compiler built-in, too);
+            // by only some -> varies.
+            foreach (var name in cmds.SelectMany(c => c.Undefines).Distinct(StringComparer.Ordinal))
+            {
+                if (specsByName.ContainsKey(name)) continue;   // defined by another command: already varying
+                if (cmds.All(c => c.Undefines.Contains(name))) consistent.Add("!" + name);
+                else varying.Add(name);
             }
             return (consistent, varying);
         }
@@ -728,8 +745,10 @@ public static class CarveCommand
             var t = probeBase is not null ? probeBase.Clone() : MacroTable.FromDefines(manualDefines);
             t.Ambient = ambientMacros;
             t.UndefinedSomewhere = undefinedSomewhere;
-            foreach (var s in consistent) t.Define(s);
-            foreach (var n in varying) t.MarkUnknown(n);
+            foreach (var s in consistent)
+                if (s.StartsWith('!')) t.UndefCertain(s[1..]); else t.Define(s);
+            // ForceUnknown: a predefined (probed) value one command overrides or -Us varies too (review W6).
+            foreach (var n in varying) t.ForceUnknown(n);
             foreach (var n in cv.VaryingDefines) t.MarkUnknown(n);   // defined differently by the selected builds
             return t;
         }
@@ -756,13 +775,16 @@ public static class CarveCommand
             var openTable = universalTable.Clone();
             openTable.OpenWorld = true;
             var srcExt = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
+            openTU = f => openWorldFiles.Contains(f)
+                          || (!perFile.ContainsKey(f) && srcExt.Any(e => f.EndsWith(e, StringComparison.OrdinalIgnoreCase)));
             perFileDefines = f => includedCFiles.Contains(f) ? universalTable
                                   : openWorldFiles.Contains(f) ? openTable
                                   : perFile.TryGetValue(f, out var t) ? t
                                   : srcExt.Any(e => f.EndsWith(e, StringComparison.OrdinalIgnoreCase)) ? openTable
+                                  : openHeaders is not null && openHeaders.Contains(f) ? openTable
                                   : universalTable;
             defines = universalTable;                 // fallback (files absent from the log; non-TreeSitter paths)
-            defineSpecs = manualDefines.Concat(universalConsistent).Distinct().ToList(); // summary/manifest
+            defineSpecs = manualDefines.Concat(universalConsistent.Where(s => !s.StartsWith('!'))).Distinct().ToList(); // summary/manifest
 
             var naive = buildCmds.SelectMany(c => c.Defines.Select(SpecName)).Distinct().Count();
             err.WriteLine($"  build   : {buildLogs.Distinct().Count()} build-log(s), {buildCmds.Count} compile command(s), "
@@ -1235,11 +1257,13 @@ public static class CarveCommand
         var seedCond = new HashSet<string>(StringComparer.Ordinal);
         // PP1 (the macro pre-pass, below): every macro name #defined/#undef'd anywhere in the tree, and every name an #if
         // tests. Any directive spelling: #, the digraph %:, the trigraph ??=.
-        var hash = CodeCarver.Core.Preprocess.SourceText.DirectiveStart;
+        // A comment may come first: `/* old */ #if X` (review W5).
+        var hash = @"(?:/\*[^\r\n]*?\*/[ \t]*)*" + CodeCarver.Core.Preprocess.SourceText.DirectiveStart;
         var defRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:define|undef)\s+([A-Za-z_]\w*)",
             System.Text.RegularExpressions.RegexOptions.Multiline);
-        // The condition runs on over backslash-newline splices (`#if defined(A) && \` / `defined(B)`).
-        var condRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:if|ifdef|ifndef|elif|elifdef|elifndef)\b((?:\\\r?\n|[^\r\n])*)",
+        // The condition runs on over backslash-newline splices (`#if defined(A) && \` / `defined(B)`), and over a
+        // comment open at the end of the line (`#if defined(A) /* ...` / `... */ && defined(B)`).
+        var condRe = new System.Text.RegularExpressions.Regex(@"^\s*" + hash + @"\s*(?:if|ifdef|ifndef|elif|elifdef|elifndef)\b((?:\\\r?\n|/\*(?:[^*]|\*(?!/))*\*/|[^\r\n])*)",
             System.Text.RegularExpressions.RegexOptions.Multiline);
         var identRe = new System.Text.RegularExpressions.Regex(@"[A-Za-z_]\w*");
         // Review W1: by rel, what each scanned file's #ifs test and the basenames it #includes ("..." and <...>), so the
@@ -1247,6 +1271,31 @@ public static class CarveCommand
         var includeFacts = new Dictionary<string, (string[] Tested, string[] Quoted, string[] Angled)>(StringComparer.Ordinal);
         var incNameRe = new System.Text.RegularExpressions.Regex(@"^\s*#\s*include(?:_next)?\s*(?:""([^""]+)""|<([^>]+)>)",
             System.Text.RegularExpressions.RegexOptions.Multiline);
+        Dictionary<string, List<string>>? includeRelsByBase = null;
+        // The seeds and every scanned file they #include, transitively (by basename: over-approximate).
+        HashSet<string> IncludeClosure(IEnumerable<string> seeds)
+        {
+            if (includeRelsByBase is null)
+            {
+                includeRelsByBase = new(StringComparer.OrdinalIgnoreCase);
+                foreach (var rel in includeFacts.Keys)
+                {
+                    var bn = Path.GetFileName(rel);
+                    if (!includeRelsByBase.TryGetValue(bn, out var rl)) includeRelsByBase[bn] = rl = new List<string>();
+                    rl.Add(rel);
+                }
+            }
+            var seen = new HashSet<string>(seeds, StringComparer.Ordinal);
+            var queue = new Queue<string>(seen);
+            while (queue.Count > 0)
+            {
+                if (!includeFacts.TryGetValue(queue.Dequeue(), out var f)) continue;
+                foreach (var inc in f.Quoted.Concat(f.Angled.Select(a => Path.GetFileName(a))))
+                    if (includeRelsByBase.TryGetValue(inc, out var rl))
+                        foreach (var r in rl) if (seen.Add(r)) queue.Enqueue(r);
+            }
+            return seen;
+        }
         var interned = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         string Intern(string s) => interned.TryGetValue(s, out var i) ? i : interned[s] = s;
         void ScanMacroNames(string text, HashSet<string> defined, HashSet<string> tested, string? rel = null)
@@ -1764,14 +1813,10 @@ public static class CarveCommand
                     return h;
                 }
                 var includers = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);   // basename -> rels
-                var relsByBase = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
                 var reach = new Queue<string>();
                 var unit = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var (rel, facts) in includeFacts)
                 {
-                    var bn = Path.GetFileName(rel);
-                    if (!relsByBase.TryGetValue(bn, out var rl)) relsByBase[bn] = rl = new List<string>();
-                    rl.Add(rel);
                     foreach (var inc in facts.Quoted.Concat(facts.Angled.Select(a => Path.GetFileName(a))))
                     {
                         if (!includers.TryGetValue(inc, out var il)) includers[inc] = il = new List<string>();
@@ -1783,14 +1828,7 @@ public static class CarveCommand
                 while (reach.Count > 0)   // up: whoever includes it
                     if (includers.TryGetValue(Path.GetFileName(reach.Dequeue()), out var il))
                         foreach (var r in il) if (unit.Add(r)) reach.Enqueue(r);
-                foreach (var r in unit) reach.Enqueue(r);
-                while (reach.Count > 0)   // down: what those include
-                {
-                    var f = includeFacts[reach.Dequeue()];
-                    foreach (var inc in f.Quoted.Concat(f.Angled.Select(a => Path.GetFileName(a))))
-                        if (relsByBase.TryGetValue(inc, out var rl))
-                            foreach (var r in rl) if (unit.Add(r)) reach.Enqueue(r);
-                }
+                unit = IncludeClosure(unit);   // down: what those include
                 var dashD = new HashSet<string>(buildCmds.SelectMany(c => c.Defines).Select(SpecName).Concat(manualDefines.Select(SpecName)), StringComparer.Ordinal);
                 var mayBeSystem = unit.SelectMany(r => includeFacts[r].Tested).Where(n => !ambientMacros.Contains(n) && !dashD.Contains(n))
                                       .Distinct(StringComparer.Ordinal).ToList();
@@ -1799,6 +1837,12 @@ public static class CarveCommand
                     err.WriteLine($"  config  : {mayBeSystem.Count:N0} #if name(s) tested by {unit.Count:N0} file(s) that reach a system header not read here "
                         + $"({systemFiles:N0} file(s) include one) stay unknown. A build trace makes this exact.");
                 summary["world.systemHeaderMacroNames"] = mayBeSystem.Count;
+            }
+            if (openTU is not null)
+            {
+                openHeaders = IncludeClosure(includeFacts.Keys.Where(r => openTU(r) && !includedCFiles.Contains(r)));
+                openHeaders.RemoveWhere(r => openTU(r));
+                summary["world.headersOfUnloggedFiles"] = openHeaders.Count;
             }
             // The big and dense headers the parser skips: the names they #define that some #if tests, or null when one
             // can't be read (then every tested name might come from it). A big one is read in pieces at once.

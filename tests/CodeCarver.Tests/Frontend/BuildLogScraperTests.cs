@@ -226,6 +226,18 @@ public class BuildLogScraperTests
         Assert.Contains("X=1", redef.Defines);
         var attached = Assert.Single(BuildLogScraper.Parse("clang -DA -DB -UA -c a.c"));
         Assert.Equal(new[] { "B" }, attached.Defines);            // A defined then undefined -> only B
+        Assert.Equal(new[] { "A" }, attached.Undefines);
+        Assert.Empty(redef.Undefines);                            // -D after the -U wins
+    }
+
+    [Fact]
+    public void FunctionLikeDefine_IsKeyedByItsName()
+    {
+        // Review W6: `-DTRACE(x)=x` was keyed `TRACE(x)`, so a later -UTRACE missed it.
+        var fn = Assert.Single(BuildLogScraper.Parse("gcc '-DTRACE(x)=x' -c a.c"));
+        Assert.Equal(new[] { "TRACE(x)=x" }, fn.Defines);
+        var undone = Assert.Single(BuildLogScraper.Parse("gcc '-DTRACE(x)=x' -UTRACE -c a.c"));
+        Assert.Empty(undone.Defines);
     }
 
     [Fact]
