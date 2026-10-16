@@ -1976,6 +1976,17 @@ public static class CarveCommand
         var forceKeep = fe is TreeSitterFrontEnd tsk ? tsk.ForceKeepFiles : Array.Empty<string>();
         var forceKeepRoots = forceKeep.Count > 0
             ? new ExplicitRootProvider(files: forceKeep).Discover(graph).ToList() : new List<Root>();
+        // A source file the carve never looked inside (over maxParseBytes, macro-dense, unreadable): what it defines is
+        // unknown, so it is kept whole rather than dropped. Headers come with their includers.
+        List<string> blindUnits;
+        lock (readWarned)
+            blindUnits = skipParse.Concat(readWarned).Where(r => !EmittedLinkCheck.IsHeader(r) && fullByRel.ContainsKey(r))
+                                  .Distinct(StringComparer.Ordinal).ToList();
+        if (blindUnits.Count > 0)
+        {
+            forceKeepRoots.AddRange(new ExplicitRootProvider(files: blindUnits).Discover(graph));
+            summary["roots.unparsedUnitsKeptWhole"] = blindUnits.Count;
+        }
 
         // Runtime trace (functions a real run executed): root them so the carve is guaranteed to keep what ran,
         // including dynamic-dispatch / function-pointer edges static reachability can't see. Trace names are
