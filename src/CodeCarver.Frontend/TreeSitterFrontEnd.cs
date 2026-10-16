@@ -81,6 +81,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private static readonly Regex CallInBody = new(@"[A-Za-z_]\w*\s*\(", RegexOptions.Compiled);
     // Variables a header defines (not just declares): defined in each translation unit that includes it.
     private readonly List<(NodeId Id, string Header, bool CondExtern)> _headerData = new();
+    // C++ namespace-scope objects whose initialization may run code at start-up (review X1): the class whose
+    // constructor would run, or "" when the initializer itself calls something.
+    private readonly List<(NodeId Id, string Class)> _startupObjects = new();
     // Per object-like macro defined EMPTY, the names the #if conditions around that definition test; and, for the
     // EXTERN-style macros, all of them: the flags a unit #defines (or gets by -D) to turn EXTERN off.
     private readonly Dictionary<string, HashSet<string>> _emptyDefineConditions = new(StringComparer.Ordinal);
@@ -489,6 +492,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _condExternMacros.Clear();
         _callFreeMacros.Clear();
         _headerData.Clear();
+        _startupObjects.Clear();
         _emptyDefineConditions.Clear();
         _condExternFlags.Clear();
         _definesExternFlag.Clear();
@@ -667,6 +671,21 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 && !(globalsByName.TryGetValue(name, out var kg) && kg.Any(id => graph.GetNode(id).FilePath == kpath))
                 && !_forceKeepSet.Contains(kpath))
                 ForceKeep(kpath);
+        // A C++ object at namespace scope whose initialization runs code (review X1): a registrar, `static int r =
+        // reg("x");`, `static auto x = []{...}();`. The linker keeps its unit and the runtime runs it before main, with
+        // nothing in the program naming it, so it is a root like a constructor attribute. An object of a class only
+        // counts when the class has a constructor in the tree: a library type's or an aggregate's registers nothing.
+        if (_startupObjects.Count > 0)
+        {
+            var types = graph.Nodes.Where(n => n.Kind == NodeKind.Type).Select(n => n.Name).ToHashSet(StringComparer.Ordinal);
+            foreach (var (id, cls) in _startupObjects)
+                if (cls.Length == 0 || (types.Contains(cls) && functionsByName.ContainsKey(cls)))
+                {
+                    graph.AddFlag(id, NodeFlags.Keep);
+                    foreach (var e in graph.OutEdges(id).ToList())
+                        if (e.Kind == EdgeKind.DefinedIn) graph.AddEdge(e.To, id, EdgeKind.References);
+                }
+        }
 
         Phase("pastes+rest");
         return graph;
@@ -1479,16 +1498,44 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <summary>A C++ variable whose construction can run code: one whose initializer calls a function (not a macro),
     /// or an object of a non-builtin type (not through a pointer) that isn't brace-initialized — a table of aggregates
     /// (<c>Entry t[] = {{...}}</c>) runs nothing.</summary>
-    private bool CppObject(TsNode declaration, TsNode decl, string path)
+    private bool CppObject(TsNode declaration, TsNode decl, string path) =>
+        StartupClass(declaration, decl, path, out var braced) is not null && !braced;
+
+    /// <summary>
+    /// Can initializing this C++ namespace-scope object run code at start-up? Null: no. "": its initializer calls
+    /// something (a function, <c>new</c>, a lambda). Otherwise the class whose constructor would run
+    /// (<c>Registrar r("x");</c>, <c>Registrar r{"x"};</c>, <c>static Registrar r;</c>) — "?" when the type has no
+    /// readable name. <paramref name="braced"/>: the initializer is a brace list, which runs code only when the
+    /// class has a constructor (an aggregate's doesn't).
+    /// </summary>
+    private string? StartupClass(TsNode declaration, TsNode decl, string path, out bool braced)
     {
-        if (_cGrammar || path.EndsWith(".c", StringComparison.OrdinalIgnoreCase)) return false;
+        braced = false;
+        if (_cGrammar || path.EndsWith(".c", StringComparison.OrdinalIgnoreCase)) return null;
+        if (decl.Type != "init_declarator" && NodeKids.All(declaration).Any(c => c.Type == "storage_class_specifier" && c.Text == "extern"))
+            return null;
         var value = decl.Type == "init_declarator" ? decl.GetChildForField("value") : null;
-        if (value is not null && HasCall(value)) return true;
-        if (declaration.GetChildForField("type")?.Type is "primitive_type" or "sized_type_specifier" or "enum_specifier") return false;
-        if (value?.Type == "initializer_list") return false;
+        if (value is not null && HasCall(value)) return "";
+        var type = declaration.GetChildForField("type");
+        if (type?.Type is "primitive_type" or "sized_type_specifier" or "enum_specifier") return null;
         for (var d = decl; d is not null; d = d.GetChildForField("declarator"))
-            if (d.Type is "pointer_declarator" or "reference_declarator" or "function_declarator") return false;
-        return true;
+            if (d.Type is "pointer_declarator" or "reference_declarator" or "function_declarator") return null;
+        if (value?.Type == "compound_literal_expression") type = value.GetChildForField("type");   // auto r = T{...};
+        braced = value?.Type == "initializer_list";
+        return ClassName(type) ?? "?";
+    }
+
+    /// <summary>The last name of a type: <c>Registrar</c>, <c>ns::Registrar</c> and <c>Registry&lt;int&gt;</c> name a class.</summary>
+    private static string? ClassName(TsNode? type)
+    {
+        for (var i = 0; i < 8 && type is not null; i++)
+            switch (type.Type)
+            {
+                case "type_identifier": return type.Text;
+                case "qualified_identifier" or "template_type": type = type.GetChildForField("name"); break;
+                default: return null;
+            }
+        return null;
     }
 
     /// <summary>A call, <c>new</c> or lambda anywhere in an initializer; a function-like macro whose body calls nothing
@@ -1748,6 +1795,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         public readonly List<string> ForceKeeps = new();
         public readonly List<NodeId> FileLocal = new();
         public readonly List<(NodeId Id, string Header, bool CondExtern)> HeaderData = new();
+        public readonly List<(NodeId Id, string Class)> StartupObjects = new();
         public readonly List<(NodeId File, string Macro, List<string> Names)> WordInvocations = new();
         public bool DefinesExternFlag, Unparsed;
         public int? BudgetSymbols;
@@ -1844,6 +1892,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         foreach (var p in w.ForceKeeps) ForceKeep(p);
         foreach (var id in w.FileLocal) _fileLocal.Add(M(id));
         foreach (var (id, header, condExtern) in w.HeaderData) _headerData.Add((M(id), header, condExtern));
+        foreach (var (id, cls) in w.StartupObjects) _startupObjects.Add((M(id), cls));
         foreach (var (file, macro, names) in w.WordInvocations) _wordInvocations.Add((M(file), macro, names));
         if (w.DefinesExternFlag) _definesExternFlag.Add(path);
         if (w.Unparsed) _unparsed.Add(path);
@@ -2117,7 +2166,15 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var decl = cap.Node;
             if (IsDead(decl)) continue;
             if (scopes.InBody(decl.StartIndex)) continue; // a LOCAL variable, not a file-scope global
-            if (MintedGlobal(decl, path, srcLines, out var isStatic, out var condExtern, out var headerDefinition) is not { } node) continue;
+            if (MintedGlobal(decl, path, srcLines, out var isStatic, out var condExtern, out var headerDefinition) is not { } node)
+            {
+                // A `static` object is not a node of its own (it stays with its file): one that runs code at start-up
+                // makes its file the root.
+                if (isStatic && IsTranslationUnit(path) && Up(decl) is { Type: "declaration", HasError: false } sd
+                    && StartupClass(sd, decl, path, out _) is { } sc)
+                    w.StartupObjects.Add((fileNode, sc));
+                continue;
+            }
             var gname = node.Text;
             var span = GlobalDeclarationSpan(node);
             if (span is null) continue;
@@ -2129,8 +2186,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             // Not removable on its own: a declaration that also defines a named type (`struct cfg {...} dead_cfg;` — the
             // type goes with it), or a C++ object whose constructor can register something at start-up. Only in a unit:
             // a header is never cut, and such an edge there would pull in every unit including it.
-            if (IsTranslationUnit(path) && Up(decl) is { } owner && (DefinesType(owner) || CppObject(owner, decl, path)))
-                graph.AddEdge(fileNode, gid, EdgeKind.References);
+            if (IsTranslationUnit(path) && Up(decl) is { } owner)
+            {
+                var startup = StartupClass(owner, decl, path, out var braced);
+                if (DefinesType(owner) || (startup is not null && !braced))
+                    graph.AddEdge(fileNode, gid, EdgeKind.References);
+                if (startup is not null) w.StartupObjects.Add((gid, startup));
+            }
             // What its initializer names, read from the text after the name: a section-placed entry
             // (`const fn_t e __attribute__((section("x"))) = handler;`) doesn't parse as an initializer at all, and
             // the entry is kept by itself (a linker KEEP root) while the file around it may be pruned.

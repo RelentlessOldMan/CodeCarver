@@ -33,6 +33,37 @@ public class CppFrontEndTests
         """;
 
     [Fact]
+    public void StartupRegistrations_AreRoots_AggregatesAndLibraryTypesAreNot()
+    {
+        // Review X1: units holding only a registering object are linked and run before main, with nothing naming them.
+        var files = new[]
+        {
+            ("reg.h", "struct Registrar { Registrar(const char *n); Registrar(); };\nint reg_ret(const char *n);\n"),
+            ("reg.cpp", "#include \"reg.h\"\nRegistrar::Registrar(const char *n) {}\nRegistrar::Registrar() {}\nint reg_ret(const char *n) { return 1; }\n"),
+            ("b.cpp", "#include \"reg.h\"\nstatic Registrar rb{\"B\"};\n"),
+            ("c.cpp", "#include \"reg.h\"\nnamespace { Registrar rc(\"C\"); }\n"),
+            ("d.cpp", "#include \"reg.h\"\nnamespace app { static Registrar rd; }\n"),
+            ("f.cpp", "#include \"reg.h\"\nstatic int rf = reg_ret(\"F\");\n"),
+            ("e.cpp", "#include \"reg.h\"\nstatic auto re = [] { return reg_ret(\"E\"); }();\n"),
+            ("p.cpp", "struct Pod { int a; };\nstatic Pod pod{1};\nstatic Pod pod2;\nstd::mutex lock_obj;\n"),
+            ("main.cpp", "int main() { return 0; }\n"),
+        };
+        using var fe = new CppFrontEnd();
+        var graph = fe.BuildGraph(files);
+        var roots = new ExplicitRootProvider(symbols: new[] { "main" }).Discover(graph)
+            .Concat(new AttributeRootProvider().Discover(graph)).ToList();
+        var plan = ReachabilityEngine.Compute(graph, roots);
+        // A static object is no node of its own (it stays with its file): the file is what must be kept.
+        bool Kept(NodeKind kind, string name) => plan.IsKept(graph.Nodes.Single(n => n.Kind == kind && n.Name == name).Id);
+
+        foreach (var file in new[] { "b.cpp", "d.cpp", "f.cpp", "e.cpp" }) Assert.True(Kept(NodeKind.File, file), file);
+        Assert.True(Kept(NodeKind.Global, "rc"));
+        Assert.True(Kept(NodeKind.Function, "reg_ret"));
+        Assert.False(Kept(NodeKind.File, "p.cpp"));
+        Assert.False(Kept(NodeKind.Global, "lock_obj"));
+    }
+
+    [Fact]
     public void VirtualCall_KeepsEveryOverride_DropsUnrelated()
     {
         using var fe = new CppFrontEnd();
