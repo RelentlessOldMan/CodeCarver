@@ -208,6 +208,15 @@ public static class IoMeter
         }
     }
 
+    /// <summary>Per kind with any done since <paramref name="since"/>: its key (read, list, ...), how many and their time in
+    /// ms summed over the threads waiting.</summary>
+    public static IEnumerable<(string Kind, long Count, long Ms)> Since(Snapshot now, Snapshot since)
+    {
+        for (var k = 0; k < Kinds; k++)
+            if (now.Count[k] - since.Count[k] is var n and > 0)
+                yield return (Keys[k], n, (long)Ms(now.Ticks[k] - since.Ticks[k]));
+    }
+
     /// <summary>Totals for the summary since <paramref name="since"/> (the run's start): io.&lt;kind&gt;.count / .ms, and .maxMs, the slowest
     /// in this process.</summary>
     public static IEnumerable<(string Key, long Value)> Totals(Snapshot s, Snapshot? since = null)

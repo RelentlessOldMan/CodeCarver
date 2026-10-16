@@ -307,6 +307,23 @@ public static class CarveCommand
         // reports, never stops the run.
         var _stepIo = CodeCarver.Core.Util.IoMeter.Now();
         var _runIo = _stepIo;
+        // Per phase and stage step: CPU time (all cores) and time waiting on files (all threads), next to the wall time,
+        // to tell a step that computes from one that waits on the drive or the share.
+        var _phaseIo = _stepIo;
+        var _phaseCpu = System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime;
+        void AddLong(string key, long value) => summary[key] = value + (summary.TryGetValue(key, out var was) && was is long w ? w : 0L);
+        void CpuAndIo(string prefix, string phase, ref CodeCarver.Core.Util.IoMeter.Snapshot io, ref TimeSpan cpu)
+        {
+            var ioNow = CodeCarver.Core.Util.IoMeter.Now();
+            var cpuNow = System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime;
+            AddLong($"{prefix}cpu.{phase}.ms", (long)(cpuNow - cpu).TotalMilliseconds);
+            foreach (var (kind, n, ms) in CodeCarver.Core.Util.IoMeter.Since(ioNow, io))
+            {
+                AddLong($"{prefix}io.{phase}.{kind}.count", n);
+                AddLong($"{prefix}io.{phase}.{kind}.ms", ms);
+            }
+            io = ioNow; cpu = cpuNow;
+        }
         long _lastDone = 0, _lastIoDone = _stepIo.DoneSince(null);
         var _lastMove = TimeSpan.Zero;          // when in the step a count last moved
         TimeSpan? _lastReport = null;
@@ -455,6 +472,7 @@ public static class CarveCommand
             var peak = TakePeakMb();
             summary[$"mem.{phase}.peakMb"] = Math.Max(peak, summary.TryGetValue($"mem.{phase}.peakMb", out var pw) && pw is long pl ? pl : 0L);
             summary[$"mem.{phase}.allocatedMb"] = TakeAllocatedMb() + (summary.TryGetValue($"mem.{phase}.allocatedMb", out var aw) && aw is long al ? al : 0L);
+            CpuAndIo("", phase, ref _phaseIo, ref _phaseCpu);
             Progress(phase);
             if (_timing) err.WriteLine($"  timing  : {phase,-14} {_tsw.ElapsedMilliseconds,7} ms");
             diag.Event($"phase {phase}: {_tsw.ElapsedMilliseconds} ms"); // breadcrumb for the diagnostic package
@@ -3139,8 +3157,11 @@ public static class CarveCommand
             var keptByCheck = checkCauses[kind];
             // Where a stage's time goes: stageN.time.<step>.ms, summed over the check rounds.
             var stageClock = System.Diagnostics.Stopwatch.StartNew();
+            var stepIo = CodeCarver.Core.Util.IoMeter.Now();
+            var stepCpu = System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime;
             void Step(string step)
             {
+                CpuAndIo($"{summaryStage}.", step, ref stepIo, ref stepCpu);
                 var peak = TakePeakMb();
                 var mkey = $"{summaryStage}.mem.{step}.peakMb";
                 summary[mkey] = Math.Max(peak, summary.TryGetValue(mkey, out var mw) && mw is long ml ? ml : 0L);

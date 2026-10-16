@@ -725,6 +725,8 @@ public static class EmittedLinkCheck
     {
         try
         {
+            // Metered (io.read, and per step in the summary): the check reads the sources too, often on a share.
+            using var op = CodeCarver.Core.Util.IoMeter.Start(CodeCarver.Core.Util.IoMeter.Kind.Read);
             var fi = new FileInfo(path);
             if (!fi.Exists || fi.Length > maxBytes) return null;
             // Latin-1 is byte-transparent: identifiers are ASCII, and no byte sequence can fail to decode.

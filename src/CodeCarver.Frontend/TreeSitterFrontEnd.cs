@@ -1929,8 +1929,15 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // counted (a captured symbol needs >=2 bytes), so the overwhelming majority of small files pay nothing.
         if (PerFileSymbolBudget > 0 && text.Length >= (long)PerFileSymbolBudget * 2)
         {
-            var lines = new TextLines(text);
-            var symbols = CountCaptures(_defs, root) + CountCaptures(_globals, root, c => MintedGlobal(c.Node, path, lines, out _, out _, out _) is not null);
+            // Every global capture counted is an upper bound: under the budget, no need to ask which would be minted
+            // (a node and a walk per capture, then done again by the globals pass).
+            var defs = CountCaptures(_defs, root);
+            var symbols = defs + CountCaptures(_globals, root);
+            if (symbols > PerFileSymbolBudget)
+            {
+                var lines = new TextLines(text);
+                symbols = defs + CountCaptures(_globals, root, c => MintedGlobal(c.Node, path, lines, out _, out _, out _) is not null);
+            }
             if (symbols > PerFileSymbolBudget)
             {
                 w.BudgetSymbols = symbols;
