@@ -527,6 +527,23 @@ public class CFrontEndTests
     }
 
     [Fact]
+    public void LongGeneratedTableMacro_ParsesInSeconds()
+    {
+        // A generated decoder table: one #define continued over 3,000 lines. Error recovery nests its rows deep, and
+        // asking each identifier whether an ERROR is above it, one step up at a time, took 77 s for this file.
+        var sb = new System.Text.StringBuilder("#ifndef GEN_H\n#define GEN_H\n#define DECODE_TABLE \\\n");
+        for (var i = 0; i < 3000; i++)
+            sb.Append("  { 0x").Append((i * 2654435761u).ToString("x")).Append(", MCD_OPC_Decode, ").Append(i % 97).Append(" }, /* op ")
+              .Append(i).Append(" */ \\\n");
+        sb.Append("  { 0, 0, 0 }\nint gen_decode(unsigned insn);\n#endif\n");
+        using var fe = new CFrontEnd();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var graph = fe.BuildGraph(new[] { ("gen.h", sb.ToString()) });
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(15), $"took {clock.Elapsed.TotalSeconds:N0} s");
+        Assert.Contains(graph.Nodes, n => n.Name == "DECODE_TABLE");
+    }
+
+    [Fact]
     public void SymbolsInMacroCallInitializer_AreKept_ViaFile()
     {
         // A file-scope global initialized by a MACRO invocation (quickjs's

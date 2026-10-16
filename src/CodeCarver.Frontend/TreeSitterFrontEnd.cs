@@ -2407,6 +2407,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // avoids a costly ancestor walk per file-scope identifier in the common (clean-parse) case.
         var treeHasError = root.HasError;
         var locals = CollectLocals(root, scopes);
+        HashSet<IntPtr>? insideError = null;   // made the first time a reference needs it
         // Read straight from the library (LeanCaptures) unless a parse error needs the node itself (InsideError).
         if (treeHasError || !LeanCaptures.Usable(_idents)) using (var qc = _idents.Execute(root)) foreach (var cap in qc.Captures)
         {
@@ -2424,7 +2425,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var from = Enclosing(row + 1);
             if (from is { } f)
                 pendingRefs.Add((f, name));
-            else if (scopes.InBody(at) || (node is not null && InsideError(node)))
+            else if (scopes.InBody(at) || (node is not null && (insideError ??= NodesInsideError(root)).Contains(node.Id)))
                 // Attribute to the file (kept while the file is), same fallback as pass 3's calls, in two
                 // cases the enclosing-function lookup can't see: (a) inside a function body whose signature we couldn't
                 // capture — a macro-defined header like janet's `JANET_CORE_FN(os_shell, ...)`, so a
@@ -2813,19 +2814,35 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <summary>True if a node sits inside a function body — a compound_statement or function_definition
     /// ancestor. Used to reject LOCAL variables from global capture; works even when a function's
     /// signature mis-parsed (its body braces still form a compound_statement).</summary>
-    /// <summary>True if any ancestor (up to the translation unit) is a parse ERROR node — the node sits
+    /// <summary>The nodes with a parse ERROR node among their ancestors (up to the translation unit): they sit
     /// in a region tree-sitter couldn't parse (e.g. a file-scope table buried in macro-invocation soup).
-    /// Used to over-keep function references there rather than silently lose them.</summary>
-    private static bool InsideError(TsNode n)
+    /// Used to over-keep function references there rather than silently lose them.
+    /// Found for the whole tree in one walk: asked node by node, each step up searched down from the root, and a long
+    /// table that error recovery nests thousands deep took the square of its length (77 s for a 3,000-line one).
+    /// The set holds every node with an ERROR among its nearest 48 ancestors, below the translation unit.</summary>
+    private static HashSet<IntPtr> NodesInsideError(TsNode root)
     {
-        var p = Up(n);
-        for (var i = 0; i < 48 && p is not null; i++)
+        const int None = int.MaxValue / 2;   // no ERROR above, or the translation unit is nearer
+        var inside = new HashSet<IntPtr>();
+        var above = new Stack<int>();   // per open level, the distance its node had
+        var d = None;                   // the current node's distance up to the nearest ERROR (1 = its parent)
+        using var cur = new TreeCursor(root);
+        while (true)
         {
-            if (p.IsError || p.Type == "ERROR") return true;
-            if (p.Type == "translation_unit") return false;
-            p = Up(p);
+            var n = cur.CurrentNode;
+            if (d <= 48) inside.Add(n.Id);
+            if (cur.GotoFirstChild())
+            {
+                above.Push(d);
+                d = n.IsError || n.Type == "ERROR" ? 1 : n.Type == "translation_unit" ? None : Math.Min(d + 1, None);
+                continue;
+            }
+            while (!cur.GotoNextSibling())
+            {
+                if (above.Count == 0 || !cur.GotoParent()) return inside;
+                d = above.Pop();
+            }
         }
-        return false;
     }
 
     private static bool InsideFunctionBody(TsNode n)
