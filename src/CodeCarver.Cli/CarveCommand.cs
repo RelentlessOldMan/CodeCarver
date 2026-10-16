@@ -1775,6 +1775,17 @@ public static class CarveCommand
         var unparsedFiles = new HashSet<string>(skipParse, CodeCarver.Core.Util.PathComparer.Default);
         if (fe is TreeSitterFrontEnd tsUnparsed) unparsedFiles.UnionWith(tsUnparsed.UnparsedFiles);
         Mark("build-graph");
+        // Where the roots step goes: time.roots.<part>.ms, roots.cpu.<part>.ms, roots.io.<part>.<kind>.*.
+        var rootsSw = System.Diagnostics.Stopwatch.StartNew();
+        var rootsIo = CodeCarver.Core.Util.IoMeter.Now();
+        var rootsCpu = System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime;
+        void RootsPart(string part)
+        {
+            summary[$"time.roots.{part}.ms"] = rootsSw.ElapsedMilliseconds;
+            rootsSw.Restart();
+            CpuAndIo("roots.", part, ref rootsIo, ref rootsCpu);
+            Progress($"roots {part}");
+        }
         if (readErrors > 12) err.WriteLine($"  warn    : (+{readErrors - 12} more unreadable files kept whole)");
 
         // Non-fatal diagnostics (kept-whole fragments, unresolved/ambiguous .cmm DO). Surfacing these avoids
@@ -1802,7 +1813,9 @@ public static class CarveCommand
             // the tree answers every name: a run with 85 such names once re-read the whole tree 85 times on the drive.
             var why = new Dictionary<string, string>(StringComparer.Ordinal);
             var unresolvedSet = new HashSet<string>(unresolvedRoots, StringComparer.Ordinal);
-            var anyName = new System.Text.RegularExpressions.Regex(@"\b(?:" + string.Join("|", unresolvedRoots.Select(System.Text.RegularExpressions.Regex.Escape)) + @")\b");
+            var anyName = new System.Text.RegularExpressions.Regex(@"\b(?:" + string.Join("|", unresolvedRoots.Select(System.Text.RegularExpressions.Regex.Escape)) + @")\b",
+                System.Text.RegularExpressions.RegexOptions.Compiled);   // it tests every file of the tree
+            long checkFiles = 0, checkHits = 0, checkHitChars = 0, checkDeadMaps = 0;
             void FindDefs(List<string> rels, Func<string, string> read, bool checkDead)
             {
                 (string Text, bool Hit) Load(string rel)
@@ -1812,7 +1825,10 @@ public static class CarveCommand
                 }
                 foreach (var (rel, got) in CodeCarver.Core.Util.ReadAhead.Map(rels, Load))
                 {
+                    checkFiles++;
                     if (!got.Hit) continue;
+                    checkHits++;
+                    checkHitChars += got.Text.Length;
                     bool[]? dl = null;
                     var deadDone = false;
                     foreach (var def in EmittedLinkCheck.Scan(got.Text, EmittedLinkCheck.IsHeader(rel)).Definitions)
@@ -1821,6 +1837,7 @@ public static class CarveCommand
                         if (checkDead && !deadDone)
                         {
                             deadDone = true;
+                            checkDeadMaps++;
                             dl = exactPre?.DeadLines(rel, got.Text) ?? ((perFileDefines?.Invoke(rel) ?? defines) is { } t
                                 ? PreprocessorScanner.DeadLineMap(got.Text, t, closedWorld) : null);
                         }
@@ -1842,6 +1859,13 @@ public static class CarveCommand
             // A name the source only declares or calls, defined nowhere in it, may be defined in a prebuilt binary the
             // tree carries: like a name only a binary holds (before the graph), it has no source to carve. Noted, not failed.
             var nowhere = unresolvedRoots.Where(u => !why.ContainsKey(u)).ToList();
+            summary["roots.check.unresolved"] = unresolvedRoots.Count;
+            summary["roots.check.definedNowhereInText"] = nowhere.Count;
+            summary["roots.check.filesRead"] = checkFiles;
+            summary["roots.check.filesNamingOne"] = checkHits;
+            summary["roots.check.filesNamingOneMb"] = checkHitChars >> 20;
+            summary["roots.check.deadLineMaps"] = checkDeadMaps;
+            RootsPart("checkText");
             var inBinaries = new HashSet<string>(StringComparer.Ordinal);
             if (nowhere.Count > 0 && closureLang)
             {
@@ -1871,7 +1895,7 @@ public static class CarveCommand
             if (unresolvedRoots.Count > 0)
                 err.WriteLine($"  roots   : unresolved by reason: {reasonCounts[0]} in an #if branch turned off, {reasonCounts[1]} not recognised by the parser, "
                     + $"{reasonCounts[2]} only in files the build never compiled, {reasonCounts[3]} defined nowhere");
-            Progress("rootCheck");
+            RootsPart("checkBinaries");
             // --why still answers (review U8): explaining a symbol is how you debug a missing root.
             if (whySymbol is null && unresolvedRoots.Count > 0)
             {
@@ -1919,6 +1943,7 @@ public static class CarveCommand
                 sectionRoots = new LinkerSectionRootProvider(srcTexts, linkerScripts).Discover(graph).ToList();
             }
         }
+        RootsPart("sections");
 
         // C++ constructors run on every instantiation (untraceable), so a needed one must be rooted: the
         // constructor AND whatever it calls in its init-list/body must survive (a real pugixml dangling bug).
@@ -1956,6 +1981,7 @@ public static class CarveCommand
         // including dynamic-dispatch / function-pointer edges static reachability can't see. Trace names are
         // machine-generated (many external/libc), so they do NOT go through the per-entry-point checks;
         // instead the summary reports how many resolved in-scope.
+        RootsPart("constructors");
         var traceRoots = new List<Root>();
         var traceTotal = 0;
         var observedFunctions = new HashSet<string>(StringComparer.Ordinal);   // what ran: never stubbed
@@ -1986,6 +2012,7 @@ public static class CarveCommand
         // out-of-tree noise. Observed CODE files become file-level roots (keep the file + its closure); the whole
         // observed set is threaded into the emitter (never garbage-prune an observed file) and the report
         // (attribution + flag the kept-but-unobserved infra as drop-candidates).
+        RootsPart("runTraces");
         var observedRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var runObservedRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);     // opened by a RUN (only these root their file)
         var buildObservedRel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // opened by a BUILD (what it compiled)
@@ -2092,6 +2119,7 @@ public static class CarveCommand
             summary["traces.outsideRootHeaders"] = externalHeaders;
         }
 
+        RootsPart("fileTraces");
         // Headers in the root that code OUTSIDE it includes (shared glue using the module's API): the rest of the
         // build compiles against them, so they are kept whole in every stage. Evidence: outside sources the build log
         // compiles and outside files the build trace opened. With a complete trace, only headers the build opened.
@@ -2173,6 +2201,7 @@ public static class CarveCommand
         }
 
         // Assembly startup (.s/.S) references C handlers by name (vector table `.word Handler`) — root them.
+        RootsPart("outsideHeaders");
         var asmRoots = new List<Root>();
         var asmFilesInTree = new List<string>();   // every in-scope assembly file (verify reads their symbols)
         if (lang is "c" or "cpp")
@@ -2215,6 +2244,7 @@ public static class CarveCommand
             err.WriteLine(n == 0 ? $"  warn    : forceKeepFiles '{glob}' matched no file (a bare pattern like '*.inc' searches all subdirectories)"
                                  : $"  force   : forceKeepFiles '{glob}' -> {n} file(s) kept");
         }
+        RootsPart("asmAndForceKeep");
         var forcedGraphFiles = forcedRel.Where(r => fullByRel.ContainsKey(r)).ToList();
         var forcedRoots = forcedGraphFiles.Count > 0
             ? new ExplicitRootProvider(files: forcedGraphFiles).Discover(graph).ToList() : new List<Root>();
@@ -2245,6 +2275,7 @@ public static class CarveCommand
                 .Select(r => r with { Kind = RootKind.LinkerKeep, Note = "named by the link" }).ToList()
             : new List<Root>();
         summary["roots.linkFlags"] = linkRoots.Count;
+        RootsPart("linkFlags");
         // Calls in code the build GENERATES into its build directory (a table.c.in filled in by sed, C printed by a
         // generator script): the generated file is outside the tree, so its calls are seen only here.
         var genUses = new List<(string Name, string Rel, int Line)>();
@@ -2265,6 +2296,7 @@ public static class CarveCommand
         linkRoots.AddRange(genRoots);
         var definedFns = genRoots.Select(r => graph.GetNode(r.Node).Name).ToHashSet(StringComparer.Ordinal);
         linkUses.AddRange(genUses.Where(u => definedFns.Contains(u.Name)));
+        RootsPart("generatedCode");
         // Calls from a prebuilt binary the tree carries into the tree's own code: the binary is kept as it is, and its
         // calls are seen nowhere else, so a carve that dropped their targets would fail only at the final link. Every
         // function or global whose name a binary holds as a whole word is rooted. A symbol table lists what the binary
@@ -2278,10 +2310,11 @@ public static class CarveCommand
             if (binaries.Count > 0)
             {
                 var maxLen = wanted.Max(n => n.Length);
+                var wantedSet = new CodeCarver.Core.Util.NameSet(wanted);
                 var usedBy = new System.Collections.Concurrent.ConcurrentDictionary<string, string>(StringComparer.Ordinal);
                 Parallel.ForEach(binaries, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, f =>
                 {
-                    foreach (var n in CodeCarver.Core.Util.BinaryText.NamesIn(f, wanted, maxLen))
+                    foreach (var n in CodeCarver.Core.Util.BinaryText.NamesIn(f, wantedSet, maxLen))
                         usedBy.TryAdd(n, Path.GetRelativePath(dir, f).Replace('\\', '/'));
                 });
                 if (!usedBy.IsEmpty)
@@ -2297,6 +2330,7 @@ public static class CarveCommand
             summary["files.prebuiltBinaries"] = binaries.Count;
         }
         summary["roots.namedByBinaries"] = binaryRoots.Count;
+        RootsPart("binaries");
         linkRoots.AddRange(binaryRoots);
 
         var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots).Concat(linkRoots)
@@ -2898,6 +2932,9 @@ public static class CarveCommand
             snap["stop.managedMb"] = GC.GetTotalMemory(false) / MB;
             if (machine is { } m) { snap["stop.machineFreeMb"] = m.Free / MB; if (m.CommitFree >= 0) snap["stop.commitRoomMb"] = m.CommitFree / MB; }
             if (CodeCarver.Core.Util.Activity.Describe() is { } got) snap["stop.count"] = got;
+            var (inFlight, largest) = CodeCarver.Core.Util.Activity.InHand;
+            snap["stop.inHandKb"] = inFlight >> 10;          // files being scanned when it stopped
+            snap["stop.largestFileInStepKb"] = largest >> 10;
             snap["exitCode"] = StoppedForMemoryExit;
             err.WriteLine($"memory  : STOPPED - private memory {priv / MB:N0} MB passed memoryStopMb = {_memoryStop / MB:N0} in the step after '{step}' (run {Clock(runAt)})");
             err.WriteLine($"  memory  : {MemoryLine(priv, workingSet, machine)}");

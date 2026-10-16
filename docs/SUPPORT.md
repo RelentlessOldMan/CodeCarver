@@ -27,6 +27,11 @@ carve) or `analyze` (an analysis-only run, which writes no tree). Those add up t
 `time.pre-parse.<part>.ms` splits the macro scan before parsing: `treeMacros` (the tree's own files),
 `outsideHeaders` (headers the build reads outside the root), `quotedIncludes` (following `#include "..."` out of the
 tree) and `unparsedHeaders` (big and dense headers, streamed).
+`time.roots.<part>.ms` splits `roots`, with `roots.cpu.<part>.ms` (computing, summed over cores) and
+`roots.io.<part>.<kind>.*` (waiting on files) beside it: `checkText` (only when an entry point didn't resolve: its
+definition looked for in the tree's text; `roots.check.*` says how many files that read and named one),
+`checkBinaries`, `sections`, `constructors`, `runTraces`, `fileTraces`, `outsideHeaders`, `asmAndForceKeep`,
+`linkFlags`, `generatedCode` and `binaries` (the tree's prebuilt binaries searched for its function and global names).
 `stageN.time.<step>.ms` splits one stage's share of `emit`: `emit` (writing the tree), `check` (the link check of what was
 written), `rootsForMissing` and `replan` (these four summed over `stageN.checkRounds`, the emit-and-check rounds), `copyInfrastructure`,
 `stats`, `verify`, `buildOutputCases`, `placeholders`, `headerCarve` and `promoteAndArtifacts`.

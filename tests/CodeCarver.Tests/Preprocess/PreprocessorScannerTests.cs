@@ -89,6 +89,23 @@ public class PreprocessorScannerTests
     }
 
     [Fact]
+    public void DeadLineMap_LongContinuedDefine_JoinsInLinearTime()
+    {
+        // A generated table macro of 40,000 continued lines. Re-copying the joined directive per line would
+        // allocate ~50 GB; the define still takes effect, and every line of it is live.
+        var sb = new System.Text.StringBuilder("#define TABLE \\\r\n");
+        for (var i = 0; i < 40_000; i++) sb.Append("    { entry_").Append(i).Append(", 0x12345678, 0x9abcdef0 }, \\\r\n");
+        sb.Append("    { 0 }\r\n#ifdef TABLE\r\nint live;\r\n#else\r\nint dead;\r\n#endif\r\n");
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var dead = PreprocessorScanner.DeadLineMap(sb.ToString(), Defines());
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.False(dead[40_002]);   // "{ 0 }": the macro's last line
+        Assert.False(dead[40_004]);   // int live;
+        Assert.True(dead[40_006]);    // int dead;
+        Assert.True(allocated < 100L << 20, $"allocated {allocated >> 20} MB");
+    }
+
+    [Fact]
     public void DeadLineMap_Ifdef_KnownDefine_TakesBranch()
     {
         const string text = "#ifdef A\nint live;\n#else\nint dead;\n#endif\n";

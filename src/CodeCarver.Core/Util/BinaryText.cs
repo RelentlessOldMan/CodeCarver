@@ -71,20 +71,61 @@ public static class BinaryText
         }
     }
 
-    /// <summary>Which of <paramref name="names"/> the file holds as whole words.</summary>
-    public static HashSet<string> NamesIn(string path, IReadOnlySet<string> names, int maxLen)
+    static readonly System.Buffers.SearchValues<byte> WordBytes =
+        System.Buffers.SearchValues.Create("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$"u8);
+
+    /// <summary>Which of <paramref name="names"/> (none longer than <paramref name="maxLen"/>) the file holds as whole
+    /// words. The bytes are scanned as they are read: no text is made of the file, and a word becomes a string only
+    /// when it is one of the names (a tree's binaries can run to gigabytes, nearly all of it not names).</summary>
+    public static HashSet<string> NamesIn(string path, NameSet names, int maxLen)
     {
         var found = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var text in Chunks(path, maxLen))
-            for (var i = 0; i < text.Length;)
+        FileStream s;
+        try { s = File.OpenRead(path); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return found; }
+        using (s)
+        using (IoMeter.Start(IoMeter.Kind.Read))
+        {
+            var buf = new byte[ChunkBytes];
+            var word = new char[Math.Max(maxLen, 1)];
+            int len = 0;          // the word being read, which may run on from the read before
+            var tooLong = false;
+            void End()
             {
-                if (!IsWordChar(text[i])) { i++; continue; }
-                var start = i;
-                while (i < text.Length && IsWordChar(text[i])) i++;
-                if (i - start > maxLen || char.IsAsciiDigit(text[start])) continue;
-                var w = text.Substring(start, i - start);
-                if (names.Contains(w)) found.Add(w);
+                if (len > 0 && !tooLong && !char.IsAsciiDigit(word[0]) && names.Find(word.AsSpan(0, len)) is { } name) found.Add(name);
+                len = 0;
+                tooLong = false;
             }
+            while (true)
+            {
+                int n;
+                try { n = s.ReadAtLeast(buf, buf.Length, throwOnEndOfStream: false); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { break; }
+                if (n == 0) break;
+                var bytes = buf.AsSpan(0, n);
+                var i = 0;
+                while (i < n)
+                {
+                    if (len == 0)
+                    {
+                        var next = bytes[i..].IndexOfAny(WordBytes);
+                        if (next < 0) break;
+                        i += next;
+                    }
+                    var run = bytes[i..].IndexOfAnyExcept(WordBytes);
+                    var end = run < 0 ? n : i + run;
+                    for (; i < end; i++)
+                    {
+                        if (len < maxLen) word[len++] = (char)bytes[i];
+                        else { tooLong = true; len = Math.Max(len, 1); }
+                    }
+                    if (run < 0) break;   // the word may go on in the next read
+                    End();
+                    i++;
+                }
+            }
+            End();
+        }
         return found;
     }
 }

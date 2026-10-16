@@ -75,39 +75,45 @@ public static class PreprocessorScanner
     static (bool[] Dead, bool[] Uncertain, bool Balanced) LineMaps(string text, MacroTable defines, bool closedWorld)
     {
         text = SourceText.Trigraphs(text);   // ??=if is #if
-        var lines = text.Split('\n');
-        var dead = new bool[lines.Length + 1];
-        var uncertain = new bool[lines.Length + 1];
+        // Lines are read in place: only directive lines become strings, so a large header costs no copy of itself.
+        var starts = LineStarts(text);
+        var lineCount = starts.Length - 1;
+        var dead = new bool[lineCount + 1];
+        var uncertain = new bool[lineCount + 1];
         var table = defines.Clone();
         var stack = new Stack<Frame>();
-        var guardLine = IncludeGuardLine(lines);
+        var guardLine = IncludeGuardLine(text, starts);
         var inComment = false;
         string? rawEnd = null;   // inside a C++ raw string R"d( ... )d": its lines are text, not directives
 
-        for (var idx = 0; idx < lines.Length; idx++)
+        for (var idx = 0; idx < lineCount; idx++)
         {
             var active = stack.Count == 0 || stack.Peek().Active;
-            var trimmed = lines[idx].TrimStart();
+            var line = LineAt(text, starts, idx);
+            var trimmed = line.TrimStart();
             var startsInComment = inComment;
             var startsInRaw = rawEnd is not null;
-            if (rawEnd is not null) { if (lines[idx].Contains(rawEnd, StringComparison.Ordinal)) rawEnd = null; }
+            if (rawEnd is not null) { if (line.IndexOf(rawEnd, StringComparison.Ordinal) >= 0) rawEnd = null; }
             else
             {
-                inComment = EndsInComment(lines[idx], inComment);
-                if (!inComment && lines[idx].Contains("R\"", StringComparison.Ordinal)) rawEnd = OpenRawString(lines[idx]);
+                inComment = EndsInComment(line, inComment);
+                if (!inComment && line.IndexOf("R\"", StringComparison.Ordinal) >= 0) rawEnd = OpenRawString(line.ToString());
             }
 
             if (!startsInComment && !startsInRaw && trimmed.Length > 0 && trimmed[0] == '#')
             {
                 var last = idx;
-                var joined = lines[idx].TrimEnd('\r');
-                while (joined.TrimEnd().EndsWith('\\') && last + 1 < lines.Length)
+                // Joined in one buffer: re-copying the directive per continued line costs the square of its length,
+                // gigabytes for a generated #define of thousands of lines.
+                var sb = new System.Text.StringBuilder().Append(line.TrimEnd('\r'));
+                for (var end = TrimmedLength(sb); end > 0 && sb[end - 1] == '\\' && last + 1 < lineCount; end = TrimmedLength(sb))
                 {
-                    joined = joined.TrimEnd();
-                    joined = joined[..^1] + " " + lines[++last].TrimEnd('\r');
+                    sb.Length = end - 1;
+                    sb.Append(' ').Append(LineAt(text, starts, ++last).TrimEnd('\r'));
                 }
+                var joined = sb.ToString();
                 for (var k = idx; k <= last; k++) dead[k + 1] = !active;
-                for (var k = idx + 1; k <= last; k++) inComment = EndsInComment(lines[k], inComment);
+                for (var k = idx + 1; k <= last; k++) inComment = EndsInComment(LineAt(text, starts, k), inComment);
                 var body = StripComments(joined.TrimStart().TrimStart('#'));
                 if (idx == guardLine) Push(stack, active, true, Tri.True);   // include guard: true on first inclusion
                 else HandleDirective(body, active, table, stack, closedWorld);
@@ -233,21 +239,23 @@ public static class PreprocessorScanner
     /// file's first directive and is followed directly by <c>#define X</c>; -1 if none. On first inclusion the
     /// guard is certainly true — without this, a guard macro #defined in the tree would read as unknown and make
     /// every #define in the header uncertain.</summary>
-    private static int IncludeGuardLine(string[] lines)
+    private static int IncludeGuardLine(string text, int[] starts)
     {
+        var lineCount = starts.Length - 1;
         int first = -1, second = -1;
         var inComment = false;
-        for (var i = 0; i < lines.Length && second < 0; i++)
+        for (var i = 0; i < lineCount && second < 0; i++)
         {
-            var starts = inComment;
-            inComment = EndsInComment(lines[i], inComment);
-            var t = lines[i].TrimStart();
-            if (starts || t.Length == 0 || t[0] != '#') continue;
+            var opened = inComment;
+            var line = LineAt(text, starts, i);
+            inComment = EndsInComment(line, inComment);
+            var t = line.TrimStart();
+            if (opened || t.Length == 0 || t[0] != '#') continue;
             if (first < 0) first = i; else second = i;
         }
         if (first < 0 || second < 0) return -1;
-        var (k1, r1) = SplitKeyword(StripComments(lines[first].TrimStart().TrimStart('#')));
-        var (k2, r2) = SplitKeyword(StripComments(lines[second].TrimStart().TrimStart('#')));
+        var (k1, r1) = SplitKeyword(StripComments(LineAt(text, starts, first).TrimStart().TrimStart('#').ToString()));
+        var (k2, r2) = SplitKeyword(StripComments(LineAt(text, starts, second).TrimStart().TrimStart('#').ToString()));
         if (k2 != "define") return -1;
         string? guard = null;
         if (k1 == "ifndef") guard = FirstToken(r1);
@@ -262,14 +270,15 @@ public static class PreprocessorScanner
         var depth = 0;
         var closedAt = -1;
         inComment = false;
-        for (var i = first; i < lines.Length; i++)
+        for (var i = first; i < lineCount; i++)
         {
-            var starts = inComment;
-            inComment = EndsInComment(lines[i], inComment);
-            var t = lines[i].TrimStart();
-            if (starts || t.Length == 0 || t[0] != '#') continue;
+            var opened = inComment;
+            var line = LineAt(text, starts, i);
+            inComment = EndsInComment(line, inComment);
+            var t = line.TrimStart();
+            if (opened || t.Length == 0 || t[0] != '#') continue;
             if (closedAt >= 0) return -1;   // a directive after the guard closed
-            var (k, _) = SplitKeyword(StripComments(t.TrimStart('#')));
+            var (k, _) = SplitKeyword(StripComments(t.TrimStart('#').ToString()));
             if (k is "if" or "ifdef" or "ifndef") depth++;
             else if (k is "else" or "elif" or "elifdef" or "elifndef" && depth == 1) return -1;
             else if (k == "endif" && --depth == 0) closedAt = i;
@@ -277,9 +286,31 @@ public static class PreprocessorScanner
         return closedAt >= 0 ? first : -1;
     }
 
+    /// <summary>Where each line starts, as <c>text.Split('\n')</c> would cut it, plus one past the end of the text.</summary>
+    private static int[] LineStarts(string text)
+    {
+        var starts = new int[text.AsSpan().Count('\n') + 2];
+        var n = 1;
+        for (var at = text.IndexOf('\n'); at >= 0; at = text.IndexOf('\n', at + 1)) starts[n++] = at + 1;
+        starts[n] = text.Length + 1;
+        return starts;
+    }
+
+    /// <summary>The length of <paramref name="sb"/> without its trailing white space.</summary>
+    private static int TrimmedLength(System.Text.StringBuilder sb)
+    {
+        var end = sb.Length;
+        while (end > 0 && char.IsWhiteSpace(sb[end - 1])) end--;
+        return end;
+    }
+
+    /// <summary>Line <paramref name="i"/> without its '\n' (a '\r' stays, as with Split).</summary>
+    private static ReadOnlySpan<char> LineAt(string text, int[] starts, int i)
+        => text.AsSpan(starts[i], starts[i + 1] - starts[i] - 1);
+
     /// <summary>Is a block comment open at the end of this line? (Strings are skipped so "/*" in a literal
     /// does not count.)</summary>
-    private static bool EndsInComment(string line, bool inComment)
+    private static bool EndsInComment(ReadOnlySpan<char> line, bool inComment)
     {
         var quote = '\0';
         for (var i = 0; i < line.Length; i++)

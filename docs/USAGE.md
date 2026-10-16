@@ -644,7 +644,8 @@ carries `mem.<step>.peakMb` and `stageN.mem.<step>.peakMb` (private memory), and
 A `memory  : STOPPED` line names the step, and `<outputDirectory>/codecarver/stopped-summary.txt` holds every
 summary key written so far, the run's memory keys, and `stop.reason`, `stop.afterStep`, `stop.minutesInStep`,
 `stop.runSeconds`, `stop.count`, `stop.privateMb`, `stop.workingSetMb`, `stop.managedMb`, `stop.machineFreeMb`,
-`stop.commitRoomMb`; numbers only, like `summary.txt`. The exit code is 4. Every run deletes that file when it
+`stop.commitRoomMb`, and `stop.inHandKb` / `stop.largestFileInStepKb` (the files being scanned when it stopped,
+and the largest the step had started); numbers only, like `summary.txt`. The exit code is 4. Every run deletes that file when it
 starts, so one that exists is the last run's.
 
 The two longest steps before the parse also say which part took the time: `rootNames built / binaries /

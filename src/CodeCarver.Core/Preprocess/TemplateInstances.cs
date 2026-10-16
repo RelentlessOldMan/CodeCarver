@@ -230,7 +230,17 @@ public static class TemplateInstances
                 ops.Add(new Op(OpKind.Code, i, i, raw, null));
                 continue;
             }
-            while (raw.EndsWith('\\') && i + 1 < lines.Length) raw = raw[..^1] + " " + lines[++i].TrimEnd('\r');
+            if (raw.EndsWith('\\') && i + 1 < lines.Length)
+            {
+                // One buffer: re-copying per continued line costs the square of the directive's length.
+                var sb = new System.Text.StringBuilder(raw);
+                while (sb.Length > 0 && sb[^1] == '\\' && i + 1 < lines.Length)
+                {
+                    sb.Length--;
+                    sb.Append(' ').Append(lines[++i].AsSpan().TrimEnd('\r'));
+                }
+                raw = sb.ToString();
+            }
             var d = Directive.Match(raw);
             if (!d.Success)
             {

@@ -185,7 +185,9 @@ public static class EmittedLinkCheck
             long size;
             try { size = new FileInfo(path).Length; }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { size = 0; }
-            using ((gate ?? scanGate).Take(size)) return scan();
+            using ((gate ?? scanGate).Take(size))
+            using (Activity.Working(size))
+                return scan();
         }
         (HeaderInfo? Info, string? Text) ReadDirectives(string p)
         {
