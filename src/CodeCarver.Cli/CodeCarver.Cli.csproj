@@ -26,6 +26,10 @@
          the work) was both faster and smaller at peak on a 700-file bench: check 19 s -> 9 s, peak 1.0 -> 0.7 GB. -->
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <GarbageCollectionAdaptationMode>1</GarbageCollectionAdaptationMode>
+    <!-- Instrumented tier-0 code (dynamic PGO) ran the parse on dozens of threads at once and its re-JIT work was a
+         third of a run's CPU: off, a 1,351-file #if-heavy bench 19.3 -> 12.6 s CPU and 7.5 -> 6.5 s wall; a 6,000-file
+         log-heavy one and a 12-file one also faster (review CPU, Phase 2). DOTNET_TieredPGO=1 still turns it on. -->
+    <TieredPGO>false</TieredPGO>
   </PropertyGroup>
   <ItemGroup>
     <!-- Most of a run's peak was room the GC kept, not data (one compaction after the graph build: 2.0 -> 1.08 GB).
