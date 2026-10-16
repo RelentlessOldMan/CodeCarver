@@ -31,6 +31,10 @@ public sealed class UseList : IReadOnlyList<(NodeId From, string Name)>
         if (_seen.Add((from.Value, pooled))) _items.Add((from, pooled));
     }
 
+    /// <summary>The pooled name <paramref name="text"/>[<paramref name="start"/>..<paramref name="end"/>], for a caller
+    /// that needs the name before adding it: a string per occurrence was made only to be pooled (review CPU C7).</summary>
+    public string Name(string text, int start, int end) => _names.Get(text, start, end);
+
     public int Count => _items.Count;
     public (NodeId From, string Name) this[int index] => _items[index];
     public IEnumerator<(NodeId From, string Name)> GetEnumerator() => _items.GetEnumerator();

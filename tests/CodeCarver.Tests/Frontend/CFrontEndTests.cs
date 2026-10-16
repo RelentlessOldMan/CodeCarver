@@ -711,4 +711,18 @@ public class CFrontEndTests
         var plan = ReachabilityEngine.Compute(graph, new ExplicitRootProvider(symbols: new[] { "main" }).Discover(graph).ToList());
         Assert.Equal(kept, plan.IsKept(Find(graph, "tick")));
     }
+
+    // Review CPU C7: call and reference names are pooled straight from the parsed text by their capture offsets. Text
+    // before them that is not one UTF-16 unit per byte (an accented letter, a surrogate pair) must not shift them.
+    [Fact]
+    public void NamesAfterNonAsciiText_AreReadAtTheirOffsets()
+    {
+        var src = "/* café \U0001F600 */\nvoid callee(void) {}\nvoid target(void) {}\ntypedef void (*fn)(void);\n" +
+                  "fn pick(void) { /* ü\U0001F680 */ callee(); return target; }\nint main(void) { pick(); return 0; }\n";
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("main.c", src) });
+        var plan = ReachabilityEngine.Compute(graph, new ExplicitRootProvider(symbols: new[] { "main" }).Discover(graph).ToList());
+        Assert.True(plan.IsKept(Find(graph, "callee")));
+        Assert.True(plan.IsKept(Find(graph, "target")));
+    }
 }

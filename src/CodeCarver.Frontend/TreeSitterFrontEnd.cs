@@ -2765,7 +2765,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             // or `void ZLIB_INTERNAL _tr_flush_block`). That function stays in the emitted file, so keep
             // its callees whenever the file is kept — attribute the call to the file node.
             var from = Enclosing(row + 1) ?? fileNode;
-            var callee = tree.GetText(start, end);
+            var callee = pendingCalls.Name(tree.Source, start, end);   // pooled: no string per call (review CPU C7)
             pendingCalls.Add((from, callee));
             if (callee.Length > 7 && callee.StartsWith("__real_", StringComparison.Ordinal)) pendingCalls.Add((from, callee[7..]));   // --wrap's original
         }
@@ -2823,7 +2823,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (dead is not null && row + 1 < dead.Length && dead[row + 1]) return;
             var pos = (row, column);
             if (defNamePositions.Contains(pos) || calleePositions.Contains(pos)) return;
-            var name = tree.GetText(at, end);
+            var name = pendingRefs.Name(tree.Source, at, end);   // pooled: no string per identifier (review CPU C7)
             if (IsLocalUse(locals, name, at)) return;
             var from = Enclosing(row + 1);
             if (from is { } f)
