@@ -2976,7 +2976,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         return sb.ToString();
     }
 
-    /// <summary>C identifiers appearing in a line of source (used to scan initializer-table bodies).</summary>
+    /// <summary>C identifiers appearing in a line of source (used to scan initializer-table bodies). A name after
+    /// <c>.</c> or <c>-&gt;</c> is a member (a designator <c>.reset = f</c>, <c>&amp;obj.field</c>), never a reference to the
+    /// function or global of that name (review B12).</summary>
     private static IEnumerable<string> LineIdentifiers(string line)
     {
         var i = 0;
@@ -2986,8 +2988,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             {
                 var start = i;
                 while (i < line.Length && (char.IsLetterOrDigit(line[i]) || line[i] == '_')) i++;
-                yield return line[start..i];
+                var p = start - 1;
+                while (p >= 0 && line[p] is ' ' or '\t') p--;
+                var member = p >= 0 && (line[p] == '.' && (p == 0 || line[p - 1] != '.') || line[p] == '>' && p > 0 && line[p - 1] == '-');
+                if (!member) yield return line[start..i];
             }
+            else if (char.IsDigit(line[i]))
+                while (i < line.Length && (char.IsLetterOrDigit(line[i]) || line[i] is '_' or '.')) i++;   // a number: 1.5f, 0x1Fu
             else i++;
         }
     }

@@ -667,4 +667,27 @@ public class CFrontEndTests
                 return n.Id;
         throw new InvalidOperationException($"{kind} '{name}' not found");
     }
+
+    // Review B12: a designator names a member, not the global function of the same name.
+    [Theory]
+    [InlineData("static struct dev d = { .reset = my_reset, .probe = my_probe };\nint main(void) { return d.reset != 0; }\n")]
+    [InlineData("int main(void) { struct dev d = { .reset = my_reset, .probe = my_probe }; return d.reset != 0; }\n")]
+    [InlineData("int main(void) { struct dev d; d = (struct dev){ .reset = my_reset, .probe = my_probe }; return d.reset != 0; }\n")]
+    public void Designator_IsNotAReferenceToTheSameNamedFunction(string mainBody)
+    {
+        const string dev = "struct dev { int (*reset)(void); int (*probe)(void); };\n"
+                         + "static int my_reset(void) { return 1; }\nstatic int my_probe(void) { return 2; }\n";
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[]
+        {
+            ("main.c", dev + mainBody),
+            ("reset.c", "int reset(void) { return 3; }\n"),
+            ("probe.c", "int probe(void) { return 4; }\n"),
+        });
+        var plan = ReachabilityEngine.Compute(graph, new[] { new Root(Find(graph, "main"), RootKind.EntryPoint) });
+        Assert.True(plan.IsKept(Find(graph, "my_reset")));
+        Assert.True(plan.IsKept(Find(graph, "my_probe")));
+        Assert.False(plan.IsKept(Find(graph, "reset")));
+        Assert.False(plan.IsKept(Find(graph, "probe")));
+    }
 }
