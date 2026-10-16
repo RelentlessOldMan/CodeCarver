@@ -290,4 +290,53 @@ in kernel-style code).
 
 ## N. Fixes applied
 
-(Phase 2 — filled in as fixes land.)
+Each fix began with a regression test that failed without it, and the full suite passed before each release.
+File-level tests can be masked by the verify fallback (it re-keeps the file defining a name kept code uses), so the
+graph-side fixes are also pinned by graph-level tests.
+
+| Finding | Fix | Release |
+|---|---|---|
+| K1, S3 | Keep attributes in every spelling | 1.0.243 |
+| P1 | A source file the carve could not look inside is kept whole | 1.0.244 |
+| X1 | C++ objects that run code before `main` are roots | 1.0.245 |
+| X2 | C++ operators, conversions and destructors are definitions | 1.0.246 |
+| X3 | The virtuals of every class the carve keeps instantiated are kept | 1.0.247 |
+| W2, W3, W4 | `#elifdef`/`#elifndef`; disagreeing per-build defines and `#include` make macros unknown | 1.0.248 |
+| W1 | Names a missing system header may define stay unknown in the closed world | 1.0.249 |
+| M1 | Keep and register macros defined outside the tree are honoured | 1.0.250 |
+| H1, L1, L2 | Header carving keeps system-read macros; `weakref` and more alias shapes | 1.0.251 |
+| O1 | The output-overlap guard follows junctions and symlinks | 1.0.252 |
+| W5, W6, W7 | Directives after comments, `-U` and `F(x)` defines, headers of unlogged files | 1.0.253 |
+| S1, S2 | What assembly `#include`s is followed; symbols defined by top-level `asm` | 1.0.254 |
+| X4–X8 | Specializations, instantiations, range-for, structured bindings, parameter scope (X7 was already fixed by X1) | 1.0.255 |
+| R1 | The intra carve removes whole `#if` branches only | 1.0.256 |
+| B7 | Static functions in headers count as emitted | 1.0.257 |
+| B9 | Definitions spelled through a rename or paste macro | 1.0.258 |
+| E3 | Computed `#include`s are followed (object and function-like macros, `#`, `##`; an unknown macro matches any name) | 1.0.259 |
+| T1 | Keep and interrupt spellings of other toolchains (`#pragma RETAIN`/`required`/`vector`, `__root`, `__interrupt`, `ISR()`, Keil `interrupt N`) | 1.0.260 |
+| S4 | Input sections between `sym = .` assignments are tables, KEEP or not | 1.0.261 |
+| R2 | A dead definition whose head defines a used struct/union/enum is kept whole | 1.0.262 |
+| R3 | Stub parameter names skip attribute syntax and trailing attribute macros | 1.0.263 |
+| R4 | The UTF-8 BOM survives when line 1 is dropped | 1.0.264 |
+| R5 | Section names that differ only by case are a config error | 1.0.265 |
+| E11 | Empty list items, and excludes that name no directory, are config errors | 1.0.266 |
+| E10 | Warning when `excludeDirectories` removes a file the build log compiles | 1.0.267 |
+| E9 | `--why` answers every stage, labeled | 1.0.268 |
+| B11 | The console's `files`/`dropped` lines come from each stage's final plan; an empty verify says so | 1.0.269 |
+| B12 | Designators (`.reset = f`) and members are not references | 1.0.270 |
+
+### Deferred
+
+- **V1 (verify blind spots).** Architectural, as section K says: the only independent check is a real compile and
+  link of the emitted tree when a toolchain is known. Not attempted here.
+- **E8 (initializers charged to the file node).** Tried and reverted. Charging a table's references to the table
+  alone lets the intra carve cut an unreferenced table, and a vector table is exactly that: no C code names it, but
+  the link keeps it. The arm-gcc build test broke. The fix needs to know which tables the link retains (KEEP,
+  section, `used`, `-u`), and to charge the file only for those.
+- **C11 (qualified and anonymous-namespace calls resolved by last name).** Graph nodes carry unqualified names, so
+  `A::run` and `B::run` share one name. Precise resolution needs qualified node identities throughout the C++ front
+  end. It over-retains but is sound.
+- **B13 (unexpanded function-like macro bodies count as uses).** The link check reads every `#define` body as code on
+  purpose (CheckClosureTests pins it). Telling an unexpanded macro apart needs each file's macro-use set, which the
+  scan drops to save memory. It also has to handle a `.c` that another file `#include`s, or dropping the static
+  breaks that build. The cost is one kept static per such macro.
