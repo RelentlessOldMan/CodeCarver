@@ -34,7 +34,10 @@ public static class CodeTokens
     /// </summary>
     public static List<string> MacroTokens(string code)
     {
-        var toks = new List<string>();
+        // Gathered in a list kept per thread and copied out at its size: grown from empty, a long body's list was
+        // copied at every doubling (most of a register header's definer scan).
+        var toks = t_tokens ??= new List<string>();
+        toks.Clear();
         var n = code.Length;
         for (var i = 0; i < n;)
         {
@@ -50,8 +53,11 @@ public static class CodeTokens
             }
             toks.Add(NamePool.Char(c));
         }
-        return toks;
+        var result = new List<string>(toks);
+        if (toks.Count > 4096) { toks.Clear(); toks.TrimExcess(); }
+        return result;
     }
+    [ThreadStatic] static List<string>? t_tokens;
 
     /// <summary>
     /// Where each name of <c>[A-Za-z_]\w*</c> starts and ends, as the regex finds them: one may start right after a

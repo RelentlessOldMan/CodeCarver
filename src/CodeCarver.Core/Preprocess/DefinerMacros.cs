@@ -201,21 +201,31 @@ public static class DefinerMacros
     {
         param = -1; pre = suf = ""; end = i;
         if (!IsIdent(toks[i]) || (i > 0 && toks[i - 1] == "#")) return false;
-        var parts = new List<string> { toks[i] };
+        // The pieces are toks[i], toks[i + 2], ... toks[end]: read in place, where a list of them was made at every name.
         var j = i;
-        while (j + 2 < toks.Count && toks[j + 1] == "##" && IsIdent(toks[j + 2])) { parts.Add(toks[j + 2]); j += 2; }
+        while (j + 2 < toks.Count && toks[j + 1] == "##" && IsIdent(toks[j + 2])) j += 2;
         end = j;
         var at = -1;
-        for (var k = 0; k < parts.Count; k++)
-            if (ps.IndexOf(parts[k]) is var pi && pi >= 0)
+        for (var k = i; k <= j; k += 2)
+            if (ps.IndexOf(toks[k]) is var pi && pi >= 0)
             {
                 if (at >= 0) return false;   // two parameters pasted together: not a name we can predict
                 at = k; param = pi;
             }
         if (at < 0) return false;
-        pre = string.Concat(parts.Take(at));
-        suf = string.Concat(parts.Skip(at + 1));
+        pre = Pieces(toks, i, at);
+        suf = Pieces(toks, at + 2, j + 2);
         return true;
+    }
+
+    /// <summary>toks[from], toks[from + 2], ... before <paramref name="to"/>, joined.</summary>
+    private static string Pieces(List<string> toks, int from, int to)
+    {
+        if (from >= to) return "";
+        if (from + 2 >= to) return toks[from];
+        var sb = new System.Text.StringBuilder();
+        for (var k = from; k < to; k += 2) sb.Append(toks[k]);
+        return sb.ToString();
     }
 
     /// <summary>Top-level comma-separated argument token lists of the call whose '(' is at <paramref name="open"/>.</summary>

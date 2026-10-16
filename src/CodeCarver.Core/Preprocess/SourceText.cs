@@ -114,6 +114,8 @@ public static class SourceText
     /// (newlines kept), so indices map one-to-one onto the original.</summary>
     public static string CodeOnly(string text)
     {
+        // Nothing to blank without a directive, comment or literal: the text itself (most macro bodies).
+        if (text.AsSpan().IndexOfAny("#/\"'") < 0) return text;
         var sb = new StringBuilder(text.Length);
         var i = 0;
         var atLineStart = true;

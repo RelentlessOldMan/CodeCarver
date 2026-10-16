@@ -28,7 +28,7 @@ public static class MacroBodies
 
     private static (List<string> Params, List<string> Tokens)? Split(string raw)
     {
-        var flat = Regex.Replace(raw, @"\\\r?\n", " ");
+        var flat = raw.Contains('\\') ? Regex.Replace(raw, @"\\\r?\n", " ") : raw;
         var close = flat.IndexOf(')');
         if (close < 0) return null;
         var ps = flat[..close].Split(',').Select(p => p.Trim()).ToList();
