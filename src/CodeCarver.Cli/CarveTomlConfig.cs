@@ -336,12 +336,17 @@ public static class ConfigLoader
     private static IEnumerable<(string Name, TomlTable Table)> NamedTables(TomlTable root, string parent, Ctx ctx)
     {
         if (GetTable(root, parent, ctx) is not { } p) yield break;
+        var seen = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var k in p.Keys)
         {
             // Names become path segments (stage output directories) and appear in messages: restrict them so
             // [stages."../../x"] can never write outside outputDirectory (review D2).
             if (k.Length == 0 || !k.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-'))
             { ctx.Errors.Add($"[{parent}.{k}]: section names may use only letters, digits, '_' and '-'."); continue; }
+            // ...and on a case-insensitive file system [stages.Fast] and [stages.fast] are one folder (review R5).
+            if (seen.TryGetValue(k, out var other))
+            { ctx.Errors.Add($"[{parent}.{k}] and [{parent}.{other}]: section names must not differ only by case."); continue; }
+            seen[k] = k;
             if (p[k] is TomlTable t) yield return (k, t);
             else ctx.Errors.Add($"[{parent}.{k}] must be a section/table.");
         }

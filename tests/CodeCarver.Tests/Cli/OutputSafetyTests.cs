@@ -70,6 +70,22 @@ public sealed class OutputSafetyTests
         finally { try { Directory.Delete(work, true); } catch { } }
     }
 
+    // Review R5: on a case-insensitive file system [stages.Fast] and [stages.fast] write the same folder.
+    [Fact]
+    public void StageNamesDifferingOnlyByCase_AreAConfigError()
+    {
+        var work = NewWork();
+        try
+        {
+            var (code, err) = Carve(work, $"outputDirectory = \"{Path.Combine(work, "out").Replace('\\', '/')}\"\n"
+                + "[common]\nentryPoints=[\"main\"]\n[stages.Fast]\ncarveSourceFileContents = false\n"
+                + "[stages.fast]\ncarveSourceFileContents = true\n");
+            Assert.Equal(2, code);
+            Assert.Contains("differ only by case", err);
+        }
+        finally { try { Directory.Delete(work, true); } catch { } }
+    }
+
     [Fact]
     public void Carve_UnexpectedFailure_WritesDiagZip_WithNoSourceNames()
     {
