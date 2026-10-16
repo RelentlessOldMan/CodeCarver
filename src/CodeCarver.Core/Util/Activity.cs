@@ -16,7 +16,77 @@ public static class Activity
     /// <summary>Starts counting a new step: <paramref name="what"/> names what is counted ("files copied").</summary>
     public static void Begin(string what = "files", long total = -1)
     {
-        lock (Gate) { _what = what; _total = total; _summed = false; Interlocked.Exchange(ref _done, 0); Interlocked.Exchange(ref _bytes, 0); Interlocked.Exchange(ref _largest, 0); }
+        lock (Gate) { _what = what; _total = total; _summed = false; Interlocked.Exchange(ref _done, 0); Interlocked.Exchange(ref _bytes, 0); Interlocked.Exchange(ref _largest, 0); _parts.Clear(); Interlocked.Exchange(ref _ready, 0); }
+    }
+
+    // ---- what the memory goes to, per part of a step's work (C20/C21: 9 GB in 90 s with 0.5 MB of files in hand) ----
+
+    sealed class PartStats { public long Allocated, MaxItem, InFlight, Items, Notes, NoteBytes; }
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, PartStats> _parts = new(StringComparer.Ordinal);
+    static long _ready;
+    [ThreadStatic] static long t_notes, t_noteBytes;
+
+    /// <summary>CODECARVER_DEBUG_CHECKMEM=1 (temporary): a line for each item a part allocated at least
+    /// <see cref="DebugItemBytes"/> on. Numbers only.</summary>
+    public static Action<string>? DebugSink { get; set; }
+    public static long DebugItemBytes { get; set; } = 256L << 20;
+
+    /// <summary>Counts what the calling thread allocates until the scope is disposed against <paramref name="part"/>,
+    /// with how many items of the part are running at once. Nested scopes each count their own (an outer one includes
+    /// an inner one's).</summary>
+    public static PartScope Part(string part, long itemBytes = 0) => new(part, itemBytes);
+
+    /// <summary>Something the current part's item pulled in (a header a walk read): counted with the item.</summary>
+    public static void Note(long bytes) { t_notes++; t_noteBytes += bytes; }
+
+    /// <summary>Results finished ahead of the loop consuming them (<see cref="ReadAhead"/>), held until it gets there.</summary>
+    public static void Ready(int delta) => Interlocked.Add(ref _ready, delta);
+
+    /// <summary>Forgets the parts counted so far: a loop that reported them hands the next a clean count.</summary>
+    public static void ClearParts() => _parts.Clear();
+
+    public readonly struct PartScope : IDisposable
+    {
+        readonly PartStats _s; readonly string _name; readonly long _start, _itemBytes, _notes, _noteBytes;
+        internal PartScope(string name, long itemBytes)
+        {
+            _name = name; _itemBytes = itemBytes;
+            _s = _parts.GetOrAdd(name, _ => new PartStats());
+            Interlocked.Increment(ref _s.InFlight);
+            _notes = t_notes; _noteBytes = t_noteBytes;
+            _start = GC.GetAllocatedBytesForCurrentThread();
+        }
+        public void Dispose()
+        {
+            if (_s is null) return;
+            var used = GC.GetAllocatedBytesForCurrentThread() - _start;
+            Interlocked.Add(ref _s.Allocated, used);
+            Interlocked.Increment(ref _s.Items);
+            Interlocked.Add(ref _s.Notes, t_notes - _notes);
+            Interlocked.Add(ref _s.NoteBytes, t_noteBytes - _noteBytes);
+            for (var was = Interlocked.Read(ref _s.MaxItem); used > was; was = Interlocked.Read(ref _s.MaxItem))
+                if (Interlocked.CompareExchange(ref _s.MaxItem, used, was) == was) break;
+            var running = Interlocked.Decrement(ref _s.InFlight) + 1;
+            if (DebugSink is { } sink && used >= DebugItemBytes)
+                sink($"check-mem {_name}: item {_itemBytes >> 10:N0} KB allocated {used >> 20:N0} MB, pulled in {t_notes - _notes:N0} file(s) / "
+                     + $"{(t_noteBytes - _noteBytes) >> 10:N0} KB; running at once {running}; " + string.Join(", ", Parts().Where(p => p.Key.EndsWith(".inFlight")).Select(p => $"{p.Key} {p.Value}")));
+        }
+    }
+
+    /// <summary>The step's parts so far: part.&lt;name&gt;.allocatedMb, .itemMaxMb, .items, .inFlight, .pulledIn,
+    /// .pulledInMb, and readyAhead.</summary>
+    public static IEnumerable<KeyValuePair<string, long>> Parts()
+    {
+        foreach (var (name, s) in _parts.ToArray())
+        {
+            yield return new($"part.{name}.allocatedMb", Interlocked.Read(ref s.Allocated) >> 20);
+            yield return new($"part.{name}.itemMaxMb", Interlocked.Read(ref s.MaxItem) >> 20);
+            yield return new($"part.{name}.items", Interlocked.Read(ref s.Items));
+            yield return new($"part.{name}.inFlight", Interlocked.Read(ref s.InFlight));
+            yield return new($"part.{name}.pulledIn", Interlocked.Read(ref s.Notes));
+            yield return new($"part.{name}.pulledInMb", Interlocked.Read(ref s.NoteBytes) >> 20);
+        }
+        yield return new("readyAhead", Interlocked.Read(ref _ready));
     }
 
     /// <summary>A loop of <paramref name=total/> items starts: the step's total is what its loops expect, added up, unless

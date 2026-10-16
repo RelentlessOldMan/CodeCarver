@@ -95,6 +95,8 @@ public static class EmittedLinkCheck
     /// <param name="maxBytes">Files larger than this are not read (counted in FilesSkipped).</param>
     /// <param name="original">For a stage that carves INSIDE kept files: emitted relative path → the original file on
     /// disk. A function the original defines and the emitted copy doesn't was pruned, and counts as dropped.</param>
+    [ThreadStatic] static int t_reread;   // headers a template walk on this thread read again (see walkGate)
+
     public static LinkCheckResult Run(
         IEnumerable<(string Rel, string Path)> emitted,
         IEnumerable<(string Rel, string Path)> dropped,
@@ -142,22 +144,35 @@ public static class EmittedLinkCheck
             stats["held.droppedDefsMax"] = droppedDefs.Count;
             stats["held.macroCallsMax"] = macroCalls.Count;
             stats["held.usesMax"] = live.Count + dead.Count;
+            // What each part of the loop's per-file work allocated (Activity.Part): the loop's own, reset as the next begins.
+            foreach (var (pk, pv) in Activity.Parts())
+                if (pk.StartsWith("part.", StringComparison.Ordinal) && !pk.EndsWith(".inFlight", StringComparison.Ordinal)) stats[$"{key}.{pk}"] = pv;
+            Activity.ClearParts();
             phase.Restart();
             // Handed out as each loop ends, so a run stopped inside the check still has the loops before.
             foreach (var k in new[] { key + "Ms", key + ".privateMaxMb", key + ".heapMaxMb", key + ".allocatedMb" }
-                         .Concat(stats.Keys.Where(k => k.StartsWith("held.", StringComparison.Ordinal))).ToList())
+                         .Concat(stats.Keys.Where(k => k.StartsWith("held.", StringComparison.Ordinal) || k.StartsWith(key + ".part.", StringComparison.Ordinal))).ToList())
                 if (stats.TryGetValue(k, out var v)) report?.Invoke(k, v);
         }
         long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0;
         var scanGate = new CodeCarver.Core.Util.ByteGate(ScanBudget());   // see Gated
         var readGate = new CodeCarver.Core.Util.ByteGate(ReadBudget());
+        // Template walks that re-read headers the check could not hold re-parse them, a walk at a time (C20/C21: 64 walks
+        // at once re-parsing their include closures went from 12 to 21 GB in 90 s). Once a header was not held, a walk
+        // takes what the largest re-reading walk allocated before it, or the whole budget until one has: the first runs
+        // alone and sizes the rest.
+        var walkBudget = WalkBudget();
+        var walkGate = new CodeCarver.Core.Util.ByteGate(walkBudget);
+        long walkCost = -1;
+        var headerOverflow = false;
         LinkCheckResult Done(IReadOnlyList<LinkViolation> v)
         {
             Lap("rest");
             stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["instancesRedone"] = instancesRedone;
-            stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits;
+            stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits;
+            stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;
             stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped;
-            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "templateWalks", "templateWalksSkipped" })
+            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -191,6 +206,7 @@ public static class EmittedLinkCheck
         }
         (HeaderInfo? Info, string? Text) ReadDirectives(string p)
         {
+            using var part = Activity.Part("headerRead");
             Interlocked.Increment(ref filesRead);
             var t = TryRead(p, maxBytes);
             if (t is null) return (null, null);
@@ -236,7 +252,7 @@ public static class EmittedLinkCheck
         }
         void Hold(string p, string text, bool template)
         {
-            if (!template && heldChars + text.Length > budget) return;
+            if (!template && heldChars + text.Length > budget) { headerOverflow = true; return; }
             headerText[p] = text;
             if (!template) heldChars += text.Length;
         }
@@ -250,6 +266,7 @@ public static class EmittedLinkCheck
         {
             if (Info(p) is null) return null;
             lock (headerInfo) if (headerText.TryGetValue(p, out var t)) return t;
+            t_reread++;
             var (info, text) = ReadDirectives(p);   // not held: read again (the same text: within a run a file stays as it is)
             if (info is null || text is null) return null;
             lock (headerInfo)
@@ -343,13 +360,25 @@ public static class EmittedLinkCheck
         List<Definition> TemplateDefs(string text, List<(string Raw, HeaderInfo? Read)>? deps)
         {
             Interlocked.Increment(ref templateWalks);
-            return CodeCarver.Core.Preprocess.TemplateInstances.Find(text, raw =>
-                   {
-                       var t = ReadTemplate(raw);
-                       deps?.Add((raw, TemplateKey(raw)));
-                       return t;
-                   }, commandLineMacros)
-                   .Select(i => new Definition(i.Name, i.Line, false, false)).ToList();
+            using var part = Activity.Part("templateWalk", text.Length);
+            var cost = Volatile.Read(ref headerOverflow) ? Interlocked.Read(ref walkCost) is var c and >= 0 ? c : walkBudget : 0;
+            using var slot = walkGate.Take(cost);
+            var (reread, start) = (t_reread, GC.GetAllocatedBytesForCurrentThread());
+            var found = CodeCarver.Core.Preprocess.TemplateInstances.Find(text, raw =>
+                        {
+                            var t = ReadTemplate(raw);
+                            Activity.Note(t?.Length ?? 0);
+                            deps?.Add((raw, TemplateKey(raw)));
+                            return t;
+                        }, commandLineMacros)
+                        .Select(i => new Definition(i.Name, i.Line, false, false)).ToList();
+            if (t_reread != reread)
+            {
+                var used = GC.GetAllocatedBytesForCurrentThread() - start;
+                for (var was = Interlocked.Read(ref walkCost); used > was; was = Interlocked.Read(ref walkCost))
+                    if (Interlocked.CompareExchange(ref walkCost, used, was) == was) break;
+            }
+            return found;
         }
         List<Definition> C99Defs(string text)
         {
@@ -388,10 +417,11 @@ public static class EmittedLinkCheck
             else
             {
                 Interlocked.Increment(ref filesRead);
-                text = TryRead(f.Path, maxBytes);
+                using (Activity.Part("dropped.read")) text = TryRead(f.Path, maxBytes);
                 e = null;
                 if (text is not null)
                 {
+                    using var scanPart = Activity.Part("dropped.scan", text.Length);
                     var own = Scan(text, header, declarators: false, definerMacros);
                     e = new DroppedEntry
                     {
@@ -439,6 +469,7 @@ public static class EmittedLinkCheck
         Activity.Begin("check: dropped files scanned", droppedSorted.Count);
         foreach (var (di, dscan) in ReadAhead.Ordered(droppedSorted, d => Gated(d.Path, () => ScanDropped(d))))
         {
+            using var consume = Activity.Part("dropped.consume");
             var rel = droppedSorted[di].Rel;
             if (dscan is null) { skipped++; continue; }
             checkedFiles++;
@@ -530,11 +561,14 @@ public static class EmittedLinkCheck
         var anyWrap = wrapped is { Count: > 0 } && droppedDefs.Keys.Any(k => k.StartsWith("__wrap_", StringComparison.Ordinal));
         (ScanResult Scan, bool[]? Map)? ScanEmitted((string Rel, string Path) f)
         {
-            var text = TryRead(f.Path, maxBytes);
+            string? text;
+            using (Activity.Part("emitted.read")) text = TryRead(f.Path, maxBytes);
             if (text is null) return null;
-            var map = deadLines?.Invoke(f.Rel, text);
-            var s = IsAssembly(f.Rel) ? ScanAssembly(text) : Scan(text, IsHeader(f.Rel), definerMacros: definerMacros);
-            s.Definitions.AddRange(Instances(f.Rel, text));
+            bool[]? map;
+            using (Activity.Part("emitted.deadLines", text.Length)) map = deadLines?.Invoke(f.Rel, text);
+            ScanResult s;
+            using (Activity.Part("emitted.scan", text.Length)) s = IsAssembly(f.Rel) ? ScanAssembly(text) : Scan(text, IsHeader(f.Rel), definerMacros: definerMacros);
+            using (Activity.Part("emitted.instances", text.Length)) s.Definitions.AddRange(Instances(f.Rel, text));
             Renamed(s);
             // A use is read below only for a name a dropped file defines, a static pruned from this file, or a wrapped
             // symbol: the others are let go here, so a result waiting its turn holds little.
@@ -548,6 +582,7 @@ public static class EmittedLinkCheck
         Activity.Begin("check: emitted files scanned", emittedSorted.Count);
         foreach (var (ei, scanned) in ReadAhead.Ordered(emittedSorted, e => Gated(e.Path, () => ScanEmitted(e))))
         {
+            using var consume = Activity.Part("emitted.consume");
             var rel = emittedSorted[ei].Rel;
             if (scanned is not { } got) { skipped++; continue; }
             var (scan, map) = got;
@@ -694,6 +729,16 @@ public static class EmittedLinkCheck
             return mb * 1024 * 1024 / sizeof(char);
         var total = CodeCarver.Core.Util.MemoryGate.BudgetBytes();
         return (total > 0 ? total / 32 : 512L << 20) / sizeof(char);
+    }
+
+    /// <summary>Bytes the template walks that re-read headers allocate at once: an 8th of the machine's memory or the run
+    /// limit (2.5 GB under memoryStopMb 20000), at least 256 MB, or CODECARVER_CHECK_WALK_MB.</summary>
+    static long WalkBudget()
+    {
+        if (long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_CHECK_WALK_MB"), out var mb) && mb > 0)
+            return mb * 1024 * 1024;
+        var total = CodeCarver.Core.Util.MemoryGate.BudgetBytes();
+        return Math.Max(256L << 20, total > 0 ? total / 8 : 2L << 30);
     }
 
     /// <summary>Bytes of files the check scans at once: a 512th of the machine's memory (64 MB of 32 GB, about 2 GB while

@@ -163,6 +163,54 @@ public sealed class StreamingCheckTests
     }
 
     [Fact]
+    public void LinkCheck_WalksThatReadHeadersAgain_WaitForTheWalkBudget_SameAnswer()
+    {
+        // 48 dropped files each walk cfg.h, a big register header and the template t.h. With no header text held every
+        // walk re-reads and re-parses its includes (C20/C21: 64 at once); under a 1 MB walk budget they take turns.
+        var root = Path.Combine(Path.GetTempPath(), "cc-walk-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var was = (Environment.GetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB"), Environment.GetEnvironmentVariable("CODECARVER_CHECK_WALK_MB"));
+        try
+        {
+            (string, string) W(string rel, string text)
+            {
+                var p = Path.Combine(root, rel);
+                File.WriteAllText(p, text);
+                return (rel, p);
+            }
+            var regs = new System.Text.StringBuilder();
+            for (var k = 0; k < 20_000; k++) regs.Append($"#define BLK_R{k}_OFS (BLK_BASE + 0x{k * 4:X}u) /* reg {k} */\n");
+            var emitted = new[]
+            {
+                W("cfg.h", "#define HIDE(n) hid_##n\n"),
+                W("regs.h", regs.ToString()),
+                W("t.h", "int HIDE(den)(void) { return 0; }\n"),
+                W("main.c", "int hid_den(void);\nint main(void) { return hid_den(); }\n"),
+            };
+            var dropped = Enumerable.Range(0, 48).Select(k => W($"gone{k}.c", "#include \"cfg.h\"\n#include \"regs.h\"\n#include \"t.h\"\n")).ToArray();
+
+            Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", null);
+            Environment.SetEnvironmentVariable("CODECARVER_CHECK_WALK_MB", null);
+            var held = EmittedLinkCheck.Run(emitted, dropped);
+            Assert.Equal(0, held.Stats["walkWaits"]);   // every header held: walks parse each header once, never wait
+
+            Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", "0");
+            Environment.SetEnvironmentVariable("CODECARVER_CHECK_WALK_MB", "1");
+            var reread = EmittedLinkCheck.Run(emitted, dropped);
+            Assert.Equal(held.Violations.Select(v => (v.Name, v.ReferencedIn)), reread.Violations.Select(v => (v.Name, v.ReferencedIn)));
+            Assert.Equal(new[] { "hid_den" }, reread.Violations.Select(v => v.Name).Distinct().ToArray());
+            Assert.True(reread.Stats["walkCostMaxMb"] >= 1, reread.Stats["walkCostMaxMb"].ToString());
+            Assert.True(reread.Stats["walkWaits"] > 0, reread.Stats["walkWaits"].ToString());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", was.Item1);
+            Environment.SetEnvironmentVariable("CODECARVER_CHECK_WALK_MB", was.Item2);
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
+    [Fact]
     public void LinkCheck_TemplateWalk_SkippedOnlyWhereItCanFindNothing()
     {
         // gone.c reaches the template t.h only round an include cycle (a.h <-> b.h, b.h -> t.h); split.c has its own

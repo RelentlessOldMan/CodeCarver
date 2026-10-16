@@ -653,6 +653,20 @@ of the machine's memory, or of `memoryStopMb` when that is less. A lower stop ma
 make the parse slower); it never changes what is kept. Most of a run's peak is the .NET heap's headroom over its live
 data: `DOTNET_GCConserveMemory=9` (default 7) trades about 15% of the peak for a slower graph build.
 
+The link check's template walks that must read headers again (more header text than the check holds) share a budget
+of an eighth of that memory; `CODECARVER_CHECK_WALK_MB=N` sets it. Each check loop reports what each part of its
+per-file work allocated: `check.<loop>.part.<part>.allocatedMb`, `.itemMaxMb`, `.items`, `.pulledIn` and `.pulledInMb`
+(headers a template walk read), and a memory stop adds `stop.part.<part>.*` and `stop.readyAhead` for the loop it
+stopped in.
+
+Two TEMPORARY switches for chasing the check's memory, to be removed once it is understood:
+`CODECARVER_DEBUG_ONLY=check-emitted` (or `check-dropped`, or `check`) runs only the link check, right after the
+input scan, over the tree's code files (every 50th file taken as dropped, or all but every 50th, or every 3rd), and
+writes `<outputDirectory>/codecarver/debug-only-summary.txt` (numbers only: `debug.checkMs`, `debug.peakPrivateMb`, and
+the check's keys). It carves nothing and its findings mean nothing; its memory and time are the point: minutes instead
+of a whole run. `CODECARVER_DEBUG_CHECKMEM=1` (on with DEBUG_ONLY) prints a `debug   :` line for each file a part of
+the check allocated 256 MB or more on.
+
 The two longest steps before the parse also say which part took the time: `rootNames built / binaries /
 unbuilt` and `pre-parse treeMacros / outsideHeaders / quotedIncludes / unparsedHeaders`, each a `progress:`
 line and a `time.<step>.<part>.ms` summary key.

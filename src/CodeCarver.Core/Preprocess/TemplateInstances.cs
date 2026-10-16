@@ -16,9 +16,6 @@ public static class TemplateInstances
 {
     /// <summary>A definition head whose name is a macro call: <c>NAME(args)(params) {</c>.</summary>
     static readonly Regex MacroNamedHead = new(@"\b([A-Za-z_]\w*)\s*\(((?:[^()\n]|\([^()\n]*\))*)\)\s*\([^(){};]*\)\s*\{", RegexOptions.Compiled);
-    static readonly Regex Directive = new(@"^[ \t]*#[ \t]*(define|undef|include)\b[ \t]*(.*)$", RegexOptions.Compiled);
-    static readonly Regex Conditional = new(@"^[ \t]*#[ \t]*(if|ifdef|ifndef|endif)\b", RegexOptions.Compiled);
-    static readonly Regex DefineHead = new(@"^([A-Za-z_]\w*)(\(([^)]*)\))?[ \t]*(.*)$", RegexOptions.Compiled | RegexOptions.Singleline);
 
     /// <summary>Past this many combinations of alternative macro values, each alternative is tried alone.</summary>
     public const int MaxWorlds = 64;
@@ -217,58 +214,99 @@ public static class TemplateInstances
     static Parsed ParseOf(string header)
         => s_parsed.GetValue(header, t => new Lazy<Parsed>(() => Parse(t, HasMacroNamedHead(t)))).Value;
 
+    // Read by hand, not by the Directive/Conditional/DefineHead regexes: a Match and its Groups for every #define line
+    // came to 25 times the header (C20/C21: a walk re-parses every header the check could not hold, 64 walks at once).
+    // Same answers as those regexes.
     static Parsed Parse(string text, bool isTemplate)
     {
-        var lines = text.Split('\n');
-        var ops = new List<Op>(lines.Length);
-        for (var i = 0; i < lines.Length; i++)
+        var ops = new List<Op>(text.Length / 40 + 16);
+        var i = -1;   // the 0-based line, as a split on '\n' numbers it
+        for (var start = 0; start <= text.Length; )
         {
-            var raw = lines[i].TrimEnd('\r');
+            var (end, next) = Line(text, start);
+            i++;
             var first = i;
-            if (!raw.TrimStart().StartsWith('#'))
+            var k = start;
+            while (k < end && char.IsWhiteSpace(text[k])) k++;
+            if (k >= end || text[k] != '#')
             {
-                ops.Add(new Op(OpKind.Code, i, i, raw, null));
+                ops.Add(new Op(OpKind.Code, i, i, text.Substring(start, end - start), null));
+                start = next;
                 continue;
             }
-            if (raw.EndsWith('\\') && i + 1 < lines.Length)
+            if (!(end > start && text[end - 1] == '\\' && next <= text.Length))
+                ops.Add(ParseDirective(text.AsSpan(start, end - start), first, i));
+            else
             {
                 // One buffer: re-copying per continued line costs the square of the directive's length.
-                var sb = new System.Text.StringBuilder(raw);
-                while (sb.Length > 0 && sb[^1] == '\\' && i + 1 < lines.Length)
+                var sb = new StringBuilder(end - start + 64);
+                sb.Append(text, start, end - start);
+                while (sb.Length > 0 && sb[^1] == '\\' && next <= text.Length)
                 {
                     sb.Length--;
-                    sb.Append(' ').Append(lines[++i].AsSpan().TrimEnd('\r'));
+                    (end, next) = Line(text, start = next);
+                    i++;
+                    sb.Append(' ').Append(text, start, end - start);
                 }
-                raw = sb.ToString();
+                ops.Add(ParseDirective(sb.ToString(), first, i));
             }
-            var d = Directive.Match(raw);
-            if (!d.Success)
-            {
-                var kind = Conditional.Match(raw) is { Success: true } c ? c.Groups[1].Value == "endif" ? OpKind.Close : OpKind.Open : OpKind.Other;
-                ops.Add(new Op(kind, first, i, null, null));
-                continue;
-            }
-            var rest = StripComment(d.Groups[2].Value).Trim();
-            switch (d.Groups[1].Value)
-            {
-                case "define":
-                    var h = DefineHead.Match(rest);
-                    ops.Add(h.Success
-                        ? new Op(OpKind.Define, first, i, h.Groups[1].Value, new Macro(
-                            h.Groups[2].Success ? h.Groups[3].Value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList() : null,
-                            h.Groups[4].Value.Trim()))
-                        : new Op(OpKind.Define, first, i, null, null));
-                    break;
-                case "undef":
-                    ops.Add(new Op(OpKind.Undef, first, i, rest.Split(' ', '\t')[0], null));
-                    break;
-                default:   // include
-                    var close = rest.Length >= 2 && rest[0] == '"' ? rest.IndexOf('"', 1) : -1;
-                    ops.Add(new Op(OpKind.Include, first, i, close < 0 ? null : rest[1..close], null));
-                    break;
-            }
+            start = next;
         }
         return new Parsed(ops.ToArray(), isTemplate);
+    }
+
+    /// <summary>Tests: each op of <see cref="Parse"/> as "kind first-last text (params) body".</summary>
+    internal static IEnumerable<string> DescribeParse(string text)
+        => Parse(text, false).Ops.Select(o => $"{o.Kind} {o.First}-{o.Last} [{o.Text}] "
+                                              + (o.Macro is { } m ? $"({(m.Params is null ? "-" : string.Join(",", m.Params))}) [{m.Body}]" : ""));
+
+    static bool IsWord(char c) => char.IsLetterOrDigit(c) || c == '_';
+
+    /// <summary>A directive line (continuations joined), as the Directive/Conditional/DefineHead regexes read it. Read
+    /// in place: only the name and body are copied out.</summary>
+    static Op ParseDirective(ReadOnlySpan<char> raw, int first, int last)
+    {
+        var k = 0;
+        while (k < raw.Length && raw[k] is ' ' or '\t') k++;
+        if (k >= raw.Length || raw[k] != '#') return new Op(OpKind.Other, first, last, null, null);
+        k++;
+        while (k < raw.Length && raw[k] is ' ' or '\t') k++;
+        var w = k;
+        while (k < raw.Length && IsWord(raw[k])) k++;
+        var word = raw[w..k];
+        if (word is "if" or "ifdef" or "ifndef") return new Op(OpKind.Open, first, last, null, null);
+        if (word is "endif") return new Op(OpKind.Close, first, last, null, null);
+        if (word is not ("define" or "undef" or "include")) return new Op(OpKind.Other, first, last, null, null);
+        while (k < raw.Length && raw[k] is ' ' or '\t') k++;
+        var rest = raw[k..];
+        if (rest.IndexOf("//", StringComparison.Ordinal) is var c and >= 0) rest = rest[..c];
+        if (rest.Contains("/*", StringComparison.Ordinal)) rest = StripComment(rest.ToString());
+        rest = rest.Trim();
+        switch (word)
+        {
+            case "define":
+            {
+                if (rest.Length == 0 || !(char.IsAsciiLetter(rest[0]) || rest[0] == '_')) return new Op(OpKind.Define, first, last, null, null);
+                var n = 1;
+                while (n < rest.Length && IsWord(rest[n])) n++;
+                var name = rest[..n].ToString();
+                List<string>? ps = null;
+                var b = n;
+                if (n < rest.Length && rest[n] == '(' && rest[(n + 1)..].IndexOf(')') is var close and >= 0)
+                {
+                    ps = rest.Slice(n + 1, close).ToString().Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries).ToList();
+                    b = n + 1 + close + 1;
+                }
+                while (b < rest.Length && rest[b] is ' ' or '\t') b++;
+                return new Op(OpKind.Define, first, last, name, new Macro(ps, rest[b..].Trim().ToString()));
+            }
+            case "undef":
+                var sp = rest.IndexOfAny(' ', '\t');
+                return new Op(OpKind.Undef, first, last, (sp < 0 ? rest : rest[..sp]).ToString(), null);
+            default:   // include
+                var q = rest.Length >= 2 && rest[0] == '"' ? rest[1..].IndexOf('"') : -1;
+                return new Op(OpKind.Include, first, last, q < 0 ? null : rest.Slice(1, q).ToString(), null);
+        }
     }
 
     static void Walk(Parsed parsed, WalkState w, int? unitLine, int depth, int ifBase)
@@ -285,10 +323,13 @@ public static class TemplateInstances
             code.Clear();
             if (!s.Contains('(')) return;
             w.Asked.Clear();   // the trail has grown since
+            int at = 0, lines = 0;   // newlines before the match, counted on from the last (a copy of s up to each match is the square of it)
             foreach (Match m in MacroNamedHead.Matches(s))
             {
                 if (w.Lookup(m.Groups[1].Value) is null) continue;
-                var line = unitLine ?? codeStartLine + s[..m.Index].Count(c => c == '\n');
+                lines += s.AsSpan(at, m.Index - at).Count('\n');
+                at = m.Index;
+                var line = unitLine ?? codeStartLine + lines;
                 foreach (var name in Names(m.Groups[1].Value + "(" + m.Groups[2].Value + ")", w.Lookup)) w.Found.Add((name, line));
             }
         }
@@ -386,7 +427,7 @@ public static class TemplateInstances
     {
         var c = s.IndexOf("//", StringComparison.Ordinal);
         if (c >= 0) s = s[..c];
-        return Regex.Replace(s, @"/\*.*?\*/", " ");
+        return s.Contains("/*", StringComparison.Ordinal) ? Regex.Replace(s, @"/\*.*?\*/", " ") : s;
     }
 
     static readonly Regex Token = new(@"[A-Za-z_]\w*|\d\w*|""(?:[^""\\]|\\.)*""|'(?:[^'\\]|\\.)*'|##|\S", RegexOptions.Compiled);

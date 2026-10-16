@@ -69,7 +69,7 @@ public static class ReadAhead
                     lock (gate) { failed ??= System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex); stop = true; Monitor.PulseAll(gate); }
                     return;
                 }
-                lock (gate) { results[i] = r; done[i] = true; Monitor.PulseAll(gate); }
+                lock (gate) { results[i] = r; done[i] = true; Activity.Ready(1); Monitor.PulseAll(gate); }
             }
         }
         var workers = new Task[Math.Min(Window, Math.Max(1, n))];
@@ -85,6 +85,7 @@ public static class ReadAhead
                     failed?.Throw();
                     value = results[cursor];
                     results[cursor] = default!;
+                    Activity.Ready(-1);
                     cursor++;
                     Monitor.PulseAll(gate);
                 }

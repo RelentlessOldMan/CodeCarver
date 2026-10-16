@@ -373,6 +373,9 @@ public static class CarveCommand
         var _memoryStop = (cv.MemoryStopMb ?? 0) * 1024 * 1024;
         // The parse, pre-pass and check budgets are fractions of this when it is less than the machine.
         CodeCarver.Core.Util.MemoryGate.RunLimitBytes = _memoryStop;
+        // TEMPORARY (C20/C21): a line for each file one part of the check's work allocated 256 MB or more on.
+        if (Environment.GetEnvironmentVariable("CODECARVER_DEBUG_ONLY") is { Length: > 0 } || Environment.GetEnvironmentVariable("CODECARVER_DEBUG_CHECKMEM") == "1")
+            CodeCarver.Core.Util.Activity.DebugSink = line => { lock (err) err.WriteLine($"  debug   : {line}"); };
         var _stopping = 0;
         var _memGate = new object();
         void NoteMemory(long priv, long workingSet, (long Total, long Free, long CommitFree)? machine)
@@ -1639,6 +1642,43 @@ public static class CarveCommand
             }
         }
         Mark("input+refscan"); // reference includes, unity-build .c detection, build scripts
+
+        // TEMPORARY (C20/C21 memory spike): CODECARVER_DEBUG_ONLY=check-emitted | check-dropped | check runs only the
+        // link check's per-file loops over every code file of the tree, here, without parsing or carving - minutes
+        // instead of the hour before the check. What it finds means nothing; its memory, time and part.* keys do.
+        if (Environment.GetEnvironmentVariable("CODECARVER_DEBUG_ONLY") is "check" or "check-emitted" or "check-dropped" && lang is "c" or "cpp")
+        {
+            var only = Environment.GetEnvironmentVariable("CODECARVER_DEBUG_ONLY")!;
+            var code = parseRels.OrderBy(r => r, StringComparer.Ordinal)
+                                .Select(r => (Rel: r, Path: fullByRel.TryGetValue(r, out var fp) ? fp : Path.Combine(dir, r))).ToList();
+            // The check scans its emitted files only when something was dropped: every 50th file dropped puts nearly the
+            // whole tree through the emitted loop (check-emitted), every file but every 50th through the dropped loop
+            // (check-dropped), and every 3rd dropped is about work's mix (check).
+            bool Drop(int i) => only switch { "check-emitted" => i % 50 == 0, "check-dropped" => i % 50 != 0, _ => i % 3 == 0 };
+            var onlyDropped = code.Where((_, i) => Drop(i)).ToList();
+            var onlyEmitted = code.Where((_, i) => !Drop(i)).ToList();
+            err.WriteLine($"debug   : CODECARVER_DEBUG_ONLY={only} - only the link check: {onlyEmitted.Count:N0} code file(s) as emitted, "
+                          + $"{onlyDropped.Count:N0} as dropped; no carve (its findings mean nothing, its memory and time do)");
+            Func<string, string, bool[]?>? onlyDead = defines is null && perFileDefines is null ? null
+                : (rel, text) => (perFileDefines?.Invoke(rel) ?? defines) is { } t ? PreprocessorScanner.DeadLineMap(text, t, closedWorld) : null;
+            var debugKeys = new SortedDictionary<string, object?>(StringComparer.Ordinal) { ["codecarverVersion"] = Version(), ["debug.only"] = only, ["debug.files"] = (long)code.Count, ["debug.emitted"] = (long)onlyEmitted.Count, ["debug.dropped"] = (long)onlyDropped.Count };
+            var onlyClock = System.Diagnostics.Stopwatch.StartNew();
+            var onlyResult = EmittedLinkCheck.Run(onlyEmitted, onlyDropped, onlyDead, maxParseBytes,
+                                                  commandLineMacros: commandLineMacros, report: (k, v) => debugKeys[$"debug.check.{k}"] = v);
+            debugKeys["debug.checkMs"] = onlyClock.ElapsedMilliseconds;
+            debugKeys["debug.checkedFiles"] = (long)onlyResult.FilesChecked;
+            using (var self = System.Diagnostics.Process.GetCurrentProcess())
+            {
+                debugKeys["debug.peakPrivateMb"] = Math.Max(_runPeakPrivate, self.PrivateMemorySize64) >> 20;
+                debugKeys["debug.peakWorkingSetMb"] = self.PeakWorkingSet64 >> 20;
+            }
+            var debugPath = Path.Combine(outputFull, "codecarver", "debug-only-summary.txt");
+            Directory.CreateDirectory(Path.GetDirectoryName(debugPath)!);
+            File.WriteAllText(debugPath, "# CodeCarver CODECARVER_DEBUG_ONLY run - numbers only: no path, file name or symbol. Safe to send back.\n"
+                + string.Concat(debugKeys.Select(kv => $"{kv.Key} = {SummaryValue(kv.Value)}\n")));
+            err.WriteLine($"debug   : done in {onlyClock.Elapsed.TotalSeconds:N0} s, peak private {debugKeys["debug.peakPrivateMb"]:N0} MB -> {debugPath}");
+            return 0;
+        }
 
         // Sign of life for a large tree so a multi-minute analyze isn't a silent black box (and you can see
         // how far it got if it's interrupted). CODECARVER_TIMING=1 adds a per-phase + slow-file breakdown.
@@ -3207,6 +3247,8 @@ public static class CarveCommand
             var (inFlight, largest) = CodeCarver.Core.Util.Activity.InHand;
             snap["stop.inHandKb"] = inFlight >> 10;          // files being scanned when it stopped
             snap["stop.largestFileInStepKb"] = largest >> 10;
+            // What each part of the step's per-file work allocated so far, and how many of each were running.
+            foreach (var (k, v) in CodeCarver.Core.Util.Activity.Parts()) snap[$"stop.{k}"] = v;
             snap["exitCode"] = StoppedForMemoryExit;
             err.WriteLine($"memory  : STOPPED - private memory {priv / MB:N0} MB passed memoryStopMb = {_memoryStop / MB:N0} in the step after '{step}' (run {Clock(runAt)})");
             err.WriteLine($"  memory  : {MemoryLine(priv, workingSet, machine)}");

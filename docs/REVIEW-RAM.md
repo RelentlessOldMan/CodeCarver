@@ -12,13 +12,16 @@ HYPOTHESIS = consistent with the evidence, not reproduced.
 - The link check was the largest avoidable peak: on regtree (65 register headers, 228 MB) its dropped-files loop peaked
   at 2.7 GB. Three fixes (M1-M3) bring the run's peak to 1.47 GB (-46% against the 1.0.283 baseline) and the check runs
   faster too.
-- M3 matters most for work: every memory budget (parse, macro pre-pass, check scans, held header text) was a fraction
-  of the MACHINE's memory, whatever memoryStopMb said. On a large work machine the check's scans were sized for many
-  times the stop. That is the likeliest cause of C19 (stopped 119 files into the dropped-files loop at 21 GB private, 19
-  GB managed).
-- The C20 spike (11.7 -> 21.3 GB in 90 s, emitted-files loop) is most likely the quadratic #define join that 1.0.241
-  removed (14 GB allocated in that loop, now 0.9 GB): short-lived strings that size go to the large object heap, which
-  only a full collection frees (M4, HYPOTHESIS; C21's stop.* keys tell if it is not).
+- M3: every memory budget (parse, macro pre-pass, check scans, held header text) was a fraction of the MACHINE's
+  memory, whatever memoryStopMb said. The work machine has 32 GB and stops at 20 GB, so the budgets were 1.6x the stop's
+  share: real, but not by itself the cause of C19 (an earlier draft of this report assumed a 128 GB machine; wrong).
+- The C20/C21 spike (12 -> 21 GB in 90 s, 347 files into the emitted-files loop, 0.5 MB of files in hand, 18 GB
+  managed) is the template walk (M9, CONFIRMED locally by allocation; work run pending). A walk reads a file's whole
+  include closure; a header the check could not hold (work held its 1 GB budget) is read again, a new string, so the
+  parse cached per string missed and every walk re-parsed every header it reached, at 35x the header text, up to 64
+  walks at once, none of it counted by the scan gate. Two fixes: the parse reads by hand (35x -> 6.5x), and walks that
+  re-read take their measured cost from a walk budget (an 8th of the run limit). M4 (the 1.0.241 quadratic join) was
+  WRONG: C21 ran on 1.0.283 and spiked the same way.
 
 ## B. Memory architecture overview
 
@@ -49,7 +52,8 @@ HYPOTHESIS = consistent with the evidence, not reproduced.
 | M3 | Memory budgets sized from the machine, not memoryStopMb | CONFIRMED | regtree 2217 -> 1465 MB; scales with machine size | fixed |
 | M1 | Check tokenizer list presized at a token per 4 chars | CONFIRMED | 227 MB of headers -> ~900 MB of list for 10 tokens | fixed |
 | M2 | Check reads via File.ReadAllText (text held twice, 4 KB reads) | CONFIRMED | -10..30% check allocation | fixed |
-| M4 | C20 emitted-loop spike = large-object garbage of the quadratic join | HYPOTHESIS | 9.6 GB at work | fixed in 1.0.241; C21 confirms |
+| M9 | Template walk re-parses every header not held, 35x its text, 64 walks at once, ungated | CONFIRMED (local alloc) | C20/C21: 12 -> 21 GB in 90 s | fixed: hand parse + walk budget |
+| M4 | C20 spike = large-object garbage of the quadratic join | WRONG | - | C21 spiked the same on 1.0.283 |
 | M5 | GC headroom: heap ~2.5x live data | CONFIRMED | mactree 1.44 GB heap for 0.58 GB live | knob documented, no default change |
 | M6 | A define table per logged TU, identical ones not shared | HYPOTHESIS | ~+13 MB on L; work: TUs x specs | deferred |
 | M7 | LineMaps clones the define table per file scanned | CONFIRMED (alloc) | small per file | deferred |
@@ -61,7 +65,7 @@ Cut line: M1-M3 ship now; M5 as documentation. Below the line: M6-M8 (transient 
 
 **M3 - budgets ignore memoryStopMb.** `MemoryGate.MachineBytes()` fed ParseMemory (1/4), the pre-pass and check scan
 gates (1/8), ScanBudget (1/512 of file bytes in flight; a scan holds ~35x its file), ReadBudget and HeaderTextBudget
-(1/32). A run told to stop at 20 GB on a 128 GB machine let the check's scans hold ~9 GB at once. Fix:
+(1/32). A run told to stop at 20 GB on a 32 GB machine had budgets sized for 32. Fix:
 `MemoryGate.RunLimitBytes` (set from memoryStopMb at the start of a run) and `BudgetBytes()` = the lesser, used by every
 budget. Budgets only decide when work runs, never what it finds (the check's results are unchanged; a header not held is
 read again). Cost: with a low stop the parse runs fewer large files at once (mactree build-graph 29.4 -> 33.6 s in one
@@ -76,8 +80,17 @@ next to the string (2x the text for a large file) in 4 KB reads. Now `IoMeter.Re
 pooled buffer and, new, decodes a large Latin-1 file straight into its string (no builder) unless a byte-order mark says
 otherwise.
 
-**M4 - C20.** See A. If C21 stops again in the emitted loop, `stop.inHandKb` / `stop.largestFileInStepKb` separate data
-in flight from heap headroom.
+**M9 - template walk (C20/C21).** Found by `Activity.Part` (allocation per part of a check loop's per-file work) and
+`CODECARVER_DEBUG_ONLY=check-emitted` (the link check alone, in seconds). On tmpltree one walk that pulled in 27 headers
+(28 MB of directive text) allocated 1,011 MB; the profile put 950 MB of it in `TemplateInstances.Parse`, 670 MB of that
+the Match/Group objects of the Directive/Conditional/DefineHead regexes run on every #define. The parse is cached per
+header string; a header past HeaderTextBudget is read again for each walk (a new string) and so parsed again for each
+walk. Fixes: the parse reads each line in place by hand (same answers: TemplateParseTests runs the old regex parse
+beside it), 1,011 -> 184 MB; once a header was not held, a walk takes from a walk budget (an 8th of the run limit,
+`CODECARVER_CHECK_WALK_MB`) what the largest re-reading walk allocated, the first one running alone to size the rest.
+Keys: `check.walkWaits`, `check.walkCostMaxMb`, and `check.<loop>.part.<part>.allocatedMb/itemMaxMb/items/pulledIn/pulledInMb`.
+
+**M4 - C20 = the quadratic join. WRONG.** C21 ran on 1.0.283 (join fixed) and spiked the same way.
 
 **M5 - GC headroom.** ConserveMemory 9: peak -16% (mactree 1841 -> 1547) and -12% (L) but build-graph +23..50%; gen0size
 16 MB: no gain. Left at 7; `DOTNET_GCConserveMemory=9` is the knob for a memory-tight machine (USAGE).
@@ -112,17 +125,19 @@ MacroTable/LineMaps, per-TU define tables. Not audited line by line: the CLI's e
 
 ## J. Remaining unknowns
 
-C20's spike (M4) not reproduced locally. Work-scale graph floor (3M macro nodes) estimated, not measured.
+M9 is confirmed by allocation on a local tree, not yet by a work run (CODECARVER_DEBUG_ONLY=check-emitted on the work tree says). Work-scale graph floor (3M macro nodes) estimated, not measured.
 
 ## K. Fixes applied
 
 | ID | Version | Test |
 |---|---|---|
-| M1, M2, M3 | (this commit) | IoMeterTests.LargeLatin1Reads_DecodeExactlyAsFileDoes; StreamingCheckTests.Budgets_AreFractionsOfTheRunLimit_WhenItIsLessThanTheMachine; full suite |
+| M1, M2, M3 | 1.0.284 | IoMeterTests.LargeLatin1Reads_DecodeExactlyAsFileDoes; StreamingCheckTests.Budgets_AreFractionsOfTheRunLimit_WhenItIsLessThanTheMachine; full suite |
+| M9 | (this commit) | TemplateParseTests.HandParse_ReadsDirectivesAsTheRegexesDid; StreamingCheckTests.LinkCheck_WalksThatReadHeadersAgain_WaitForTheWalkBudget_SameAnswer; full suite |
 
 Measured (run peak private MB, 1.0.283 -> with M1-M3): regtree 2699 -> 1465, bigtree 993 -> 971, L 1630 -> 1560,
 mactree 1602 -> 1841 (GC noise: same live data, check allocation -31%).
 
 ## L. Changes to documented behavior
 
-memoryStopMb now also caps the memory budgets (parse, pre-pass, check), not only the stop.
+memoryStopMb now also caps the memory budgets (parse, pre-pass, check), not only the stop. New: CODECARVER_CHECK_WALK_MB
+(the template walk budget), and two temporary debug switches, CODECARVER_DEBUG_ONLY and CODECARVER_DEBUG_CHECKMEM (USAGE).
