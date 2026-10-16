@@ -1256,6 +1256,37 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <summary>Resolve an #include the way the compiler would (P1). Quoted: beside the includer first (gcc's
     /// rule, exact even without a build log). Then the file's -I directories: for a TU with its own command the
     /// FIRST hit is what the compiler opens; with a union of directories every hit is kept (sound).</summary>
+    private static readonly Regex ComputedIncludeLine = new(@"^\s*#\s*include(?:_next)?\s+(?<op>[A-Za-z_].*?)\s*(?://.*|/\*.*)?$", RegexOptions.Compiled);
+    private static readonly Regex DefineLine = new(@"^[ \t]*#[ \t]*define[ \t]+(?<n>[A-Za-z_]\w*)(?<p>\([^)]*\))?[ \t]*(?<b>.*?)[ \t]*\r?$",
+                                                   RegexOptions.Compiled | RegexOptions.Multiline);
+
+    /// <summary>The files a computed <c>#include OPERAND</c> in <paramref name="includer"/> may name (review E3): its operand
+    /// expanded through the file's own #defines, the build's -D macros and the tree's function-like macros. A tree macro
+    /// whose value isn't followed matches any text, so every file it could be is included (sound, may over-keep).</summary>
+    private List<string> ComputedIncludeTargets(string includer, string text, string operand, Dictionary<string, NodeId> files)
+    {
+        var local = new Dictionary<string, List<(IReadOnlyList<string>? Params, string Body)>>(StringComparer.Ordinal);
+        foreach (Match d in DefineLine.Matches(text))
+        {
+            if (!local.TryGetValue(d.Groups["n"].Value, out var l)) local[d.Groups["n"].Value] = l = new();
+            IReadOnlyList<string>? ps = d.Groups["p"].Success
+                ? d.Groups["p"].Value.Trim('(', ')').Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                : null;
+            l.Add((ps, d.Groups["b"].Value));
+        }
+        IReadOnlyList<(IReadOnlyList<string>? Params, string Body)>? Lookup(string n)
+        {
+            if (local.TryGetValue(n, out var l)) return l;
+            if (CommandLineMacros is { } clm && clm.TryGetValue(n, out var c)) return c.Select(v => ((IReadOnlyList<string>?)v.Params, v.Body)).ToList();
+            return FunctionMacro(n)?.Select(f => ((IReadOnlyList<string>?)f.Params, f.Body)).ToList();
+        }
+        var name = ComputedInclude.Expand(operand, Lookup, n => _objectMacros.Contains(n) || _funcLikeMacroNames.Contains(n));
+        if (string.IsNullOrWhiteSpace(name)) return new List<string>();
+        if (!name.Contains(ComputedInclude.Unknown) && ResolveInclude(includer, name, true, files) is { Count: > 0 } exact) return exact;
+        var pattern = ComputedInclude.PathPattern(name);
+        return files.Keys.Where(k => pattern.IsMatch(k)).ToList();
+    }
+
     private List<string> ResolveInclude(string includer, string raw, bool quoted, Dictionary<string, NodeId> files)
     {
         var hits = new List<string>();
@@ -2456,7 +2487,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (dead is not null && li + 1 < dead.Length && dead[li + 1]) continue;
             if (!IncludeShaped(srcLines.Span(li))) continue;   // no line string made for every other line
             var m = IncludeLine.Match(srcLines[li]);
-            if (!m.Success) continue;
+            if (!m.Success)
+            {
+                // `#include XSTR(IMPL_FILE)`: the file it names, expanded (review E3).
+                if (ComputedIncludeLine.Match(srcLines[li]) is { Success: true } cm)
+                    foreach (var tp in ComputedIncludeTargets(path, text, cm.Groups["op"].Value, fileNodeByPath))
+                        if (tp != path) graph.AddEdge(fileNode, w.FileNode(tp), EdgeKind.Includes);
+                continue;
+            }
             var raw = m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value;
             // P1: resolve like the compiler — beside the includer (quoted form), then the TU's -I dirs in order —
             // and only when that finds nothing fall back to every file with the basename (sound, may over-keep).
