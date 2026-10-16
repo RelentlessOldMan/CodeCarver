@@ -2309,7 +2309,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         if (!_cGrammar && IsTranslationUnit(path) && text.Contains("default", StringComparison.Ordinal))
             foreach (Match m in DefaultedOutOfLine.Matches(text))
             {
-                var line = 1 + text.AsSpan(0, m.Index).Count('\n');
+                var line = srcLines.LineOf(m.Index);
                 if (dead is not null && line < dead.Length && dead[line]) continue;
                 var cls = m.Groups["cls"].Value;
                 var dtor = m.Groups["tilde"].Success;
@@ -2626,8 +2626,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         {
             var name = m.Groups["name"].Value;
             if (Keywords.Contains(name)) continue;
-            var ln = 1;
-            for (var k = 0; k < m.Groups["name"].Index && k < text.Length; k++) if (text[k] == '\n') ln++;
+            var ln = srcLines.LineOf(m.Groups["name"].Index);   // review CPU C14: was a count from offset 0 per match
             if (dead is not null && ln < dead.Length && dead[ln]) continue;
             var aid = graph.GetOrAddNode(NodeKind.Function, name, path, new SourceSpan(ln, ln));
             graph.AddEdge(aid, fileNode, EdgeKind.DefinedIn);
@@ -2644,8 +2643,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         void LinkerName(string cname, string sym, int index)
         {
             if (Keywords.Contains(cname)) return;
-            var ln = 1;
-            for (var k = 0; k < index && k < text.Length; k++) if (text[k] == '\n') ln++;
+            var ln = srcLines.LineOf(index);
             if (dead is not null && ln < dead.Length && dead[ln]) return;
             var bodyHere = functionsByName.TryGetValue(cname, out var have) && have.Any(h => graph.GetNode(h).FilePath == path);
             var (defined, target) = bodyHere ? (sym, cname) : (cname, sym);
@@ -2662,8 +2660,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             foreach (var (name, index) in CodeCarver.Core.Frontend.AsmSymbols.DefinedLabels(text))
             {
                 if (Keywords.Contains(name) || (functionsByName.TryGetValue(name, out var have) && have.Any(h => graph.GetNode(h).FilePath == path))) continue;
-                var ln = 1;
-                for (var k = 0; k < index && k < text.Length; k++) if (text[k] == '\n') ln++;
+                var ln = srcLines.LineOf(index);
                 if (dead is not null && ln < dead.Length && dead[ln]) continue;
                 var aid = graph.GetOrAddNode(NodeKind.Function, name, path, new SourceSpan(ln, ln));
                 graph.AddEdge(aid, fileNode, EdgeKind.DefinedIn);
@@ -2739,8 +2736,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         {
             void Implicit(int index, params string[] callees)
             {
-                var line = 1;
-                for (var k = 0; k < index && k < text.Length; k++) if (text[k] == '\n') line++;
+                var line = srcLines.LineOf(index);
                 if (dead is not null && line < dead.Length && dead[line]) return;
                 var from = Enclosing(line) ?? fileNode;
                 foreach (var c in callees) pendingCalls.Add((from, c));

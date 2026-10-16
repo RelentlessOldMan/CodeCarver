@@ -21,6 +21,14 @@ internal sealed class TextLines
 
     public int Length => _starts.Length;
 
+    /// <summary>The 1-based line holding <paramref name="offset"/> (1 + the newlines before it; past the end, the last
+    /// line): a search over the line starts, where counting from offset 0 cost a pass over the text per match.</summary>
+    public int LineOf(int offset)
+    {
+        var i = Array.BinarySearch(_starts, Math.Clamp(offset, 0, _text.Length));
+        return i >= 0 ? i + 1 : ~i;
+    }
+
     public string this[int line] => _text.Substring(_starts[line], End(line) - _starts[line]);
 
     /// <summary>The line's characters, without making a string.</summary>
