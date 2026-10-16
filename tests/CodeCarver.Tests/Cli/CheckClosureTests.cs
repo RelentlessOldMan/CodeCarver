@@ -221,4 +221,22 @@ public sealed class CheckClosureTests
             Assert.Contains("KEPT modd_helper", File.ReadAllText(Path.Combine(t.Root, "out", s, "codecarver", "verify.txt")));
         }
     }
+
+    /// <summary>Review B11: the console printed the plan before the check closed over it: helper.c, added back by the
+    /// check and written, was listed as dropped.</summary>
+    [Fact]
+    public void Console_ReportsTheFilesTheStageWrote()
+    {
+        using var t = new TreeCarve();
+        t.W("main.c", "#define RUN_HELPER() modd_helper()\nint main(void){ return 0; }\n")
+         .W("helper.c", "int modd_helper(void){ return 1; }\n")
+         .W("dead.c", "int modd_dead(void){ return 2; }\n");
+        var (code, o, e) = t.Carve();
+        Assert.True(code == 0, o + e);
+        var dropped = o.Split('\n').Where(l => l.TrimStart().StartsWith("dropped :", StringComparison.Ordinal)).ToList();
+        Assert.NotEmpty(dropped);
+        Assert.All(dropped, l => Assert.DoesNotContain("helper.c", l));
+        Assert.Contains("2/3 kept, 1 dropped", o);
+        Assert.DoesNotContain("1/3 kept", o);
+    }
 }

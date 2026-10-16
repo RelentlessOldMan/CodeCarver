@@ -2771,7 +2771,8 @@ public static class CarveCommand
             @out.WriteLine($"  config  : {defineSpecs.Distinct().Count()} define(s), #ifdef resolution ON" +
                               (closedWorld ? " (closed-world: absent macros treated as undefined)" : " (open-world: unknown branches kept)"));
         @out.WriteLine($"  nodes   : {s.ReachedNodes}/{s.TotalNodes} kept ({s.NodeKeepRatio:0%}), {s.DroppedNodes} carved");
-        @out.WriteLine($"  files   : {s.KeptFiles}/{s.TotalFiles} kept, {s.DroppedFiles} dropped");
+        // A stage prints its own files/dropped once its plan is final (review B11); an analysis-only run prints the plan here.
+        if (cv.AnalysisOnly) @out.WriteLine($"  files   : {s.KeptFiles}/{s.TotalFiles} kept, {s.DroppedFiles} dropped");
         if (bigFiles.Count > 0)
             @out.WriteLine($"  big     : {bigFiles.Count} file(s) > {maxParseBytes:N0} B not parsed (kept whole via #include-closure): "
                               + Summarize(bigFiles.OrderByDescending(b => b.Bytes).Select(b => $"{b.Rel} ({b.Bytes:N0} B)").ToList()));
@@ -2782,7 +2783,7 @@ public static class CarveCommand
         if (budgetKept.Count > 0)
             @out.WriteLine($"  budget  : {budgetKept.Count} file(s) over the per-file symbol budget auto-kept-whole (would explode the graph — a shape the dense/big skips missed): "
                               + Summarize(budgetKept.OrderByDescending(b => b.Symbols).Select(b => $"{b.Path} ({b.Symbols:N0} symbols)").ToList()));
-        if (plan.DroppedFiles.Count > 0)
+        if (cv.AnalysisOnly && plan.DroppedFiles.Count > 0)
             @out.WriteLine("  dropped : " + Summarize(plan.DroppedFiles));
 
         // --- Secondary .cmm trace-seeded closure (infrastructure tightening) --------------------------------
@@ -3076,7 +3077,10 @@ public static class CarveCommand
             foreach (var v in notBuiltOnly) sb.AppendLine($"NOTE {v.Name}\tused {v.ReferencedIn}:{v.Line}\tdefined only in never-compiled {string.Join(", ", v.DefinedInAll)}");
             Directory.CreateDirectory(ccDir);
             WriteArtifact(Path.Combine(ccDir, "verify.txt"), sb.ToString(), "verifylog");
-            if (hard.Count == 0)
+            if (hard.Count == 0 && r.FilesChecked == 0 && r.FilesSkipped == 0)
+                // Not "0 file(s) checked", which reads as a check that didn't run (review B11).
+                @out.WriteLine("  verify  : OK — no file was dropped and no definition removed, so no use can be left without one");
+            else if (hard.Count == 0)
                 @out.WriteLine($"  verify  : OK — emitted code uses no function or variable defined only in a dropped file ({r.FilesChecked} file(s) checked)");
             else
             {
@@ -3556,6 +3560,9 @@ public static class CarveCommand
             }
             var carvedBytes = res.BytesWritten;
             var buildRequiredFiles = res.Written;
+            // What this stage wrote: its own plan, after the check closed over it (review B11), not the reachability plan above.
+            @out.WriteLine($"  files   : {splan.Stats.KeptFiles}/{splan.Stats.TotalFiles} kept, {splan.Stats.DroppedFiles} dropped");
+            if (splan.DroppedFiles.Count > 0) @out.WriteLine("  dropped : " + Summarize(splan.DroppedFiles));
             @out.WriteLine($"  emitted : {res.FilesWritten} files -> {outDir}  [{(prune ? "intra-file (unused functions removed)" : "file-level (whole kept files)")}]");
             if (prune) @out.WriteLine("  note    : carveSourceFileContents is EXPERIMENTAL — always build-verify.");
 
