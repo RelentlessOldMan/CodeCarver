@@ -22,18 +22,22 @@ public sealed class ConstructorGate
     readonly HashSet<string> _scanned = new(StringComparer.Ordinal);
     readonly HashSet<string> _released = new(StringComparer.Ordinal);
 
-    public ConstructorGate(CodeGraph graph)
+    /// <param name="companions">Functions that run with a class's objects without being called by name - its
+    /// operators, conversions and destructor (review X2) - released with its constructors.</param>
+    public ConstructorGate(CodeGraph graph, IEnumerable<(NodeId Id, string Class)>? companions = null)
     {
         ArgumentNullException.ThrowIfNull(graph);
         var typeNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var n in graph.Nodes)
             if (n.Kind == NodeKind.Type) typeNames.Add(n.Name);
+        void Govern(string type, NodeId id)
+        {
+            if (!_ctorsByType.TryGetValue(type, out var l)) _ctorsByType[type] = l = new List<NodeId>();
+            l.Add(id);
+        }
         foreach (var n in graph.Nodes)
-            if (n.Kind == NodeKind.Function && typeNames.Contains(n.Name))
-            {
-                if (!_ctorsByType.TryGetValue(n.Name, out var l)) _ctorsByType[n.Name] = l = new List<NodeId>();
-                l.Add(n.Id);
-            }
+            if (n.Kind == NodeKind.Function && typeNames.Contains(n.Name)) Govern(n.Name, n.Id);
+        foreach (var (id, cls) in companions ?? Array.Empty<(NodeId, string)>()) Govern(cls, id);
     }
 
     /// <summary>Number of constructor nodes the gate governs.</summary>

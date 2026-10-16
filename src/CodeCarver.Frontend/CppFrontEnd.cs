@@ -13,6 +13,8 @@ namespace CodeCarver.Frontend;
 /// </summary>
 public sealed class CppFrontEnd() : TreeSitterFrontEnd("tree-sitter-cpp", "tree_sitter_cpp", DefsQuery, CallsQuery)
 {
+    // Operators, conversions and destructors (review X2) are definitions too: nothing calls them by name, so each is
+    // tied to its class (see TreeSitterFrontEnd.ClassCompanions) and runs when one is made.
     // `ns::Widget::draw` nests one qualified_identifier per scope, and a query can't recurse, so each depth
     // (up to 4 scopes) is spelled out. With only the one-scope pattern an out-of-line method of a class in a
     // namespace never became a node: its file was dropped while a call still needed it, and verify, which
@@ -25,6 +27,15 @@ public sealed class CppFrontEnd() : TreeSitterFrontEnd("tree-sitter-cpp", "tree_
         (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (identifier) @function)))
         (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @function))))
         (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @function)))))
+        (function_declarator declarator: (operator_name) @function)
+        (function_declarator declarator: (destructor_name) @function)
+        (function_declarator declarator: (qualified_identifier name: (operator_name) @function))
+        (function_declarator declarator: (qualified_identifier name: (destructor_name) @function))
+        (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (operator_name) @function)))
+        (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (destructor_name) @function)))
+        (function_definition declarator: (operator_cast) @function)
+        (function_definition declarator: (qualified_identifier name: (operator_cast) @function))
+        (function_definition declarator: (qualified_identifier name: (qualified_identifier name: (operator_cast) @function)))
         (class_specifier name: (type_identifier) @class)
         (struct_specifier name: (type_identifier) @struct)
         (enum_specifier name: (type_identifier) @enum)

@@ -84,6 +84,15 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // C++ namespace-scope objects whose initialization may run code at start-up (review X1): the class whose
     // constructor would run, or "" when the initializer itself calls something.
     private readonly List<(NodeId Id, string Class)> _startupObjects = new();
+    private readonly List<(NodeId Id, string Class)> _companions = new();
+
+    /// <summary>
+    /// C++ operators, conversions and destructors with the class whose objects run them (review X2): <c>a + b</c>,
+    /// <c>if (m)</c>, the end of a scope call no name. The CLI's constructor gate keeps each one when its class is
+    /// instantiated in emitted code, as it does the class's constructors. A free operator is listed under each of its
+    /// parameters' classes.
+    /// </summary>
+    public IReadOnlyList<(NodeId Id, string Class)> ClassCompanions => _companions;
     // Per object-like macro defined EMPTY, the names the #if conditions around that definition test; and, for the
     // EXTERN-style macros, all of them: the flags a unit #defines (or gets by -D) to turn EXTERN off.
     private readonly Dictionary<string, HashSet<string>> _emptyDefineConditions = new(StringComparer.Ordinal);
@@ -493,6 +502,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _callFreeMacros.Clear();
         _headerData.Clear();
         _startupObjects.Clear();
+        _companions.Clear();
         _emptyDefineConditions.Clear();
         _condExternFlags.Clear();
         _definesExternFlag.Clear();
@@ -1525,6 +1535,55 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         return ClassName(type) ?? "?";
     }
 
+    private static readonly Regex Spaces = new(@"\s+", RegexOptions.Compiled);
+    private static readonly Regex DefaultedOutOfLine = new(
+        @"(?<!\w)(?<cls>[A-Za-z_]\w*)\s*::\s*(?<tilde>~\s*)?\k<cls>\s*\([^;{}()]*\)\s*(?:noexcept\s*)?=\s*default\s*;",
+        RegexOptions.Compiled);
+    private static readonly Regex OperatorSymbol = new(@"^operator\s*(?=[^\w\s])", RegexOptions.Compiled);
+
+    /// <summary>The node name of an operator, conversion or destructor definition: <c>operator+</c>,
+    /// <c>operator new</c>, <c>operator double</c>, <c>~Vec</c>.</summary>
+    private static string OperatorName(TsNode n) => n.Type switch
+    {
+        "operator_cast" => "operator " + Spaces.Replace(n.GetChildForField("type")?.Text ?? "", " "),
+        "destructor_name" => Spaces.Replace(n.Text, ""),
+        _ => OperatorSymbol.Replace(Spaces.Replace(n.Text, " "), "operator"),
+    };
+
+    /// <summary>
+    /// The classes whose objects run an operator, conversion or destructor without naming it: the destructor's
+    /// class, the class it is a member of (qualified out of line, or defined in the class body), or for a free
+    /// operator each parameter's class. Empty: no class at all (a replacement <c>operator new</c>).
+    /// </summary>
+    private static List<string> OperatorClasses(TsNode nameNode)
+    {
+        var classes = new List<string>();
+        if (nameNode.Type == "destructor_name")
+        {
+            classes.Add(Spaces.Replace(nameNode.Text, "").TrimStart('~'));
+            return classes;
+        }
+        if (Up(nameNode) is { Type: "qualified_identifier" } q && q.GetChildForField("scope") is { } scope)
+        {
+            if ((scope.Type == "template_type" ? scope.GetChildForField("name")?.Text : scope.Text) is { Length: > 0 } s)
+                classes.Add(s);
+            return classes;
+        }
+        for (var (p, i) = (Up(nameNode), 0); p is not null && i < 8; p = Up(p), i++)
+        {
+            if (p.Type is "class_specifier" or "struct_specifier" or "union_specifier")
+            {
+                if (p.GetChildForField("name") is { } cn) classes.Add(ClassName(cn) ?? cn.Text);
+                return classes;
+            }
+            if (p.Type is "translation_unit" or "declaration_list" or "compound_statement") break;
+        }
+        if (Up(nameNode) is { Type: "function_declarator" } fd && fd.GetChildForField("parameters") is { } ps)
+            foreach (var param in NodeKids.Named(ps))
+                if (ClassName(param.GetChildForField("type")) is { } c && !classes.Contains(c)) classes.Add(c);
+        return classes;
+    }
+
     /// <summary>The last name of a type: <c>Registrar</c>, <c>ns::Registrar</c> and <c>Registry&lt;int&gt;</c> name a class.</summary>
     private static string? ClassName(TsNode? type)
     {
@@ -1796,6 +1855,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         public readonly List<NodeId> FileLocal = new();
         public readonly List<(NodeId Id, string Header, bool CondExtern)> HeaderData = new();
         public readonly List<(NodeId Id, string Class)> StartupObjects = new();
+        public readonly List<(NodeId Id, string Class)> Companions = new();
         public readonly List<(NodeId File, string Macro, List<string> Names)> WordInvocations = new();
         public bool DefinesExternFlag, Unparsed;
         public int? BudgetSymbols;
@@ -1893,6 +1953,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         foreach (var id in w.FileLocal) _fileLocal.Add(M(id));
         foreach (var (id, header, condExtern) in w.HeaderData) _headerData.Add((M(id), header, condExtern));
         foreach (var (id, cls) in w.StartupObjects) _startupObjects.Add((M(id), cls));
+        foreach (var (id, cls) in w.Companions) _companions.Add((M(id), cls));
         foreach (var (file, macro, names) in w.WordInvocations) _wordInvocations.Add((M(file), macro, names));
         if (w.DefinesExternFlag) _definesExternFlag.Add(path);
         if (w.Unparsed) _unparsed.Add(path);
@@ -2005,7 +2066,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         {
             var node = cap.Node;
             if (IsDead(node)) continue;
-            var name = node.Text;
+            var isOperator = node.Type is "operator_name" or "destructor_name" or "operator_cast";
+            var name = isOperator ? OperatorName(node) : node.Text;
             var row = node.StartPosition.Row + 1;
 
             if (cap.Name == "function")
@@ -2026,6 +2088,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 // calls this one by name. It stays whenever its file does.
                 if (_macroNamedHeaders.Contains(path) || (_funcLikeMacroNames.Contains(name) && ComputedName(node)))
                     graph.AddEdge(fileNode, fid, EdgeKind.References);
+                if (isOperator)
+                {
+                    var classes = OperatorClasses(node);
+                    if (classes.Count == 0) graph.AddFlag(fid, NodeFlags.Keep);   // a replacement operator new/delete
+                    foreach (var c in classes) w.Companions.Add((fid, c));
+                }
             }
             else if (cap.Name == "macro")
             {
@@ -2049,6 +2117,20 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(tid, fileNode, EdgeKind.DefinedIn);
             }
         }
+        // `Shape::~Shape() = default;` out of line parses as an expression, not a definition, yet the compiler defines
+        // the destructor here, and with it the class's vtable when it is the first virtual member (review X2).
+        if (!_cGrammar && IsTranslationUnit(path) && text.Contains("default", StringComparison.Ordinal))
+            foreach (Match m in DefaultedOutOfLine.Matches(text))
+            {
+                var line = 1 + text.AsSpan(0, m.Index).Count('\n');
+                if (dead is not null && line < dead.Length && dead[line]) continue;
+                var cls = m.Groups["cls"].Value;
+                var dtor = m.Groups["tilde"].Success;
+                var fid = graph.GetOrAddNode(NodeKind.Function, dtor ? "~" + cls : cls, path, new SourceSpan(line, line + m.Value.Count(c => c == '\n')));
+                graph.AddEdge(fid, fileNode, EdgeKind.DefinedIn);
+                Add(functionsByName, dtor ? "~" + cls : cls, fid);
+                if (dtor) w.Companions.Add((fid, cls));
+            }
         w.Lap(2);
 
         // Pass 1a: a function head split across #if/#else/#endif with the body's '{' after the #endif —

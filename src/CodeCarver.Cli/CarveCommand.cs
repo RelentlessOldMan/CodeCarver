@@ -1952,9 +1952,11 @@ public static class CarveCommand
         // plan's closure. A fresh gate per plan: what a stage emits decides what it roots.
         var ctorHeaders = new List<string>();
         var ctorGoverned = 0;
+        IEnumerable<(NodeId, string)> Companions() =>
+            fe is TreeSitterFrontEnd tsc ? tsc.ClassCompanions : Array.Empty<(NodeId, string)>();
         if (lang is "cpp")
         {
-            ctorGoverned = new ConstructorGate(graph).ConstructorCount;
+            ctorGoverned = new ConstructorGate(graph, Companions()).ConstructorCount;
             if (ctorGoverned > 0)
                 ctorHeaders = treeFiles.Where(p => !Excluded(p))
                     .Select(p => Path.GetRelativePath(dir, p).Replace('\\', '/'))
@@ -1963,7 +1965,7 @@ public static class CarveCommand
         (ConstructorGate? Gate, List<Root> Initial) NewCtorGate()
         {
             if (ctorGoverned == 0) return (null, new List<Root>());
-            var gate = new ConstructorGate(graph);
+            var gate = new ConstructorGate(graph, Companions());
             var initial = ctorHeaders.SelectMany(r => gate.ReleasedByFile(r, Path.Combine(dir, r), maxParseBytes))
                                      .Select(id => new Root(id, RootKind.Constructor, $"constructor {graph.GetNode(id).Name}")).ToList();
             return (gate, initial);
