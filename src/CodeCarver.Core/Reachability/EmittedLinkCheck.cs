@@ -783,11 +783,11 @@ public static class EmittedLinkCheck
     //   __asm__(".set hook, impl")   .equ / .equiv      .globl hook ... hook:
     const System.Text.RegularExpressions.RegexOptions Rx = System.Text.RegularExpressions.RegexOptions.Multiline
         | System.Text.RegularExpressions.RegexOptions.CultureInvariant;
-    // Group 1 = the alias (a definition), group 2 = its target (a use: the alias needs it).
+    // name = the alias (a definition), target = what it names (a use: the alias needs it).
     static readonly System.Text.RegularExpressions.Regex AliasAfter = new(
-        @"\b([A-Za-z_]\w*)\s*\([^(){};]*\)\s*__attribute__\s*\(\([^;{}]*?\b(?:alias|ifunc)\s*\(\s*""(\w+)""", Rx);
+        CodeCarver.Core.Frontend.Attributes.AliasAfterPattern, Rx);
     static readonly System.Text.RegularExpressions.Regex AliasBefore = new(
-        @"__attribute__\s*\(\([^;{}]*?\b(?:alias|ifunc)\s*\(\s*""(?<t>\w+)""\s*\)[^;{}]*?\)\)[\w\s\*]*?\b(?<n>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*;", Rx);
+        CodeCarver.Core.Frontend.Attributes.AliasBeforePattern, Rx);
     static readonly System.Text.RegularExpressions.Regex AliasMacroDefine = new(
         @"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(\s*(\w+)\s*\)[^\n]*\balias\s*\(\s*#\s*\2\b", Rx);
     static readonly System.Text.RegularExpressions.Regex MacroDeclarator = new(
@@ -860,10 +860,10 @@ public static class EmittedLinkCheck
         void Add(string name, int index) => result.Definitions.Add(new Definition(name, LineOf(starts, index), false, false));
         // The alias needs its target: a use (it sits in a string or a directive, which the tokenizer skips).
         void Use(System.Text.RegularExpressions.Group g) { if (g.Success) result.Uses.Add((g.Value, LineOf(starts, g.Index))); }
-        if (text.Contains("alias", StringComparison.Ordinal) || text.Contains("ifunc", StringComparison.Ordinal))   // an ifunc: defined by its resolver
+        if (text.Contains("alias", StringComparison.Ordinal) || text.Contains("ifunc", StringComparison.Ordinal) || text.Contains("weakref", StringComparison.Ordinal))   // an ifunc: defined by its resolver
         {
-            foreach (System.Text.RegularExpressions.Match m in AliasAfter.Matches(text)) { Add(m.Groups[1].Value, m.Groups[1].Index); Use(m.Groups[2]); }
-            foreach (System.Text.RegularExpressions.Match m in AliasBefore.Matches(text)) { Add(m.Groups["n"].Value, m.Groups["n"].Index); Use(m.Groups["t"]); }
+            foreach (System.Text.RegularExpressions.Match m in AliasAfter.Matches(text)) { Add(m.Groups["name"].Value, m.Groups["name"].Index); Use(m.Groups["target"]); }
+            foreach (System.Text.RegularExpressions.Match m in AliasBefore.Matches(text)) { Add(m.Groups["name"].Value, m.Groups["name"].Index); Use(m.Groups["target"]); }
             foreach (System.Text.RegularExpressions.Match m in AliasMacroDefine.Matches(text)) result.AliasMacros.Add(m.Groups[1].Value);
         }
         if (declarators) foreach (System.Text.RegularExpressions.Match m in MacroDeclarator.Matches(text))

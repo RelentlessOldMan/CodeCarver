@@ -76,7 +76,7 @@ public static class HeaderCarver
         // A define is wanted if the code references its name, OR a paste fragment could build that name.
         bool Wanted(string name)
         {
-            if (needed.Contains(name)) return true;
+            if (needed.Contains(name) || ReadBySystemHeaders(name)) return true;
             if (fragments.Count <= 64)
                 return fragments.Any(fr => name.StartsWith(fr, StringComparison.Ordinal) || name.EndsWith(fr, StringComparison.Ordinal));
             for (var k = 1; k <= name.Length; k++)
@@ -278,6 +278,20 @@ public static class HeaderCarver
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return true; }
     }
+
+    /// <summary>
+    /// A macro the compiler's own headers read, which the tree never names: a reserved name (<c>_GNU_SOURCE</c>,
+    /// <c>__STDC_WANT_LIB_EXT1__</c>) or a well-known configuration macro (<c>NDEBUG</c> for <c>&lt;assert.h&gt;</c>).
+    /// Dropping its #define changes what the build compiles (review H1).
+    /// </summary>
+    internal static bool ReadBySystemHeaders(string name) =>
+        CodeCarver.Core.Preprocess.MacroTable.IsReserved(name) || SystemConfigMacros.Contains(name);
+
+    private static readonly HashSet<string> SystemConfigMacros = new(StringComparer.Ordinal)
+    {
+        "NDEBUG", "DEBUG", "WIN32_LEAN_AND_MEAN", "VC_EXTRALEAN", "NOMINMAX", "STRICT", "UNICODE", "NOGDI",
+        "NOUSER", "NOCRYPT", "NOSERVICE", "NOMCX", "NOIME", "WINVER", "NTDDI_VERSION",
+    };
 
     private static bool IsDefineDirective(string trimmed) => StartsWithHash(trimmed, "define");
 

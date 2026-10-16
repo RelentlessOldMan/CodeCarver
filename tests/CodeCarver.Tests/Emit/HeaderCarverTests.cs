@@ -307,4 +307,26 @@ public class HeaderCarverTests
         Assert.Contains("#define WIDE_ONLY 1", carved);
         Assert.DoesNotContain("WIDE_OTHER", carved);
     }
+
+    [Fact]
+    public void Carve_KeepsMacrosOnlySystemHeadersRead()
+    {
+        // Review H1: <assert.h> reads NDEBUG, <features.h> _GNU_SOURCE, <windows.h> WIN32_LEAN_AND_MEAN. Nothing in the
+        // tree names them, and dropping one changes what the build compiles.
+        var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdr-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "app.c"), "#include \"cfg.h\"\n#include <assert.h>\nint f(int x){ assert(x); return x; }\n");
+            File.WriteAllText(Path.Combine(dir, "cfg.h"),
+                "#define NDEBUG\n#define _GNU_SOURCE 1\n#define WIN32_LEAN_AND_MEAN\n#define NOT_USED 7\n");
+            HeaderCarver.Carve(dir, new[] { "cfg.h" });
+            var text = File.ReadAllText(Path.Combine(dir, "cfg.h"));
+            Assert.Contains("NDEBUG", text);
+            Assert.Contains("_GNU_SOURCE", text);
+            Assert.Contains("WIN32_LEAN_AND_MEAN", text);
+            Assert.DoesNotContain("NOT_USED", text);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
 }

@@ -19,6 +19,22 @@ public static class Attributes
     private const int MaxBody = 4096;
 
     /// <summary>Every attribute block, in text order.</summary>
+    // A parameter list with any nesting: `(void (*cb)(int))`.
+    private const string Params = @"\((?>[^()]+|\((?<d>)|\)(?<-d>))*(?(d)(?!))\)";
+    private const string AliasWord = @"\b(?:alias|ifunc|weakref)\s*\(\s*""(?<target>[A-Za-z_]\w*)""";
+
+    /// <summary>
+    /// <c>void h(void) __attribute__((weak, alias("target")))</c>, <c>int v __attribute__((alias("w")))</c>,
+    /// <c>static int p(void) __attribute__((weakref("impl")))</c>: <c>name</c> is defined as (or refers to)
+    /// <c>target</c>. An ifunc names its resolver (reviews L1, L2).
+    /// </summary>
+    public const string AliasAfterPattern =
+        @"(?<name>(?!__attribute__\b)[A-Za-z_]\w*)\s*(?:" + Params + @"\s*)?__attribute__\s*\(\([^;{}]*?" + AliasWord;
+
+    /// <summary>The attribute first: <c>__attribute__((alias("impl"))) void hook(void);</c>.</summary>
+    public const string AliasBeforePattern =
+        @"__attribute__\s*\(\([^;{}]*?" + AliasWord + @"\s*\)[^;{}]*?\)\)[\w\s\*]*?\b(?<name>[A-Za-z_]\w*)\s*(?:" + Params + @"\s*)?;";
+
     public static IEnumerable<Block> Blocks(string text)
     {
         for (var i = 0; i < text.Length; i++)

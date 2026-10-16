@@ -111,7 +111,9 @@ public sealed class NameBindingTests
     [InlineData("attr", "void hook_impl(void){}\nvoid hook(void) __attribute__((weak, alias(\"hook_impl\")));\n")]
     [InlineData("attrAliasOnly", "void hook_impl(void){}\nvoid hook(void) __attribute__((alias(\"hook_impl\")));\n")]
     [InlineData("attrBefore", "void hook_impl(void){}\n__attribute__((weak, alias(\"hook_impl\"))) void hook(void);\n")]
-    [InlineData("attrMacro", "#define WEAK_ALIAS(f) __attribute__((weak, alias(#f)))\nvoid hook_impl(void){}\nvoid hook(void) WEAK_ALIAS(hook_impl);\n")]
+    [InlineData("fnPtrParam", "void hook_impl(void (*cb)(int)){ (void)cb; }\nvoid hook(void (*cb)(int)) __attribute__((alias(\"hook_impl\")));\n")]  // review L2
+    [InlineData("afterSection", "void hook_impl(void){}\nvoid hook(void) __attribute__((section(\".text.hk\"), alias(\"hook_impl\")));\n")]
+    [InlineData("attrMacro","#define WEAK_ALIAS(f) __attribute__((weak, alias(#f)))\nvoid hook_impl(void){}\nvoid hook(void) WEAK_ALIAS(hook_impl);\n")]
     [InlineData("pragmaWeak", "#pragma weak hook = hook_impl\nvoid hook_impl(void){}\n")]
     [InlineData("pragmaWeakNoSpaces", "#pragma weak hook=hook_impl\nvoid hook_impl(void){}\n")]
     [InlineData("asmSet", "void hook_impl(void){}\n__asm__(\".weak hook\\n.set hook, hook_impl\");\n")]
@@ -128,6 +130,32 @@ public sealed class NameBindingTests
         AssertOk(t, r);
         Assert.True(t.Kept("alias.c"), "alias.c dropped: the alias was not seen as hook's definition\n" + r.Out + r.Err);
         Assert.False(t.Kept("decoy.c"));
+    }
+
+    [Fact]
+    public void Weakref_KeepsItsTarget()
+    {
+        // Review L1: calls to plugin are calls to plugin_impl.
+        using var t = new TreeCarve()
+            .W("main.c", "static int plugin(void) __attribute__((weakref(\"plugin_impl\")));\nint main(void){ return plugin ? plugin() : 0; }\n")
+            .W("impl.c", "int plugin_impl(void){ return 1; }\n");
+        t.Compile("main.c").Compile("impl.c").TraceCompiled();
+        var r = t.Carve();
+        AssertOk(t, r);
+        Assert.True(t.Kept("impl.c"), r.Out + r.Err);
+    }
+
+    [Fact]
+    public void VariableAlias_KeepsItsTarget()
+    {
+        // Review L2: an alias on a variable.
+        using var t = new TreeCarve()
+            .W("main.c", "extern int counter;\nint main(void){ return counter; }\n")
+            .W("alias.c", "int counter_impl = 0;\nextern int counter __attribute__((alias(\"counter_impl\")));\n");
+        t.Compile("main.c").Compile("alias.c").TraceCompiled();
+        var r = t.Carve();
+        AssertOk(t, r);
+        Assert.True(t.Kept("alias.c"), r.Out + r.Err);
     }
 
     [Fact]

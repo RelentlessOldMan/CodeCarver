@@ -37,16 +37,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// catches includes tree-sitter misses — e.g. inside an array initializer (the data-fragment case).</summary>
     private static readonly Regex IncludeLine = new(
         """^\s*#\s*include\s+(?:"([^"]+)"|<([^>]+)>)""", RegexOptions.Compiled);
-    /// <summary><c>void h(void) __attribute__((weak, alias("target")))</c> — a GCC symbol alias. The
+    /// <summary><c>void h(void) __attribute__((weak, alias("target")))</c> — a GCC symbol alias (also weakref, ifunc). The
     /// aliasing name IS the target function, so without an edge to the target, dropping the target breaks
     /// the link. Ubiquitous in embedded startup, where every unused handler aliases a Default_Handler.</summary>
     private static readonly Regex AliasAttr = new(
-        @"(?<name>[A-Za-z_]\w*)\s*\([^()]*\)\s*__attribute__\s*\(\(\s*[^()]*?\b(?:alias|ifunc)\s*\(\s*""(?<target>[A-Za-z_]\w*)""",
+        CodeCarver.Core.Frontend.Attributes.AliasAfterPattern,
         RegexOptions.Compiled);
     // The other ways C text makes one name an alias of another (pass 2b):
     //   __attribute__((alias("impl"))) void hook(void);     #pragma weak hook = impl     __asm__(".set hook, impl")
     private static readonly Regex AliasAttrBefore = new(
-        @"__attribute__\s*\(\([^;{}]*?\b(?:alias|ifunc)\s*\(\s*""(?<target>[A-Za-z_]\w*)""\s*\)[^;{}]*?\)\)[\w\s\*]*?\b(?<name>[A-Za-z_]\w*)\s*\([^(){};]*\)\s*;",
+        CodeCarver.Core.Frontend.Attributes.AliasBeforePattern,
         RegexOptions.Compiled);
     private static readonly Regex PragmaWeakAlias = new(
         @"(?:^[ \t]*#[ \t]*pragma[ \t]+weak|\b_Pragma\s*\(\s*""\s*weak)[ \t]+(?<name>[A-Za-z_]\w*)[ \t]*=[ \t]*(?<target>[A-Za-z_]\w*)",
@@ -2435,7 +2435,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // link it to the target, so a reference to the alias (e.g. from the vector table) keeps the target.
         IEnumerable<Match> aliases = Array.Empty<Match>();
         // An ifunc (`int f(int) __attribute__((ifunc("resolve_f")))`) is defined here too: by its resolver.
-        if (text.Contains("alias", StringComparison.Ordinal) || text.Contains("ifunc", StringComparison.Ordinal))
+        if (text.Contains("alias", StringComparison.Ordinal) || text.Contains("ifunc", StringComparison.Ordinal) || text.Contains("weakref", StringComparison.Ordinal))
             aliases =aliases.Concat(AliasAttr.Matches(text)).Concat(AliasAttrBefore.Matches(text));
         if (text.Contains("ragma", StringComparison.Ordinal)) aliases = aliases.Concat(PragmaWeakAlias.Matches(text));   // #pragma and _Pragma
         if (text.Contains("asm", StringComparison.Ordinal)) aliases = aliases.Concat(AsmSetAlias.Matches(text));
