@@ -16,9 +16,10 @@ public sealed class CppFrontEnd() : TreeSitterFrontEnd("tree-sitter-cpp", "tree_
     // Operators, conversions and destructors (review X2) are definitions too: nothing calls them by name, so each is
     // tied to its class (see TreeSitterFrontEnd.ClassCompanions) and runs when one is made.
     // `ns::Widget::draw` nests one qualified_identifier per scope, and a query can't recurse, so each depth
-    // (up to 4 scopes) is spelled out. With only the one-scope pattern an out-of-line method of a class in a
+    // (up to 7 scopes, review X8) is spelled out. With only the one-scope pattern an out-of-line method of a class in a
     // namespace never became a node: its file was dropped while a call still needed it, and verify, which
     // looks names up in the same graph, passed (work eval, 1.0.162: `--why` said "no symbol named").
+    // An explicit specialization (`template<> int codec<int>(int)`) defines codec too (review X4).
     private const string DefsQuery = """
         (function_declarator declarator: (identifier) @function)
         (function_declarator declarator: (parenthesized_declarator (identifier) @function))
@@ -27,6 +28,12 @@ public sealed class CppFrontEnd() : TreeSitterFrontEnd("tree-sitter-cpp", "tree_
         (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (identifier) @function)))
         (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @function))))
         (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @function)))))
+        (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @function))))))
+        (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @function)))))))
+        (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @function))))))))
+        (function_declarator declarator: (template_function name: (identifier) @function))
+        (function_declarator declarator: (qualified_identifier name: (template_function name: (identifier) @function)))
+        (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (template_function name: (identifier) @function))))
         (function_declarator declarator: (operator_name) @function)
         (function_declarator declarator: (destructor_name) @function)
         (function_declarator declarator: (qualified_identifier name: (operator_name) @function))
@@ -50,6 +57,7 @@ public sealed class CppFrontEnd() : TreeSitterFrontEnd("tree-sitter-cpp", "tree_
     // NOT as a bare identifier / field_identifier, so without these patterns the call edge is missed and a
     // template function/method invoked ONLY that way is pruned — the carve then fails to compile
     // (simdjson's `simd8::prev<N>`, `get<N>`, `shr<N>` … caught by the C++ link oracle).
+    // An explicit instantiation (`template int twice<int>(int);`) needs the template's body: a call from the file (X4).
     private const string CallsQuery = """
         (call_expression function: (identifier) @callee)
         (call_expression function: (field_expression field: (field_identifier) @callee))
@@ -62,5 +70,9 @@ public sealed class CppFrontEnd() : TreeSitterFrontEnd("tree-sitter-cpp", "tree_
         (call_expression function: (qualified_identifier name: (template_function name: (identifier) @callee)))
         (call_expression function: (qualified_identifier name: (qualified_identifier name: (template_function name: (identifier) @callee))))
         (call_expression function: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (template_function name: (identifier) @callee)))))
+        (template_instantiation declarator: (function_declarator declarator: (template_function name: (identifier) @callee)))
+        (template_instantiation declarator: (function_declarator declarator: (qualified_identifier name: (template_function name: (identifier) @callee))))
+        (template_instantiation declarator: (function_declarator declarator: (identifier) @callee))
+        (template_instantiation declarator: (function_declarator declarator: (qualified_identifier name: (identifier) @callee)))
         """;
 }

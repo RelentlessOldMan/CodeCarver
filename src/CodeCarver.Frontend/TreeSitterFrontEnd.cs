@@ -22,7 +22,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 {
     private const string IdentQuery = "(identifier) @id";
     // Scope nodes for ScopeIndex (the C++ grammar adds for_range_loop).
-    private const string ScopeQueryC = "(compound_statement) @block (for_statement) @for (function_definition) @fn (storage_class_specifier) @storage ";
+    private const string ScopeQueryC = "(compound_statement) @block (for_statement) @for (function_definition) @fn (storage_class_specifier) @storage (parameter_list) @params ";
     // Names a function declares for itself — parameters and locals (P3). An identifier inside the body that
     // refers to one of these is not a reference to a same-named function elsewhere.
     private const string LocalQuery = """
@@ -144,6 +144,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <summary>The build's command-line macros that rename what a file defines (see <see cref="CommandLineMacros"/>).</summary>
     public IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? CommandLineMacros { get; set; }
 
+    // `for (auto &x : range)`: a `:` (not `::`) inside the parentheses, with no `;`.
+    private static readonly Regex RangeFor = new(@"\bfor\s*\((?:[^;()]|\([^;()]*\))*?(?<!:):(?!:)", RegexOptions.Compiled);
+    // `auto [a, b] = p;`, `const auto &[k, v] : m`.
+    private static readonly Regex StructuredBinding = new(@"\bauto\s*(?:&{1,2}\s*)?\[\s*[A-Za-z_]\w*\s*(?:,\s*[A-Za-z_]\w*\s*)*\]", RegexOptions.Compiled);
     private static readonly Regex AsmKeyword =new(@"\b(?:__asm__|__asm|asm)\b", RegexOptions.Compiled);
     private static readonly Regex Identifier = new(@"[A-Za-z_]\w*", RegexOptions.Compiled);
 
@@ -452,7 +456,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _initRefs = new Query(_lang, _cGrammar ? InitRefQuery : InitRefQuery + InitRefQueryCpp);
         _globals = new Query(_lang, GlobalQuery);
         _locals = new Query(_lang, LocalQuery);
-        _scopes = new Query(_lang, _cGrammar ? ScopeQueryC : ScopeQueryC + "(for_range_loop) @for");
+        _scopes = new Query(_lang, _cGrammar ? ScopeQueryC : ScopeQueryC + "(for_range_loop) @for (lambda_expression) @fn");
     }
 
     /// <summary>
@@ -1275,7 +1279,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// </summary>
     private sealed class ScopeIndex
     {
-        private const byte Block = 0, For = 1, Function = 2;
+        private const byte Block = 0, For = 1, Function = 2, Params = 3;
         private readonly int[] _start, _end, _parent;
         private readonly byte[] _kind;
         private readonly List<(int Start, int End)> _externs = new();
@@ -1291,6 +1295,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     case "block": list.Add((n.StartIndex, n.EndIndex, Block)); break;
                     case "for": list.Add((n.StartIndex, n.EndIndex, For)); break;
                     case "fn": list.Add((n.StartIndex, n.EndIndex, Function)); break;
+                    case "params": list.Add((n.StartIndex, n.EndIndex, Params)); break;
                     case "storage":
                         if (n.Text == "extern" && Up(n) is { Type: "declaration" } d) _externs.Add((d.StartIndex, d.EndIndex));
                         break;
@@ -1327,7 +1332,23 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
 
         /// <summary>The end of the innermost block / for / function scope containing <paramref name="pos"/>.</summary>
-        public int? ScopeEnd(int pos) => Innermost(pos) is var i and >= 0 ? _end[i] : null;
+        public int? ScopeEnd(int pos)
+        {
+            var i = Innermost(pos);
+            while (i >= 0 && _kind[i] == Params) i = _parent[i];
+            return i >= 0 ? _end[i] : null;
+        }
+
+        /// <summary>For a name declared in a parameter list: where its scope ends. The body of the function or lambda
+        /// the list belongs to; else (a function-pointer declarator, a prototype, a parameter of a parameter) the list
+        /// itself, so it hides nothing after it (review X6). Null when <paramref name="pos"/> is in no parameter list.</summary>
+        public int? ParameterScopeEnd(int pos)
+        {
+            var i = Innermost(pos);
+            if (i < 0 || _kind[i] != Params) return null;
+            var owner = _parent[i];
+            return owner >= 0 && _kind[owner] == Function ? _end[owner] : _end[i];
+        }
 
         /// <summary>The end of the innermost function definition containing <paramref name="pos"/>.</summary>
         public int? FunctionEnd(int pos)
@@ -1351,7 +1372,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         void Local(int at, int endAt)
         {
             int? scopeEnd;
-            if (scopes.InBody(at))
+            if (scopes.ParameterScopeEnd(at) is { } paramEnd) scopeEnd = paramEnd;
+            else if (scopes.InBody(at))
             {
                 // A block-scope `extern int g;` names the GLOBAL g — its uses are references, not locals.
                 if (scopes.InExternDeclaration(at)) return;
@@ -2536,6 +2558,24 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 byLine[r] = s.Id;
         NodeId? Enclosing(int row) => row >= 0 && row < byLine.Length ? byLine[row] : null;
         w.Lap(11);
+
+        // Pass 2d (C++, review X5): calls nothing spells out. A range-for calls begin and end (members or free); a
+        // structured binding of a tuple-like type calls get. By name, so every begin/end/get is kept (over-approximate).
+        if (!_cGrammar)
+        {
+            void Implicit(int index, params string[] callees)
+            {
+                var line = 1;
+                for (var k = 0; k < index && k < text.Length; k++) if (text[k] == '\n') line++;
+                if (dead is not null && line < dead.Length && dead[line]) return;
+                var from = Enclosing(line) ?? fileNode;
+                foreach (var c in callees) pendingCalls.Add((from, c));
+            }
+            if (text.Contains("for", StringComparison.Ordinal))
+                foreach (Match m in RangeFor.Matches(text)) Implicit(m.Index, "begin", "end");
+            if (text.Contains('['))
+                foreach (Match m in StructuredBinding.Matches(text)) Implicit(m.Index, "get");
+        }
 
         // Pass 3: direct calls, attributed to the enclosing function by span.
         var calleePositions = new HashSet<(int, int)>();

@@ -32,6 +32,42 @@ public class CppFrontEndTests
         }
         """;
 
+    [Theory]
+    [InlineData("  auto f = [](int other) { return other + 1; };\n  (void)f;\n  return other;\n")]
+    [InlineData("  int (*fp)(int other) = 0;\n  (void)fp;\n  return other;\n")]
+    public void ParameterOfALambdaOrPointer_HidesNothingAfterIt(string body)
+    {
+        // Review X6: the parameter `other` hid the function other() for the rest of pick: `return other;` took no address.
+        var files = new[]
+        {
+            ("other.cpp", "int other(int x) { return x; }\n"),
+            ("main.cpp", "int other(int);\ntypedef int (*fn_t)(int);\nfn_t pick() {\n" + body + "}\nint main() { return pick()(1); }\n"),
+        };
+        using var fe = new CppFrontEnd();
+        var graph = fe.BuildGraph(files);
+        var plan = ReachabilityEngine.Compute(graph, new ExplicitRootProvider(symbols: new[] { "main" }).Discover(graph).ToList());
+        Assert.True(plan.IsKept(graph.Nodes.Single(n => n.Kind == NodeKind.Function && n.Name == "other").Id));
+    }
+
+    [Fact]
+    public void BracedArrayOfAClassWithAConstructor_IsAStartupRoot()
+    {
+        // Review X7: each element of `Registrar arr[] = {{"X"}, {"Y"}};` runs the constructor.
+        var files = new[]
+        {
+            ("reg.h", "void reg(const char *n);\nstruct Registrar { const char *n; Registrar(const char *x) : n(x) { reg(x); } };\n"),
+            ("reg.cpp", "#include \"reg.h\"\nvoid reg(const char *n) {}\n"),
+            ("plugins.cpp", "#include \"reg.h\"\nRegistrar arr[] = {{\"X\"}, {\"Y\"}};\n"),
+            ("main.cpp", "int main() { return 0; }\n"),
+        };
+        using var fe = new CppFrontEnd();
+        var graph = fe.BuildGraph(files);
+        var roots = new ExplicitRootProvider(symbols: new[] { "main" }).Discover(graph)
+            .Concat(new AttributeRootProvider().Discover(graph)).ToList();
+        var plan = ReachabilityEngine.Compute(graph, roots);
+        Assert.True(plan.IsKept(graph.Nodes.Single(n => n.Kind == NodeKind.Global && n.Name == "arr").Id));
+    }
+
     [Fact]
     public void StartupRegistrations_AreRoots_AggregatesAndLibraryTypesAreNot()
     {
