@@ -531,8 +531,10 @@ public class CFrontEndTests
         Assert.False(other.IsKept(Find(graph, "my_callback")));
     }
 
-    [Fact]
-    public void FunctionInErrorWrappedTable_IsKept_ViaFile()
+    [Theory]
+    [InlineData("")]
+    [InlineData("/* caf\u00e9 \U0001F600 */\n")]   // review CPU C6: inside-ERROR is asked by range; offsets after non-ASCII text
+    public void FunctionInErrorWrappedTable_IsKept_ViaFile(string prefix)
     {
         // A file-scope function-pointer table buried in macro-invocation soup (janet's `OPMETHOD(...)` run
         // before a `JanetMethod x[] = {..., cfun, ...}` table) is wrapped by tree-sitter in an ERROR node,
@@ -555,7 +557,7 @@ public class CFrontEndTests
             int root(void){ return methods[0].name[0]; }
             """;
         using var fe = new CFrontEnd();
-        var graph = fe.BuildGraph(new[] { ("m.c", src) });
+        var graph = fe.BuildGraph(new[] { ("m.c", prefix + src) });
         var plan = ReachabilityEngine.Compute(graph,
             new[] { new Root(Find(graph, "root"), RootKind.ExplicitSymbol) });
 
@@ -717,12 +719,29 @@ public class CFrontEndTests
     [Fact]
     public void NamesAfterNonAsciiText_AreReadAtTheirOffsets()
     {
-        var src = "/* café \U0001F600 */\nvoid callee(void) {}\nvoid target(void) {}\ntypedef void (*fn)(void);\n" +
+        var src = "/* caf\u00e9 \U0001F600 */\nvoid callee(void) {}\nvoid target(void) {}\ntypedef void (*fn)(void);\n" +
                   "fn pick(void) { /* ü\U0001F680 */ callee(); return target; }\nint main(void) { pick(); return 0; }\n";
         using var fe = new CFrontEnd();
         var graph = fe.BuildGraph(new[] { ("main.c", src) });
         var plan = ReachabilityEngine.Compute(graph, new ExplicitRootProvider(symbols: new[] { "main" }).Discover(graph).ToList());
         Assert.True(plan.IsKept(Find(graph, "callee")));
         Assert.True(plan.IsKept(Find(graph, "target")));
+    }
+    // Review CPU C15: a list nested in one already scanned is not scanned again. Names at every depth still count,
+    // and a name only in a comment inside the innermost list still does not.
+    [Fact]
+    public void NestedInitializerLists_EveryDepthCounts_CommentsDoNot()
+    {
+        var src = "void outer_fn(void) {}\nvoid mid_fn(void) {}\nvoid inner_fn(void) {}\nvoid commented_fn(void) {}\n" +
+                  "typedef void (*fn)(void);\nstruct L2 { fn f; fn g[2]; };\nstruct L1 { fn f; struct L2 l2; };\n" +
+                  "struct L1 table[] = {\n  { outer_fn, { mid_fn,\n    { inner_fn, /* commented_fn */ 0 } } },\n};\n" +
+                  "int main(void) { return table[0].f != 0; }\n";
+        using var fe = new CFrontEnd();
+        var graph = fe.BuildGraph(new[] { ("main.c", src) });
+        var plan = ReachabilityEngine.Compute(graph, new ExplicitRootProvider(symbols: new[] { "main" }).Discover(graph).ToList());
+        Assert.True(plan.IsKept(Find(graph, "outer_fn")));
+        Assert.True(plan.IsKept(Find(graph, "mid_fn")));
+        Assert.True(plan.IsKept(Find(graph, "inner_fn")));
+        Assert.False(plan.IsKept(Find(graph, "commented_fn")));
     }
 }

@@ -369,7 +369,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
         return list;
     }
-    private static readonly Regex IdentifierOnly = new(@"^[A-Za-z_$][\w$]*$", RegexOptions.Compiled);
+    // Whether some tree definition of a macro names its argument i (pass 3c): the same for every invocation, so it is
+    // worked out once per (macro, argument) (review CPU C18).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(string, int), bool> _argReferenced = new();
+    private bool ArgReferenced(string macro, int i) => _argReferenced.GetOrAdd((macro, i), k =>
+        (FunctionMacro(k.Item1) ?? Array.Empty<(IReadOnlyList<string> Params, string Body)>())
+            .Any(d => FileScopeInvocations.UseOf(d.Body, FileScopeInvocations.ParamFor(d.Params, k.Item2)) == FileScopeInvocations.ParamUse.References));
+    private static readonly Regex IdentifierOnly =new(@"^[A-Za-z_$][\w$]*$", RegexOptions.Compiled);
     // Spelled name -> the symbols it is renamed to (the inverse of _renamedFrom, chains followed).
     private readonly Dictionary<string, List<string>> _renamesTo = new(StringComparer.Ordinal);
     // `NAME(args)(params) {`: a head whose declarator is a function-like macro use (review B9).
@@ -1016,6 +1022,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // Held for the run only for FunctionMacro, which answers function-like macros alone: the object-like ones (nearly
         // every #define of a register-map tree) are let go here.
         _macroBodies = bodies.Where(kv => kv.Value.FnLike).ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
+        _argReferenced.Clear();
         _objectMacros = new HashSet<string>(defs.Keys, StringComparer.Ordinal);
         _pasteTable = PasteMacros.Build(fnBodies, _objectMacros.Contains);
         _headPasteTable = PasteMacros.Build(fnBodies, _objectMacros.Contains, minParams: 1);
@@ -2793,9 +2800,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 if (dead is not null && line < dead.Length && dead[line]) continue;
                 if (_funcLikeMacroNames.Contains(macro))
                 {
-                    var defs = FunctionMacro(macro) ?? Array.Empty<(IReadOnlyList<string> Params, string Body)>();
                     for (var i = 0; i < args.Count; i++)
-                        if (defs.Any(d => FileScopeInvocations.UseOf(d.Body, FileScopeInvocations.ParamFor(d.Params, i)) == FileScopeInvocations.ParamUse.References))
+                        if (ArgReferenced(macro, i))
                             foreach (var name in args[i]) pendingRefs.Add((fileNode, name));
                     continue;
                 }
@@ -2810,15 +2816,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // avoids a costly ancestor walk per file-scope identifier in the common (clean-parse) case.
         var treeHasError = root.HasError;
         var locals = CollectLocals(root, scopes);
-        HashSet<IntPtr>? insideError = null;   // made the first time a reference needs it
-        // Read straight from the library (LeanCaptures) unless a parse error needs the node itself (InsideError).
-        if (treeHasError || !LeanCaptures.Usable(_idents)) using (var qc = _idents.Execute(root)) foreach (var cap in qc.Captures)
+        HashSet<long>? insideError = null;   // made the first time a reference needs it
+        // Read straight from the library (LeanCaptures), a file with a parse error too: inside-ERROR is asked by the
+        // identifier's range, where the node itself took the binding's capture objects per identifier (review CPU C6).
+        if (!LeanCaptures.Usable(_idents)) using (var qc = _idents.Execute(root)) foreach (var cap in qc.Captures)
         {
             var node = cap.Node;
-            Ident(node.StartPosition.Row, node.StartPosition.Column, node.StartIndex, node.EndIndex, node);
+            Ident(node.StartPosition.Row, node.StartPosition.Column, node.StartIndex, node.EndIndex);
         }
-        else foreach (var id in LeanCaptures.Of(_idents, tree)) Ident(id.Row, id.Column, id.Start, id.End, null);
-        void Ident(int row, int column, int at, int end, TsNode? node)
+        else foreach (var id in LeanCaptures.Of(_idents, tree)) Ident(id.Row, id.Column, id.Start, id.End);
+        void Ident(int row, int column, int at, int end)
         {
             if (dead is not null && row + 1 < dead.Length && dead[row + 1]) return;
             var pos = (row, column);
@@ -2828,7 +2835,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var from = Enclosing(row + 1);
             if (from is { } f)
                 pendingRefs.Add((f, name));
-            else if (scopes.InBody(at) || (node is not null && (insideError ??= NodesInsideError(root)).Contains(node.Id)))
+            else if (scopes.InBody(at) || (treeHasError && (insideError ??= LeavesInsideError(root)).Contains(RangeKey(at, end))))
                 // Attribute to the file (kept while the file is), same fallback as pass 3's calls, in two
                 // cases the enclosing-function lookup can't see: (a) inside a function body whose signature we couldn't
                 // capture — a macro-defined header like janet's `JANET_CORE_FN(os_shell, ...)`, so a
@@ -2846,14 +2853,19 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // the file node so keeping the file keeps everything its initializers point at. For a whole
         // initializer_list we scan its span (catching #if-split entries); single `= fn` values match
         // the @ref patterns directly.
+        // A list nested in one already scanned is skipped: the outer scan read every line of it (review CPU C15: a
+        // 3-deep table was scanned 3 times).
+        int scannedFrom = -1, scannedTo = -1;
         using (var qc = _initRefs.Execute(root)) foreach (var cap in qc.Captures)
         {
+            if (cap.Name == "il" && cap.Node.StartIndex >= scannedFrom && cap.Node.EndIndex <= scannedTo) continue;
             if (IsDead(cap.Node)) continue;
             var startRow = cap.Node.StartPosition.Row + 1;
             if (Enclosing(startRow) is not null) continue; // file scope only
 
             if (cap.Name == "il")
             {
+                (scannedFrom, scannedTo) = (cap.Node.StartIndex, cap.Node.EndIndex);
                 // Scan only what's INSIDE the braces (using the node's columns), so the declaration
                 // prefix on the first line (`static T name[] = {`) isn't read — otherwise the variable's
                 // own name would count as a reference to itself and it could never be pruned.
@@ -3229,24 +3241,29 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// Used to over-keep function references there rather than silently lose them.
     /// Found for the whole tree in one walk: asked node by node, each step up searched down from the root, and a long
     /// table that error recovery nests thousands deep took the square of its length (77 s for a 3,000-line one).
-    /// The set holds every node with an ERROR among its nearest 48 ancestors, below the translation unit.</summary>
-    private static HashSet<IntPtr> NodesInsideError(TsNode root)
+    /// The set holds every leaf (an identifier is one) with an ERROR among its nearest 48 ancestors, below the
+    /// translation unit, by its range (<see cref="RangeKey"/>): the identifier pass reads ranges, not nodes (review CPU C6).
+    /// Two leaves share a range only when both are empty, and then counting both inside only keeps more.</summary>
+    private static long RangeKey(int start, int end) => ((long)start << 32) | (uint)end;
+
+    private static HashSet<long> LeavesInsideError(TsNode root)
     {
         const int None = int.MaxValue / 2;   // no ERROR above, or the translation unit is nearer
-        var inside = new HashSet<IntPtr>();
+        var inside = new HashSet<long>();
         var above = new Stack<int>();   // per open level, the distance its node had
         var d = None;                   // the current node's distance up to the nearest ERROR (1 = its parent)
         using var cur = new TreeCursor(root);
         while (true)
         {
             var n = cur.CurrentNode;
-            if (d <= 48) inside.Add(n.Id);
             if (cur.GotoFirstChild())
             {
                 above.Push(d);
-                d = n.IsError || n.Type == "ERROR" ? 1 : n.Type == "translation_unit" ? None : Math.Min(d + 1, None);
+                var type = n.IsError ? "ERROR" : n.Type;
+                d = type == "ERROR" ? 1 : type == "translation_unit" ? None : Math.Min(d + 1, None);
                 continue;
             }
+            if (d <= 48) inside.Add(RangeKey(n.StartIndex, n.EndIndex));
             while (!cur.GotoNextSibling())
             {
                 if (above.Count == 0 || !cur.GotoParent()) return inside;

@@ -69,15 +69,28 @@ public static class FileScopeInvocations
     /// <summary>What a macro body does with parameter <paramref name="param"/>: names something with it
     /// (<c>= fn</c>, <c>{ #fn, fn }</c>, <c>&amp;fn</c>, <c>OTHER(fn)</c>), only declares it (<c>void fn(void)</c>), or
     /// neither (absent, or only stringized or pasted: <c>#fn</c>, <c>entry_##fn</c>).</summary>
+    // Regex \w ([\p{L}\p{Mn}\p{Nd}\p{Pc}]) or $.
+    private static bool IsWordChar(char c) => c == '$' || char.GetUnicodeCategory(c) is
+        System.Globalization.UnicodeCategory.UppercaseLetter or System.Globalization.UnicodeCategory.LowercaseLetter
+        or System.Globalization.UnicodeCategory.TitlecaseLetter or System.Globalization.UnicodeCategory.ModifierLetter
+        or System.Globalization.UnicodeCategory.OtherLetter or System.Globalization.UnicodeCategory.NonSpacingMark
+        or System.Globalization.UnicodeCategory.DecimalDigitNumber or System.Globalization.UnicodeCategory.ConnectorPunctuation;
+
     public static ParamUse UseOf(string body, string param)
     {
         if (param.Length == 0) return ParamUse.None;
         var result = ParamUse.None;
-        foreach (Match m in Regex.Matches(body, @"(?<![\w$])" + Regex.Escape(param) + @"(?![\w$])"))
+        // Each whole-word occurrence (no \w or $ either side): an IndexOf walk, not a regex built per call (review CPU C18).
+        for (int at = body.IndexOf(param, StringComparison.Ordinal), next; at >= 0;
+             at = body.IndexOf(param, next, StringComparison.Ordinal))
         {
-            var p = m.Index - 1;
+            next = at + 1;
+            if (at > 0 && IsWordChar(body[at - 1])) continue;
+            if (at + param.Length < body.Length && IsWordChar(body[at + param.Length])) continue;
+            next = at + param.Length;   // matches don't overlap, as the regex's didn't
+            var p = at - 1;
             while (p >= 0 && char.IsWhiteSpace(body[p])) p--;
-            var n = m.Index + m.Length;
+            var n = at + param.Length;
             while (n < body.Length && char.IsWhiteSpace(body[n])) n++;
             if (p >= 0 && body[p] == '#') continue;                                  // #fn, x##fn
             if (n + 1 < body.Length && body[n] == '#' && body[n + 1] == '#') continue; // fn##x
