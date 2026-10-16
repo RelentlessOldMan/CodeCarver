@@ -30,6 +30,10 @@ public sealed class StagedOutput : IDisposable
     private bool _promoted;
     private bool _disposed;
 
+    /// <summary>After <see cref="Promote"/>: files the new tree has with the same bytes as the prior output, which
+    /// kept the prior one's last-write time (see <see cref="KeepUnchangedTimes"/>).</summary>
+    public int UnchangedFiles { get; private set; }
+
     /// <summary>Marker file dropped in the output AREA (the parent that holds the carved tree beside the
     /// <c>codecarver/</c> metadata), NOT inside the carved tree itself — so the carved tree stays a clean,
     /// buildable project with no stray dotfile. Its PRESENCE is how a later run recognizes a directory as a
@@ -145,6 +149,7 @@ public sealed class StagedOutput : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         ClearReadOnlyTree(Dir); // carved output must be writable (Perforce read-only sources; in-place fallback; backup deletion)
+        if (Directory.Exists(_finalOut)) UnchangedFiles = KeepUnchangedTimes(Dir, _finalOut);
         if (!Directory.Exists(_finalOut))
         {
             PromoteStaging(Dir, _finalOut); // fresh out: move staging into place
@@ -189,6 +194,50 @@ public sealed class StagedOutput : IDisposable
         _promoted = true;
         TryDelete(backup); // prior output no longer needed
         ReleaseLock();
+    }
+
+    /// <summary>
+    /// Gives each file of the new tree whose bytes equal the prior output's file at the same path that file's
+    /// last-write time, and returns how many. The tree is always written whole, so a file the carve rewrote (cut,
+    /// placeholder, carved header) is new by its time on every run even when its bytes are not. Copying the output
+    /// elsewhere by size and time (robocopy, rsync: tools/mirror) would then copy those every time; with this it
+    /// copies what changed. Only equal bytes keep a time, so a file that did change always looks changed.
+    /// </summary>
+    private static int KeepUnchangedTimes(string staged, string prior)
+    {
+        var kept = 0;
+        Parallel.ForEach(Directory.EnumerateFiles(staged, "*", SearchOption.AllDirectories),
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Min(8, Environment.ProcessorCount) }, file =>
+        {
+            try
+            {
+                var was = new FileInfo(Path.Combine(prior, Path.GetRelativePath(staged, file)));
+                var now = new FileInfo(file);
+                if (!was.Exists || was.Length != now.Length || was.LastWriteTimeUtc == now.LastWriteTimeUtc) return;
+                if (!SameBytes(file, was.FullName)) return;
+                now.LastWriteTimeUtc = was.LastWriteTimeUtc;
+                Interlocked.Increment(ref kept);
+            }
+            // Only a missed saving: the file is copied again next time.
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        });
+        return kept;
+    }
+
+    private static bool SameBytes(string a, string b)
+    {
+        using var op = IoMeter.Start(IoMeter.Kind.Read);
+        using var fa = new FileStream(a, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.SequentialScan);
+        using var fb = new FileStream(b, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1, FileOptions.SequentialScan);
+        var ba = new byte[1 << 16];
+        var bb = new byte[1 << 16];
+        while (true)
+        {
+            var n = fa.ReadAtLeast(ba, ba.Length, throwOnEndOfStream: false);
+            if (n != fb.ReadAtLeast(bb, bb.Length, throwOnEndOfStream: false)) return false;
+            if (n == 0) return true;
+            if (!ba.AsSpan(0, n).SequenceEqual(bb.AsSpan(0, n))) return false;
+        }
     }
 
     /// <summary>

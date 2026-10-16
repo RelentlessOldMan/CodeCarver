@@ -470,6 +470,40 @@ public sealed class StagedOutputTests
         finally { Cleanup(work); }
     }
 
+    [Fact]
+    public void Promote_SameBytesKeepThePriorTime_ChangedBytesDoNot()
+    {
+        // The tree is written whole every run; a copy by size + time (tools/mirror) must see only what changed.
+        var work = NewWork();
+        try
+        {
+            var outDir = Path.Combine(work, "out");
+            Directory.CreateDirectory(Path.Combine(outDir, "sub"));
+            MarkPriorOutput(outDir);
+            var old = new DateTime(2020, 1, 2, 3, 4, 6, DateTimeKind.Utc);
+            foreach (var (rel, text) in new[] { ("same.c", "int a;\n"), ("sub/edited.c", "int b;\n"), ("grown.c", "int c;\n") })
+            {
+                File.WriteAllText(Path.Combine(outDir, rel), text);
+                File.SetLastWriteTimeUtc(Path.Combine(outDir, rel), old);
+            }
+
+            using var staged = StagedOutput.Begin(outDir);
+            Directory.CreateDirectory(Path.Combine(staged.Dir, "sub"));
+            File.WriteAllText(Path.Combine(staged.Dir, "same.c"), "int a;\n");
+            File.WriteAllText(Path.Combine(staged.Dir, "sub", "edited.c"), "int x;\n");   // same size, other bytes
+            File.WriteAllText(Path.Combine(staged.Dir, "grown.c"), "int cc;\n");
+            File.WriteAllText(Path.Combine(staged.Dir, "new.c"), "int d;\n");
+            staged.Promote();
+
+            Assert.Equal(1, staged.UnchangedFiles);
+            Assert.Equal(old, File.GetLastWriteTimeUtc(Path.Combine(outDir, "same.c")));
+            Assert.NotEqual(old, File.GetLastWriteTimeUtc(Path.Combine(outDir, "sub", "edited.c")));
+            Assert.NotEqual(old, File.GetLastWriteTimeUtc(Path.Combine(outDir, "grown.c")));
+            Assert.Equal("int x;\n", File.ReadAllText(Path.Combine(outDir, "sub", "edited.c")));
+        }
+        finally { Cleanup(work); }
+    }
+
     private static void Cleanup(string work)
     {
         try { if (Directory.Exists(work)) Directory.Delete(work, recursive: true); } catch { }

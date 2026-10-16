@@ -653,39 +653,83 @@ line and a `time.<step>.<part>.ms` summary key.
 
 ### Carving a local copy of a tree on a share
 
-A tree on a network share costs a long run much of its time in waits: compare `io.<phase>.read.ms` (time
-waiting on files, summed over threads) with `cpu.<phase>.ms` (computing, summed over cores) and
-`time.<phase>.ms` (wall) in the summary. Carving a local copy instead takes those waits away, and
-`tools/mirror/mirror.ps1` (Windows, robocopy) or `tools/mirror/mirror.sh` (rsync) keeps the copy up to date by
-copying only what changed:
+On a tree that lives on a network share, a long run spends much of its time waiting on the share. The summary
+shows how much: per phase, `io.<phase>.read.ms` is time spent waiting on files (summed over threads),
+`cpu.<phase>.ms` is time spent computing (summed over cores), and `time.<phase>.ms` is wall time. When the waits
+dominate, carve a local copy instead, and copy the output back to the share only when it's needed there (for
+example, to build it). `tools/mirror/mirror.ps1` (Windows, robocopy) and `tools/mirror/mirror.sh` (Linux/macOS,
+rsync) do both copies. Each copies only files whose size or last-write time differs, so after the first time
+a copy moves only what changed.
+
+The flow, with the tree at `R:\Prj` on the share:
 
 ```
-# 1. copy the tree in: everything the first time, then only files whose size or last-write time changed
-powershell -ExecutionPolicy Bypass -File tools\mirror\mirror.ps1 -From \\server\share\tree -To D:\local\tree
-# 2. carve the copy
-codecarver carve D:\local\tree --config carve.toml
-# 3. if the output must live on the share: copy it back, again only what changed
-powershell -ExecutionPolicy Bypass -File tools\mirror\mirror.ps1 -From D:\local\out -To \\server\share\out
+            share                              local disk
+   +----------------------+   1. mirror   +----------------------+
+   | R:\Prj  (the tree)   | ------------> | C:\Prj  (a copy)     |
+   +----------------------+   (changes)   +----------------------+
+                                                     |
+                                                     | 2. carve, mirrorOf = "R:/Prj":
+                                                     |    refuses if C:\Prj differs from R:\Prj
+                                                     v
+   +----------------------+   3. mirror   +----------------------+
+   | R:\PrjCarved         | <------------ | C:\PrjCarved         |
+   +----------------------+   (changes)   +----------------------+
 ```
 
-A carve of a copy is only right if the copy is right, so name the original in the config:
+Once:
+
+```
+powershell -ExecutionPolicy Bypass -File tools\mirror\mirror.ps1 -From R:\Prj -To C:\Prj
+```
+
+and in `carve.toml`:
 
 ```toml
+outputDirectory = "C:/PrjCarved"
 [advanced]
-mirrorOf = "//server/share/tree"
-pathMap  = [{ from = "//server/share/tree", to = "." }]   # when the build log or traces name the share's paths
+mirrorOf = "R:/Prj"
+pathMap  = [{ from = "R:/Prj", to = "." }]   # only when the build log or traces name R:\Prj paths
 ```
 
-The run then lists both trees before any other work (nothing is read, so this is far cheaper than the carve's own
-reads) and stops with exit 2 if a file is missing from the copy, only in the copy, or differs in size or last-write
-time (times within 2 s count as the same, as some shares keep them that coarsely). The first differences are
-printed; run the copy again and rerun. `excludeDirectories` are left out of the comparison. The summary says
+Then each iteration:
+
+```
+# 1. bring the copy up to date: copies only what changed on the share (nothing, if nothing did)
+powershell -ExecutionPolicy Bypass -File tools\mirror\mirror.ps1 -From R:\Prj -To C:\Prj
+# 2. carve the copy
+codecarver carve C:\Prj --config carve.toml
+# 3. only when the output is needed on the share: copies only the output files that changed
+powershell -ExecutionPolicy Bypass -File tools\mirror\mirror.ps1 -From C:\PrjCarved -To R:\PrjCarved
+```
+
+**Why the copy can be trusted.** A carve of a stale copy would be a carve of the wrong tree. So with `mirrorOf`,
+the run first lists both trees, reading no file contents, which is far cheaper than the carve's own reads.
+It stops with exit 2 if a file is missing from the copy, only in the copy, or differs in size or last-write
+time. Times within 2 s count as the same, because some shares keep them that coarsely. It prints the first
+differences; run step 1 again and rerun. `excludeDirectories` are left out of the comparison. The summary says
 what the check covered and cost: `mirror.files`, `mirror.differences`, `mirror.localListMs`,
 `mirror.sourceListMs`.
 
-The script makes its target an exact copy, deleting files the source no longer has, so it refuses a non-empty
-target it did not make (`-Force` overrides); it leaves `<target>.mirror-of.txt` beside the target. Keep the
-output's `.codecarver-cache/` (it travels with the output) so the next run reuses it.
+**Why nothing goes stale in the output.**
+- **Each carve writes a complete new tree.** It is written beside the old output and swapped in only when every
+  step has succeeded, so a file an earlier carve kept and this one drops is gone. A run that fails or stops
+  leaves the previous output untouched.
+- **Step 3 deletes on the share what the output no longer has**, so `R:\PrjCarved` ends up exactly like
+  `C:\PrjCarved`. Until you run step 3, `R:\PrjCarved` is the last carve you copied there. Don't edit it by
+  hand: the next copy overwrites or deletes the change.
+
+**Why step 3 copies only what changed.**
+- A file the carve copies whole keeps its source file's last-write time.
+- A file the carve rewrites (cut code, a placeholder, a carved header) is written new on every run. When its
+  bytes come out the same as the previous output's, it keeps the previous file's time, and
+  `stageN.unchangedFiles` counts these. Only identical bytes keep a time, so a file that did change always
+  looks changed to the copy.
+
+`.codecarver-cache/` sits in the output directory, so the next run reuses it. Each mirror script makes its
+target an exact copy, deleting files the source no longer has. So the first copy refuses a non-empty target
+it didn't make (`-Force` overrides), and it leaves `<target>.mirror-of.txt` beside the target so later copies
+go ahead.
 
 ## Diagnostics
 

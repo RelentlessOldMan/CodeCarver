@@ -3366,6 +3366,7 @@ public static class CarveCommand
             summary[$"{summaryStage}.bytesBefore"] = origTotal;
             summary[$"{summaryStage}.bytesAfter"] = carvedBytes;
             summary[$"{summaryStage}.emittedCodeFiles"] = res.FilesWritten;
+            summary[$"{summaryStage}.unchangedFiles"] = staged.UnchangedFiles;
             summary[$"{summaryStage}.infrastructureFiles"] = infra.Count;
             summary[$"{summaryStage}.infrastructureBytes"] = infra.Bytes;
             summary[$"{summaryStage}.infrastructureSlowestMs"] = infra.SlowestMs;
