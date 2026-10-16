@@ -176,6 +176,8 @@ public static class FileTreeEmitter
                     var text = Encoding.Latin1.GetString(original);
                     if (stubs.Count > 0) { text = StubBodies.Apply(text, stubs); stubbed = stubs.Count; }
                     var pruned = Encoding.Latin1.GetBytes(RemoveLineRanges(text, ranges ?? new List<(int Start, int End)>(), removed));
+                    // The BOM sits on line 1: a dropped line 1 took it, and the file's encoding with it (review R4).
+                    if (HasUtf8Bom(original) && !HasUtf8Bom(pruned)) pruned = Utf8Bom.Concat(pruned).ToArray();
                     File.WriteAllBytes(dst, pruned);
                     cut = original.Length - pruned.Length;
                 }
@@ -268,6 +270,9 @@ public static class FileTreeEmitter
         return unreached.Where(n => !(n.Span.IsKnown && applied.Contains((n.Span.StartLine, n.Span.EndLine))))
                         .Select(n => n.Id).ToList();
     }
+
+    private static readonly byte[] Utf8Bom = { 0xEF, 0xBB, 0xBF };
+    private static bool HasUtf8Bom(byte[] b) => b.Length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF;
 
     /// <summary>UTF-16 by byte-order mark.</summary>
     public static bool IsUtf16(string path)

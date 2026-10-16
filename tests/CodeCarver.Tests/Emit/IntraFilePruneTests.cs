@@ -464,4 +464,30 @@ public class IntraFilePruneTests
         var carved = Prune(dead + "int reader(void) { " + use + " }\n");
         AssertCompiles(carved);
     }
+
+    // Review R4: a UTF-8 BOM sits on line 1; dropping line 1 dropped the BOM, and the file's encoding with it.
+    [Theory]
+    [InlineData("int dead(void) { return 1; }\nint reader(void) { return 0; }\n")]
+    [InlineData("int dead(void)\n{\n    return 1;\n}\nint reader(void) { return 0; }\n")]
+    public void DroppedFirstLine_KeepsTheBom(string src)
+    {
+        var work = Path.Combine(Path.GetTempPath(), "codecarver-bom-" + Guid.NewGuid().ToString("N"));
+        var srcDir = Path.Combine(work, "src");
+        var outDir = Path.Combine(work, "out");
+        Directory.CreateDirectory(srcDir);
+        try
+        {
+            File.WriteAllBytes(Path.Combine(srcDir, "t.c"), new byte[] { 0xEF, 0xBB, 0xBF }.Concat(System.Text.Encoding.UTF8.GetBytes(src)).ToArray());
+            using var fe = new CFrontEnd();
+            var graph = fe.BuildGraph(new[] { ("t.c", "﻿" + src) });
+            var reader = graph.Nodes.First(n => n.Name == "reader").Id;
+            var plan = ReachabilityEngine.Compute(graph, new[] { new Root(reader, RootKind.ExplicitSymbol) });
+            FileTreeEmitter.EmitPruned(plan, graph, srcDir, outDir);
+            var bytes = File.ReadAllBytes(Path.Combine(outDir, "t.c"));
+            var text = System.Text.Encoding.UTF8.GetString(bytes);
+            Assert.DoesNotContain("dead", text);
+            Assert.True(bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF, text);
+        }
+        finally { TempDir.Delete(work); }
+    }
 }
