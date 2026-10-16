@@ -65,7 +65,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // Keep-attributes: symbols the runtime/linker keep regardless of any call — implicit roots a
     // from-main closure would silently drop (a self-registering `constructor`, an initcall-section entry).
     private static readonly Regex KeepKeyword = new(
-        @"\b(?:constructor|destructor|used|retain)\b|section\s*\(\s*""\.(?:init_array|preinit_array|fini_array)"
+        // An interrupt handler the compiler places in the vector table (msp430 `interrupt(V)`, AVR `signal`; review T1).
+        @"\b(?:constructor|destructor|used|retain|interrupt|interrupt_handler|isr|signal)\b|section\s*\(\s*""\.(?:init_array|preinit_array|fini_array)"
         // A section named like a C identifier: the linker defines __start_/__stop_ for it, so code can walk every entry
         // without naming one (a registration table).
         + @"|section\s*\(\s*""[A-Za-z_]\w*""\s*\)",
@@ -793,6 +794,55 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
     /// <summary>Names decorated with a keep-attribute (constructor/destructor/used/retain/init-array
     /// section), resolving the decorated symbol whether the attribute leads or trails the declaration.</summary>
+    // Review T1: what other toolchains keep. Pragmas naming the symbol (TI `#pragma RETAIN(x)`, IAR `#pragma required=x`,
+    // MSVC `#pragma comment(linker, "/include:x")`), or the next declaration (TI `#pragma RETAIN`, `#pragma vector=V`).
+    private static readonly Regex ToolchainKeepPragma = new(
+        @"^[ \t]*#[ \t]*pragma[ \t]+(?:RETAIN[ \t]*\([ \t]*(?<n>[A-Za-z_]\w*)|required[ \t]*=[ \t]*(?<n>[A-Za-z_]\w*)"
+        + @"|comment[ \t]*\([ \t]*linker[ \t]*,[ \t]*""[^""\r\n]*?[/-](?i:include):(?<n>[A-Za-z_]\w*)|(?<next>RETAIN\b|vector[ \t]*=))",
+        RegexOptions.Compiled | RegexOptions.Multiline);
+    // Keywords and macros: IAR `__root` and `__interrupt` before the declaration, XC32 `__ISR(v, ipl) name(`, AVR
+    // `ISR(vector) {` (the vector is the name), Keil C51 `name(void) interrupt 1`.
+    private static readonly Regex ToolchainKeepWord = new(
+        @"(?<![\w$])(?:(?<kw>__root|__interrupt)\b|(?<xc>__ISR(?:_AT_VECTOR)?)\s*\([^()]*\)|(?<avr>ISR)\s*\(\s*(?<vec>[A-Za-z_]\w*)[^()]*\)\s*(?:[A-Za-z_]\w*\s*)?\{)"
+        + @"|(?<keil>\))\s*interrupt\s+\d+", RegexOptions.Compiled);
+
+    /// <summary>Names a non-GNU toolchain keeps or places in a vector table (review T1).</summary>
+    private static IEnumerable<string> ScanToolchainKeeps(string text)
+    {
+        if (text.Contains("pragma", StringComparison.Ordinal))
+            foreach (Match m in ToolchainKeepPragma.Matches(text))
+            {
+                if (m.Groups["n"].Success)
+                {
+                    var n = m.Groups["n"].Value;
+                    yield return n;
+                    if (n.Length > 1 && n[0] == '_') yield return n[1..];   // x86 C decoration: /include:_x
+                }
+                else
+                {
+                    var eol = text.IndexOf('\n', m.Index);
+                    if (eol < 0) continue;
+                    var after = text.AsSpan(eol + 1);
+                    if (CodeCarver.Core.Frontend.Attributes.NameAfterAt((after.Length > 200 ? after[..200] : after).ToString()) is { } an) yield return an;
+                }
+            }
+        if (!text.Contains("__root", StringComparison.Ordinal) && !text.Contains("ISR", StringComparison.Ordinal)
+            && !text.Contains("interrupt", StringComparison.Ordinal)) yield break;
+        var code = SourceText.CodeOnly(text);
+        foreach (Match m in ToolchainKeepWord.Matches(code))
+        {
+            if (m.Groups["avr"].Success) { yield return m.Groups["vec"].Value; continue; }
+            if (m.Groups["keil"].Success)
+            {
+                var before = code.AsSpan(0, m.Index + 1);
+                if (CodeCarver.Core.Frontend.Attributes.NameBeforeAt((before.Length > 200 ? before[^200..] : before).ToString()) is { } bn) yield return bn;
+                continue;
+            }
+            var rest = code.AsSpan(m.Index + m.Length);
+            if (CodeCarver.Core.Frontend.Attributes.NameAfterAt((rest.Length > 200 ? rest[..200] : rest).ToString()) is { } name) yield return name;
+        }
+    }
+
     private static IEnumerable<string> ScanKeepAttributes(string text)
     {
         if (!text.Contains("__attribute") && !text.Contains("[[")) yield break; // cheap guard: no attributes -> skip the regex
@@ -2014,6 +2064,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             finally { t_parents = null; }
             w.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
             foreach (var n in ScanKeepAttributes(text)) { w.KeepNames.Add(n); if (IsTranslationUnit(path)) w.KeepAt.Add((n, path)); }
+            foreach (var n in ScanToolchainKeeps(text)) { w.KeepNames.Add(n); if (IsTranslationUnit(path)) w.KeepAt.Add((n, path)); }
             if (_keepMacroUse is not null && fileNodeByPath.ContainsKey(path))
                 ScanKeepMacroUses(w, text, w.FileNode(path));
             w.Lap(17);
