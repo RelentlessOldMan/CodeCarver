@@ -2663,6 +2663,8 @@ public static class CarveCommand
             }
             return spared;
         }
+        HashSet<string>? macroNames = null;
+        bool IsMacro(string name) => (macroNames ??= graph.Nodes.Where(n => n.Kind == NodeKind.Macro).Select(n => n.Name).ToHashSet(StringComparer.Ordinal)).Contains(name);
         StubBodies.Body? StubOf(NodeId id)
         {
             var n = graph.GetNode(id);
@@ -2685,7 +2687,7 @@ public static class CarveCommand
                 if (twins.Any(o => Spared().Contains(o.Id) || rootIds.Contains(o.Id) || (o.Flags & NodeFlags.Keep) != 0)) continue;
                 if (defs.Any(o => o.Span.IsKnown && o.Span != n.Span && o.Span.StartLine >= n.Span.StartLine && o.Span.EndLine <= n.Span.EndLine))
                     continue;
-                if (StubBodies.Find(src, n.Span.StartLine, n.Span.EndLine, n.Name) is { } b) m[n.Id] = b;
+                if (StubBodies.Find(src, n.Span.StartLine, n.Span.EndLine, n.Name, IsMacro) is { } b) m[n.Id] = b;
             }
             return m;
         }

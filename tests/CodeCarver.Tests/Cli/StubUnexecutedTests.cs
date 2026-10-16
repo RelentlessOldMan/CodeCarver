@@ -155,6 +155,20 @@ public sealed class StubUnexecutedTests
         Assert.DoesNotContain("return", stubbed);
     }
 
+    // Review R3: an attribute after the name is not the name (`(void)unused;` doesn't compile); nor is a macro there.
+    [Theory]
+    [InlineData("int f(int a __attribute__((unused)), int b [[maybe_unused]])\n{\n    return 0;\n}\n", "a,b")]
+    [InlineData("int f(__attribute__((unused)) int a, char *p __attribute((__unused__)))\n{\n    return 0;\n}\n", "a,p")]
+    [InlineData("int f(int a UNUSED_ARG, char *p)\n{\n    return 0;\n}\n", "a,p")]
+    [InlineData("int f(unsigned N, int __declspec(align(4)) b)\n{\n    return 0;\n}\n", "N,b")]
+    public void StubBodies_ParameterNames_SkipAttributes(string text, string names)
+    {
+        var lines = text.Split('\n').Length - 1;
+        var b = StubBodies.Find(new StubBodies.Source(text), 1, lines, "f", n => n == "UNUSED_ARG");
+        Assert.NotNull(b);
+        Assert.Equal(names, string.Join(",", b!.Value.Params));
+    }
+
     [Theory]
     [InlineData("int f(int a)\n{\n#if X\n    if (a) {\n#else\n    if (!a) {\n#endif\n        a++;\n    }\n    return a;\n}\n")]   // #if splits the braces
     [InlineData("int f(int a)\n{\n#if X\n    return a;\n}\n#endif\n")]                                                              // #if not closed inside

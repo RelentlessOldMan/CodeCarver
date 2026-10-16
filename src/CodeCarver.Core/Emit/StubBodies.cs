@@ -43,8 +43,9 @@ public static class StubBodies
     }
 
     /// <summary>The body of function <paramref name="name"/> defined on 1-based lines <paramref name="startLine"/>..
-    /// <paramref name="endLine"/>, or null when it can't be found cleanly.</summary>
-    public static Body? Find(Source src, int startLine, int endLine, string name)
+    /// <paramref name="endLine"/>, or null when it can't be found cleanly. <paramref name="isMacro"/> names the macros, so
+    /// an attribute macro after a parameter name (`int a UNUSED`) is not taken for it.</summary>
+    public static Body? Find(Source src, int startLine, int endLine, string name, Func<string, bool>? isMacro = null)
     {
         if (startLine < 1 || endLine < startLine) return null;
         var text = src.Text;
@@ -83,7 +84,7 @@ public static class StubBodies
         if (depth != 0) return null;
 
         var knr = code[(close + 1)..bo].Contains(';');
-        return new Body(bo, bc, Params(code[(open + 1)..close], knr));
+        return new Body(bo, bc, Params(code[(open + 1)..close], knr, isMacro));
     }
 
     /// <summary>The text with each body replaced by the stub, newlines kept.</summary>
@@ -109,22 +110,47 @@ public static class StubBodies
 
     /// <summary>The parameter names, to mark them used (<c>(void)p;</c>). An unnamed parameter (<c>int</c>,
     /// <c>size_t</c>) has none; a single word is a name only in a K&amp;R head, whose types follow it.</summary>
-    static List<string> Params(string list, bool knr)
+    static List<string> Params(string list, bool knr, Func<string, bool>? isMacro)
     {
         var names = new List<string>();
         foreach (var raw in SplitTop(list))
         {
-            var seg = raw.Trim();
+            var seg = WithoutAttributes(raw).Trim();
             if (seg.Length == 0 || seg == "void" || seg == "...") continue;
             var fp = FnPointerName.Match(seg);
             if (fp.Success) { names.Add(fp.Groups[1].Value); continue; }
             var bracket = seg.IndexOf('[');
             if (bracket >= 0) seg = seg[..bracket];
             var ids = Ident.Matches(seg).Select(m => m.Value).ToList();
+            // An attribute macro after the name (review R3), when a type and a name stay before it.
+            while (isMacro is not null && ids.Count >= 3 && isMacro(ids[^1])) ids.RemoveAt(ids.Count - 1);
             if (ids.Count >= 2 || (knr && ids.Count == 1)) names.Add(ids[^1]);
         }
         return names.Distinct(StringComparer.Ordinal).ToList();
     }
+
+    /// <summary>The parameter with <c>__attribute__((…))</c>, <c>__declspec(…)</c>, <c>alignas(…)</c> and <c>[[…]]</c>
+    /// blanked: their words are not the parameter's name (review R3).</summary>
+    static string WithoutAttributes(string seg)
+    {
+        if (seg.IndexOf("__", StringComparison.Ordinal) < 0 && seg.IndexOf("[[", StringComparison.Ordinal) < 0
+            && seg.IndexOf("lignas", StringComparison.Ordinal) < 0) return seg;
+        var sb = new StringBuilder(seg);
+        foreach (Match m in AttributeHead.Matches(seg))
+        {
+            var close = Match(seg, m.Index + m.Length - 1, '(', ')', seg.Length);
+            if (close < 0) break;
+            for (var k = m.Index; k <= close; k++) sb[k] = ' ';
+        }
+        for (var at = seg.IndexOf("[[", StringComparison.Ordinal); at >= 0; at = seg.IndexOf("[[", at + 2, StringComparison.Ordinal))
+        {
+            var close = seg.IndexOf("]]", at + 2, StringComparison.Ordinal);
+            if (close < 0) break;
+            for (var k = at; k < close + 2; k++) sb[k] = ' ';
+        }
+        return sb.ToString();
+    }
+    private static readonly Regex AttributeHead = new(@"\b(?:__attribute__|__attribute|__declspec|_Alignas|alignas)\s*\(", RegexOptions.Compiled);
 
     static IEnumerable<string> SplitTop(string s)
     {
