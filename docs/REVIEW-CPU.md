@@ -369,7 +369,8 @@ C1, C2, C3, C4, C5, C7, C13, C14, C17 and C22 are each a few lines, low risk, an
 **Method.**
 - The Release build is run as a separate process with `CODECARVER_TIMING=1`.
 - Each run records process CPU time (`TotalProcessorTime`), wall time, and every `cpu.*`/`time.*` summary key.
-- Each run is repeated (3 times) and the median is reported.
+- The builds being compared run interleaved (A, B, C, A, B, C, ...) for 3-5 rounds, and the minimum and median of each key are reported. Back-to-back runs of one build drifted by up to 50% with machine load; interleaving gives every build the same conditions.
+- Three generated trees: `w` (the workload above, 1,351 files), `L` (log-heavy: 6,000 C and 10 C++ files, 300 `-D` per command, a 30.8 MB build log) and `T` (12 files, to catch start-up costs).
 - Timing runs hold a ComputeWarden CPU lease, so no other heavy job is running.
 - The machine has 12 logical cores; the runtime is .NET 8.
 
@@ -407,4 +408,66 @@ These are small, and their callers were reviewed.
 
 ## K. Fixes applied
 
-(Phase 2 — filled in as fixes land.)
+Each fix ran the full suite before it was pushed. Where it touched logic the suite did not cover, it came with a new test, and that test was checked to fail with the fix broken. The kept and dropped counts were the same on every benchmark tree before and after each fix (`keep.files.reached` 210 on `w`, 410 on `L`).
+
+| Fix | Version | Change | Test |
+|---|---|---|---|
+| C1 | 1.0.273 | `#if` evaluator tells an identifier from a number without throwing | existing |
+| C2 | 1.0.274 | per-file define analysis in one pass per command | existing |
+| C4 | 1.0.275 | forced includes searched and read once per (directory, -I list, name) | `ForcedInclude_SameNameUnderAnotherIncludeDir_IsItsOwnLookup` |
+| C3 | 1.0.276 | include search: sets beside the lists; each (base, include) resolved once | existing |
+| new | 1.0.277 | dynamic PGO off in the CLI runtime config (below) | n/a |
+| C5, C17 | 1.0.278 | local-name test by binary search over sorted scopes; pass 1d scans without declarators | `SameNameLocals_HideTheFunctionOnlyInTheirScopes` |
+| C14 | 1.0.279 | line of an offset by binary search over line starts | `TextLinesTests` |
+| C13 | 1.0.280 | drop/keep overlap by sorted sweep, not pairwise | `DropRanges_OverlapFallback_MatchesPairwiseRule` |
+| C7 | 1.0.281 | call and identifier names interned straight from the parsed text | `NamesAfterNonAsciiText_AreReadAtTheirOffsets` |
+| C22 | 1.0.282 | `AfterInclude` re-checks only names set or undefined since the last include | `AfterInclude_Incremental_MatchesFullPass` |
+| C6, C15, C18 | 1.0.283 | identifiers in parse-error files read lean, inside-ERROR test by range; nested initializer lists not rescanned; macro argument use worked out once per (macro, argument), without a per-call regex | `FunctionInErrorWrappedTable_IsKept_ViaFile` (non-ASCII case), `NestedInitializerLists_EveryDepthCounts_CommentsDoNot`, `UseOf_MatchesTheRegexVersion` |
+
+**Measured (interleaved, minimum of 3-5 rounds, ms).** Tree `L` (log-heavy), base = 1.0.272:
+
+| key | base | C1 | C2 | C4 | C3 |
+|---|---:|---:|---:|---:|---:|
+| `time.defines` | 23,295 | 23,357 | 2,131 | 961 | 966 |
+| `time.input+refscan` | 5,083 | 5,085 | 5,075 | 5,136 | 2,860 |
+| `stage0.cpu.check` | 4,750 | 3,359 | 3,359 | 3,218 | 3,000 |
+| `stage1.cpu.check` | 3,921 | 2,359 | 1,750 | 2,031 | 1,734 |
+| `pass.scopes` | 2,655 | 1,752 | 1,689 | 1,557 | 1,568 |
+| wall, whole run | 47.8 s | 48.0 s | 25.5 s | 24.3 s | 22.2 s |
+| CPU, whole run | 31.4 s | 30.3 s | 26.4 s | 25.4 s | 22.8 s |
+
+On `L`, the run is 2.15× faster in wall time and uses 27% less CPU. Tree `w` (`#if`-heavy): `time.defines` 1,925 → 180 ms, `pass.scopes` 3,022 → 2,291 ms (C1), wall 9.25 → 7.65 s.
+
+**New finding: dynamic PGO (1.0.277).** On `w`, C4 and C3 each cut their own phase but raised build-graph CPU (11.7 → 14.5 s). Neither the compiled regex nor the GC mode explained it (each tried as a separate build), while `TieredCompilation=0` removed it. The cause was dynamic PGO: instrumented tier-0 code ran the parse on dozens of threads at once, and its re-JIT was about a third of the run's CPU. It shows up as soon as an earlier phase finishes quickly and the parse starts while code is still at tier 0. It is now off in the CLI's runtime config (`DOTNET_TieredPGO=1` turns it back on):
+
+| tree | key | PGO on | PGO off | tiered compilation off |
+|---|---|---:|---:|---:|
+| `w` | CPU | 19.3 s | 12.6 s | 10.8 s |
+| `w` | wall | 7.47 s | 6.45 s | 6.56 s |
+| `L` | CPU | 22.5 s | 21.0 s | 22.6 s |
+| `L` | wall | 21.7 s | 20.9 s | 21.6 s |
+| `T` | wall | 1.18 s | 1.14 s | 1.56 s |
+
+Tiered compilation stays on: turning it off costs 0.4 s of start-up on a small tree.
+
+**C5, C17, C14, C13, C7, C22, C6, C15, C18: timed together, no measurable change on these trees.** One interleaved batch under the CPU lease, 3 rounds, one build per release from 1.0.277 to 1.0.283 plus 1.0.285 (another session was using 6 cores at normal priority, so absolute times are higher than the tables above; compare within this table only). Minimum of 3 runs:
+
+| tree | key | 1.0.277 | .278 | .279 | .280 | .281 | .282 | .283 | .285 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `w` | wall, s | 8.56 | 9.10 | 8.31 | 8.68 | 8.25 | 8.76 | 8.41 | 8.31 |
+| `w` | CPU, s | 26.8 | 27.7 | 27.2 | 27.4 | 26.4 | 26.3 | 27.2 | 26.2 |
+| `w` | `pass.scopes`, ms | 2,476 | 2,429 | 2,470 | 2,499 | 2,443 | 2,429 | 2,452 | 2,391 |
+| `L` | wall, s | 25.2 | 21.8 | 25.0 | 24.7 | 25.0 | 25.0 | 25.7 | 24.8 |
+| `L` | `stage0.cpu.check`, ms | 3,937 | 3,890 | 4,593 | 4,156 | 4,015 | 3,859 | 4,234 | 4,453 |
+
+Every difference is inside the run-to-run spread (`L`'s medians ranged up to 44 s of CPU under the other load), and no build failed verification. That is what was expected: each of these fixes replaces a linear scan or a per-call allocation that only grows on shapes these trees barely contain (many drop ranges in one file, deep tables, include-heavy macro tables, parse-error files). They are kept for the complexity bound and because each is pinned by a test against the old behaviour; none adds work on any path, and 1.0.285 shows no regression.
+
+**Reverted:** none. The compiled-regex part of C4 was suspected of the build-graph rise and tested as a separate build; it was not the cause and stays.
+
+**Deferred:**
+- **C8, C9, C10, C12:** caches across plans, waves and check rounds. On `L` the whole check phase is 0.46 s + 0.33 s wall, so they need a C++-heavy, many-round tree to show a gain and a cache-key design to stay sound. That is a larger change than this pass.
+- **C11:** HeaderCarver fixpoint; medium risk, needs multi-GB headers to matter.
+- **C16:** sharing one `CodeOnly` per text needs a reference-equality gate through four helper classes.
+- **C19:** the double line-map scan runs only on the failure paths (`LineMaps` for write-ups, the uncertain map per violation), so it costs nothing on a clean run.
+- **C20, C21:** low-to-medium gains, and C21's worklist must keep the `MaxPerMacro` order.
+- **C26, C32, C36 and the remaining Low findings:** small or unmeasured. C36 (read-ahead window) needs timings at several window sizes under a lease.
