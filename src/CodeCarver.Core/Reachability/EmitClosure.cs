@@ -97,7 +97,8 @@ public static class EmitClosure
 
     /// <summary>
     /// Header policy shared by both stages: a header is emitted whole, but a compiler only emits code for a
-    /// header definition that is non-<c>static</c>, non-<c>inline</c>, non-template and at file/namespace scope
+    /// header definition that is non-<c>inline</c>, non-template and at file/namespace scope (a <c>static</c> one too:
+    /// at -O0 it is compiled unused, review B7)
     /// (an unused inline or a method in a class body produces nothing to link). Those are the header
     /// definitions to retain. Decided with the same tokenizer as <see cref="EmittedLinkCheck"/>, so the
     /// closure and the verify agree on what a header contributes.
@@ -107,7 +108,7 @@ public static class EmitClosure
         if (string.IsNullOrEmpty(headerText)) yield break;
         var emitting = new HashSet<(string, int)>();
         foreach (var d in EmittedLinkCheck.Scan(headerText).Definitions)
-            if (!d.Static && !d.Inline && !d.Data) emitting.Add((d.Name, d.Line));
+            if (!d.Inline && !d.Data) emitting.Add((d.Name, d.Line));
         if (emitting.Count == 0) yield break;
         foreach (var n in defs)
         {

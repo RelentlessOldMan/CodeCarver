@@ -1060,7 +1060,7 @@ public static class EmittedLinkCheck
                 result.Definitions.Add(new Definition(name, t.Line, StaticBefore(toks, stmtStart, i), false));
                 stmtDeclared.Add(name);
                 pendingBody = true;
-                pendingQuiet = header && StaticBefore(toks, stmtStart, i);
+                pendingQuiet = false;   // never inline here: compiled even when static (review B7)
                 i = pclose;
                 continue;
             }
@@ -1075,7 +1075,7 @@ public static class EmittedLinkCheck
                 result.Definitions.Add(new Definition(inner, t.Line, st, false));
                 stmtDeclared.Add(inner);
                 pendingBody = true;
-                pendingQuiet = header && st;
+                pendingQuiet = false;
                 i = wclose;
                 continue;
             }
@@ -1098,7 +1098,7 @@ public static class EmittedLinkCheck
                     result.Definitions.Add(new Definition(name, t.Line, isStatic, isInline, bare));
                     stmtDeclared.Add(name);
                     pendingBody = true;
-                    pendingQuiet = header && (isStatic || isInline);
+                    pendingQuiet = header && isInline;   // a static non-inline one is compiled even unused at -O0 (review B7)
                     continue;
                 }
             }
