@@ -85,6 +85,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // constructor would run, or "" when the initializer itself calls something.
     private readonly List<(NodeId Id, string Class)> _startupObjects = new();
     private readonly List<(NodeId Id, string Class)> _companions = new();
+    private readonly List<(NodeId Id, string Class)> _methods = new();
+    private readonly HashSet<string> _virtualNames = new(StringComparer.Ordinal);
 
     /// <summary>
     /// C++ operators, conversions and destructors with the class whose objects run them (review X2): <c>a + b</c>,
@@ -503,6 +505,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _headerData.Clear();
         _startupObjects.Clear();
         _companions.Clear();
+        _methods.Clear();
+        _virtualNames.Clear();
         _emptyDefineConditions.Clear();
         _condExternFlags.Clear();
         _definesExternFlag.Clear();
@@ -685,6 +689,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // reg("x");`, `static auto x = []{...}();`. The linker keeps its unit and the runtime runs it before main, with
         // nothing in the program naming it, so it is a root like a constructor attribute. An object of a class only
         // counts when the class has a constructor in the tree: a library type's or an aggregate's registers nothing.
+        // Review X3: a virtual function runs through its class's vtable (or from a library base class), never by a call
+        // naming it here. A method whose name is declared virtual, override or final anywhere goes with its class, kept
+        // when the class is instantiated in emitted code.
+        if (_virtualNames.Count > 0)
+            foreach (var (id, cls) in _methods)
+                if (_virtualNames.Contains(graph.GetNode(id).Name)) _companions.Add((id, cls));
         if (_startupObjects.Count > 0)
         {
             var types = graph.Nodes.Where(n => n.Kind == NodeKind.Type).Select(n => n.Name).ToHashSet(StringComparer.Ordinal);
@@ -1536,6 +1546,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     }
 
     private static readonly Regex Spaces = new(@"\s+", RegexOptions.Compiled);
+    private static readonly Regex VirtualHead = new(@"\bvirtual\b[^;{}()]*?\b(?<name>[A-Za-z_]\w*)\s*\(", RegexOptions.Compiled);
+    private static readonly Regex OverrideTail = new(
+        @"\b(?<name>[A-Za-z_]\w*)\s*\((?:[^;{}()]|\([^;{}()]*\))*\)\s*(?:const\s*)?(?:volatile\s*)?(?:&&?\s*)?(?:noexcept\s*(?:\([^()]*\)\s*)?)?(?:override|final)\b",
+        RegexOptions.Compiled);
     private static readonly Regex DefaultedOutOfLine = new(
         @"(?<!\w)(?<cls>[A-Za-z_]\w*)\s*::\s*(?<tilde>~\s*)?\k<cls>\s*\([^;{}()]*\)\s*(?:noexcept\s*)?=\s*default\s*;",
         RegexOptions.Compiled);
@@ -1563,25 +1577,30 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             classes.Add(Spaces.Replace(nameNode.Text, "").TrimStart('~'));
             return classes;
         }
+        if (MemberOf(nameNode, out var qualified) is { } owner) classes.Add(owner);
+        else if (!qualified && Up(nameNode) is { Type: "function_declarator" } fd && fd.GetChildForField("parameters") is { } ps)
+            foreach (var param in NodeKids.Named(ps))
+                if (ClassName(param.GetChildForField("type")) is { } c && !classes.Contains(c)) classes.Add(c);
+        return classes;
+    }
+
+    /// <summary>The class a function definition belongs to: the scope it is qualified with out of line
+    /// (<c>Vec::norm</c>), or the class whose body it is defined in. Null for a free function.</summary>
+    private static string? MemberOf(TsNode nameNode, out bool qualified)
+    {
+        qualified = false;
         if (Up(nameNode) is { Type: "qualified_identifier" } q && q.GetChildForField("scope") is { } scope)
         {
-            if ((scope.Type == "template_type" ? scope.GetChildForField("name")?.Text : scope.Text) is { Length: > 0 } s)
-                classes.Add(s);
-            return classes;
+            qualified = true;
+            return (scope.Type == "template_type" ? scope.GetChildForField("name")?.Text : scope.Text) is { Length: > 0 } s ? s : null;
         }
         for (var (p, i) = (Up(nameNode), 0); p is not null && i < 8; p = Up(p), i++)
         {
             if (p.Type is "class_specifier" or "struct_specifier" or "union_specifier")
-            {
-                if (p.GetChildForField("name") is { } cn) classes.Add(ClassName(cn) ?? cn.Text);
-                return classes;
-            }
+                return p.GetChildForField("name") is { } cn ? ClassName(cn) ?? cn.Text : null;
             if (p.Type is "translation_unit" or "declaration_list" or "compound_statement") break;
         }
-        if (Up(nameNode) is { Type: "function_declarator" } fd && fd.GetChildForField("parameters") is { } ps)
-            foreach (var param in NodeKids.Named(ps))
-                if (ClassName(param.GetChildForField("type")) is { } c && !classes.Contains(c)) classes.Add(c);
-        return classes;
+        return null;
     }
 
     /// <summary>The last name of a type: <c>Registrar</c>, <c>ns::Registrar</c> and <c>Registry&lt;int&gt;</c> name a class.</summary>
@@ -1856,6 +1875,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         public readonly List<(NodeId Id, string Header, bool CondExtern)> HeaderData = new();
         public readonly List<(NodeId Id, string Class)> StartupObjects = new();
         public readonly List<(NodeId Id, string Class)> Companions = new();
+        public readonly List<(NodeId Id, string Class)> Methods = new();
+        public readonly HashSet<string> VirtualNames = new(StringComparer.Ordinal);
         public readonly List<(NodeId File, string Macro, List<string> Names)> WordInvocations = new();
         public bool DefinesExternFlag, Unparsed;
         public int? BudgetSymbols;
@@ -1954,6 +1975,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         foreach (var (id, header, condExtern) in w.HeaderData) _headerData.Add((M(id), header, condExtern));
         foreach (var (id, cls) in w.StartupObjects) _startupObjects.Add((M(id), cls));
         foreach (var (id, cls) in w.Companions) _companions.Add((M(id), cls));
+        foreach (var (id, cls) in w.Methods) _methods.Add((M(id), cls));
+        _virtualNames.UnionWith(w.VirtualNames);
         foreach (var (file, macro, names) in w.WordInvocations) _wordInvocations.Add((M(file), macro, names));
         if (w.DefinesExternFlag) _definesExternFlag.Add(path);
         if (w.Unparsed) _unparsed.Add(path);
@@ -2094,6 +2117,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     if (classes.Count == 0) graph.AddFlag(fid, NodeFlags.Keep);   // a replacement operator new/delete
                     foreach (var c in classes) w.Companions.Add((fid, c));
                 }
+                else if (!_cGrammar && MemberOf(node, out _) is { } cls) w.Methods.Add((fid, cls));
             }
             else if (cap.Name == "macro")
             {
@@ -2116,6 +2140,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 var tid = graph.GetOrAddNode(NodeKind.Type, name, path, new SourceSpan(row, row));
                 graph.AddEdge(tid, fileNode, EdgeKind.DefinedIn);
             }
+        }
+        // Names declared virtual / override / final here, prototypes included (review X3; see _virtualNames).
+        if (!_cGrammar && (text.Contains("virtual", StringComparison.Ordinal) || text.Contains("override", StringComparison.Ordinal)
+                           || text.Contains("final", StringComparison.Ordinal)))
+        {
+            foreach (Match m in VirtualHead.Matches(text)) w.VirtualNames.Add(m.Groups["name"].Value);
+            foreach (Match m in OverrideTail.Matches(text)) w.VirtualNames.Add(m.Groups["name"].Value);
         }
         // `Shape::~Shape() = default;` out of line parses as an expression, not a definition, yet the compiler defines
         // the destructor here, and with it the class's vtable when it is the first virtual member (review X2).

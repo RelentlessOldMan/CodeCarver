@@ -36,4 +36,28 @@ public sealed class CppImplicitCallTests
             Assert.True(t.Kept(f), f + "\n" + r.Out + r.Err);
         Assert.False(t.Kept("unused.cpp"), r.Out + r.Err);
     }
+
+    [Fact]
+    public void VirtualsOfInstantiatedClasses_KeepTheirUnits()
+    {
+        // Review X3: the vtable of every class made needs each virtual, called by name or not; a library base calls
+        // an override (a streambuf's overflow) with nothing in the tree naming it.
+        using var t = new TreeCarve()
+            .W("shapes.h", "struct Base { virtual ~Base() {} virtual int b() const; virtual int c() const { return 1; } };\n"
+                + "struct Derived : Base { int b() const override; };\n"
+                + "struct LibBuf { virtual ~LibBuf() {} virtual int overflow(int c) { return c; } };\n"
+                + "struct MyBuf : LibBuf { int overflow(int c) final; };\n"
+                + "struct Lonely { virtual int z() const; };\n")
+            .W("base_b.cpp", "#include \"shapes.h\"\nint Base::b() const { return 1; }\n")
+            .W("derived_b.cpp", "#include \"shapes.h\"\nint Derived::b() const { return 2; }\n")
+            .W("mybuf.cpp", "#include \"shapes.h\"\nint MyBuf::overflow(int c) { return c + 1; }\n")
+            .W("lonely.cpp", "#include \"shapes.h\"\nint Lonely::z() const { return 3; }\n")
+            .W("main.cpp", "#include \"shapes.h\"\nint main() { Derived d; Base &r = d; MyBuf mb; return r.c(); }\n");
+        foreach (var f in new[] { "base_b.cpp", "derived_b.cpp", "mybuf.cpp", "lonely.cpp", "main.cpp" }) t.Compile(f);
+        var r = t.Carve(languages: "\"cpp\"");
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        foreach (var f in new[] { "base_b.cpp", "derived_b.cpp", "mybuf.cpp" })
+            Assert.True(t.Kept(f), f + "\n" + r.Out + r.Err);
+        Assert.False(t.Kept("lonely.cpp"), r.Out + r.Err);
+    }
 }
