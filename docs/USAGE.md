@@ -654,10 +654,17 @@ make the parse slower); it never changes what is kept. Most of a run's peak is t
 data: `DOTNET_GCConserveMemory=9` (default 7) trades about 15% of the peak for a slower graph build.
 
 The link check's template walks that must read headers again (more header text than the check holds) share a budget
-of an eighth of that memory; `CODECARVER_CHECK_WALK_MB=N` sets it. Each check loop reports what each part of its
+of an eighth of that memory, and so do the first parses of headers in all walks; `CODECARVER_CHECK_WALK_MB=N` sets
+it (`check.walkWaits`, `check.parseWaits`: times one waited). Each check loop reports what each part of its
 per-file work allocated: `check.<loop>.part.<part>.allocatedMb`, `.itemMaxMb`, `.items`, `.pulledIn` and `.pulledInMb`
-(headers a template walk read), and a memory stop adds `stop.part.<part>.*` and `stop.readyAhead` for the loop it
+(headers a template walk read; part `templateParse` is the first parses of headers within the walks), and a memory stop adds `stop.part.<part>.*` and `stop.readyAhead` for the loop it
 stopped in.
+
+The check also reports the tree's shape, numbers only, as each loop ends, for sizing a test corpus like the tree:
+`check.shape.headers`, `.headersOver1Mb`, `.headerTotalMb`, `.headerKb.p50/p95/max` (the headers read), and for each
+template walk's include closure `.walkFiles` and `.walkKb` (distinct files) and `.walkReads` and `.walkReadKb`
+(includes followed, re-includes counted again), each `.p50/p95/max`, and `.walkedPct` (files walked of those that
+could be). Sizes are in characters.
 
 Two TEMPORARY switches for chasing the check's memory, to be removed once it is understood:
 `CODECARVER_DEBUG_ONLY=check-emitted` (or `check-dropped`, or `check`) runs only the link check, right after the

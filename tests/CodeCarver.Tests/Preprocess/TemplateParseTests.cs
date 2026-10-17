@@ -89,6 +89,9 @@ public sealed class TemplateParseTests
         "",
         "\n\n#",
         "#define LAST\\",
+        // The name read in place (no copy) where a comment or continuation sits at or before its end.
+        "#define /*x*/LEAD 1\n#define GLUED/*x*/1\n#define SP /*x*/ 1\n#undef U/*c*/\n#undef V /*c*/\n#undef\tW\v/*c*/\n#undef /*c*/ X\n",
+        "#define \\\nCONT 1\n#undef \\\nUC\n#define NAME\\\n(x) x\n#define K // only //\n#undef // gone\n",
     }.Select(t => new object[] { t });
 
     [Theory]

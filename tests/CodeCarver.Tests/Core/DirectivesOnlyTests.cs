@@ -46,6 +46,32 @@ public sealed class DirectivesOnlyTests
     }
 
     [Fact]
+    public void MostlyDirectiveTexts_MatchTheLineSplittingVersion_AndAllDirectivesIsTheTextItself()
+    {
+        // Mostly whole directive lines, as a register-map header is: the measured length and the text-is-its-own-answer
+        // shortcut (C22: a header read again for each walk was copied twice over by a StringBuilder).
+        string[] lines = { "#define A 1\n", "#define B 2\n", "  #if X\n", "#endif\n", "\n", "#define C \\\n", "\r\n", "x\n", "#define D 4" };
+        var r = new Random(7);
+        for (var t = 0; t < 20000; t++)
+        {
+            var sb = new StringBuilder();
+            for (var n = r.Next(0, 12); n > 0; n--) sb.Append(lines[r.Next(r.Next(2) == 0 ? 4 : lines.Length)]);
+            var text = sb.ToString();
+            Assert.Equal(Reference(text), TemplateInstances.DirectivesOnly(text));
+        }
+        var regs = string.Concat(Enumerable.Range(0, 50_000).Select(k => $"#define R{k} (BASE + 0x{k * 4:X}u) /* reg {k} */\n"));
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var same = TemplateInstances.DirectivesOnly(regs);
+        Assert.True(GC.GetAllocatedBytesForCurrentThread() - before < 1024);
+        Assert.Same(regs, same);
+        var mixed = "int x;\n" + regs;
+        before = GC.GetAllocatedBytesForCurrentThread();
+        Assert.Equal(regs, TemplateInstances.DirectivesOnly(mixed));
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.True(allocated < 2L * regs.Length + 1024, $"{allocated:N0} bytes for {regs.Length:N0} chars (one string)");
+    }
+
+    [Fact]
     public void LongContinuation_IsLinear()
     {
         var text = "#define BIG \\\n" + string.Concat(Enumerable.Repeat("    REG_FIELD(a, b, c) \\\n", 200_000)) + "    0\nint x;\n";

@@ -127,6 +127,10 @@ public static class EmittedLinkCheck
         // Each loop's time, and memory as it ends: the process's private bytes, the managed heap the last GC left, and
         // managed bytes allocated in the loop (MB). A "Max" key is kept at its largest over a stage's rounds.
         var allocatedAt = GC.GetTotalAllocatedBytes();
+        long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0;
+        // The tree's shape, for sizing a test corpus like it (shape.*): each header's size, each walk's include closure.
+        var headerSizes = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
+        var closures = new ConcurrentBag<(int Files, long Chars, int Reads, long ReadChars)>();
         void Lap(string key)
         {
             stats[key + "Ms"] = phase.ElapsedMilliseconds;
@@ -148,13 +152,13 @@ public static class EmittedLinkCheck
             foreach (var (pk, pv) in Activity.Parts())
                 if (pk.StartsWith("part.", StringComparison.Ordinal) && !pk.EndsWith(".inFlight", StringComparison.Ordinal)) stats[$"{key}.{pk}"] = pv;
             Activity.ClearParts();
+            Shape(stats, headerSizes.Values, closures, templateWalks, templateWalksSkipped);
             phase.Restart();
             // Handed out as each loop ends, so a run stopped inside the check still has the loops before.
             foreach (var k in new[] { key + "Ms", key + ".privateMaxMb", key + ".heapMaxMb", key + ".allocatedMb" }
-                         .Concat(stats.Keys.Where(k => k.StartsWith("held.", StringComparison.Ordinal) || k.StartsWith(key + ".part.", StringComparison.Ordinal))).ToList())
+                         .Concat(stats.Keys.Where(k => k.StartsWith("held.", StringComparison.Ordinal) || k.StartsWith("shape.", StringComparison.Ordinal) || k.StartsWith(key + ".part.", StringComparison.Ordinal))).ToList())
                 if (stats.TryGetValue(k, out var v)) report?.Invoke(k, v);
         }
-        long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0;
         var scanGate = new CodeCarver.Core.Util.ByteGate(ScanBudget());   // see Gated
         var readGate = new CodeCarver.Core.Util.ByteGate(ReadBudget());
         // Template walks that re-read headers the check could not hold re-parse them, a walk at a time (C20/C21: 64 walks
@@ -165,14 +169,19 @@ public static class EmittedLinkCheck
         var walkGate = new CodeCarver.Core.Util.ByteGate(walkBudget);
         long walkCost = -1;
         var headerOverflow = false;
+        // A header's first parse (kept with the header after) allocates a few times its text; walks of different units parse
+        // different closures at once (C22: 16 walks at once, one parsing 402 MB of headers). Each parse takes its estimate
+        // from the same budget, one at a time per thread, so the walks hold at most the budget in parses running at once.
+        var parseGate = new CodeCarver.Core.Util.ByteGate(walkBudget);
+        IDisposable? Parsing(int chars) => new ParseSlot(Activity.Part("templateParse", chars), parseGate.Take(Math.Min(walkBudget, chars * ParseBytesPerChar)));
         LinkCheckResult Done(IReadOnlyList<LinkViolation> v)
         {
             Lap("rest");
             stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["instancesRedone"] = instancesRedone;
-            stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits;
+            stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits; stats["parseWaits"] = parseGate.Waits;
             stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;
             stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped;
-            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped" })
+            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -210,6 +219,7 @@ public static class EmittedLinkCheck
             Interlocked.Increment(ref filesRead);
             var t = TryRead(p, maxBytes);
             if (t is null) return (null, null);
+            headerSizes.TryAdd(p, t.Length);
             t = CodeCarver.Core.Preprocess.SourceText.Normalize(t);
             var template = CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(t);
             if (!template) t = CodeCarver.Core.Preprocess.TemplateInstances.DirectivesOnly(t);
@@ -364,14 +374,18 @@ public static class EmittedLinkCheck
             var cost = Volatile.Read(ref headerOverflow) ? Interlocked.Read(ref walkCost) is var c and >= 0 ? c : walkBudget : 0;
             using var slot = walkGate.Take(cost);
             var (reread, start) = (t_reread, GC.GetAllocatedBytesForCurrentThread());
+            var entered = new HashSet<string>(StringComparer.Ordinal);
+            long chars = 0, readChars = 0; var reads = 0;
             var found = CodeCarver.Core.Preprocess.TemplateInstances.Find(text, raw =>
                         {
                             var t = ReadTemplate(raw);
                             Activity.Note(t?.Length ?? 0);
+                            if (t is not null) { reads++; readChars += t.Length; if (entered.Add(raw)) chars += t.Length; }
                             deps?.Add((raw, TemplateKey(raw)));
                             return t;
-                        }, commandLineMacros)
+                        }, commandLineMacros, Parsing)
                         .Select(i => new Definition(i.Name, i.Line, false, false)).ToList();
+            closures.Add((entered.Count, chars, reads, readChars));
             if (t_reread != reread)
             {
                 var used = GC.GetAllocatedBytesForCurrentThread() - start;
@@ -729,6 +743,41 @@ public static class EmittedLinkCheck
             return mb * 1024 * 1024 / sizeof(char);
         var total = CodeCarver.Core.Util.MemoryGate.BudgetBytes();
         return (total > 0 ? total / 32 : 512L << 20) / sizeof(char);
+    }
+
+    /// <summary>The tree's shape as the check saw it, numbers only (no names), for sizing a test corpus like it: the
+    /// headers read (count, KB p50/p95/max, how many over 1 MB, total MB), each template walk's include closure (distinct
+    /// files and KB, includes followed and KB with re-includes, p50/p95/max) and the share of files walked. Sizes are in
+    /// chars (bytes for one-byte text).</summary>
+    static void Shape(Dictionary<string, long> stats, ICollection<long> headerSizes, IEnumerable<(int Files, long Chars, int Reads, long ReadChars)> closures,
+                      long walks, long skipped)
+    {
+        void Spread(string key, IEnumerable<long> values)
+        {
+            var v = values.OrderBy(x => x).ToArray();
+            if (v.Length == 0) return;
+            long At(double q) => v[Math.Min(v.Length - 1, (int)(q * v.Length))];
+            stats[key + ".p50"] = At(0.50); stats[key + ".p95"] = At(0.95); stats[key + ".max"] = v[^1];
+        }
+        stats["shape.headers"] = headerSizes.Count;
+        stats["shape.headersOver1Mb"] = headerSizes.Count(s => s > 1L << 20);
+        stats["shape.headerTotalMb"] = headerSizes.Sum() >> 20;
+        Spread("shape.headerKb", headerSizes.Select(s => s >> 10));
+        var c = closures.ToList();
+        Spread("shape.walkFiles", c.Select(x => (long)x.Files));
+        Spread("shape.walkKb", c.Select(x => x.Chars >> 10));
+        Spread("shape.walkReads", c.Select(x => (long)x.Reads));
+        Spread("shape.walkReadKb", c.Select(x => x.ReadChars >> 10));
+        stats["shape.walkedPct"] = walks + skipped == 0 ? 0 : walks * 100 / (walks + skipped);
+    }
+
+    /// <summary>What a header's first template parse allocates for each char of it, as measured (the ops, the define
+    /// index), with room: what a parse takes from the walk budget.</summary>
+    const long ParseBytesPerChar = 2;
+
+    sealed class ParseSlot(Activity.PartScope part, CodeCarver.Core.Util.ByteGate.Held held) : IDisposable
+    {
+        public void Dispose() { held.Dispose(); part.Dispose(); }
     }
 
     /// <summary>Bytes the template walks that re-read headers allocate at once: an 8th of the machine's memory or the run

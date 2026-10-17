@@ -90,6 +90,22 @@ beside it), 1,011 -> 184 MB; once a header was not held, a walk takes from a wal
 `CODECARVER_CHECK_WALK_MB`) what the largest re-reading walk allocated, the first one running alone to size the rest.
 Keys: `check.walkWaits`, `check.walkCostMaxMb`, and `check.<loop>.part.<part>.allocatedMb/itemMaxMb/items/pulledIn/pulledInMb`.
 
+C22 (1.0.285, check-emitted alone) still stopped at 21.6 GB in 3 minutes: one walk pulled in 436 headers (402 MB) and
+allocated 3.6 GB, up to 16 walks at once: the walk budget, which charges only walks that re-read headers, did not
+hold them back. The parse was kept with each held header at about 5x its text (an Op per line with a copy of the line, the
+name and body of every #define, a Macro, and a string-keyed index). Second fix: an Op is now only where the line is
+(kind, lines, start, end); the name, include and macro are read again from the text when a walk asks for them, the
+define index goes by the name's hash (no string per name). A first parse takes 2 bytes a char from the same budget
+(`check.parseWaits`, part `templateParse`). Local repro (64 units over 120 register headers, 70 MB of #defines): the
+walk that parses them 712 -> 197 MB (parse 58 MB, the rest the re-read text), 63 re-reading walks 8.6 -> 4.5 GB, check
+56 -> 21 s; 64 units over different 64-header chains: walks 670 -> 157 MB, peak 507 -> 292 MB.
+
+The ratio tests (TemplateWalkMemoryTests: allocation per char of header pulled in, held and read again) then found the
+re-read path at 7.7 bytes a char: `DirectivesOnly` built each header again in a StringBuilder (chunks, then its
+ToString). It now measures, writes the string once at its size, and returns a header that is all directive lines as it
+is: 683 -> 322 MB for 89 M chars read again (the file's bytes, its string and its parse). Limits asserted: a first walk
+2 bytes a char, a cached walk 0.1, the link check's walks 1.5 held and 4 read again (about 10 before these fixes).
+
 **M4 - C20 = the quadratic join. WRONG.** C21 ran on 1.0.283 (join fixed) and spiked the same way.
 
 **M5 - GC headroom.** ConserveMemory 9: peak -16% (mactree 1841 -> 1547) and -12% (L) but build-graph +23..50%; gen0size

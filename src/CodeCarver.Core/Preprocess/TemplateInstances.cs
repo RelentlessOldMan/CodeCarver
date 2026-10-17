@@ -52,15 +52,17 @@ public static class TemplateInstances
     /// directive lines (<see cref="DirectivesOnly"/>), and it should return the same string object for the same header
     /// (a header with no macro-named head is read once per unit). <paramref name="initial"/>: macros defined before the
     /// unit (the build's command-line <c>-D</c>), so <c>int HIDE(den)(void) {</c> under <c>-D'HIDE(n)=hid_##n'</c>
-    /// defines hid_den.</summary>
+    /// defines hid_den. <paramref name="parsing"/>: called with the length of each header about to be parsed for the first
+    /// time (its parse is kept with the header string), the result disposed when done: the caller can hold back parses.</summary>
     public static List<(string Name, int Line)> Find(string unit, Func<string, string?> readInclude,
-                                                     IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? initial = null)
+                                                     IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? initial = null,
+                                                     Func<int, IDisposable?>? parsing = null)
     {
         var found = new List<(string, int)>();
         if (!unit.Contains('#') && (initial is null || initial.Count == 0)) return found;
         var macros = new Dictionary<string, List<Macro>>(StringComparer.Ordinal);
         if (initial is not null) foreach (var kv in initial) if (kv.Value.Count > 0) macros[kv.Key] = kv.Value.Select(v => new Macro(v.Params, v.Body)).ToList();
-        var w = new WalkState(macros, readInclude, found);
+        var w = new WalkState(macros, readInclude, found) { Parsing = parsing };
         Walk(Parse(unit, false), w, unitLine: null, depth: 0, ifBase: 0);
         return found.Distinct().ToList();
     }
@@ -69,9 +71,20 @@ public static class TemplateInstances
     /// reads in a header with no macro-named head.</summary>
     public static string DirectivesOnly(string text)
     {
-        // One pass, each piece appended once: a directive continued over many lines was copied again for each line it
-        // took in (gigabytes for a tree of register-map headers).
-        var sb = new StringBuilder();
+        // Each piece copied once: a directive continued over many lines was copied again for each line it took in
+        // (gigabytes for a tree of register-map headers). Measured first, then written at its size: a StringBuilder's
+        // chunks and its ToString came to twice the text, for each header a walk reads again (C22). A text that is
+        // all directive lines ending in '\n', none continued, is its own answer.
+        var length = DirectivesOnly(text, default);
+        if (length == text.Length && Same(text)) return text;
+        return string.Create(length, text, (dst, t) => DirectivesOnly(t, dst));
+    }
+
+    // The directive lines of text (as DirectivesOnly), written to dst when given; their length.
+    static int DirectivesOnly(string text, Span<char> dst)
+    {
+        var n = 0;
+        void Put(ReadOnlySpan<char> s, Span<char> d) { if (!d.IsEmpty) s.CopyTo(d[n..]); n += s.Length; }
         for (var start = 0; start <= text.Length; )
         {
             var (end, next) = Line(text, start);
@@ -82,16 +95,22 @@ public static class TemplateInstances
                 // A line ending in a backslash takes in the next one, the backslash becoming a space.
                 while (end > start && text[end - 1] == '\\' && next <= text.Length)
                 {
-                    sb.Append(text, start, end - 1 - start).Append(' ');
+                    Put(text.AsSpan(start, end - 1 - start), dst);
+                    Put(" ", dst);
                     start = next;
                     (end, next) = Line(text, start);
                 }
-                sb.Append(text, start, end - start).Append('\n');
+                Put(text.AsSpan(start, end - start), dst);
+                Put("\n", dst);
             }
             start = next;
         }
-        return sb.ToString();
+        return n;
     }
+
+    // Is text exactly its directive lines? (Same length was checked: every line kept whole, so only a '\r' or a
+    // continuation, which DirectivesOnly drops or joins, could differ.)
+    static bool Same(string text) => !text.Contains('\r') && !text.Contains("\\\n", StringComparison.Ordinal) && text.EndsWith('\n');
 
     // The line from start: where its text ends (before the '\n' and the '\r's before it), and where the next line
     // starts (past the end of the text for the last line).
@@ -111,6 +130,7 @@ public static class TemplateInstances
     /// (<see cref="Trail"/>), and a name is looked up back along them: the value list a table would hold.</summary>
     sealed record WalkState(Dictionary<string, List<Macro>> Initial, Func<string, string?> ReadInclude, List<(string, int)> Found)
     {
+        public Func<int, IDisposable?>? Parsing { get; init; }
         public readonly HashSet<string> Walked = new(ReferenceEqualityComparer.Instance);
         public readonly List<Stretch> Trail = new();
         // Answers since the trail last grew (Walk clears it).
@@ -131,15 +151,17 @@ public static class TemplateInstances
             for (var t = Trail.Count - 1; t >= 0 && !settled; t--)
             {
                 var st = Trail[t];
-                var ix = st.Parsed.Index;
-                if (!ix.Last.TryGetValue(name, out var i)) continue;
+                var p = st.Parsed;
+                var ix = p.Index;
+                if (!ix.Last.TryGetValue(string.GetHashCode(name.AsSpan()), out var i)) continue;
                 for (; i >= st.From; i = ix.Prev[i])
                 {
-                    if (i >= st.To) continue;
-                    var op = st.Parsed.Ops[i];
+                    // The index goes by the name's hash: an op of another name with the same hash is passed over.
+                    if (i >= st.To || !p.NameOf(i).SequenceEqual(name)) continue;
+                    var op = p.Ops[i];
                     var inIf = st.IfBase + ix.Depth[i] > 0;
                     if (op.Kind == OpKind.Undef) { if (inIf) continue; settled = true; break; }
-                    back.Add((op.Macro!, inIf));
+                    back.Add((p.Directive(i).Macro!, inIf));
                     if (!inIf) { settled = true; break; }
                 }
             }
@@ -165,15 +187,17 @@ public static class TemplateInstances
         public int To = from;
     }
 
-    /// <summary>A parsed text's defines and undefs by name: the last op of each name, each op's previous one of its
-    /// name (-1 for none), and the #if depth each op is at (within the text).</summary>
+    /// <summary>A parsed text's defines and undefs by the hash of their name (no string per name: a register map
+    /// has tens of thousands): the last op of each hash, each op's previous one of its hash (-1 for none), and the #if
+    /// depth each op is at (within the text).</summary>
     sealed class DefineIndex
     {
-        public readonly Dictionary<string, int> Last = new(StringComparer.Ordinal);
+        public readonly Dictionary<int, int> Last = new();
         public readonly int[] Prev, Depth;
 
-        public DefineIndex(Op[] ops)
+        public DefineIndex(Parsed p)
         {
+            var ops = p.Ops;
             Prev = new int[ops.Length];
             Depth = new int[ops.Length];
             var depth = 0;
@@ -184,10 +208,11 @@ public static class TemplateInstances
                 Prev[i] = -1;
                 if (op.Kind == OpKind.Open) depth++;
                 else if (op.Kind == OpKind.Close) depth = Math.Max(0, depth - 1);
-                else if (op.Text is { } name && ((op.Kind == OpKind.Define && op.Macro is not null) || op.Kind == OpKind.Undef))
+                else if (op.Kind is OpKind.Define or OpKind.Undef && p.HasName(i))
                 {
-                    Prev[i] = Last.TryGetValue(name, out var p) ? p : -1;
-                    Last[name] = i;
+                    var h = string.GetHashCode(p.NameOf(i));
+                    Prev[i] = Last.TryGetValue(h, out var q) ? q : -1;
+                    Last[h] = i;
                 }
             }
         }
@@ -195,15 +220,56 @@ public static class TemplateInstances
 
     enum OpKind { Code, Other, Open, Close, Define, Undef, Include }
 
-    /// <summary>One line of a text, or one directive with its continuations (lines <c>First..Last</c>, 0-based), as
-    /// <see cref="Walk"/> reads it: the regexes run once per text, not once per unit that includes it.</summary>
-    readonly record struct Op(OpKind Kind, int First, int Last, string? Text, Macro? Macro);
+    /// <summary>One line of a text, or one directive with its continuations (lines <c>First..Last</c>, 0-based, from
+    /// character <c>Start</c> to <c>End</c>), as <see cref="Walk"/> reads it. Only where it is: the name, include and
+    /// macro are read again from the text when asked (<see cref="Parsed.Directive"/>), a copy of each was 5 times the
+    /// header, kept for as long as the header is.</summary>
+    readonly record struct Op(OpKind Kind, int First, int Last, int Start, int End);
+
+    /// <summary>What a directive says: its name (or include), and for a #define with one, the macro.</summary>
+    readonly record struct Directive(OpKind Kind, string? Text, Macro? Macro);
 
     /// <summary>A text split into <see cref="Op"/>s, and whether it holds a macro-named head (a template header).</summary>
-    sealed record Parsed(Op[] Ops, bool IsTemplate)
+    sealed record Parsed(string Text, Op[] Ops, bool IsTemplate)
     {
         DefineIndex? _index;
-        public DefineIndex Index => LazyInitializer.EnsureInitialized(ref _index, () => new DefineIndex(Ops));
+        public DefineIndex Index => LazyInitializer.EnsureInitialized(ref _index, () => new DefineIndex(this));
+
+        /// <summary>The op's text, continuations joined (a backslash and line end becoming a space).</summary>
+        public ReadOnlySpan<char> Raw(int i)
+        {
+            var op = Ops[i];
+            if (op.First == op.Last) return Text.AsSpan(op.Start, op.End - op.Start);
+            return JoinContinued(Text, op.Start, op.Last - op.First);
+        }
+
+        public Directive Directive(int i) => ParseDirective(Raw(i));
+
+        /// <summary>A #define with a name, or an #undef.</summary>
+        public bool HasName(int i) => Ops[i].Kind == OpKind.Undef || !NameOf(i).IsEmpty;
+
+        /// <summary>The name of a #define or #undef, read in place unless a comment or continuation could change it.</summary>
+        public ReadOnlySpan<char> NameOf(int i)
+        {
+            var op = Ops[i];
+            if (op.First == op.Last && FastName(Text.AsSpan(op.Start, op.End - op.Start), op.Kind, out var name)) return name;
+            return Directive(i).Text;
+        }
+    }
+
+    // The joined text of a directive starting at start and continued over lines more lines.
+    static string JoinContinued(string text, int start, int lines)
+    {
+        var (end, next) = Line(text, start);
+        var sb = new StringBuilder(end - start + 64);
+        sb.Append(text, start, end - start);
+        for (var n = 0; n < lines && sb.Length > 0 && sb[^1] == '\\' && next <= text.Length; n++)
+        {
+            sb.Length--;
+            (end, next) = Line(text, start = next);
+            sb.Append(' ').Append(text, start, end - start);
+        }
+        return sb.ToString();
     }
 
     // Per header string (readInclude returns the same string for the same header): parsed once for every unit. Behind a
@@ -211,12 +277,16 @@ public static class TemplateInstances
     // for the same big headers on dozens of threads at once.
     static readonly System.Runtime.CompilerServices.ConditionalWeakTable<string, Lazy<Parsed>> s_parsed = new();
 
-    static Parsed ParseOf(string header)
-        => s_parsed.GetValue(header, t => new Lazy<Parsed>(() => Parse(t, HasMacroNamedHead(t)))).Value;
+    static Parsed ParseOf(string header, Func<int, IDisposable?>? parsing)
+        => s_parsed.GetValue(header, t => new Lazy<Parsed>(() =>
+        {
+            using var slot = parsing?.Invoke(t.Length);
+            return Parse(t, HasMacroNamedHead(t));
+        })).Value;
 
     // Read by hand, not by the Directive/Conditional/DefineHead regexes: a Match and its Groups for every #define line
     // came to 25 times the header (C20/C21: a walk re-parses every header the check could not hold, 64 walks at once).
-    // Same answers as those regexes.
+    // Same answers as those regexes. Nothing is copied out but continued directives (to read their kind).
     static Parsed Parse(string text, bool isTemplate)
     {
         var ops = new List<Op>(text.Length / 40 + 16);
@@ -230,63 +300,82 @@ public static class TemplateInstances
             while (k < end && char.IsWhiteSpace(text[k])) k++;
             if (k >= end || text[k] != '#')
             {
-                ops.Add(new Op(OpKind.Code, i, i, text.Substring(start, end - start), null));
+                ops.Add(new Op(OpKind.Code, i, i, start, end));
                 start = next;
                 continue;
             }
+            var opStart = start;
             if (!(end > start && text[end - 1] == '\\' && next <= text.Length))
-                ops.Add(ParseDirective(text.AsSpan(start, end - start), first, i));
+                ops.Add(new Op(Head(text.AsSpan(start, end - start)).Kind, first, i, opStart, end));
             else
             {
-                // One buffer: re-copying per continued line costs the square of the directive's length.
-                var sb = new StringBuilder(end - start + 64);
-                sb.Append(text, start, end - start);
-                while (sb.Length > 0 && sb[^1] == '\\' && next <= text.Length)
+                // As JoinContinued: each line ending in a backslash takes in the next.
+                var lastEnd = end;
+                while (lastEnd > start && text[lastEnd - 1] == '\\' && next <= text.Length)
                 {
-                    sb.Length--;
-                    (end, next) = Line(text, start = next);
+                    (lastEnd, next) = Line(text, start = next);
                     i++;
-                    sb.Append(' ').Append(text, start, end - start);
                 }
-                ops.Add(ParseDirective(sb.ToString(), first, i));
+                ops.Add(new Op(Head(JoinContinued(text, opStart, i - first)).Kind, first, i, opStart, lastEnd));
             }
             start = next;
         }
-        return new Parsed(ops.ToArray(), isTemplate);
+        return new Parsed(text, ops.ToArray(), isTemplate);
     }
 
-    /// <summary>Tests: each op of <see cref="Parse"/> as "kind first-last text (params) body".</summary>
+    /// <summary>Tests: each op of <see cref="Parse"/> as "kind first-last text (params) body"; throws where the name
+    /// read in place is not the one <see cref="ParseDirective"/> reads.</summary>
     internal static IEnumerable<string> DescribeParse(string text)
-        => Parse(text, false).Ops.Select(o => $"{o.Kind} {o.First}-{o.Last} [{o.Text}] "
-                                              + (o.Macro is { } m ? $"({(m.Params is null ? "-" : string.Join(",", m.Params))}) [{m.Body}]" : ""));
+    {
+        var p = Parse(text, false);
+        for (var i = 0; i < p.Ops.Length; i++)
+        {
+            var o = p.Ops[i];
+            var d = o.Kind == OpKind.Code ? new Directive(OpKind.Code, p.Raw(i).ToString(), null) : p.Directive(i);
+            if (d.Kind != o.Kind) throw new InvalidOperationException($"op {i}: kind {o.Kind}, directive {d.Kind}");
+            if (o.Kind is OpKind.Define or OpKind.Undef && p.HasName(i) && !p.NameOf(i).SequenceEqual(d.Text))
+                throw new InvalidOperationException($"op {i}: name [{p.NameOf(i).ToString()}], directive [{d.Text}]");
+            yield return $"{o.Kind} {o.First}-{o.Last} [{d.Text}] "
+                         + (d.Macro is { } m ? $"({(m.Params is null ? "-" : string.Join(",", m.Params))}) [{m.Body}]" : "");
+        }
+    }
 
     static bool IsWord(char c) => char.IsLetterOrDigit(c) || c == '_';
 
-    /// <summary>A directive line (continuations joined), as the Directive/Conditional/DefineHead regexes read it. Read
-    /// in place: only the name and body are copied out.</summary>
-    static Op ParseDirective(ReadOnlySpan<char> raw, int first, int last)
+    /// <summary>A directive line's kind, as the Directive/Conditional regexes read it, and where the text after a
+    /// define/undef/include word (and the blanks after it) starts (-1 for other kinds).</summary>
+    static (OpKind Kind, int After) Head(ReadOnlySpan<char> raw)
     {
         var k = 0;
         while (k < raw.Length && raw[k] is ' ' or '\t') k++;
-        if (k >= raw.Length || raw[k] != '#') return new Op(OpKind.Other, first, last, null, null);
+        if (k >= raw.Length || raw[k] != '#') return (OpKind.Other, -1);
         k++;
         while (k < raw.Length && raw[k] is ' ' or '\t') k++;
         var w = k;
         while (k < raw.Length && IsWord(raw[k])) k++;
         var word = raw[w..k];
-        if (word is "if" or "ifdef" or "ifndef") return new Op(OpKind.Open, first, last, null, null);
-        if (word is "endif") return new Op(OpKind.Close, first, last, null, null);
-        if (word is not ("define" or "undef" or "include")) return new Op(OpKind.Other, first, last, null, null);
+        if (word is "if" or "ifdef" or "ifndef") return (OpKind.Open, -1);
+        if (word is "endif") return (OpKind.Close, -1);
+        var kind = word switch { "define" => OpKind.Define, "undef" => OpKind.Undef, "include" => OpKind.Include, _ => OpKind.Other };
+        if (kind == OpKind.Other) return (kind, -1);
         while (k < raw.Length && raw[k] is ' ' or '\t') k++;
-        var rest = raw[k..];
+        return (kind, k);
+    }
+
+    /// <summary>A directive line (continuations joined), as the Directive/Conditional/DefineHead regexes read it.</summary>
+    static Directive ParseDirective(ReadOnlySpan<char> raw)
+    {
+        var (kind, r) = Head(raw);
+        if (r < 0) return new Directive(kind, null, null);
+        var rest = raw[r..];
         if (rest.IndexOf("//", StringComparison.Ordinal) is var c and >= 0) rest = rest[..c];
         if (rest.Contains("/*", StringComparison.Ordinal)) rest = StripComment(rest.ToString());
         rest = rest.Trim();
-        switch (word)
+        switch (kind)
         {
-            case "define":
+            case OpKind.Define:
             {
-                if (rest.Length == 0 || !(char.IsAsciiLetter(rest[0]) || rest[0] == '_')) return new Op(OpKind.Define, first, last, null, null);
+                if (rest.Length == 0 || !(char.IsAsciiLetter(rest[0]) || rest[0] == '_')) return new Directive(kind, null, null);
                 var n = 1;
                 while (n < rest.Length && IsWord(rest[n])) n++;
                 var name = rest[..n].ToString();
@@ -298,15 +387,39 @@ public static class TemplateInstances
                     b = n + 1 + close + 1;
                 }
                 while (b < rest.Length && rest[b] is ' ' or '\t') b++;
-                return new Op(OpKind.Define, first, last, name, new Macro(ps, rest[b..].Trim().ToString()));
+                return new Directive(kind, name, new Macro(ps, rest[b..].Trim().ToString()));
             }
-            case "undef":
+            case OpKind.Undef:
                 var sp = rest.IndexOfAny(' ', '\t');
-                return new Op(OpKind.Undef, first, last, (sp < 0 ? rest : rest[..sp]).ToString(), null);
+                return new Directive(kind, (sp < 0 ? rest : rest[..sp]).ToString(), null);
             default:   // include
                 var q = rest.Length >= 2 && rest[0] == '"' ? rest[1..].IndexOf('"') : -1;
-                return new Op(OpKind.Include, first, last, q < 0 ? null : rest.Slice(1, q).ToString(), null);
+                return new Directive(kind, q < 0 ? null : rest.Slice(1, q).ToString(), null);
         }
+    }
+
+    /// <summary>The name <see cref="ParseDirective"/> gives a one-line #define (empty: none) or #undef, read in place;
+    /// false when a comment at or before the name's end could change it (a stripped comment leaves a blank, so one
+    /// after it can't).</summary>
+    static bool FastName(ReadOnlySpan<char> raw, OpKind kind, out ReadOnlySpan<char> name)
+    {
+        name = default;
+        var (_, r) = Head(raw);
+        if (r < 0) return false;
+        var rest = raw[r..];
+        if (rest.IndexOf("//", StringComparison.Ordinal) is var c and >= 0) rest = rest[..c];
+        var trimmed = rest.Trim();
+        var s = rest.Length - rest.TrimStart().Length;   // where trimmed starts in rest
+        var n = 0;
+        if (kind == OpKind.Define)
+        {
+            if (trimmed.Length > 0 && (char.IsAsciiLetter(trimmed[0]) || trimmed[0] == '_'))
+                for (n = 1; n < trimmed.Length && IsWord(trimmed[n]); n++) { }
+        }
+        else n = trimmed.IndexOfAny(' ', '\t') is var sp and >= 0 ? sp : trimmed.Length;
+        if (rest.IndexOf("/*", StringComparison.Ordinal) is var cm and >= 0 && cm <= s + n) return false;
+        name = trimmed[..n];
+        return true;
     }
 
     static void Walk(Parsed parsed, WalkState w, int? unitLine, int depth, int ifBase)
@@ -341,7 +454,7 @@ public static class TemplateInstances
             {
                 case OpKind.Code:
                     if (code.Length == 0) codeStartLine = op.First + 1;
-                    code.Append(op.Text).Append('\n');
+                    code.Append(parsed.Text, op.Start, op.End - op.Start).Append('\n');
                     continue;
                 case OpKind.Other or OpKind.Open or OpKind.Close:
                     if (op.Kind == OpKind.Open) ifDepth++;
@@ -357,11 +470,11 @@ public static class TemplateInstances
             {
                 // A define or undef is on the trail (stretch) from the next op on; WalkState.Resolve reads it there.
                 case OpKind.Include:
-                    if (depth >= 8 || op.Text is null) break;
-                    var inc = w.ReadInclude(op.Text);
+                    if (depth >= 8 || parsed.Directive(k).Text is not { } incName) break;
+                    var inc = w.ReadInclude(incName);
                     if (inc is null) break;
                     // A template header is instantiated by every #include; any other header only adds macros, once.
-                    var p = ParseOf(inc);
+                    var p = ParseOf(inc, w.Parsing);
                     if (!p.IsTemplate && !w.Walked.Add(inc)) break;
                     stretch.To = k + 1;
                     Walk(p, w, unitLine ?? op.First + 1, depth + 1, ifDepth);
