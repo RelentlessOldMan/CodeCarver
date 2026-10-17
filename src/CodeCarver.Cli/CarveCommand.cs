@@ -3249,6 +3249,8 @@ public static class CarveCommand
             snap["stop.largestFileInStepKb"] = largest >> 10;
             // What each part of the step's per-file work allocated so far, and how many of each were running.
             foreach (var (k, v) in CodeCarver.Core.Util.Activity.Parts()) snap[$"stop.{k}"] = v;
+            // The tree's shape as far as the link check got (numbers only).
+            foreach (var (k, v) in CodeCarver.Core.Reachability.EmittedLinkCheck.ShapeSoFar()) snap[$"stop.{k}"] = v;
             snap["exitCode"] = StoppedForMemoryExit;
             err.WriteLine($"memory  : STOPPED - private memory {priv / MB:N0} MB passed memoryStopMb = {_memoryStop / MB:N0} in the step after '{step}' (run {Clock(runAt)})");
             err.WriteLine($"  memory  : {MemoryLine(priv, workingSet, machine)}");

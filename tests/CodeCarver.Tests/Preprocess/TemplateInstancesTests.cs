@@ -53,4 +53,90 @@ public sealed class TemplateInstancesTests
         Assert.Equal(50, Names(unit.ToString(), headers).Count);
         Assert.True(sw.ElapsedMilliseconds < 3000, $"{sw.ElapsedMilliseconds} ms");
     }
+
+    [Fact]
+    public void ATemplateFarDown_IsFound()
+    {
+        // 30 includes down (death-lite reaches 46); the walk stopped at 8 and missed it.
+        var headers = new Dictionary<string, string> { ["cat.h"] = Cat, ["tmpl.h"] = "int CAT(TNAME, _get)(void) { return 1; }\n" };
+        for (var k = 0; k < 30; k++) headers[$"l{k}.h"] = k == 29 ? "#define TNAME deep\n#include \"tmpl.h\"\n" : $"#include \"l{k + 1}.h\"\n";
+        Assert.Equal(new[] { "deep_get" }, Names("#include \"cat.h\"\n#include \"l0.h\"\n", headers));
+    }
+
+    [Fact]
+    public void AGuardedHeaderReadAgain_IsWalkedOnce()
+    {
+        // The check hands a header it does not hold as a new string each read: the walk must not take it for a new header
+        // (each include of a guarded header walked it again, with all it includes).
+        var headers = new Dictionary<string, string> { ["cat.h"] = Cat, ["tmpl.h"] = "int CAT(TNAME, _get)(void) { return 1; }\n" };
+        for (var k = 0; k < 12; k++)
+            headers[$"g{k}.h"] = $"#ifndef G{k}\n#define G{k}\n" + (k < 11 ? $"#include \"g{k + 1}.h\"\n#include \"g{k + 1}.h\"\n" : "") + "#endif\n";
+        var reads = 0;
+        var unit = "#include \"cat.h\"\n#include \"g0.h\"\n#define TNAME t\n#include \"tmpl.h\"\n";
+        var found = TemplateInstances.Find(unit, raw =>
+        {
+            reads++;
+            return headers.TryGetValue(raw, out var t) ? new string(t.AsSpan()) : null;   // a new string each read
+        });
+        Assert.Equal(new[] { "t_get" }, found.Select(i => i.Name).Distinct().ToArray());
+        Assert.True(reads < 200, $"{reads} reads for 14 headers (each re-include walked again doubles them)");
+    }
+
+    [Theory]
+    [InlineData("#if 0\n#include \"g0.h\"\n#endif\n")]                   // under an #if
+    [InlineData("/* notes:\n#include \"g0.h\"\n*/\n")]                  // in a comment
+    public void AGuardedChainReachedFirstElsewhere_IsWalkedAgainWhereTheNameIsSet(string first)
+    {
+        // A guarded chain down to a template, reached first (maybe) with no TNAME, then again with TNAME set: walked
+        // once, the second include was skipped and its instance missed (death-lite: 60% of them).
+        var headers = new Dictionary<string, string> { ["cat.h"] = Cat, ["tmpl.h"] = "int CAT(TNAME, _get)(void) { return 1; }\n" };
+        for (var k = 0; k < 10; k++)
+            headers[$"g{k}.h"] = $"#ifndef G{k}\n#define G{k}\n#include \"{(k < 9 ? $"g{k + 1}.h" : "tmpl.h")}\"\n#endif\n";
+        var unit = "#include \"cat.h\"\n" + first + "#define TNAME r3\n#include \"g0.h\"\n#undef TNAME\n";
+        Assert.Contains("r3_get", Names(unit, headers));
+    }
+
+    [Fact]
+    public void AGuardedChainIncludedForRealBeforeTheNameIsSet_IsNothingAfter()
+    {
+        // As gcc: the first include, for real, walks the chain with no TNAME; after it every guard is defined and the
+        // include with TNAME set is nothing (walked again, it put out instances gcc never sees: death-lite, 103 a unit).
+        var headers = new Dictionary<string, string> { ["cat.h"] = Cat, ["tmpl.h"] = "#ifdef TNAME\nint CAT(TNAME, _get)(void) { return 1; }\n#endif\n" };
+        for (var k = 0; k < 10; k++)
+            headers[$"g{k}.h"] = $"#ifndef G{k}\n#define G{k}\n#include \"{(k < 9 ? $"g{k + 1}.h" : "tmpl.h")}\"\n#endif\n";
+        var unit = "#include \"cat.h\"\n#include \"g0.h\"\n#define TNAME r3\n#include \"g0.h\"\n#undef TNAME\n";
+        Assert.DoesNotContain("r3_get", Names(unit, headers));
+        // The guard taken away again: the next include is a walk again.
+        Assert.Contains("r4_get", Names(unit + "#undef G0\n#define TNAME r4\n#include \"g0.h\"\n", headers));
+    }
+
+    [Fact]
+    public void AHeaderWalkedInsideACycle_IsWalkedAgainWhereTheNameIsSet()
+    {
+        // a.h includes b.h, b.h includes a.h back and then the template. Walked first from a.h (no TNAME), b.h's include
+        // of a.h is nothing (a.h is on the stack) and its record held nothing of a.h. A later #include "b.h" with TNAME
+        // set, under an #if before, walks a.h for the first time with it, and the template.
+        var headers = new Dictionary<string, string>
+        {
+            ["cat.h"] = Cat,
+            ["tmpl.h"] = "#ifdef TNAME\nint CAT(TNAME, _get)(void) { return 1; }\n#endif\n",
+            ["a.h"] = "#ifndef A_H\n#define A_H\n#include \"b.h\"\n#include \"tmpl.h\"\n#endif\n",
+            ["b.h"] = "#ifndef B_H\n#define B_H\n#include \"a.h\"\n#endif\n",
+        };
+        var unit = "#include \"cat.h\"\n#if 0\n#include \"a.h\"\n#endif\n#define TNAME r5\n#include \"b.h\"\n#undef TNAME\n";
+        Assert.Contains("r5_get", Names(unit, headers));
+    }
+    [Fact]
+    public void ATemplateIncludingItselfUnderAnIf_IsNotWalkedWithoutEnd()
+    {
+        // A maybe-include adds no depth: tmpl.h reaching itself twice under an #if walked 2, 4, 8... copies of itself
+        // and never stopped.
+        var headers = new Dictionary<string, string>
+        {
+            ["cat.h"] = Cat,
+            ["tmpl.h"] = "int CAT(TNAME, _get)(void) { return 1; }\n#if MORE\n#include \"tmpl.h\"\n#include \"tmpl.h\"\n#endif\n",
+        };
+        var unit = "#include \"cat.h\"\n#define TNAME r5\n#include \"tmpl.h\"\n";
+        Assert.Equal(new[] { "r5_get" }, Names(unit, headers));
+    }
 }

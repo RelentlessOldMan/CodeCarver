@@ -68,8 +68,10 @@ public sealed class TemplateParseTests
                     ops.Add(Op("Undef", first, i, rest.Split(' ', '\t')[0], null));
                     break;
                 default:
-                    var close = rest.Length >= 2 && rest[0] == '"' ? rest.IndexOf('"', 1) : -1;
-                    ops.Add(Op("Include", first, i, close < 0 ? null : rest[1..close], null));
+                    // "name" and <name> (death-lite: a template behind an <> include was never walked), and a macro's name.
+                    var close = rest.Length >= 2 && rest[0] is '"' or '<' ? rest.IndexOf(rest[0] == '"' ? '"' : '>', 1) : -1;
+                    var computed = close < 0 ? Regex.Match(rest, @"^[A-Za-z_]\w*") : Match.Empty;
+                    ops.Add(Op("Include", first, i, close >= 0 ? rest[1..close] : computed.Success ? computed.Value : null, null));
                     break;
             }
         }

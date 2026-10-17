@@ -32,17 +32,23 @@ public static class TemplateInstances
     /// <summary>False only when <see cref="Find"/> can find no head in this text itself (its includes aside).</summary>
     public static bool MayHaveMacroNamedHead(string text) => text.Contains(')') && LooseHead.IsMatch(text);
 
-    // A quoted #include as Parse reads one (#, spaces, include, spaces, then "name"), with line continuations and
-    // comments allowed in the gaps: a name too many costs a walk, a name missed would skip one that finds something.
-    static readonly Regex QuotedInclude = new(
-        @"#(?:[ \t]|\\\r?\n|/\*.*?\*/)*include\b(?:[ \t]|\\\r?\n|/\*.*?\*/)*""([^""\r\n]*)""", RegexOptions.Compiled | RegexOptions.Singleline);
+    // An #include (or #include_next) as Parse reads one (#, spaces, include, spaces, then "name", <name> or a macro), with
+    // line continuations and comments allowed in the gaps: a name too many costs a walk, a name missed would skip one that
+    // finds something. A macro (a computed include) is given as ComputedInclude: it may name any header.
+    static readonly Regex AnyInclude = new(
+        @"#(?:[ \t]|\\\r?\n|/\*.*?\*/)*include(?:_next)?\b(?:[ \t]|\\\r?\n|/\*.*?\*/)*(?:""([^""\r\n]*)""|<([^>\r\n]*)>|([A-Za-z_]))", RegexOptions.Compiled | RegexOptions.Singleline);
 
-    /// <summary>Every name a quoted #include in <paramref name="text"/> may name: all those <see cref="Find"/> follows.</summary>
-    public static string[] QuotedIncludeNames(string text)
+    /// <summary>The name <see cref="IncludeNames"/> gives a computed include (#include MACRO): any header.</summary>
+    public const string ComputedInclude = "*";
+
+    /// <summary>Every name an #include in <paramref name="text"/> may name ("x.h" or &lt;x.h&gt;, #include_next too, and
+    /// <see cref="ComputedInclude"/> for #include MACRO): all those <see cref="Find"/> follows.</summary>
+    public static string[] IncludeNames(string text)
     {
         if (!text.Contains("include", StringComparison.Ordinal)) return Array.Empty<string>();
         var names = new List<string>();
-        foreach (Match m in QuotedInclude.Matches(text)) names.Add(m.Groups[1].Value);
+        foreach (Match m in AnyInclude.Matches(text))
+            names.Add(m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Success ? m.Groups[2].Value : ComputedInclude);
         return names.Count == 0 ? Array.Empty<string>() : names.Distinct(StringComparer.Ordinal).ToArray();
     }
 
@@ -62,7 +68,12 @@ public static class TemplateInstances
         if (!unit.Contains('#') && (initial is null || initial.Count == 0)) return found;
         var macros = new Dictionary<string, List<Macro>>(StringComparer.Ordinal);
         if (initial is not null) foreach (var kv in initial) if (kv.Value.Count > 0) macros[kv.Key] = kv.Value.Select(v => new Macro(v.Params, v.Body)).ToList();
-        var w = new WalkState(macros, readInclude, found) { Parsing = parsing };
+        // A header the caller does not hold comes back as a new string each read, and the walk knows a header (walked, parsed)
+        // by its string: each include of it again walked it and all it includes again (C23: one walk resolving 1,592
+        // includes). readInclude sees only the name, so one read per name is the same header.
+        var read = new Dictionary<string, string?>(StringComparer.Ordinal);
+        string? ReadOnce(string raw) => read.TryGetValue(raw, out var t) ? t : read[raw] = readInclude(raw);
+        var w = new WalkState(macros, ReadOnce, found) { Parsing = parsing };
         Walk(Parse(unit, false), w, unitLine: null, depth: 0, ifBase: 0);
         return found.Distinct().ToList();
     }
@@ -85,6 +96,7 @@ public static class TemplateInstances
     {
         var n = 0;
         void Put(ReadOnlySpan<char> s, Span<char> d) { if (!d.IsEmpty) s.CopyTo(d[n..]); n += s.Length; }
+        var inComment = false;
         for (var start = 0; start <= text.Length; )
         {
             var (end, next) = Line(text, start);
@@ -95,13 +107,22 @@ public static class TemplateInstances
                 // A line ending in a backslash takes in the next one, the backslash becoming a space.
                 while (end > start && text[end - 1] == '\\' && next <= text.Length)
                 {
+                    inComment = InCommentAfter(text.AsSpan(start, end - start), inComment);
                     Put(text.AsSpan(start, end - 1 - start), dst);
                     Put(" ", dst);
                     start = next;
                     (end, next) = Line(text, start);
                 }
+                inComment = InCommentAfter(text.AsSpan(start, end - start), inComment);
                 Put(text.AsSpan(start, end - start), dst);
                 Put("\n", dst);
+            }
+            // A line of code that opens or closes a block comment leaves a mark, so a directive inside one is still
+            // read as inside one ("/* notes:\n#include ..." is no include).
+            else if (InCommentAfter(text.AsSpan(start, end - start), inComment) is var after && after != inComment)
+            {
+                Put(after ? "/*\n" : "*/\n", dst);
+                inComment = after;
             }
             start = next;
         }
@@ -111,6 +132,29 @@ public static class TemplateInstances
     // Is text exactly its directive lines? (Same length was checked: every line kept whole, so only a '\r' or a
     // continuation, which DirectivesOnly drops or joins, could differ.)
     static bool Same(string text) => !text.Contains('\r') && !text.Contains("\\\n", StringComparison.Ordinal) && text.EndsWith('\n');
+
+    // Whether a block comment is open at the end of line, given whether one was at its start. A "//" outside one ends
+    // the line; quotes are not read (a "/*" in a string reads as a comment: what is inside is followed as maybe).
+    static bool InCommentAfter(ReadOnlySpan<char> line, bool inComment)
+    {
+        while (true)
+        {
+            if (inComment)
+            {
+                var e = line.IndexOf("*/", StringComparison.Ordinal);
+                if (e < 0) return true;
+                line = line[(e + 2)..];
+                inComment = false;
+                continue;
+            }
+            var o = line.IndexOf('/');
+            while (o >= 0 && o + 1 < line.Length && line[o + 1] is not ('*' or '/'))
+                o = line[(o + 1)..].IndexOf('/') is var r and >= 0 ? o + 1 + r : -1;
+            if (o < 0 || o + 1 >= line.Length || line[o + 1] == '/') return false;
+            line = line[(o + 2)..];
+            inComment = true;
+        }
+    }
 
     // The line from start: where its text ends (before the '\n' and the '\r's before it), and where the next line
     // starts (past the end of the text for the last line).
@@ -125,47 +169,376 @@ public static class TemplateInstances
 
     sealed record Macro(List<string>? Params, string Body);
 
+    static readonly string[] Undefined = { "\0" };
+
+    // A macro's values as one comparable key each ("undefined" one of them).
+    static string[] KeysOf(List<Macro>? values)
+        => values is null ? Undefined : values.Select(m => (m.Params is null ? "" : "(" + string.Join(",", m.Params) + ")") + "\u0001" + m.Body).ToArray();
+
+    /// <summary>A walk under way: the names it looked up whose value came from before it (its free names, by id, with
+    /// the earliest trail stretch an answer went back to), and what makes it stand for less than a whole walk. Kept
+    /// one to an include depth and used again (a walk's names are merged into the one around it name by name).</summary>
+    sealed class Frame
+    {
+        /// <summary>The trail index of the walk's first stretch: a name settled at or after it is the walk's own.</summary>
+        public int Start;
+        /// <summary>The free names, in the order first used.</summary>
+        public readonly List<int> Free = new();
+        int[] _from = Array.Empty<int>();
+        /// <summary>A walk under it stopped at the include depth limit: what it looked up is not all a whole walk would.</summary>
+        public bool Cut;
+        /// <summary>The headers it skipped as being walked further up (an include cycle): a walk of it elsewhere walks
+        /// them (death-lite: a register map walked 196 deep skipped the next one, on the stack, so its record never held
+        /// TNAME, and the include under TNAME later was skipped).</summary>
+        public readonly Dictionary<string, Parsed> Deps = new(ReferenceEqualityComparer.Instance);
+
+        public void Reset(int start)
+        {
+            foreach (var id in Free) _from[id] = int.MaxValue;
+            Free.Clear();
+            Deps.Clear();
+            Cut = false;
+            Start = start;
+        }
+
+        public int FromOf(int id) => _from[id];
+
+        /// <summary>A name looked up, its answer going back to trail stretch <paramref name="from"/> (-1: to before the
+        /// trail).</summary>
+        public void Use(int id, int from)
+        {
+            if (from >= Start) return;
+            if (id >= _from.Length)
+            {
+                var had = _from.Length;
+                Array.Resize(ref _from, Math.Max(id + 1, had * 2));
+                Array.Fill(_from, int.MaxValue, had, _from.Length - had);
+            }
+            ref var f = ref _from[id];
+            if (f == int.MaxValue) Free.Add(id);
+            if (from < f) f = from;
+        }
+
+        /// <summary>A walk inside this one is over: what of its came from before this one.</summary>
+        public void Take(Frame inner)
+        {
+            Cut |= inner.Cut;
+            foreach (var (inc, p) in inner.Deps) Deps.TryAdd(inc, p);
+            foreach (var id in inner.Free) Use(id, inner._from[id]);
+        }
+    }
+
+    /// <summary>One walk of a header: the value each of its free names had where it started (the walk is the same
+    /// wherever they have those values again), and the headers it skipped as on the stack.</summary>
+    sealed class Entry
+    {
+        public readonly int[] Ids;
+        public readonly string[][] Keys;
+        /// <summary>Where each free name's answer went back to when it last matched (kept up with the change log): what
+        /// a walk that skips the header takes on.</summary>
+        public readonly int[] From;
+        /// <summary>Each free name's place in <see cref="Ids"/>.</summary>
+        public readonly Dictionary<int, int> Slot;
+        public readonly Dictionary<string, Parsed> Deps;
+        /// <summary>The length of the change log when the free names last all had these values (-1: not known).</summary>
+        public int MatchedAt = -1;
+        /// <summary>The place of the name that last had another value (-1: none): checked first.</summary>
+        public int LastMiss = -1;
+
+        public Entry(int[] ids, string[][] keys, Dictionary<string, Parsed> deps)
+        {
+            Ids = ids;
+            Keys = keys;
+            From = new int[ids.Length];
+            Slot = new Dictionary<int, int>(ids.Length);
+            for (var i = 0; i < ids.Length; i++) Slot[ids[i]] = i;
+            Deps = deps;
+        }
+    }
+
     /// <summary>A walk's macros are not copied into a table of its own (every #define of every header a unit reached:
     /// hundreds of MB a unit in a tree of register maps). The walk keeps the stretches of text it has walked, in order
     /// (<see cref="Trail"/>), and a name is looked up back along them: the value list a table would hold.</summary>
     sealed record WalkState(Dictionary<string, List<Macro>> Initial, Func<string, string?> ReadInclude, List<(string, int)> Found)
     {
         public Func<int, IDisposable?>? Parsing { get; init; }
-        public readonly HashSet<string> Walked = new(ReferenceEqualityComparer.Instance);
+        /// <summary>Each header walked, and its walks (<see cref="Entry"/>). A header included again is walked again only
+        /// when no walk of it started with the values its free names have now. Walked once and never again (a header
+        /// guard), the first walk took the header for good, and that walk may be no include at all (under an #if, in a
+        /// comment): an 8-header chain under an #if took a guarded header from the include that really brings it in,
+        /// with TNAME set, and the template instance with it (death-lite: 60% of them missed). Kept as the values each
+        /// name was seen with instead, a check of a header went over every name of every header it skipped in a cycle,
+        /// and theirs (death-lite: 80 million names in half a minute of one unit).</summary>
+        public readonly Dictionary<string, List<Entry>> Walked = new(ReferenceEqualityComparer.Instance);
+        /// <summary>The headers being walked (an include of one inside its walk is nothing, as its guard makes it).</summary>
+        public readonly HashSet<string> Walking = new(ReferenceEqualityComparer.Instance);
+        /// <summary>The guarded headers walked for certain: their guard is defined from then on.</summary>
+        public readonly HashSet<string> Certain = new(ReferenceEqualityComparer.Instance);
+        /// <summary>The template headers being walked. One included again inside its own walk is walked again (each
+        /// include instantiates it) only for certain, where the depth limit stops it as gcc's does: a maybe-include adds
+        /// no depth, and a template reaching itself that way recursed without end (a parse of a public repo hung).</summary>
+        public readonly HashSet<string> WalkingTemplates = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>Is the name defined on every way here (an #undef or a define only under an #if leaves it open)?</summary>
+        public bool Defined(string name) => Now(Id(name)) is { Values: not null, Open: false };
+        /// <summary>The walks under way, innermost last.</summary>
+        public readonly List<Frame> Looking = new();
+        readonly List<Frame> _frames = new();
         public readonly List<Stretch> Trail = new();
+        // For each name looked up (by its hash), the closed stretches of the trail that define or undefine a name of
+        // that hash, in trail order. Built at a name's first lookup and kept up as stretches close: only names looked
+        // up cost anything (a register map's tens of thousands of #defines are never asked for).
+        readonly Dictionary<int, List<int>> _chains = new();
+        /// <summary>The names looked up whose chain grew (by id), in order: since an entry last matched, only these can
+        /// differ.</summary>
+        readonly List<int> _changes = new();
+        // The names looked up, by id (a frame or entry holds ids: no string hashed to merge one walk's names into the
+        // next), with their hash.
+        readonly Dictionary<string, int> _ids = new(StringComparer.Ordinal);
+        readonly List<string> _names = new();
+        readonly List<int> _hashes = new();
+        // Each name's values (their keys, and the stretch its answer went back to) as last resolved, with the length of
+        // its chain then (-1: never). With the whole trail closed a name changes only as its chain grows; an open last
+        // stretch that has no name of its hash answers nothing either.
+        readonly List<(int Count, List<Macro>? Values, string[] Keys, int From, bool Open)> _now = new();
+
+        int Id(string name)
+        {
+            if (_ids.TryGetValue(name, out var id)) return id;
+            _ids[name] = id = _names.Count;
+            _names.Add(name);
+            _hashes.Add(string.GetHashCode(name.AsSpan()));
+            _now.Add((-1, null, Undefined, -1, false));
+            return id;
+        }
+
+        /// <summary>A walk of a header starts at the end of the trail.</summary>
+        public Frame Push()
+        {
+            if (_frames.Count == Looking.Count) _frames.Add(new Frame());
+            var f = _frames[Looking.Count];
+            f.Reset(Trail.Count);
+            Looking.Add(f);
+            return f;
+        }
+
+        public void Pop() => Looking.RemoveAt(Looking.Count - 1);
+
+        static bool Has(Stretch st, int h)
+        {
+            var ix = st.Parsed.Index;
+            if (!ix.Last.TryGetValue(h, out var i)) return false;
+            for (; i >= st.From; i = ix.Prev[i])
+                if (i < st.To) return true;
+            return false;
+        }
+
+        List<int> Chain(int h)
+        {
+            if (_chains.TryGetValue(h, out var chain)) return chain;
+            chain = new List<int>();
+            for (var j = 0; j < Trail.Count; j++)
+                if (Trail[j].Closed && Has(Trail[j], h)) chain.Add(j);
+            return _chains[h] = chain;
+        }
+
+        /// <summary>A stretch of the trail ends (its To is final): the chains of names it defines take it.</summary>
+        public void Close(Stretch st)
+        {
+            if (st.Closed) return;
+            st.Closed = true;
+            if (_chains.Count == 0) return;
+            var index = Trail.Count - 1;
+            while (index >= 0 && !ReferenceEquals(Trail[index], st)) index--;
+            var p = st.Parsed;
+            for (var i = st.From; i < st.To; i++)
+            {
+                if (p.Ops[i].Kind is not (OpKind.Define or OpKind.Undef) || !p.HasName(i)) continue;
+                var name = p.NameOf(i);
+                if (!_chains.TryGetValue(string.GetHashCode(name), out var chain)) continue;
+                if (chain.Count == 0 || chain[^1] != index) chain.Add(index);
+                if (_ids.TryGetValue(name.ToString(), out var id)) _changes.Add(id);
+            }
+        }
+
         // Answers since the trail last grew (Walk clears it).
-        public readonly Dictionary<string, List<Macro>?> Asked = new(StringComparer.Ordinal);
+        public readonly Dictionary<string, (List<Macro>? Values, int From, int Id)> Asked = new(StringComparer.Ordinal);
 
         public List<Macro>? Lookup(string name)
         {
-            if (!Asked.TryGetValue(name, out var l)) Asked[name] = l = Resolve(name);
-            return l;
+            if (!Asked.TryGetValue(name, out var a)) Asked[name] = a = (Resolve(name, Trail.Count, out _, out var from), from, Id(name));
+            if (Looking.Count > 0) Looking[^1].Use(a.Id, a.From);
+            return a.Values;
+        }
+
+        /// <summary>Lookup outside a head: its answers hold only until the trail grows (Asked is cleared at each head).</summary>
+        public List<Macro>? LookupNow(string name)
+        {
+            var id = Id(name);
+            var (values, _, from, _) = Now(id);
+            if (Looking.Count > 0) Looking[^1].Use(id, from);
+            return values;
+        }
+
+        (List<Macro>? Values, string[] Keys, int From, bool Open) Now(int id)
+        {
+            var h = _hashes[id];
+            if (Trail.Count > 0 && !Trail[^1].Closed && Has(Trail[^1], h))
+            {
+                var v = Resolve(_names[id], Trail.Count, out var o, out var f);
+                return (v, KeysOf(v), f, o);
+            }
+            var n = Chain(h).Count;
+            var c = _now[id];
+            if (c.Count == n) return (c.Values, c.Keys, c.From, c.Open);
+            var values = Resolve(_names[id], Trail.Count, out var open, out var from);
+            var keys = KeysOf(values);
+            _now[id] = (n, values, keys, from, open);
+            return (values, keys, from, open);
+        }
+
+        /// <summary>Is an include of the (non-template) header here nothing (on the stack, or its guard defined), or a
+        /// walk of it already walked?</summary>
+        public bool Skips(string inc, Parsed p)
+        {
+            if (Walking.Contains(inc))
+            {
+                if (Looking.Count > 0) Looking[^1].Deps.TryAdd(inc, p);
+                return true;
+            }
+            if (GuardHolds(inc, p)) return true;
+            if (!Walked.TryGetValue(inc, out var entries)) return false;
+            var used = new List<Entry>();
+            var visiting = new HashSet<string>(ReferenceEqualityComparer.Instance) { inc };
+            foreach (var e in entries)
+            {
+                used.Clear();
+                if (!Matches(e, visiting, used)) continue;
+                // The walk under way is the same again only where this header is skipped again: its free names (and
+                // those of the walks that stand for the headers it skipped in a cycle) are those of the walk under way too.
+                if (Looking.Count > 0)
+                {
+                    var f = Looking[^1];
+                    foreach (var u in used)
+                    {
+                        for (var i = 0; i < u.Ids.Length; i++) f.Use(u.Ids[i], u.From[i]);
+                        foreach (var (dep, dp) in u.Deps) if (Walking.Contains(dep)) f.Deps.TryAdd(dep, dp);
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+
+        bool GuardHolds(string inc, Parsed p) => p.GuardDefine >= 0 && Certain.Contains(inc) && Defined(p.NameOf(p.GuardDefine).ToString());
+
+        bool Same(Entry e, int slot)
+        {
+            var now = Now(e.Ids[slot]);
+            if (!now.Keys.AsSpan().SequenceEqual(e.Keys[slot])) return false;
+            e.From[slot] = now.From;
+            return true;
+        }
+
+        // Do the entry's free names have the values it started with, and is each header it skipped as on the stack
+        // nothing here too (on the stack again, its guard defined, or a walk of it matching here)? used: the entries
+        // that matched.
+        bool Matches(Entry e, HashSet<string> visiting, List<Entry> used)
+        {
+            if (!FreeMatch(e)) return false;
+            used.Add(e);
+            foreach (var (dep, p) in e.Deps)
+            {
+                if (Walking.Contains(dep) || GuardHolds(dep, p) || !visiting.Add(dep)) continue;
+                var any = false;
+                if (Walked.TryGetValue(dep, out var des))
+                    foreach (var de in des)
+                    {
+                        var mark = used.Count;
+                        if (Matches(de, visiting, used)) { any = true; break; }
+                        used.RemoveRange(mark, used.Count - mark);
+                    }
+                if (!any) return false;
+            }
+            return true;
+        }
+
+        // Since an entry last matched, only names whose chain grew are looked at.
+        bool FreeMatch(Entry e)
+        {
+            if (e.MatchedAt >= 0)
+            {
+                for (var i = e.MatchedAt; i < _changes.Count; i++)
+                    if (e.Slot.TryGetValue(_changes[i], out var slot) && !Same(e, slot))
+                    {
+                        e.MatchedAt = -1;
+                        e.LastMiss = slot;
+                        return false;
+                    }
+                e.MatchedAt = _changes.Count;
+                return true;
+            }
+            if (e.LastMiss >= 0 && !Same(e, e.LastMiss)) return false;
+            for (var slot = 0; slot < e.Ids.Length; slot++)
+                if (!Same(e, slot)) { e.LastMiss = slot; return false; }
+            e.MatchedAt = _changes.Count;
+            return true;
+        }
+
+        /// <summary>A walk of the header is over: an entry of what its free names were where it started. A cut walk
+        /// stands for nothing (the next include walks it again).</summary>
+        public void Record(string inc, Frame f)
+        {
+            if (f.Cut) return;
+            var ids = f.Free.ToArray();
+            var keys = new string[ids.Length][];
+            for (var i = 0; i < ids.Length; i++) keys[i] = KeysOf(Resolve(_names[ids[i]], f.Start, out _, out _));
+            var e = new Entry(ids, keys, new Dictionary<string, Parsed>(f.Deps, ReferenceEqualityComparer.Instance));
+            if (Walked.TryGetValue(inc, out var had)) had.Add(e);
+            else Walked[inc] = new List<Entry> { e };
         }
 
         // A define at #if depth 0 replaces the value, one inside an #if is an alternative to it (not twice the same),
         // an #undef at depth 0 removes it: going back to the first that settles it, then forward as a table would.
-        List<Macro>? Resolve(string name)
+        // Over the first count stretches of the trail (those before them are not changed by what came after). open:
+        // undefined is one of the ways (a define only under an #if over none, or an #undef under one). from: the trail
+        // stretch that settled it, -1 for none (the answer went back past the trail).
+        List<Macro>? Resolve(string name, int count, out bool open, out int from)
         {
             var back = new List<(Macro Macro, bool InIf)>();
             var settled = false;
-            for (var t = Trail.Count - 1; t >= 0 && !settled; t--)
+            var undefInIf = false;
+            var h = string.GetHashCode(name.AsSpan());
+            // A stretch's defines of the name, last first; true once one settles it.
+            bool Take(Stretch st)
             {
-                var st = Trail[t];
                 var p = st.Parsed;
                 var ix = p.Index;
-                if (!ix.Last.TryGetValue(string.GetHashCode(name.AsSpan()), out var i)) continue;
+                if (!ix.Last.TryGetValue(h, out var i)) return false;
                 for (; i >= st.From; i = ix.Prev[i])
                 {
                     // The index goes by the name's hash: an op of another name with the same hash is passed over.
                     if (i >= st.To || !p.NameOf(i).SequenceEqual(name)) continue;
                     var op = p.Ops[i];
                     var inIf = st.IfBase + ix.Depth[i] > 0;
-                    if (op.Kind == OpKind.Undef) { if (inIf) continue; settled = true; break; }
+                    if (op.Kind == OpKind.Undef) { if (inIf) { undefInIf = true; continue; } return true; }
                     back.Add((p.Directive(i).Macro!, inIf));
-                    if (!inIf) { settled = true; break; }
+                    if (!inIf) return true;
                 }
+                return false;
+            }
+            // Only the stretches that define or undefine a name of its hash (going back over every stretch, for a name
+            // never settled, was most of a walk: death-lite, minutes a unit), and the one still growing.
+            from = -1;
+            if (count == Trail.Count && count > 0 && !Trail[count - 1].Closed && Take(Trail[count - 1])) (settled, from) = (true, count - 1);
+            if (!settled)
+            {
+                var chain = Chain(h);
+                for (var j = chain.Count - 1; j >= 0 && !settled; j--)
+                    if (chain[j] < count && Take(Trail[chain[j]])) (settled, from) = (true, chain[j]);
             }
             List<Macro>? cur = !settled && Initial.TryGetValue(name, out var init) ? new List<Macro>(init) : null;
+            open = cur is null;
             for (var k = back.Count - 1; k >= 0; k--)
             {
                 var (m, inIf) = back[k];
@@ -173,8 +546,9 @@ public static class TemplateInstances
                 {
                     if (!cur.Any(a => a.Body == m.Body && (a.Params is null) == (m.Params is null))) cur.Add(m);
                 }
-                else cur = new List<Macro> { m };
+                else { cur = new List<Macro> { m }; if (!inIf) open = false; }
             }
+            open |= undefInIf;
             return cur;
         }
     }
@@ -185,6 +559,8 @@ public static class TemplateInstances
         public readonly Parsed Parsed = parsed;
         public readonly int IfBase = ifBase, From = from;
         public int To = from;
+        /// <summary>Its To is final, and it is in the trail's index of names.</summary>
+        public bool Closed;
     }
 
     /// <summary>A parsed text's defines and undefs by the hash of their name (no string per name: a register map
@@ -201,11 +577,23 @@ public static class TemplateInstances
             Prev = new int[ops.Length];
             Depth = new int[ops.Length];
             var depth = 0;
+            var c = 0;   // the next commented op
             for (var i = 0; i < ops.Length; i++)
             {
                 var op = ops[i];
                 Depth[i] = depth;
                 Prev[i] = -1;
+                // A directive in a comment: an #if or #endif counts for nothing, a #define or #undef as one under an #if
+                // (an alternative, never what settles a name).
+                if (c < p.Commented.Length && p.Commented[c] == i)
+                {
+                    c++;
+                    if (op.Kind is OpKind.Open or OpKind.Close) continue;
+                    Depth[i] = depth + 1;
+                }
+                // The include guard's #ifndef: what is inside it is unconditional, as the walk takes it (a header walked
+                // again with its guard defined is not walked: WalkState.Certain).
+                if (i == p.GuardOpen || i == p.GuardClose) continue;
                 if (op.Kind == OpKind.Open) depth++;
                 else if (op.Kind == OpKind.Close) depth = Math.Max(0, depth - 1);
                 else if (op.Kind is OpKind.Define or OpKind.Undef && p.HasName(i))
@@ -226,12 +614,22 @@ public static class TemplateInstances
     /// header, kept for as long as the header is.</summary>
     readonly record struct Op(OpKind Kind, int First, int Last, int Start, int End);
 
-    /// <summary>What a directive says: its name (or include), and for a #define with one, the macro.</summary>
-    readonly record struct Directive(OpKind Kind, string? Text, Macro? Macro);
+    /// <summary>What a directive says: its name (or include), and for a #define with one, the macro. Computed: an
+    /// #include of a macro (Text the macro's name), not of a "name" or <name>.</summary>
+    readonly record struct Directive(OpKind Kind, string? Text, Macro? Macro, bool Computed = false);
 
     /// <summary>A text split into <see cref="Op"/>s, and whether it holds a macro-named head (a template header).</summary>
     sealed record Parsed(string Text, Op[] Ops, bool IsTemplate)
     {
+        /// <summary>The include guard's #ifndef and its #endif (ops), -1 when the text has none: the walk takes what is
+        /// inside it as unconditional.</summary>
+        public int GuardOpen { get; init; } = -1;
+        public int GuardClose { get; init; } = -1;
+        /// <summary>The guard's #define (op), -1 when there is none.</summary>
+        public int GuardDefine { get; init; } = -1;
+        /// <summary>The directives (ops, in order) that start inside a block comment: no directive to a compiler, but a
+        /// "/*" in a string can look like one, so the walk follows such an #include as it would one under an #if.</summary>
+        public int[] Commented { get; init; } = Array.Empty<int>();
         DefineIndex? _index;
         public DefineIndex Index => LazyInitializer.EnsureInitialized(ref _index, () => new DefineIndex(this));
 
@@ -290,6 +688,8 @@ public static class TemplateInstances
     static Parsed Parse(string text, bool isTemplate)
     {
         var ops = new List<Op>(text.Length / 40 + 16);
+        List<int>? commented = null;
+        var inComment = false;
         var i = -1;   // the 0-based line, as a split on '\n' numbers it
         for (var start = 0; start <= text.Length; )
         {
@@ -301,26 +701,75 @@ public static class TemplateInstances
             if (k >= end || text[k] != '#')
             {
                 ops.Add(new Op(OpKind.Code, i, i, start, end));
+                if (k < end) inComment = InCommentAfter(text.AsSpan(k, end - k), inComment);
                 start = next;
                 continue;
             }
+            if (inComment) (commented ??= new List<int>()).Add(ops.Count);
             var opStart = start;
             if (!(end > start && text[end - 1] == '\\' && next <= text.Length))
+            {
                 ops.Add(new Op(Head(text.AsSpan(start, end - start)).Kind, first, i, opStart, end));
+                inComment = InCommentAfter(text.AsSpan(start, end - start), inComment);
+            }
             else
             {
                 // As JoinContinued: each line ending in a backslash takes in the next.
                 var lastEnd = end;
+                inComment = InCommentAfter(text.AsSpan(start, end - start), inComment);
                 while (lastEnd > start && text[lastEnd - 1] == '\\' && next <= text.Length)
                 {
                     (lastEnd, next) = Line(text, start = next);
+                    inComment = InCommentAfter(text.AsSpan(start, lastEnd - start), inComment);
                     i++;
                 }
                 ops.Add(new Op(Head(JoinContinued(text, opStart, i - first)).Kind, first, i, opStart, lastEnd));
             }
             start = next;
         }
-        return new Parsed(text, ops.ToArray(), isTemplate);
+        var all = ops.ToArray();
+        var (open, close, guardDefine) = Guard(text, all, commented);
+        return new Parsed(text, all, isTemplate) { GuardOpen = open, GuardClose = close, GuardDefine = guardDefine, Commented = commented?.ToArray() ?? Array.Empty<int>() };
+    }
+
+    // The include guard: the first directive an #ifndef X (or #if !defined X), the next a #define of X, and the #endif that
+    // closes it the last directive. (-1, -1, -1) when there is none.
+    static (int Open, int Close, int Define) Guard(string text, Op[] ops, List<int>? commented)
+    {
+        int Directive(int from) { while (from < ops.Length && ops[from].Kind == OpKind.Code) from++; return from; }
+        var g = Directive(0);
+        if (g >= ops.Length || ops[g].Kind != OpKind.Open || commented?.Contains(g) == true) return (-1, -1, -1);
+        var name = GuardName(text.AsSpan(ops[g].Start, ops[g].End - ops[g].Start));
+        if (name.IsEmpty) return (-1, -1, -1);
+        var d = Directive(g + 1);
+        if (d >= ops.Length || ops[d].Kind != OpKind.Define) return (-1, -1, -1);
+        var (_, after) = Head(text.AsSpan(ops[d].Start, ops[d].End - ops[d].Start));
+        var rest = text.AsSpan(ops[d].Start + after, ops[d].End - ops[d].Start - after);
+        if (!rest.StartsWith(name) || rest.Length > name.Length && IsWord(rest[name.Length])) return (-1, -1, -1);
+        var depth = 0;
+        for (var k = g; k < ops.Length; k++)
+        {
+            if (ops[k].Kind == OpKind.Open) depth++;
+            else if (ops[k].Kind == OpKind.Close && --depth == 0)
+                return Directive(k + 1) >= ops.Length ? (g, k, d) : (-1, -1, -1);
+        }
+        return (-1, -1, -1);
+    }
+
+    // X of "#ifndef X" or "#if !defined X" / "#if !defined(X)"; empty for any other #if.
+    static ReadOnlySpan<char> GuardName(ReadOnlySpan<char> raw)
+    {
+        var s = raw.TrimStart()[1..].TrimStart();
+        if (s.StartsWith("ifndef")) s = s[6..].TrimStart();
+        else if (s.StartsWith("if") && s[2..].TrimStart() is var t && t.StartsWith("!") && t[1..].TrimStart() is var u && u.StartsWith("defined"))
+        {
+            s = u[7..].TrimStart();
+            if (s.StartsWith("(")) s = s[1..].TrimStart();
+        }
+        else return default;
+        var n = 0;
+        while (n < s.Length && IsWord(s[n])) n++;
+        return n > 0 && !char.IsAsciiDigit(s[0]) ? s[..n] : default;
     }
 
     /// <summary>Tests: each op of <see cref="Parse"/> as "kind first-last text (params) body"; throws where the name
@@ -356,7 +805,8 @@ public static class TemplateInstances
         var word = raw[w..k];
         if (word is "if" or "ifdef" or "ifndef") return (OpKind.Open, -1);
         if (word is "endif") return (OpKind.Close, -1);
-        var kind = word switch { "define" => OpKind.Define, "undef" => OpKind.Undef, "include" => OpKind.Include, _ => OpKind.Other };
+        // #include_next: the walk can't tell the next header of a name from the first, and follows it as an #include.
+        var kind = word switch { "define" => OpKind.Define, "undef" => OpKind.Undef, "include" or "include_next" => OpKind.Include, _ => OpKind.Other };
         if (kind == OpKind.Other) return (kind, -1);
         while (k < raw.Length && raw[k] is ' ' or '\t') k++;
         return (kind, k);
@@ -392,9 +842,16 @@ public static class TemplateInstances
             case OpKind.Undef:
                 var sp = rest.IndexOfAny(' ', '\t');
                 return new Directive(kind, (sp < 0 ? rest : rest[..sp]).ToString(), null);
-            default:   // include
-                var q = rest.Length >= 2 && rest[0] == '"' ? rest[1..].IndexOf('"') : -1;
-                return new Directive(kind, q < 0 ? null : rest.Slice(1, q).ToString(), null);
+            default:   // include: "name", <name>, or a macro naming one
+                if (rest.Length >= 2 && rest[0] is '"' or '<' && rest[1..].IndexOf(rest[0] == '"' ? '"' : '>') is var q and >= 0)
+                    return new Directive(kind, rest.Slice(1, q).ToString(), null);
+                if (rest.Length > 0 && (char.IsAsciiLetter(rest[0]) || rest[0] == '_'))
+                {
+                    var w = 1;
+                    while (w < rest.Length && IsWord(rest[w])) w++;
+                    return new Directive(kind, rest[..w].ToString(), null, Computed: true);
+                }
+                return new Directive(kind, null, null);
         }
     }
 
@@ -422,13 +879,44 @@ public static class TemplateInstances
         return true;
     }
 
-    static void Walk(Parsed parsed, WalkState w, int? unitLine, int depth, int ifBase)
+    // gcc's include depth limit, for includes walked for certain. Includes in comments and under #ifs (no include to
+    // gcc, or not all of them) are not counted: chains of them ran 200 deep in death-lite, where gcc nests 46. The walk
+    // goes as deep as the headers not on its stack take it, and the thread's stack.
+    const int MaxIncludeDepth = 200;
+
+    /// <summary>The headers a computed include (#include MACRO) may name: each value of the macro that is a "name" or
+    /// &lt;name&gt;, through macros naming macros. A value it can't read (a pasted name) names nothing it can follow.</summary>
+    static List<string> IncludedBy(string macro, WalkState w)
+    {
+        var names = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var todo = new Stack<string>();
+        todo.Push(macro);
+        while (todo.TryPop(out var m) && seen.Count < 64)
+        {
+            if (!seen.Add(m) || w.LookupNow(m) is not { } values) continue;
+            foreach (var v in values)
+            {
+                if (v.Params is not null) continue;
+                var b = v.Body.Trim();
+                if (b.Length >= 2 && (b[0] == '"' && b[^1] == '"' || b[0] == '<' && b[^1] == '>')) names.Add(b[1..^1]);
+                else if (b.Length > 0 && (char.IsAsciiLetter(b[0]) || b[0] == '_') && b.All(IsWord)) todo.Push(b);
+            }
+        }
+        return names.Distinct(StringComparer.Ordinal).ToList();
+    }
+
+    /// <summary>Walks a text: its heads, and each header it includes in turn. <paramref name="maybe"/>: the text may not be
+    /// included at all (see <see cref="WalkState.Walked"/>).</summary>
+    static void Walk(Parsed parsed, WalkState w, int? unitLine, int depth, int ifBase, bool maybe = false)
     {
         var stretch = new Stretch(parsed, ifBase, 0);
         w.Trail.Add(stretch);
         var code = new StringBuilder();   // the non-directive text since the last define/undef/include, line for line
         var codeStartLine = 1;
         var ifDepth = ifBase;   // an #if around the #include that brought this text in counts too
+        var localIf = 0;        // the #ifs open in this text, its include guard aside
+        var nextCommented = 0;
         void Flush()
         {
             if (code.Length == 0) return;
@@ -450,6 +938,8 @@ public static class TemplateInstances
         {
             var op = parsed.Ops[k];
             stretch.To = k;
+            var inComment = nextCommented < parsed.Commented.Length && parsed.Commented[nextCommented] == k;
+            if (inComment) nextCommented++;
             switch (op.Kind)
             {
                 case OpKind.Code:
@@ -457,8 +947,10 @@ public static class TemplateInstances
                     code.Append(parsed.Text, op.Start, op.End - op.Start).Append('\n');
                     continue;
                 case OpKind.Other or OpKind.Open or OpKind.Close:
-                    if (op.Kind == OpKind.Open) ifDepth++;
-                    else if (op.Kind == OpKind.Close) ifDepth = Math.Max(ifBase, ifDepth - 1);
+                    // An #if or #endif in a comment is none (as DefineIndex counts them).
+                    if (inComment) { }
+                    else if (op.Kind == OpKind.Open) { ifDepth++; if (k != parsed.GuardOpen) localIf++; }
+                    else if (op.Kind == OpKind.Close) { ifDepth = Math.Max(ifBase, ifDepth - 1); if (k != parsed.GuardClose) localIf = Math.Max(0, localIf - 1); }
                     // Keep the line count, so a head after this directive gets its own line.
                     if (code.Length == 0) codeStartLine = op.First + 1;
                     code.Append('\n', op.Last - op.First + 1);
@@ -470,19 +962,57 @@ public static class TemplateInstances
             {
                 // A define or undef is on the trail (stretch) from the next op on; WalkState.Resolve reads it there.
                 case OpKind.Include:
-                    if (depth >= 8 || parsed.Directive(k).Text is not { } incName) break;
-                    var inc = w.ReadInclude(incName);
-                    if (inc is null) break;
-                    // A template header is instantiated by every #include; any other header only adds macros, once.
-                    var p = ParseOf(inc, w.Parsing);
-                    if (!p.IsTemplate && !w.Walked.Add(inc)) break;
-                    stretch.To = k + 1;
-                    Walk(p, w, unitLine ?? op.First + 1, depth + 1, ifDepth);
-                    w.Trail.Add(stretch = new Stretch(parsed, ifBase, k + 1));
+                    // An include depth limit of 8 missed every template more than 8 includes down (death-lite: 10,108 of
+                    // 21,659 instances, down to 46).
+                    if (parsed.Directive(k) is not { Text: { } incName } d) break;
+                    if (depth >= MaxIncludeDepth || !System.Runtime.CompilerServices.RuntimeHelpers.TryEnsureSufficientExecutionStack())
+                    {
+                        // Cut: the walks under way never stand for a whole one (a header first walked at the limit looked
+                        // up no TNAME, and its include with TNAME set was skipped).
+                        if (w.Looking.Count > 0) w.Looking[^1].Cut = true;
+                        break;
+                    }
+                    var names = d.Computed ? IncludedBy(incName, w) : new List<string> { incName };
+                    var uncertain = maybe || localIf > 0 || inComment || names.Count > 1;
+                    foreach (var name in names)
+                    {
+                        var inc = w.ReadInclude(name);
+                        if (inc is null) continue;
+                        // A template header is instantiated by every #include; any other header only adds macros, once.
+                        var p = ParseOf(inc, w.Parsing);
+                        stretch.To = k + 1;
+                        // The whole trail closed at an include: what a name is then is its chain (WalkState.Now).
+                        if (!stretch.Closed)
+                        {
+                            w.Close(stretch);
+                            w.Trail.Add(stretch = new Stretch(parsed, ifBase, k + 1));
+                        }
+                        // A header included inside its own walk: as its guard would, nothing. A guarded header once walked
+                        // for certain (no #if, comment or choice of name on the way) is nothing again while its guard is
+                        // defined: walked again where a name it looks up has a value now, it put out an instance gcc never
+                        // sees (death-lite: 103 in one unit, a register map first included before TNAME was set).
+                        if (!p.IsTemplate && w.Skips(inc, p)) continue;
+                        if (p.IsTemplate && uncertain && w.WalkingTemplates.Contains(inc)) continue;
+                        if (!uncertain && p.GuardDefine >= 0) w.Certain.Add(inc);
+                        w.Close(stretch);
+                        var frame = w.Push();
+                        if (!p.IsTemplate) w.Walking.Add(inc);
+                        var outerTemplate = p.IsTemplate && w.WalkingTemplates.Add(inc);
+                        // What a walk that may be no include defines is an alternative (as under an #if), never what settles a name.
+                        Walk(p, w, unitLine ?? op.First + 1, uncertain ? depth : depth + 1, uncertain ? Math.Max(ifDepth, 1) : ifDepth, uncertain);
+                        w.Walking.Remove(inc);
+                        if (outerTemplate) w.WalkingTemplates.Remove(inc);
+                        w.Pop();
+                        frame.Deps.Remove(inc);   // itself, included inside its own walk: nothing, as its guard makes it
+                        if (w.Looking.Count > 0) w.Looking[^1].Take(frame);
+                        if (!p.IsTemplate) w.Record(inc, frame);
+                        w.Trail.Add(stretch = new Stretch(parsed, ifBase, k + 1));
+                    }
                     break;
             }
         }
         stretch.To = parsed.Ops.Length;
+        w.Close(stretch);
         Flush();
     }
 
