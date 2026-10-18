@@ -21,7 +21,21 @@ public static class TemplateInstances
     public const int MaxWorlds = 64;
 
     /// <summary>Quick gate: could <paramref name="text"/> hold a macro-named definition head at all?</summary>
-    public static bool HasMacroNamedHead(string text) => text.Contains(')') && MacroNamedHead.IsMatch(text);
+    public static bool HasMacroNamedHead(string text) => ClosesIntoBody(text) && MacroNamedHead.IsMatch(text);
+
+    /// <summary>False when no <c>)</c> is followed by whitespace and <c>{</c>, which every MacroNamedHead match ends with:
+    /// the regex is tried from every name in the text, and most code read by a walk has none (40% of a walk was that
+    /// regex). Whitespace as the regex <c>\s</c> reads it.</summary>
+    static bool ClosesIntoBody(string text)
+    {
+        for (var i = text.IndexOf('{'); i >= 0; i = text.IndexOf('{', i + 1))
+        {
+            var k = i - 1;
+            while (k >= 0 && char.IsWhiteSpace(text[k])) k--;
+            if (k >= 0 && text[k] == ')') return true;
+        }
+        return false;
+    }
 
     /// <summary>False only when <see cref="Find"/> can find no head in this text itself (its includes aside).</summary>
     /// <remarks>Looser than MacroNamedHead: `NAME(args)` then `(`, with directive lines (and their continuations) allowed
@@ -1236,7 +1250,7 @@ public static class TemplateInstances
             if (code.Length == 0) return;
             var s = code.ToString();
             code.Clear();
-            if (!s.Contains('(')) return;
+            if (!ClosesIntoBody(s)) return;
             w.Asked.Clear();   // the trail has grown since
             int at = 0, lines = 0;   // newlines before the match, counted on from the last (a copy of s up to each match is the square of it)
             foreach (Match m in MacroNamedHead.Matches(s))

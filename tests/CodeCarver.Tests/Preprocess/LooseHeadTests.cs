@@ -56,6 +56,23 @@ public sealed class LooseHeadTests
         }
     }
 
+    static readonly Regex Head = new(@"\b([A-Za-z_]\w*)\s*\(((?:[^()\n]|\([^()\n]*\))*)\)\s*\([^(){};]*\)\s*\{");
+
+    [Fact]
+    public void TheStrictGate_SaysWhatItsRegexSaid_OnRandomText()
+    {
+        // HasMacroNamedHead tries the regex only where a `)` is followed by whitespace and `{`, as every match ends.
+        var rnd = new Random(11);
+        var bits = new[] { "F", "_g1", "é", "(", ")", "(a)", " ", "\t", "\n", "\u00a0", "\u2028", "{", "}", ";", "x" };
+        for (var n = 0; n < 50_000; n++)
+        {
+            var sb = new StringBuilder();
+            for (var k = rnd.Next(1, 24); k > 0; k--) sb.Append(bits[rnd.Next(bits.Length)]);
+            var t = sb.ToString();
+            Assert.True(Head.IsMatch(t) == TemplateInstances.HasMacroNamedHead(t), $"differs on [{t.Replace("\n", "\\n")}]");
+        }
+    }
+
     [Theory]
     [InlineData("#define A_{0} B_{0}\n")]
     [InlineData("#define A_{0} B_{0}(x)\n")]
