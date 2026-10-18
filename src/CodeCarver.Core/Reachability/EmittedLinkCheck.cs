@@ -142,7 +142,7 @@ public static class EmittedLinkCheck
         // Each loop's time, and memory as it ends: the process's private bytes, the managed heap the last GC left, and
         // managed bytes allocated in the loop (MB). A "Max" key is kept at its largest over a stage's rounds.
         var allocatedAt = GC.GetTotalAllocatedBytes();
-        long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0;
+        long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
         // The tree's shape, for sizing a test corpus like it (shape.*): each header's size, each walk's include closure.
         var headerSizes = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
         var closures = new ConcurrentBag<(int Files, long Chars, int Reads, long ReadChars)>();
@@ -196,9 +196,9 @@ public static class EmittedLinkCheck
             stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits; stats["parseWaits"] = parseGate.Waits;
             stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;
             stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped; stats["templateWalksReused"] = templateWalksReused;
-            stats["templateWalksRedone"] = templateWalksRedone; stats["templateWalksWhole"] = templateWalksWhole; stats["headersRefiltered"] = headersRefiltered;
+            stats["templateWalksRedone"] = templateWalksRedone; stats["templateWalksWhole"] = templateWalksWhole; stats["headersRefiltered"] = headersRefiltered; stats["templateWalkHashHits"] = templateWalkHashHits;
             stats["walkNames"] = walkNames.Count;
-            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "walkNames" })
+            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -478,7 +478,7 @@ public static class EmittedLinkCheck
                 // by its string: each re-include of a guarded header was read, parsed and walked again with all it includes
                 // (death-lite: a unit's walk resolving 2,817 includes, 2 GB). One read per header per walk, whatever name reached it.
                 var read = new Dictionary<string, string?>(StringComparer.Ordinal);
-                var filtered = new List<(int[] Dropped, int Through)>();
+                var filtered = new List<(int[] Dropped, int Through, string Path)>();
                 var asked = deps is null ? null : new HashSet<string>(StringComparer.Ordinal);   // a dep per include name, not per #include line
                 deps?.Clear();
                 var lookedUp = new List<string>();
@@ -489,7 +489,7 @@ public static class EmittedLinkCheck
                                 {
                                     var (rt, dropped, through) = ReadHeader(path, whole);
                                     read[path] = t = rt;
-                                    if (dropped.Length > 0) filtered.Add((dropped, through));
+                                    if (dropped.Length > 0) filtered.Add((dropped, through, path));
                                     if (t is not null) { reads++; readChars += t.Length; if (entered.Add(path)) chars += t.Length; }
                                 }
                                 Activity.Note(t?.Length ?? 0);
@@ -500,22 +500,31 @@ public static class EmittedLinkCheck
                 if (whole) { Interlocked.Increment(ref templateWalksWhole); break; }
                 // A name looked up that a header read dropped: one walkNames did not have when that header was filtered.
                 var names = Volatile.Read(ref walkNames);
-                var hashes = new List<(int Hash, int At)>(lookedUp.Count);
+                var hashes = new List<(int Hash, int At, string Name)>(lookedUp.Count);
                 var fresh = false;
                 foreach (var n in lookedUp)
                 {
                     var h = string.GetHashCode(n.AsSpan());
                     var at = names.TryGetValue(h, out var i) ? i : int.MaxValue;
                     fresh |= at == int.MaxValue;
-                    hashes.Add((h, at));
+                    hashes.Add((h, at, n));
                 }
                 var missed = false;
                 if (filtered.Count > 0)
                 {
                     var oldest = filtered.Min(r => r.Through);
                     var late = hashes.Where(x => x.At >= oldest).ToList();
-                    foreach (var (dropped, through) in filtered)
-                        if (late.Count > 0 && DropsAny(dropped, late.Where(x => x.At >= through).Select(x => x.Hash))) { missed = true; break; }
+                    foreach (var (dropped, through, path) in filtered)
+                    {
+                        if (late.Count == 0) break;
+                        // A hash dropped is most often not the name looked up (32 bits, millions of define names): the
+                        // header is read again and asked by name (death-lite: 91 of 92 such hits, each a walk done again).
+                        var hits = late.Where(x => x.At >= through && Array.BinarySearch(dropped, x.Hash) >= 0).Select(x => x.Name).Distinct().ToList();
+                        if (hits.Count == 0) continue;
+                        var directives = ReadDirectives(path).Text;
+                        if (directives is null || CodeCarver.Core.Preprocess.TemplateInstances.DefinesAny(directives, hits)) { missed = true; break; }
+                        Interlocked.Increment(ref templateWalkHashHits);
+                    }
                 }
                 if (fresh) lock (headerInfo) Grow(hashes.Where(x => x.At == int.MaxValue).Select(x => x.Hash));
                 if (!missed) break;

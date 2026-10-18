@@ -236,6 +236,45 @@ public static class TemplateInstances
     /// The same string when nothing is dropped.</summary>
     public static string KeepDefines(string directives, Func<int, bool> keep, List<int> dropped)
     {
+        StringBuilder? sb = null;
+        var copied = 0;   // the text before this is in sb
+        EachDefine(directives, (name, h, start, next) =>
+        {
+            if (keep(h)) return false;
+            dropped.Add(h);
+            (sb ??= new StringBuilder(directives.Length / 8)).Append(directives, copied, start - copied);
+            copied = Math.Min(next, directives.Length);
+            return false;
+        });
+        if (sb is null) return directives;
+        sb.Append(directives, copied, directives.Length - copied);
+        return sb.ToString();
+    }
+
+    /// <summary>Would <see cref="KeepDefines"/> drop a #define or #undef of one of <paramref name="names"/> from this text
+    /// (given that their hashes are not kept)? A hash is 32 bits and a tree has millions of define names: a name looked
+    /// up whose hash a header dropped is most often a name the header never defines (death-lite: 91 of 92).</summary>
+    public static bool DefinesAny(string directives, IReadOnlyCollection<string> names)
+    {
+        var hashes = new HashSet<int>();
+        foreach (var n in names) hashes.Add(string.GetHashCode(n.AsSpan()));
+        var found = false;
+        EachDefine(directives, (name, h, _, _) =>
+        {
+            if (!hashes.Contains(h)) return false;
+            foreach (var n in names) if (name.SequenceEqual(n)) return found = true;
+            return false;
+        });
+        return found;
+    }
+
+    delegate bool DefineLine(ReadOnlySpan<char> name, int hash, int start, int next);
+
+    // The #define and #undef lines KeepDefines may drop, in order, until one returns true. Not these: the first two
+    // directives and those after the last #endif (the include guard is read from them), and a line that opens or closes
+    // a block comment (the lines after it would read otherwise).
+    static void EachDefine(string directives, DefineLine each)
+    {
         var lastClose = -1;   // where the last #endif line starts
         for (var start = 0; start < directives.Length; )
         {
@@ -243,8 +282,6 @@ public static class TemplateInstances
             if (Head(directives.AsSpan(start, end - start)).Kind == OpKind.Close) lastClose = start;
             start = next;
         }
-        StringBuilder? sb = null;
-        var copied = 0;   // the text before this is in sb
         var directivesSeen = 0;
         var inComment = false;
         for (var start = 0; start < directives.Length; )
@@ -255,18 +292,11 @@ public static class TemplateInstances
             var (kind, _) = Head(line);
             if (line.TrimStart().StartsWith("#")) directivesSeen++;
             if (kind is OpKind.Define or OpKind.Undef && directivesSeen > 2 && (lastClose < 0 || start < lastClose) && after == inComment
-                && FastName(line, kind, out var name) && !name.IsEmpty && string.GetHashCode(name) is var h && !keep(h))
-            {
-                dropped.Add(h);
-                (sb ??= new StringBuilder(directives.Length / 8)).Append(directives, copied, start - copied);
-                copied = Math.Min(next, directives.Length);
-            }
+                && FastName(line, kind, out var name) && !name.IsEmpty && each(name, string.GetHashCode(name), start, next))
+                return;
             inComment = after;
             start = next;
         }
-        if (sb is null) return directives;
-        sb.Append(directives, copied, directives.Length - copied);
-        return sb.ToString();
     }
 
     // Whether a block comment is open at the end of line, given whether one was at its start. A "//" outside one ends
