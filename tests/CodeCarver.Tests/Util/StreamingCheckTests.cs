@@ -8,7 +8,9 @@ namespace CodeCarver.Tests.Util;
 /// What keeps the link check's memory flat over a big tree: results streamed in order with a bounded lead, scans held
 /// to a memory budget, and a function-like macro's visibility asked per name (a set of every visible macro per file was
 /// files x macros). Each must change only how much is held at once, never what the check finds.
+/// Some set the check's budgets (process-wide environment variables): with the walk memory tests, alone.
 /// </summary>
+[Collection(nameof(CodeCarver.Tests.Preprocess.TemplateWalkMemoryTests))]
 public sealed class StreamingCheckTests
 {
     [Fact]
