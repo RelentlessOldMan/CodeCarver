@@ -241,7 +241,9 @@ public sealed class StreamingCheckTests
             Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", null);
             Environment.SetEnvironmentVariable("CODECARVER_CHECK_WALK_MB", null);
             var held = EmittedLinkCheck.Run(emitted, dropped);
-            Assert.Equal(0, held.Stats["walkWaits"]);   // every header held: walks parse each header once, never wait
+            // Every header held: only the walks that start before the first one ends wait (its cost is not known yet, so
+            // it takes the whole budget); after it, a walk costs what the largest one before it allocated.
+            Assert.True(held.Stats["walkWaits"] < dropped.Length, held.Stats["walkWaits"].ToString());
 
             Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", "0");
             Environment.SetEnvironmentVariable("CODECARVER_CHECK_WALK_MB", "1");

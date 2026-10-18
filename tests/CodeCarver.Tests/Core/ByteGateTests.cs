@@ -39,4 +39,31 @@ public sealed class ByteGateTests
         Assert.Equal(0, gate.Waits);
         using (gate.Take(0)) { }   // nothing taken: nothing to give back
     }
+
+    [Fact]
+    public void AWaitingPiece_IsSizedAgainWhenItGoes()
+    {
+        // The template walks: before the first one ends the size is unknown and each takes the whole budget; one sized once
+        // would then hold it all too, and the walks waiting for the first ran one at a time.
+        var gate = new ByteGate(100);
+        long size = -1, peers = 0, most = 0;
+        var first = gate.Take(() => Interlocked.Read(ref size) is var s and >= 0 ? s : 100);
+        var waiting = Enumerable.Range(0, 8).Select(_ => new Thread(() =>
+        {
+            using (gate.Take(() => Interlocked.Read(ref size) is var s and >= 0 ? s : 100))
+            {
+                var now = Interlocked.Increment(ref peers);
+                for (long m; (m = Interlocked.Read(ref most)) < now && Interlocked.CompareExchange(ref most, now, m) != m;) { }
+                Thread.Sleep(200);
+                Interlocked.Decrement(ref peers);
+            }
+        })).ToArray();
+        foreach (var t in waiting) t.Start();
+        SpinWait.SpinUntil(() => gate.Waits == 8, 5000);
+        Interlocked.Exchange(ref size, 10);   // the first one measured itself
+        first.Dispose();
+        foreach (var t in waiting) t.Join();
+        Assert.Equal(8, gate.Waits);
+        Assert.True(most > 1, most.ToString());   // sized again: they ran together, not one at a time
+    }
 }

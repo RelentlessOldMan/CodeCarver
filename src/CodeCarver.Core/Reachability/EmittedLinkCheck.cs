@@ -457,8 +457,9 @@ public static class EmittedLinkCheck
         List<Definition> TemplateDefs(string text, List<(string Raw, HeaderInfo? Read)>? deps)
         {
             Interlocked.Increment(ref templateWalks);
-            var cost = Interlocked.Read(ref walkCost) is var c and >= 0 ? c : walkBudget;
-            using var slot = walkGate.Take(cost);
+            // A walk before any has ended takes the whole budget; one waiting for it then takes what that walk allocated
+            // (sized once, it would have taken the whole budget too: those first walks ran one at a time).
+            using var slot = walkGate.Take(() => Interlocked.Read(ref walkCost) is var c and >= 0 ? c : walkBudget);
             // After the gate: a walk waiting for room is not counted as running (C23 read 16 "running at once").
             using var part = Activity.Part("templateWalk", text.Length);
             var start = GC.GetAllocatedBytesForCurrentThread();

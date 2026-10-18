@@ -19,16 +19,22 @@ public sealed class ByteGate
     long _waits;
 
     /// <summary>Takes <paramref name="bytes"/> of the budget, waiting until they fit (or nothing else holds any).</summary>
-    public Held Take(long bytes)
+    public Held Take(long bytes) => Take(() => bytes);
+
+    /// <summary>Takes what <paramref name="bytes"/> says, waiting until it fits (or nothing else holds any); the size is
+    /// asked again after each wait, so work that sized itself on a guess takes what is known when it gets to go.</summary>
+    public Held Take(Func<long> bytes)
     {
-        if (bytes <= 0) return default;
+        long b;
         lock (_gate)
         {
-            if (_used > 0 && _used + bytes > _limit) Interlocked.Increment(ref _waits);
-            while (_used > 0 && _used + bytes > _limit) Monitor.Wait(_gate);
-            _used += bytes;
+            b = bytes();
+            if (b <= 0) return default;
+            if (_used > 0 && _used + b > _limit) Interlocked.Increment(ref _waits);
+            while (_used > 0 && _used + b > _limit) { Monitor.Wait(_gate); b = bytes(); if (b <= 0) return default; }
+            _used += b;
         }
-        return new Held(this, bytes);
+        return new Held(this, b);
     }
 
     void Give(long bytes)
