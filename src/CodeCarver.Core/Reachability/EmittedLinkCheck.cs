@@ -53,6 +53,10 @@ public sealed class LinkCheckCache
     internal readonly ConcurrentDictionary<string, EmittedLinkCheck.OriginalEntry?> Originals = new(StringComparer.Ordinal);
     // The #include names in each header (TemplateInstances.IncludeNames).
     internal readonly ConcurrentDictionary<string, string[]> HeaderIncludes = new(StringComparer.Ordinal);
+    // An emitted unit's template walk by its text (length, hash): what it found and each include it read, so a later
+    // round emitting the same text serves it while those headers read as they did. Every round walked every emitted
+    // unit again (C24: a round's 3,308 walks took about 30 min at work, and a carve runs several rounds).
+    internal readonly ConcurrentDictionary<(int Length, ulong Hash), (List<(string Raw, EmittedLinkCheck.HeaderInfo? Read)> Deps, List<EmittedLinkCheck.Definition> Defs)> Walks = new();
 
     private object?[]? _inputs;
 
@@ -132,7 +136,7 @@ public static class EmittedLinkCheck
         // Each loop's time, and memory as it ends: the process's private bytes, the managed heap the last GC left, and
         // managed bytes allocated in the loop (MB). A "Max" key is kept at its largest over a stage's rounds.
         var allocatedAt = GC.GetTotalAllocatedBytes();
-        long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0;
+        long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0;
         // The tree's shape, for sizing a test corpus like it (shape.*): each header's size, each walk's include closure.
         var headerSizes = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
         var closures = new ConcurrentBag<(int Files, long Chars, int Reads, long ReadChars)>();
@@ -186,8 +190,8 @@ public static class EmittedLinkCheck
             stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["instancesRedone"] = instancesRedone;
             stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits; stats["parseWaits"] = parseGate.Waits;
             stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;
-            stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped;
-            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped" })
+            stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped; stats["templateWalksReused"] = templateWalksReused;
+            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -361,7 +365,7 @@ public static class EmittedLinkCheck
                              text.Contains("define", StringComparison.Ordinal),
                              () => CodeCarver.Core.Preprocess.TemplateInstances.MayHaveMacroNamedHead(text),
                              () => CodeCarver.Core.Preprocess.TemplateInstances.IncludeNames(text)))
-                r.AddRange(TemplateDefs(text, null));
+                r.AddRange(Walked(text));
             r.AddRange(C99Defs(text));
             return r;
         }
@@ -373,6 +377,21 @@ public static class EmittedLinkCheck
             if (mayHead() || ReachesTemplate(includes())) return true;
             Interlocked.Increment(ref templateWalksSkipped);
             return false;
+        }
+        // An emitted unit's walk, served from an earlier round when the same text read the same headers (LinkCheckCache.Walks).
+        List<Definition> Walked(string text)
+        {
+            if (cache is null) return TemplateDefs(text, null);
+            var key = (text.Length, ContentHash(text));
+            if (cache.Walks.TryGetValue(key, out var had) && had.Deps.All(d => Equals(TemplateKey(d.Raw), d.Read)))
+            {
+                Interlocked.Increment(ref templateWalksReused);
+                return had.Defs;
+            }
+            var deps = new List<(string Raw, HeaderInfo? Read)>();
+            var defs = TemplateDefs(text, deps);
+            cache.Walks[key] = (deps, defs);
+            return defs;
         }
         // deps: each include the walk read and what its text hashed to, so a later run can tell whether the answer still holds.
         List<Definition> TemplateDefs(string text, List<(string Raw, HeaderInfo? Read)>? deps)
@@ -389,6 +408,7 @@ public static class EmittedLinkCheck
             // by its string: each re-include of a guarded header was read, parsed and walked again with all it includes
             // (death-lite: a unit's walk resolving 2,817 includes, 2 GB). One read per header per walk, whatever name reached it.
             var read = new Dictionary<string, string?>(StringComparer.Ordinal);
+            var asked = deps is null ? null : new HashSet<string>(StringComparer.Ordinal);   // a dep per include name, not per #include line
             var found = CodeCarver.Core.Preprocess.TemplateInstances.Find(text, raw =>
                         {
                             string? t = null;
@@ -398,7 +418,7 @@ public static class EmittedLinkCheck
                                 if (t is not null) { reads++; readChars += t.Length; if (entered.Add(path)) chars += t.Length; }
                             }
                             Activity.Note(t?.Length ?? 0);
-                            deps?.Add((raw, TemplateKey(raw)));
+                            if (asked?.Add(raw) == true) deps!.Add((raw, TemplateKey(raw)));
                             return t;
                         }, commandLineMacros, Parsing)
                         .Select(i => new Definition(i.Name, i.Line, false, false)).ToList();

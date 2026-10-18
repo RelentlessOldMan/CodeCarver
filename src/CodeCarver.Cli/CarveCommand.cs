@@ -3020,7 +3020,8 @@ public static class CarveCommand
                                          report: (k, v) =>
                                          {
                                              var had = summary.TryGetValue($"{summaryStage}.check.{k}", out var was) && was is long l ? l : 0L;
-                                             summary[$"{summaryStage}.check.{k}"] = k.Contains("Max", StringComparison.Ordinal) ? Math.Max(had, v) : had + v;
+                                             // shape.* describe the tree, reported as each loop ends: summed they read 8x (C24: walkedPct 468).
+                                             summary[$"{summaryStage}.check.{k}"] = k.Contains("Max", StringComparison.Ordinal) || k.StartsWith("shape.", StringComparison.Ordinal) ? Math.Max(had, v) : had + v;
                                          });
             var hard = r.Hard.ToList();
             // Defined only in files the traced build never compiled, with the build log confirming the trace is

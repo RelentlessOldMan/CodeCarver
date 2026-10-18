@@ -163,6 +163,53 @@ public sealed class StreamingCheckTests
     }
 
     [Fact]
+    public void LinkCheck_AnEmittedUnitsWalk_IsServedNextRound_AndWalkedAgainWhenAHeaderItReadChanges()
+    {
+        // The emitted u.c instantiates t.h's head through cfg.h's HIDE: it defines hid_den, so only main.c's vis_den call
+        // names a dropped definition. A second round over the same files serves u.c's walk from the cache; once cfg.h
+        // reads differently the walk is redone and the answer follows it.
+        var root = Path.Combine(Path.GetTempPath(), "cc-ewalk-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            (string, string) W(string rel, string text)
+            {
+                var p = Path.Combine(root, rel);
+                File.WriteAllText(p, text);
+                return (rel, p);
+            }
+            var cfg = W("cfg.h", "#define HIDE(n) hid_##n\n");
+            var emitted = new[]
+            {
+                cfg,
+                W("t.h", "int HIDE(den)(void) { return 0; }\n"),
+                W("u.c", "#include \"cfg.h\"\n#include \"t.h\"\n"),
+                W("main.c", "int hid_den(void);\nint vis_den(void);\nint main(void) { return hid_den() + vis_den(); }\n"),
+            };
+            var dropped = new[] { W("gone.c", "int hid_den(void) { return 1; }\nint vis_den(void) { return 2; }\n") };
+            var cache = new LinkCheckCache(p => p.EndsWith("gone.c", StringComparison.Ordinal));
+            string[] Names(LinkCheckResult r) => r.Violations.Select(v => v.Name).Order().ToArray();
+
+            var first = EmittedLinkCheck.Run(emitted, dropped, cache: cache);
+            Assert.Equal(new[] { "vis_den" }, Names(first));
+            Assert.Equal(0, first.Stats["templateWalksReused"]);
+
+            var again = EmittedLinkCheck.Run(emitted, dropped, cache: cache);
+            Assert.Equal(new[] { "vis_den" }, Names(again));
+            Assert.Equal(1, again.Stats["templateWalksReused"]);
+
+            File.WriteAllText(cfg.Item2, "#define HIDE(n) vis_##n\n");
+            var changed = EmittedLinkCheck.Run(emitted, dropped, cache: cache);
+            Assert.Equal(new[] { "hid_den" }, Names(changed));
+            Assert.Equal(0, changed.Stats["templateWalksReused"]);
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
+    [Fact]
     public void LinkCheck_WalksThatReadHeadersAgain_WaitForTheWalkBudget_SameAnswer()
     {
         // 48 dropped files each walk cfg.h, a big register header and the template t.h. With no header text held every

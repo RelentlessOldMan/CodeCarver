@@ -21,7 +21,7 @@ public static class Activity
 
     // ---- what the memory goes to, per part of a step's work (C20/C21: 9 GB in 90 s with 0.5 MB of files in hand) ----
 
-    sealed class PartStats { public long Allocated, MaxItem, InFlight, Items, Notes, NoteBytes; }
+    sealed class PartStats { public long Allocated, MaxItem, InFlight, Items, Notes, NoteBytes, Ticks, MaxTicks; }
     static readonly System.Collections.Concurrent.ConcurrentDictionary<string, PartStats> _parts = new(StringComparer.Ordinal);
     static long _ready;
     [ThreadStatic] static long t_notes, t_noteBytes;
@@ -47,7 +47,7 @@ public static class Activity
 
     public readonly struct PartScope : IDisposable
     {
-        readonly PartStats _s; readonly string _name; readonly long _start, _itemBytes, _notes, _noteBytes;
+        readonly PartStats _s; readonly string _name; readonly long _start, _itemBytes, _notes, _noteBytes, _t0;
         internal PartScope(string name, long itemBytes)
         {
             _name = name; _itemBytes = itemBytes;
@@ -55,6 +55,7 @@ public static class Activity
             Interlocked.Increment(ref _s.InFlight);
             _notes = t_notes; _noteBytes = t_noteBytes;
             _start = GC.GetAllocatedBytesForCurrentThread();
+            _t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         }
         public void Dispose()
         {
@@ -62,6 +63,10 @@ public static class Activity
             var used = GC.GetAllocatedBytesForCurrentThread() - _start;
             Interlocked.Add(ref _s.Allocated, used);
             Interlocked.Increment(ref _s.Items);
+            var took = System.Diagnostics.Stopwatch.GetTimestamp() - _t0;
+            Interlocked.Add(ref _s.Ticks, took);
+            for (var was = Interlocked.Read(ref _s.MaxTicks); took > was; was = Interlocked.Read(ref _s.MaxTicks))
+                if (Interlocked.CompareExchange(ref _s.MaxTicks, took, was) == was) break;
             Interlocked.Add(ref _s.Notes, t_notes - _notes);
             Interlocked.Add(ref _s.NoteBytes, t_noteBytes - _noteBytes);
             for (var was = Interlocked.Read(ref _s.MaxItem); used > was; was = Interlocked.Read(ref _s.MaxItem))
@@ -74,7 +79,7 @@ public static class Activity
     }
 
     /// <summary>The step's parts so far: part.&lt;name&gt;.allocatedMb, .itemMaxMb, .items, .inFlight, .pulledIn,
-    /// .pulledInMb, and readyAhead.</summary>
+    /// .pulledInMb, .ms, .itemMaxMs, and readyAhead.</summary>
     public static IEnumerable<KeyValuePair<string, long>> Parts()
     {
         foreach (var (name, s) in _parts.ToArray())
@@ -85,6 +90,9 @@ public static class Activity
             yield return new($"part.{name}.inFlight", Interlocked.Read(ref s.InFlight));
             yield return new($"part.{name}.pulledIn", Interlocked.Read(ref s.Notes));
             yield return new($"part.{name}.pulledInMb", Interlocked.Read(ref s.NoteBytes) >> 20);
+            // Time inside the part, summed over its items on every thread (a loop of 8 threads busy 1 min reads 8 min).
+            yield return new($"part.{name}.ms", Interlocked.Read(ref s.Ticks) * 1000 / System.Diagnostics.Stopwatch.Frequency);
+            yield return new($"part.{name}.itemMaxMs", Interlocked.Read(ref s.MaxTicks) * 1000 / System.Diagnostics.Stopwatch.Frequency);
         }
         yield return new("readyAhead", Interlocked.Read(ref _ready));
     }
