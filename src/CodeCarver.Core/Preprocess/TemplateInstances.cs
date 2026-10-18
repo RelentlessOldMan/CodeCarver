@@ -240,10 +240,13 @@ public static class TemplateInstances
         /// <summary>Each free name's place in <see cref="Ids"/>.</summary>
         public readonly Dictionary<int, int> Slot;
         public readonly Dictionary<string, Parsed> Deps;
-        /// <summary>The length of the change log when the free names last all had these values (-1: not known).</summary>
-        public int MatchedAt = -1;
-        /// <summary>The place of the name that last had another value (-1: none): checked first.</summary>
-        public int LastMiss = -1;
+        /// <summary>The length of the change log when <see cref="Miss"/> was last brought up to date (-1: never).</summary>
+        public int SeenAt = -1;
+        /// <summary>The places of the free names whose value differs from the one the walk started with.</summary>
+        public readonly HashSet<int> Miss = new();
+        /// <summary>The walk under way (and its start, and the change log then) that last took on its free names.</summary>
+        public Frame? AppliedTo;
+        public int AppliedStart = -1, AppliedChanges = -1;
 
         public Entry(int[] ids, string[][] keys, Dictionary<string, Parsed> deps)
         {
@@ -319,10 +322,11 @@ public static class TemplateInstances
             var f = _frames[Looking.Count];
             f.Reset(Trail.Count);
             Looking.Add(f);
+            _version++;
             return f;
         }
 
-        public void Pop() => Looking.RemoveAt(Looking.Count - 1);
+        public void Pop() { Looking.RemoveAt(Looking.Count - 1); _version++; }
 
         static bool Has(Stretch st, int h)
         {
@@ -333,13 +337,39 @@ public static class TemplateInstances
             return false;
         }
 
+        // The closed stretches of the trail, by the text they are of.
+        readonly Dictionary<Parsed, List<int>> _byParsed = new(ReferenceEqualityComparer.Instance);
+
         List<int> Chain(int h)
         {
             if (_chains.TryGetValue(h, out var chain)) return chain;
             chain = new List<int>();
-            for (var j = 0; j < Trail.Count; j++)
-                if (Trail[j].Closed && Has(Trail[j], h)) chain.Add(j);
+            // Only the texts that define a name of the hash (each stretch of the trail asked: death-lite, a fifth of a walk).
+            foreach (var (parsed, at) in _byParsed)
+                if (parsed.Index.Last.ContainsKey(h))
+                    foreach (var j in at) if (Has(Trail[j], h)) chain.Add(j);
+            chain.Sort();
             return _chains[h] = chain;
+        }
+
+        /// <summary>A walk is over: a define it made outside its own #ifs is from now on only an alternative where an #if
+        /// or a maybe was around its include, and the names looked up it defined so may differ.</summary>
+        public void End(Scope scope, List<Stretch> stretches)
+        {
+            scope.Active = false;
+            if (stretches[0].IfBase == 0 || _chains.Count == 0) return;
+            foreach (var st in stretches)
+            {
+                var p = st.Parsed;
+                var ix = p.Index;
+                for (var d = ix.DefAt(st.From); d < ix.Defs.Length && ix.Defs[d] < st.To; d++)
+                {
+                    var i = ix.Defs[d];
+                    if (ix.Depth[i] > 0 || !_chains.ContainsKey(ix.Hash[i]) || !_ids.TryGetValue(p.NameOf(i).ToString(), out var id)) continue;
+                    _changes.Add(id);
+                    _now[id] = _now[id] with { Count = -1 };
+                }
+            }
         }
 
         /// <summary>A stretch of the trail ends (its To is final): the chains of names it defines take it.</summary>
@@ -347,17 +377,19 @@ public static class TemplateInstances
         {
             if (st.Closed) return;
             st.Closed = true;
-            if (_chains.Count == 0) return;
+            var p = st.Parsed;
+            var ix = p.Index;
+            if (ix.Defs.Length == 0 || ix.DefAt(st.From) is var first && (first == ix.Defs.Length || ix.Defs[first] >= st.To)) return;
             var index = Trail.Count - 1;
             while (index >= 0 && !ReferenceEquals(Trail[index], st)) index--;
-            var p = st.Parsed;
-            for (var i = st.From; i < st.To; i++)
+            if (_byParsed.TryGetValue(p, out var at)) at.Add(index); else _byParsed[p] = new List<int> { index };
+            if (_chains.Count == 0) return;
+            for (var d = first; d < ix.Defs.Length && ix.Defs[d] < st.To; d++)
             {
-                if (p.Ops[i].Kind is not (OpKind.Define or OpKind.Undef) || !p.HasName(i)) continue;
-                var name = p.NameOf(i);
-                if (!_chains.TryGetValue(string.GetHashCode(name), out var chain)) continue;
+                var i = ix.Defs[d];
+                if (!_chains.TryGetValue(ix.Hash[i], out var chain)) continue;
                 if (chain.Count == 0 || chain[^1] != index) chain.Add(index);
-                if (_ids.TryGetValue(name.ToString(), out var id)) _changes.Add(id);
+                if (_ids.TryGetValue(p.NameOf(i).ToString(), out var id)) _changes.Add(id);
             }
         }
 
@@ -407,27 +439,109 @@ public static class TemplateInstances
                 return true;
             }
             if (GuardHolds(inc, p)) return true;
-            if (!Walked.TryGetValue(inc, out var entries)) return false;
-            var used = new List<Entry>();
-            var visiting = new HashSet<string>(ReferenceEqualityComparer.Instance) { inc };
-            foreach (var e in entries)
+            if (!Walked.ContainsKey(inc)) return false;
+            if (_matchAt != (_changes.Count, _version)) { _match.Clear(); _matchAt = (_changes.Count, _version); }
+            if (!Match(inc)) return false;
+            // The walk under way is the same again only where this header is skipped again: its free names (and those of
+            // the walks that stand for the headers it skipped in a cycle) are those of the walk under way too.
+            if (Looking.Count > 0) { _applied.Clear(); Apply(_match[inc]!, Looking[^1]); }
+            return true;
+        }
+
+        // Each header matched since the walk last changed (a walk pushed or popped, a name looked up changed): the walk of
+        // it that matches here, or null for none. Until the walk changes every include asks the same, so a header's answer
+        // is worked out once: each include went over the chain of headers skipped below it again (death-lite: a web unit of
+        // 1.3 KB took 14 s, 1.0.288).
+        readonly Dictionary<string, Entry?> _match = new(ReferenceEqualityComparer.Instance);
+        readonly HashSet<Entry> _applied = new(ReferenceEqualityComparer.Instance);   // taken on by this skip
+        (int Changes, long Version) _matchAt = (-1, -1);
+        long _version;   // Push and Pop: the walk under way, and the headers walking or walked for certain, may differ
+
+        // Does a walk of the header match here: its free names as they started, and each header it skipped as on the
+        // stack nothing here too (on the stack, its guard defined, or a walk of it matching)? Worked out at once for all
+        // the headers the question reaches, as the most of them that match together: each has a walk whose free names
+        // match and whose skipped headers are on the stack, guarded, or matching too. In a cycle each is then as when it
+        // was walked: walked here, one is on the stack where the other's walk skipped it. (A header reached again while
+        // being matched taken as not matching, no header in a cycle matched, and death-lite walked it all again and
+        // again; taken as matching one at a time, a no further down was undone with every walk tried above it.)
+        bool Match(string inc)
+        {
+            if (_match.TryGetValue(inc, out var had)) return had is not null;
+            var nodes = new Dictionary<string, int>(ReferenceEqualityComparer.Instance);
+            var names = new List<string>();
+            var cands = new List<List<Entry>>();   // each header's walks that may match
+            var users = new List<List<(int Node, int Cand)>>();   // the walks that need a header to match
+            var todo = new Stack<int>();
+            int Node(string h)
             {
-                used.Clear();
-                if (!Matches(e, visiting, used)) continue;
-                // The walk under way is the same again only where this header is skipped again: its free names (and
-                // those of the walks that stand for the headers it skipped in a cycle) are those of the walk under way too.
-                if (Looking.Count > 0)
-                {
-                    var f = Looking[^1];
-                    foreach (var u in used)
-                    {
-                        for (var i = 0; i < u.Ids.Length; i++) f.Use(u.Ids[i], u.From[i]);
-                        foreach (var (dep, dp) in u.Deps) if (Walking.Contains(dep)) f.Deps.TryAdd(dep, dp);
-                    }
-                }
-                return true;
+                if (nodes.TryGetValue(h, out var n)) return n;
+                nodes[h] = n = names.Count;
+                names.Add(h);
+                cands.Add(new List<Entry>());
+                users.Add(new List<(int, int)>());
+                todo.Push(n);
+                return n;
             }
-            return false;
+            Node(inc);
+            var need = new List<string>();
+            while (todo.Count > 0)
+            {
+                var n = todo.Pop();
+                if (!Walked.TryGetValue(names[n], out var entries)) continue;
+                foreach (var e in entries)
+                {
+                    if (!FreeMatch(e)) continue;
+                    need.Clear();
+                    var ok = true;
+                    foreach (var (dep, dp) in e.Deps)
+                    {
+                        if (Walking.Contains(dep) || GuardHolds(dep, dp)) continue;
+                        if (_match.TryGetValue(dep, out var m)) { if (m is null) { ok = false; break; } continue; }
+                        need.Add(dep);
+                    }
+                    if (!ok) continue;
+                    var c = cands[n].Count;
+                    cands[n].Add(e);
+                    foreach (var dep in need) users[Node(dep)].Add((n, c));
+                    if (need.Count == 0) break;   // matches whatever the others do
+                }
+            }
+            // Take out a header none of whose walks is left, and with it the walks that need it, until none goes.
+            var left = new int[names.Count];
+            var gone = new bool[names.Count][];
+            var dead = new bool[names.Count];
+            var queue = new Queue<int>();
+            for (var n = 0; n < names.Count; n++)
+            {
+                left[n] = cands[n].Count;
+                gone[n] = new bool[cands[n].Count];
+                if (left[n] == 0) { dead[n] = true; queue.Enqueue(n); }
+            }
+            while (queue.Count > 0)
+                foreach (var (u, c) in users[queue.Dequeue()])
+                {
+                    if (gone[u][c]) continue;
+                    gone[u][c] = true;
+                    if (--left[u] == 0 && !dead[u]) { dead[u] = true; queue.Enqueue(u); }
+                }
+            for (var n = 0; n < names.Count; n++)
+                _match[names[n]] = dead[n] ? null : cands[n][Array.IndexOf(gone[n], false)];
+            return !dead[0];
+        }
+
+        // The walk under way takes on a matching walk's free names, and those of the walks matching for the headers it skipped.
+        void Apply(Entry e, Frame f)
+        {
+            if (!_applied.Add(e)) return;
+            // Its own names once a walk under way (a skip a line on asked them all again: death-lite, a fifth of a walk).
+            if (!ReferenceEquals(e.AppliedTo, f) || e.AppliedStart != f.Start || e.AppliedChanges != _changes.Count)
+            {
+                for (var i = 0; i < e.Ids.Length; i++) f.Use(e.Ids[i], e.From[i]);
+                (e.AppliedTo, e.AppliedStart, e.AppliedChanges) = (f, f.Start, _changes.Count);
+            }
+            foreach (var (dep, dp) in e.Deps)
+                if (Walking.Contains(dep)) f.Deps.TryAdd(dep, dp);
+                else if (!GuardHolds(dep, dp) && _match.TryGetValue(dep, out var m) && m is { } c) Apply(c, f);
         }
 
         bool GuardHolds(string inc, Parsed p) => p.GuardDefine >= 0 && Certain.Contains(inc) && Defined(p.NameOf(p.GuardDefine).ToString());
@@ -439,50 +553,22 @@ public static class TemplateInstances
             e.From[slot] = now.From;
             return true;
         }
-
-        // Do the entry's free names have the values it started with, and is each header it skipped as on the stack
-        // nothing here too (on the stack again, its guard defined, or a walk of it matching here)? used: the entries
-        // that matched.
-        bool Matches(Entry e, HashSet<string> visiting, List<Entry> used)
-        {
-            if (!FreeMatch(e)) return false;
-            used.Add(e);
-            foreach (var (dep, p) in e.Deps)
-            {
-                if (Walking.Contains(dep) || GuardHolds(dep, p) || !visiting.Add(dep)) continue;
-                var any = false;
-                if (Walked.TryGetValue(dep, out var des))
-                    foreach (var de in des)
-                    {
-                        var mark = used.Count;
-                        if (Matches(de, visiting, used)) { any = true; break; }
-                        used.RemoveRange(mark, used.Count - mark);
-                    }
-                if (!any) return false;
-            }
-            return true;
-        }
-
-        // Since an entry last matched, only names whose chain grew are looked at.
+        // The names that differ are kept up with the change log: only names whose chain grew are looked at again (each
+        // check after a miss went over every free name: death-lite, a walk under TNAME undefined matched again after each
+        // #undef TNAME, 666 names a check).
         bool FreeMatch(Entry e)
         {
-            if (e.MatchedAt >= 0)
-            {
-                for (var i = e.MatchedAt; i < _changes.Count; i++)
-                    if (e.Slot.TryGetValue(_changes[i], out var slot) && !Same(e, slot))
+            if (e.SeenAt < 0)
+                for (var slot = 0; slot < e.Ids.Length; slot++) { if (!Same(e, slot)) e.Miss.Add(slot); }
+            else
+                for (var i = e.SeenAt; i < _changes.Count; i++)
+                    if (e.Slot.TryGetValue(_changes[i], out var slot))
                     {
-                        e.MatchedAt = -1;
-                        e.LastMiss = slot;
-                        return false;
+                        if (Same(e, slot)) e.Miss.Remove(slot);
+                        else e.Miss.Add(slot);
                     }
-                e.MatchedAt = _changes.Count;
-                return true;
-            }
-            if (e.LastMiss >= 0 && !Same(e, e.LastMiss)) return false;
-            for (var slot = 0; slot < e.Ids.Length; slot++)
-                if (!Same(e, slot)) { e.LastMiss = slot; return false; }
-            e.MatchedAt = _changes.Count;
-            return true;
+            e.SeenAt = _changes.Count;
+            return e.Miss.Count == 0;
         }
 
         /// <summary>A walk of the header is over: an entry of what its free names were where it started. A cut walk
@@ -492,7 +578,9 @@ public static class TemplateInstances
             if (f.Cut) return;
             var ids = f.Free.ToArray();
             var keys = new string[ids.Length][];
-            for (var i = 0; i < ids.Length; i++) keys[i] = KeysOf(Resolve(_names[ids[i]], f.Start, out _, out _));
+            // A name nothing defined since the walk started has the value it had then.
+            for (var i = 0; i < ids.Length; i++)
+                keys[i] = Chain(_hashes[ids[i]]) is var c && (c.Count == 0 || c[^1] < f.Start) ? Now(ids[i]).Keys : KeysOf(Resolve(_names[ids[i]], f.Start, out _, out _));
             var e = new Entry(ids, keys, new Dictionary<string, Parsed>(f.Deps, ReferenceEqualityComparer.Instance));
             if (Walked.TryGetValue(inc, out var had)) had.Add(e);
             else Walked[inc] = new List<Entry> { e };
@@ -520,7 +608,7 @@ public static class TemplateInstances
                     // The index goes by the name's hash: an op of another name with the same hash is passed over.
                     if (i >= st.To || !p.NameOf(i).SequenceEqual(name)) continue;
                     var op = p.Ops[i];
-                    var inIf = st.IfBase + ix.Depth[i] > 0;
+                    var inIf = (st.Scope.Active ? 0 : st.IfBase) + ix.Depth[i] > 0;
                     if (op.Kind == OpKind.Undef) { if (inIf) { undefInIf = true; continue; } return true; }
                     back.Add((p.Directive(i).Macro!, inIf));
                     if (!inIf) return true;
@@ -553,11 +641,20 @@ public static class TemplateInstances
         }
     }
 
+    /// <summary>One walk of a text. While it is under way it is on the way to whatever is walked: a define it made outside
+    /// its own #ifs holds there, an #if or a maybe around its include aside (death-lite: a register map maybe-included
+    /// defined the name it then included by, "#define X \"next.h\"" and "#include X", and as an alternative the name went
+    /// back past every walk, so every walk around it took it as free: a thousand free names a walk, none walked again
+    /// matched).</summary>
+    sealed class Scope { public bool Active = true; }
+
     /// <summary>Ops <c>From..To</c> (exclusive) of a parsed text, walked at #if depth <c>IfBase</c>.</summary>
-    sealed class Stretch(Parsed parsed, int ifBase, int from)
+    sealed class Stretch(Parsed parsed, int ifBase, int from, Scope scope)
     {
         public readonly Parsed Parsed = parsed;
         public readonly int IfBase = ifBase, From = from;
+        /// <summary>The walk of the text it is a stretch of.</summary>
+        public readonly Scope Scope = scope;
         public int To = from;
         /// <summary>Its To is final, and it is in the trail's index of names.</summary>
         public bool Closed;
@@ -569,13 +666,17 @@ public static class TemplateInstances
     sealed class DefineIndex
     {
         public readonly Dictionary<int, int> Last = new();
-        public readonly int[] Prev, Depth;
+        public readonly int[] Prev, Depth, Hash;
+        /// <summary>The ops that define or undefine a name, in order (a walk's stretches go over these, not every line).</summary>
+        public readonly int[] Defs;
 
         public DefineIndex(Parsed p)
         {
             var ops = p.Ops;
             Prev = new int[ops.Length];
             Depth = new int[ops.Length];
+            Hash = new int[ops.Length];
+            var defs = new List<int>();
             var depth = 0;
             var c = 0;   // the next commented op
             for (var i = 0; i < ops.Length; i++)
@@ -598,12 +699,17 @@ public static class TemplateInstances
                 else if (op.Kind == OpKind.Close) depth = Math.Max(0, depth - 1);
                 else if (op.Kind is OpKind.Define or OpKind.Undef && p.HasName(i))
                 {
-                    var h = string.GetHashCode(p.NameOf(i));
+                    var h = Hash[i] = string.GetHashCode(p.NameOf(i));
+                    defs.Add(i);
                     Prev[i] = Last.TryGetValue(h, out var q) ? q : -1;
                     Last[h] = i;
                 }
             }
+            Defs = defs.ToArray();
         }
+
+        /// <summary>The place in <see cref="Defs"/> of the first at or after op <paramref name="from"/>.</summary>
+        public int DefAt(int from) { var i = Array.BinarySearch(Defs, from); return i < 0 ? ~i : i; }
     }
 
     enum OpKind { Code, Other, Open, Close, Define, Undef, Include }
@@ -910,7 +1016,9 @@ public static class TemplateInstances
     /// included at all (see <see cref="WalkState.Walked"/>).</summary>
     static void Walk(Parsed parsed, WalkState w, int? unitLine, int depth, int ifBase, bool maybe = false)
     {
-        var stretch = new Stretch(parsed, ifBase, 0);
+        var scope = new Scope();
+        var stretch = new Stretch(parsed, ifBase, 0, scope);
+        var stretches = new List<Stretch> { stretch };
         w.Trail.Add(stretch);
         var code = new StringBuilder();   // the non-directive text since the last define/undef/include, line for line
         var codeStartLine = 1;
@@ -985,7 +1093,7 @@ public static class TemplateInstances
                         if (!stretch.Closed)
                         {
                             w.Close(stretch);
-                            w.Trail.Add(stretch = new Stretch(parsed, ifBase, k + 1));
+                            w.Trail.Add(stretch = new Stretch(parsed, ifBase, k + 1, scope)); stretches.Add(stretch);
                         }
                         // A header included inside its own walk: as its guard would, nothing. A guarded header once walked
                         // for certain (no #if, comment or choice of name on the way) is nothing again while its guard is
@@ -1006,7 +1114,7 @@ public static class TemplateInstances
                         frame.Deps.Remove(inc);   // itself, included inside its own walk: nothing, as its guard makes it
                         if (w.Looking.Count > 0) w.Looking[^1].Take(frame);
                         if (!p.IsTemplate) w.Record(inc, frame);
-                        w.Trail.Add(stretch = new Stretch(parsed, ifBase, k + 1));
+                        w.Trail.Add(stretch = new Stretch(parsed, ifBase, k + 1, scope)); stretches.Add(stretch);
                     }
                     break;
             }
@@ -1014,6 +1122,7 @@ public static class TemplateInstances
         stretch.To = parsed.Ops.Length;
         w.Close(stretch);
         Flush();
+        w.End(scope, stretches);
     }
 
     /// <summary>The names <paramref name="head"/> expands to. An expansion depends on the macros only through the

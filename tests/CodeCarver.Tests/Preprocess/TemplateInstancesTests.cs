@@ -139,4 +139,28 @@ public sealed class TemplateInstancesTests
         var unit = "#include \"cat.h\"\n#define TNAME r5\n#include \"tmpl.h\"\n";
         Assert.Equal(new[] { "r5_get" }, Names(unit, headers));
     }
+
+    [Fact]
+    public void AChainIncludedByDefinedNames_FirstUnderAnIf_IsMatchedNotWalkedAgainAndAgain()
+    {
+        // Each header defines the name of the next and includes it by that name, and the template; the unit walks the
+        // chain under an #if first, then for several values of TNAME. The defines of the walk under the #if went back
+        // past every walk as alternatives, so every walk took each as free and none matched again: the chain walked
+        // anew at every include (death-lite: a 1.3 KB unit 14 s and more, 1.0.289).
+        const int n = 1000;
+        var headers = new Dictionary<string, string> { ["cat.h"] = Cat, ["tmpl.h"] = "#ifdef TNAME\nint CAT(TNAME, _get)(void) { return 1; }\n#endif\n" };
+        for (var i = 0; i < n; i++)
+        {
+            var sb = new StringBuilder($"#ifndef CH{i}_H\n#define CH{i}_H\n#include \"tmpl.h\"\n");
+            for (var k = 0; k < 40; k++) sb.Append($"#define CH{i}_R{k} (CH{i}_BASE + {k * 4})\n");
+            if (i + 1 < n) sb.Append($"#define CH_NEXT_{i} \"ch{i + 1}.h\"\n#include CH_NEXT_{i}\n");
+            headers[$"ch{i}.h"] = sb.Append("#endif\n").ToString();
+        }
+        var unit = new StringBuilder("#include \"cat.h\"\n#if MAYBE\n#include \"ch0.h\"\n#endif\n");
+        for (var t = 0; t < 8; t++) unit.Append($"#define TNAME r{t}\n#if V{t}\n#include \"ch0.h\"\n#endif\n#undef TNAME\n#if W{t}\n#include \"ch{n / 2}.h\"\n#endif\n");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var names = Names(unit.ToString(), headers);
+        Assert.Equal(new[] { "TNAME_get" }.Concat(Enumerable.Range(0, 8).Select(t => $"r{t}_get")).ToArray(), names.Distinct().ToArray());   // TNAME_get: the walk under MAYBE (#ifdef TNAME not evaluated)
+        Assert.True(sw.ElapsedMilliseconds < 5_000, $"{sw.ElapsedMilliseconds} ms (1.0.289: 10 s)");
+    }
 }
