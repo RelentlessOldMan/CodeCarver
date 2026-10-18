@@ -641,6 +641,18 @@ public static class TemplateInstances
         (int Changes, long Version) _matchAt = (-1, -1);
         long _version;   // Push and Pop: the walk under way, and the headers walking or walked for certain, may differ
 
+        // Match's working lists, kept from call to call (each call made a dozen, and a walk makes hundreds of thousands).
+        readonly List<Header> _mNames = new();
+        readonly List<Entry> _mCands = new();          // each header's walks that may match, a header's together
+        readonly List<int> _mCandAt = new();           // where a header's start in _mCands (added while it is the one popped)
+        readonly List<int> _mCandCount = new();
+        readonly List<List<(int Node, int Cand)>> _mUsers = new();   // the walks that need a header to match
+        readonly Stack<int> _mTodo = new();
+        readonly List<Header> _mNeed = new();
+        readonly Queue<int> _mQueue = new();
+        int[] _mLeft = Array.Empty<int>();
+        bool[] _mGone = Array.Empty<bool>(), _mDead = Array.Empty<bool>();
+
         // Does a walk of the header match here: its free names as they started, and each header it skipped as on the
         // stack nothing here too (on the stack, its guard defined, or a walk of it matching)? Worked out at once for all
         // the headers the question reaches, as the most of them that match together: each has a walk whose free names
@@ -652,26 +664,26 @@ public static class TemplateInstances
         {
             if (inc.MatchedAt == _epoch) return inc.Match is not null;
             var at = ++_matchCalls;
-            var names = new List<Header>();
-            var cands = new List<List<Entry>>();   // each header's walks that may match
-            var users = new List<List<(int Node, int Cand)>>();   // the walks that need a header to match
-            var todo = new Stack<int>();
+            var names = _mNames;
+            names.Clear(); _mCands.Clear(); _mCandAt.Clear(); _mCandCount.Clear(); _mTodo.Clear();
             int Node(Header h)
             {
                 if (h.NodeAt == at) return h.Node;
                 var n = h.Node = names.Count;
                 h.NodeAt = at;
                 names.Add(h);
-                cands.Add(new List<Entry>());
-                users.Add(new List<(int, int)>());
-                todo.Push(n);
+                _mCandAt.Add(0);
+                _mCandCount.Add(0);
+                if (_mUsers.Count == n) _mUsers.Add(new List<(int, int)>()); else _mUsers[n].Clear();
+                _mTodo.Push(n);
                 return n;
             }
             Node(inc);
-            var need = new List<Header>();
-            while (todo.Count > 0)
+            var need = _mNeed;
+            while (_mTodo.Count > 0)
             {
-                var n = todo.Pop();
+                var n = _mTodo.Pop();
+                _mCandAt[n] = _mCands.Count;
                 if (names[n].Walked is not { } entries) continue;
                 foreach (var e in entries)
                 {
@@ -685,33 +697,44 @@ public static class TemplateInstances
                         need.Add(dep);
                     }
                     if (!ok) continue;
-                    var c = cands[n].Count;
-                    cands[n].Add(e);
-                    foreach (var dep in need) users[Node(dep)].Add((n, c));
+                    var c = _mCands.Count;
+                    _mCands.Add(e);
+                    _mCandCount[n]++;
+                    foreach (var dep in need) _mUsers[Node(dep)].Add((n, c));
                     if (need.Count == 0) break;   // matches whatever the others do
                 }
             }
             // Take out a header none of whose walks is left, and with it the walks that need it, until none goes.
-            var left = new int[names.Count];
-            var gone = new bool[names.Count][];
-            var dead = new bool[names.Count];
-            var queue = new Queue<int>();
-            for (var n = 0; n < names.Count; n++)
+            var count = names.Count;
+            if (_mLeft.Length < count) { _mLeft = new int[Math.Max(count, _mLeft.Length * 2)]; _mDead = new bool[_mLeft.Length]; }
+            if (_mGone.Length < _mCands.Count) _mGone = new bool[Math.Max(_mCands.Count, _mGone.Length * 2)];
+            var left = _mLeft; var dead = _mDead; var gone = _mGone;
+            Array.Clear(gone, 0, _mCands.Count);
+            var queue = _mQueue;
+            queue.Clear();
+            for (var n = 0; n < count; n++)
             {
-                left[n] = cands[n].Count;
-                gone[n] = new bool[cands[n].Count];
-                if (left[n] == 0) { dead[n] = true; queue.Enqueue(n); }
+                left[n] = _mCandCount[n];
+                dead[n] = left[n] == 0;
+                if (dead[n]) queue.Enqueue(n);
             }
             while (queue.Count > 0)
-                foreach (var (u, c) in users[queue.Dequeue()])
+                foreach (var (u, c) in _mUsers[queue.Dequeue()])
                 {
-                    if (gone[u][c]) continue;
-                    gone[u][c] = true;
+                    if (gone[c]) continue;
+                    gone[c] = true;
                     if (--left[u] == 0 && !dead[u]) { dead[u] = true; queue.Enqueue(u); }
                 }
-            for (var n = 0; n < names.Count; n++)
-                (names[n].Match, names[n].MatchedAt) = (dead[n] ? null : cands[n][Array.IndexOf(gone[n], false)], _epoch);
-            return !dead[0];
+            for (var n = 0; n < count; n++)
+            {
+                Entry? m = null;
+                if (!dead[n])
+                    for (var c = _mCandAt[n]; ; c++) if (!gone[c]) { m = _mCands[c]; break; }
+                (names[n].Match, names[n].MatchedAt) = (m, _epoch);
+            }
+            var matched = !dead[0];
+            names.Clear(); _mCands.Clear(); need.Clear();   // hold no headers or walks past the call
+            return matched;
         }
 
         // The walk under way takes on a matching walk's free names, and those of the walks matching for the headers it skipped.
