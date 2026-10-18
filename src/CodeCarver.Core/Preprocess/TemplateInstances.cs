@@ -355,6 +355,29 @@ public static class TemplateInstances
 
         public bool Marked(int id) => id >> 6 < _has.Length && (_has[id >> 6] & (1UL << id)) != 0;
 
+        /// <summary>Use and Mark for each of a walk's free names (the arrays sized once: a skip takes on ~1,000 names).</summary>
+        public void UseAll(int[] ids, int[] from, int maxId)
+        {
+            if (maxId >> 6 >= _has.Length) Array.Resize(ref _has, Math.Max((maxId >> 6) + 1, _has.Length * 2));
+            if (maxId >= _from.Length)
+            {
+                var had = _from.Length;
+                Array.Resize(ref _from, Math.Max(maxId + 1, had * 2));
+                Array.Fill(_from, int.MaxValue, had, _from.Length - had);
+            }
+            var has = _has; var fr = _from; var start = Start;
+            for (var i = 0; i < ids.Length; i++)
+            {
+                var id = ids[i];
+                has[id >> 6] |= 1UL << id;
+                var f = from[i];
+                if (f >= start) continue;
+                ref var at = ref fr[id];
+                if (at == int.MaxValue) Free.Add(id);
+                if (f < at) at = f;
+            }
+        }
+
         /// <summary>A name looked up, its answer going back to trail stretch <paramref name="from"/> (-1: to before the
         /// trail).</summary>
         public void Use(int id, int from)
@@ -417,6 +440,7 @@ public static class TemplateInstances
         /// <summary>Each free name's place in <see cref="Ids"/>.</summary>
         public readonly Dictionary<int, int> Slot;
         public readonly Header[] Deps;
+        public readonly int MaxId = -1;
         /// <summary>The length of the change log when <see cref="Miss"/> was last brought up to date (-1: never).</summary>
         public int SeenAt = -1;
         /// <summary>The places of the free names whose value differs from the one the walk started with.</summary>
@@ -431,7 +455,7 @@ public static class TemplateInstances
             Keys = keys;
             From = new int[ids.Length];
             Slot = new Dictionary<int, int>(ids.Length);
-            for (var i = 0; i < ids.Length; i++) Slot[ids[i]] = i;
+            for (var i = 0; i < ids.Length; i++) { Slot[ids[i]] = i; MaxId = Math.Max(MaxId, ids[i]); }
             Deps = deps;
         }
     }
@@ -750,7 +774,7 @@ public static class TemplateInstances
             if (Covers(f, e.AppliedBy)) return;
             e.AppliedBy = f.Serial;
             if (f.SyncedAt > _changes.Count) f.SyncedAt = _changes.Count;
-            for (var i = 0; i < e.Ids.Length; i++) { f.Use(e.Ids[i], e.From[i]); f.Mark(e.Ids[i]); }
+            f.UseAll(e.Ids, e.From, e.MaxId);
             foreach (var dep in e.Deps)
                 // A header matched since the walk last changed was neither on the stack nor guarded then (Match), and is not now.
                 if (dep.MatchedAt == _epoch) { if (dep.Match is { } c) Apply(c, f); }
