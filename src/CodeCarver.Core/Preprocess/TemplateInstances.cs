@@ -23,14 +23,93 @@ public static class TemplateInstances
     /// <summary>Quick gate: could <paramref name="text"/> hold a macro-named definition head at all?</summary>
     public static bool HasMacroNamedHead(string text) => text.Contains(')') && MacroNamedHead.IsMatch(text);
 
-    // Looser than MacroNamedHead: `NAME(args)` then `(`, with directive lines (and their continuations) allowed in the
-    // gaps - Find reads code with its directive lines blanked, so a head split by an #if is one there. The gaps are atomic
-    // (no gap can hold a '(' to give back), so a long run of directive lines is not tried every way it splits.
-    static readonly Regex LooseHead = new(
-        @"\b[A-Za-z_]\w*(?>(?:\s+|#(?:[^\\\n]|\\(?:\r?\n|.))*)*)\((?:[^()\n]|\([^()\n]*\))*\)(?>(?:\s+|#(?:[^\\\n]|\\(?:\r?\n|.))*)*)\(", RegexOptions.Compiled);
-
     /// <summary>False only when <see cref="Find"/> can find no head in this text itself (its includes aside).</summary>
-    public static bool MayHaveMacroNamedHead(string text) => text.Contains(')') && LooseHead.IsMatch(text);
+    /// <remarks>Looser than MacroNamedHead: `NAME(args)` then `(`, with directive lines (and their continuations) allowed
+    /// in the gaps - Find reads code with its directive lines blanked, so a head split by an #if is one there. Read by
+    /// hand, as the regex <c>\b[A-Za-z_]\w*GAP\((?:[^()\n]|\([^()\n]*\))*\)GAP\(</c> with GAP the atomic
+    /// <c>(?>(?:\s+|#(?:[^\\\n]|\\(?:\r?\n|.))*)*)</c> read it, but with each gap's end found once: the regex scanned a
+    /// gap again from every name before it, so a header of n #define lines with no head cost n² (8,000 lines: 4 s).</remarks>
+    public static bool MayHaveMacroNamedHead(string text)
+    {
+        if (!text.Contains(')')) return false;
+        var gapEnd = new Dictionary<int, int>(); // where the gap through each '#' read so far ends
+        var hashes = new List<int>();
+        var i = 0;
+        while (i < text.Length)
+        {
+            var c = text[i];
+            if (!(c is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or '_') || (i > 0 && IsWordChar(text[i - 1]))) { i++; continue; }
+            var e = i + 1;
+            while (e < text.Length && IsWordChar(text[e])) e++;
+            i = e;
+            var p = GapEnd(text, e, gapEnd, hashes);
+            if (p >= text.Length || text[p] != '(') continue;
+            p = ArgsEnd(text, p + 1);
+            if (p < 0) continue;
+            p = GapEnd(text, p, gapEnd, hashes);
+            if (p < text.Length && text[p] == '(') return true;
+        }
+        return false;
+    }
+
+    // A char \w reads (letters, nonspacing marks, digits, connectors); never more than \w, so no name is cut short.
+    static bool IsWordChar(char c) => c < 128
+        ? c is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or '_'
+        : char.GetUnicodeCategory(c) is System.Globalization.UnicodeCategory.UppercaseLetter
+            or System.Globalization.UnicodeCategory.LowercaseLetter or System.Globalization.UnicodeCategory.TitlecaseLetter
+            or System.Globalization.UnicodeCategory.ModifierLetter or System.Globalization.UnicodeCategory.OtherLetter
+            or System.Globalization.UnicodeCategory.NonSpacingMark
+            or System.Globalization.UnicodeCategory.DecimalDigitNumber or System.Globalization.UnicodeCategory.ConnectorPunctuation;
+
+    // Where the gap from p ends: whitespace and directive lines (# to an unescaped newline). A gap's end is kept at each
+    // '#' it read: a gap from a name inside a directive line meets the outer gap at the next '#' at the latest, so each
+    // directive line is read about once whichever name the gap follows.
+    static int GapEnd(string text, int p, Dictionary<int, int> memo, List<int> hashes)
+    {
+        hashes.Clear();
+        while (p < text.Length)
+        {
+            var c = text[p];
+            if (char.IsWhiteSpace(c)) { p++; continue; }
+            if (c != '#') break;
+            if (memo.TryGetValue(p, out var end)) { p = end; break; }
+            hashes.Add(p);
+            p++;
+            while (p < text.Length)
+            {
+                var d = text[p];
+                if (d == '\n') break;
+                if (d == '\\')
+                {
+                    if (p + 1 >= text.Length) break;
+                    p += text[p + 1] == '\r' && p + 2 < text.Length && text[p + 2] == '\n' ? 3 : 2;
+                    continue;
+                }
+                p++;
+            }
+        }
+        foreach (var h in hashes) memo[h] = p;
+        return p;
+    }
+
+    // After `(`: one-level-nested args on one line up to their `)`; the position after it, or -1.
+    static int ArgsEnd(string text, int p)
+    {
+        while (p < text.Length)
+        {
+            var c = text[p];
+            if (c == ')') return p + 1;
+            if (c == '\n') return -1;
+            if (c == '(')
+            {
+                p++;
+                while (p < text.Length && text[p] is not ('(' or ')' or '\n')) p++;
+                if (p >= text.Length || text[p] != ')') return -1;
+            }
+            p++;
+        }
+        return -1;
+    }
 
     // An #include (or #include_next) as Parse reads one (#, spaces, include, spaces, then "name", <name> or a macro), with
     // line continuations and comments allowed in the gaps: a name too many costs a walk, a name missed would skip one that
