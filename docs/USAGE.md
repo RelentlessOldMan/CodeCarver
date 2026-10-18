@@ -224,7 +224,10 @@ under `<outputDirectory>/codecarver/`, and `verify` checks the kept files as the
 
 `summary.txt` / `summary.json` hold only counts, booleans and fixed category names (world, graph, roots by
 kind, traces, `.cmm`, per-stage sizes and verify counts, warnings by category, exit code). They are what you
-send back when the source must not leave the machine. Repeated warnings (unresolved `#include`s, front-end notes) are capped at 20 per category on the console;
+send back when the source must not leave the machine. The one exception to "numbers only" is two short digests per stage:
+`<stage>.keptFilesSha` and `<stage>.emittedFilesSha` are the first 16 hex digits of a SHA-256 over the sorted list of kept or
+written file paths. When two runs or versions show the same value, they kept or wrote the same files, which equal counts
+alone don't prove. A digest says nothing about which files they are. Repeated warnings (unresolved `#include`s, front-end notes) are capped at 20 per category on the console;
 the full list is in `warnings.txt` and the count per category in the summary. `decisions.txt` is replaced by a short note above
 500,000 graph nodes (use `--why` or `manifest.json` then).
 
@@ -668,14 +671,6 @@ The check also reports the tree's shape, numbers only, as each loop ends, for si
 template walk's include closure `.walkFiles` and `.walkKb` (distinct files) and `.walkReads` and `.walkReadKb`
 (includes followed, re-includes counted again), each `.p50/p95/max`, and `.walkedPct` (files walked of those that
 could be). Sizes are in characters.
-
-Two TEMPORARY switches for chasing the check's memory, to be removed once it is understood:
-`CODECARVER_DEBUG_ONLY=check-emitted` (or `check-dropped`, or `check`) runs only the link check, right after the
-input scan, over the tree's code files (every 50th file taken as dropped, or all but every 50th, or every 3rd), and
-writes `<outputDirectory>/codecarver/debug-only-summary.txt` (numbers only: `debug.checkMs`, `debug.peakPrivateMb`, and
-the check's keys). It carves nothing and its findings mean nothing; its memory and time are the point: minutes instead
-of a whole run. `CODECARVER_DEBUG_CHECKMEM=1` (on with DEBUG_ONLY) prints a `debug   :` line for each file a part of
-the check allocated 256 MB or more on.
 
 The two longest steps before the parse also say which part took the time: `rootNames built / binaries /
 unbuilt` and `pre-parse treeMacros / outsideHeaders / quotedIncludes / unparsedHeaders`, each a `progress:`

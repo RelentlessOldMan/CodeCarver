@@ -26,10 +26,6 @@ public static class Activity
     static long _ready;
     [ThreadStatic] static long t_notes, t_noteBytes;
 
-    /// <summary>CODECARVER_DEBUG_CHECKMEM=1 (temporary): a line for each item a part allocated at least
-    /// <see cref="DebugItemBytes"/> on. Numbers only.</summary>
-    public static Action<string>? DebugSink { get; set; }
-    public static long DebugItemBytes { get; set; } = 256L << 20;
 
     /// <summary>Counts what the calling thread allocates until the scope is disposed against <paramref name="part"/>,
     /// with how many items of the part are running at once. Nested scopes each count their own (an outer one includes
@@ -47,10 +43,10 @@ public static class Activity
 
     public readonly struct PartScope : IDisposable
     {
-        readonly PartStats _s; readonly string _name; readonly long _start, _itemBytes, _notes, _noteBytes, _t0;
+        readonly PartStats _s; readonly long _start, _notes, _noteBytes, _t0;
         internal PartScope(string name, long itemBytes)
         {
-            _name = name; _itemBytes = itemBytes;
+
             _s = _parts.GetOrAdd(name, _ => new PartStats());
             Interlocked.Increment(ref _s.InFlight);
             _notes = t_notes; _noteBytes = t_noteBytes;
@@ -71,10 +67,7 @@ public static class Activity
             Interlocked.Add(ref _s.NoteBytes, t_noteBytes - _noteBytes);
             for (var was = Interlocked.Read(ref _s.MaxItem); used > was; was = Interlocked.Read(ref _s.MaxItem))
                 if (Interlocked.CompareExchange(ref _s.MaxItem, used, was) == was) break;
-            var running = Interlocked.Decrement(ref _s.InFlight) + 1;
-            if (DebugSink is { } sink && used >= DebugItemBytes)
-                sink($"check-mem {_name}: item {_itemBytes >> 10:N0} KB allocated {used >> 20:N0} MB, pulled in {t_notes - _notes:N0} file(s) / "
-                     + $"{(t_noteBytes - _noteBytes) >> 10:N0} KB; running at once {running}; " + string.Join(", ", Parts().Where(p => p.Key.EndsWith(".inFlight")).Select(p => $"{p.Key} {p.Value}")));
+            Interlocked.Decrement(ref _s.InFlight);
         }
     }
 

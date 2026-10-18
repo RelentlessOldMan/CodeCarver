@@ -176,6 +176,38 @@ public sealed class OutputSafetyTests
     }
 
     [Fact]
+    public void Summary_FileListDigests_MatchForTheSameKeptFiles_AndDifferOtherwise()
+    {
+        // Two runs whose file counts are equal can still keep different files: the digests tell them apart.
+        string Run(string helperCalls)
+        {
+            var work = NewWork();
+            try
+            {
+                var src = Path.Combine(work, "src");
+                Directory.CreateDirectory(src);
+                File.WriteAllText(Path.Combine(src, "main.c"), $"void a(void); void b(void);\nint main(void){{ {helperCalls} return 0; }}\n");
+                File.WriteAllText(Path.Combine(src, "a.c"), "void a(void){}\n");
+                File.WriteAllText(Path.Combine(src, "b.c"), "void b(void){}\n");
+                var cfg = Path.Combine(work, "carve.toml");
+                File.WriteAllText(cfg, "outputDirectory = \"out\"\n[common]\nentryPoints = [\"main\"]\n");
+                var se = new StringWriter();
+                Assert.True(CarveCommand.Run(new[] { "carve", src, "--config", cfg }, new StringWriter(), se) == 0, se.ToString());
+                var text = File.ReadAllText(Path.Combine(work, "out", "codecarver", "summary.txt"));
+                Assert.Contains("stage0.keptFiles = 2", text);
+                var kept = System.Text.RegularExpressions.Regex.Match(text, @"stage0\.keptFilesSha = ([0-9a-f]{16})\b");
+                var emitted = System.Text.RegularExpressions.Regex.Match(text, @"stage0\.emittedFilesSha = ([0-9a-f]{16})\b");
+                Assert.True(kept.Success && emitted.Success, text);
+                return kept.Groups[1].Value + emitted.Groups[1].Value;
+            }
+            finally { try { Directory.Delete(work, true); } catch { } }
+        }
+        var first = Run("a();");
+        Assert.Equal(first, Run("a();"));      // another directory, the same files
+        Assert.NotEqual(first, Run("b();"));   // the same count, other files
+    }
+
+    [Fact]
     public void ConfigRelativePaths_ResolveAgainstTheConfigFile_U1()
     {
         var work = NewWork();
