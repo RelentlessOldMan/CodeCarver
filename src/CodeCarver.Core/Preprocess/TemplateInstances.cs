@@ -475,6 +475,9 @@ public static class TemplateInstances
         // that hash, in trail order. Built at a name's first lookup and kept up as stretches close: only names looked
         // up cost anything (a register map's tens of thousands of #defines are never asked for).
         readonly Dictionary<int, List<int>> _chains = new();
+        // A bit per chain hash (of 64K): a closed stretch asks for each name it defines, and most are never looked up.
+        readonly ulong[] _chainBits = new ulong[1024];
+        bool MayChain(int h) => (_chainBits[((uint)h & 0xFFFF) >> 6] & (1UL << h)) != 0;
         /// <summary>The names looked up whose chain grew (by id), in order: since an entry last matched, only these can
         /// differ.</summary>
         readonly List<int> _changes = new();
@@ -529,9 +532,10 @@ public static class TemplateInstances
         {
             if (_chains.TryGetValue(h, out var chain)) return chain;
             chain = new List<int>();
+            _chainBits[((uint)h & 0xFFFF) >> 6] |= 1UL << h;
             // Only the texts that define a name of the hash (each stretch of the trail asked: death-lite, a fifth of a walk).
             foreach (var (parsed, at) in _byParsed)
-                if (parsed.Index.Last.ContainsKey(h))
+                if (parsed.Index.MayDefine(h) && parsed.Index.Last.ContainsKey(h))
                     foreach (var j in at) if (Has(Trail[j], h)) chain.Add(j);
             chain.Sort();
             return _chains[h] = chain;
@@ -550,7 +554,7 @@ public static class TemplateInstances
                 for (var d = ix.DefAt(st.From); d < ix.Defs.Length && ix.Defs[d] < st.To; d++)
                 {
                     var i = ix.Defs[d];
-                    if (ix.Depth[i] > 0 || !_chains.ContainsKey(ix.Hash[i]) || !_ids.TryGetValue(p.NameOf(i).ToString(), out var id)) continue;
+                    if (ix.Depth[i] > 0 || !MayChain(ix.Hash[i]) || !_chains.ContainsKey(ix.Hash[i]) || !_ids.TryGetValue(p.NameOf(i).ToString(), out var id)) continue;
                     _changes.Add(id);
                     _now[id] = _now[id] with { Count = -1 };
                 }
@@ -572,7 +576,7 @@ public static class TemplateInstances
             for (var d = first; d < ix.Defs.Length && ix.Defs[d] < st.To; d++)
             {
                 var i = ix.Defs[d];
-                if (!_chains.TryGetValue(ix.Hash[i], out var chain)) continue;
+                if (!MayChain(ix.Hash[i]) || !_chains.TryGetValue(ix.Hash[i], out var chain)) continue;
                 if (chain.Count == 0 || chain[^1] != index) chain.Add(index);
                 if (_ids.TryGetValue(p.NameOf(i).ToString(), out var id)) _changes.Add(id);
             }
@@ -907,6 +911,7 @@ public static class TemplateInstances
         public readonly int[] Prev, Depth, Hash;
         /// <summary>The ops that define or undefine a name, in order (a walk's stretches go over these, not every line).</summary>
         public readonly int[] Defs;
+        readonly ulong[] Bits;
 
         public DefineIndex(Parsed p)
         {
@@ -944,10 +949,18 @@ public static class TemplateInstances
                 }
             }
             Defs = defs.ToArray();
+            // A bit per hash, 8 bits a define (at most 64K): a walk asks every text it closed for each name it looks up.
+            var bits = 64;
+            while (bits < defs.Count * 8 && bits < 1 << 16) bits <<= 1;
+            Bits = new ulong[bits >> 6];
+            foreach (var h in Last.Keys) Bits[((uint)h & (uint)(bits - 1)) >> 6] |= 1UL << h;
         }
 
         /// <summary>The place in <see cref="Defs"/> of the first at or after op <paramref name="from"/>.</summary>
         public int DefAt(int from) { var i = Array.BinarySearch(Defs, from); return i < 0 ? ~i : i; }
+
+        /// <summary>False when no name of hash <paramref name="h"/> is defined here (true may still be none).</summary>
+        public bool MayDefine(int h) => (Bits[((uint)h & (uint)(Bits.Length * 64 - 1)) >> 6] & (1UL << h)) != 0;
     }
 
     enum OpKind { Code, Other, Open, Close, Define, Undef, Include }
