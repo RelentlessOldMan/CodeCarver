@@ -106,6 +106,23 @@ ToString). It now measures, writes the string once at its size, and returns a he
 is: 683 -> 322 MB for 89 M chars read again (the file's bytes, its string and its parse). Limits asserted: a first walk
 2 bytes a char, a cached walk 0.1, the link check's walks 1.5 held and 4 read again (about 10 before these fixes).
 
+C23 (1.0.287) showed the walk skipping a guarded header it had walked before, even where a name the header looks up
+had changed since: instances gcc builds were missed. 1.0.288 skips a header only where a walk of it saw the same
+values of its free names (the names it looked up but did not define), and records which headers each walk skipped.
+C24 (1.0.289) serves an emitted unit's walk from an earlier check round while the headers it read are unchanged
+(`check.templateWalksReused`), and adds `part.<part>.ms` and `.itemMaxMs`.
+
+That sound skip was slow on the death-lite web shape. Each register-map header defines the name of the next header and
+includes it by that name (`#define NEXT "x.h"`, `#include NEXT`), and the chain is first reached under an #if. The
+defines made by that walk were taken as alternatives everywhere after it, so every later walk took about 1,000 names
+as free, no walk matched again, and every include walked the chain anew. 1.0.290 scopes a define made by a walk
+under an #if to that walk while it is under way. Whether a header may be skipped is worked out at once for every
+header the question reaches (the most that match together), and kept until a walk starts or ends or a name changes.
+One web unit: 21.6 s -> about 14 s, the same instances found (every one gcc's preprocessed output has). The check's
+walks over 4 units: 90 s and 19.9 GB allocated -> 49 s and 10.4 GB. (1.0.287 took about 30 s because it skipped
+walks it needed.) What is left of the skip's cost is taking on the free names of each skipped header's chain again
+at every skip.
+
 **M4 - C20 = the quadratic join. WRONG.** C21 ran on 1.0.283 (join fixed) and spiked the same way.
 
 **M5 - GC headroom.** ConserveMemory 9: peak -16% (mactree 1841 -> 1547) and -12% (L) but build-graph +23..50%; gen0size
@@ -148,7 +165,10 @@ M9 is confirmed by allocation on a local tree, not yet by a work run (CODECARVER
 | ID | Version | Test |
 |---|---|---|
 | M1, M2, M3 | 1.0.284 | IoMeterTests.LargeLatin1Reads_DecodeExactlyAsFileDoes; StreamingCheckTests.Budgets_AreFractionsOfTheRunLimit_WhenItIsLessThanTheMachine; full suite |
-| M9 | (this commit) | TemplateParseTests.HandParse_ReadsDirectivesAsTheRegexesDid; StreamingCheckTests.LinkCheck_WalksThatReadHeadersAgain_WaitForTheWalkBudget_SameAnswer; full suite |
+| M9 | 1.0.285, 1.0.287 | TemplateParseTests.HandParse_ReadsDirectivesAsTheRegexesDid; StreamingCheckTests.LinkCheck_WalksThatReadHeadersAgain_WaitForTheWalkBudget_SameAnswer; TemplateWalkMemoryTests; full suite |
+| C23 sound skip | 1.0.288 | TemplateInstancesTests (guarded chains and cycles walked again where the name is set); full suite |
+| C24 walk reuse | 1.0.289 | full suite |
+| C25 slow sound skip | 1.0.290 | TemplateInstancesTests.AChainIncludedByDefinedNames_FirstUnderAnIf_IsMatchedNotWalkedAgainAndAgain (0.7 s; 10 s on 1.0.289); full suite |
 
 Measured (run peak private MB, 1.0.283 -> with M1-M3): regtree 2699 -> 1465, bigtree 993 -> 971, L 1630 -> 1560,
 mactree 1602 -> 1841 (GC noise: same live data, check allocation -31%).

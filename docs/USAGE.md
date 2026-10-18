@@ -656,9 +656,12 @@ data: `DOTNET_GCConserveMemory=9` (default 7) trades about 15% of the peak for a
 The link check's template walks that must read headers again (more header text than the check holds) share a budget
 of an eighth of that memory, and so do the first parses of headers in all walks; `CODECARVER_CHECK_WALK_MB=N` sets
 it (`check.walkWaits`, `check.parseWaits`: times one waited). Each check loop reports what each part of its
-per-file work allocated: `check.<loop>.part.<part>.allocatedMb`, `.itemMaxMb`, `.items`, `.pulledIn` and `.pulledInMb`
-(headers a template walk read; part `templateParse` is the first parses of headers within the walks), and a memory stop adds `stop.part.<part>.*` and `stop.readyAhead` for the loop it
-stopped in.
+per-file work allocated and took: `check.<loop>.part.<part>.allocatedMb`, `.itemMaxMb`, `.ms`, `.itemMaxMs`, `.items`,
+`.pulledIn` and `.pulledInMb` (headers a template walk read; part `templateParse` is the first parses of headers within
+the walks), and a memory stop adds `stop.part.<part>.*` and `stop.readyAhead` for the loop it stopped in.
+`check.templateWalks` counts the units' template walks, `check.templateWalksSkipped` the ones not needed (no head and no
+template reachable), `check.templateWalksReused` an emitted unit's walk served from an earlier check round (same text,
+the headers it read unchanged), and `check.instancesRedone` a dropped file's walk done again.
 
 The check also reports the tree's shape, numbers only, as each loop ends, for sizing a test corpus like the tree:
 `check.shape.headers`, `.headersOver1Mb`, `.headerTotalMb`, `.headerKb.p50/p95/max` (the headers read), and for each
