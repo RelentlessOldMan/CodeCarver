@@ -656,8 +656,8 @@ of the machine's memory, or of `memoryStopMb` when that is less. A lower stop ma
 make the parse slower); it never changes what is kept. Most of a run's peak is the .NET heap's headroom over its live
 data: `DOTNET_GCConserveMemory=9` (default 7) trades about 15% of the peak for a slower graph build.
 
-The link check's template walks that must read headers again (more header text than the check holds) share a budget
-of an eighth of that memory, and so do the first parses of headers in all walks; `CODECARVER_CHECK_WALK_MB=N` sets
+The link check's template walks share a budget of an eighth of that memory (each takes what the largest walk before
+it allocated), and so do the first parses of headers in all walks; `CODECARVER_CHECK_WALK_MB=N` sets
 it (`check.walkWaits`, `check.parseWaits`: times one waited). Each check loop reports what each part of its
 per-file work allocated and took: `check.<loop>.part.<part>.allocatedMb`, `.itemMaxMb`, `.ms`, `.itemMaxMs`, `.items`,
 `.pulledIn` and `.pulledInMb` (headers a template walk read; part `templateParse` is the first parses of headers within
@@ -665,6 +665,14 @@ the walks), and a memory stop adds `stop.part.<part>.*` and `stop.readyAhead` fo
 `check.templateWalks` counts the units' template walks, `check.templateWalksSkipped` the ones not needed (no head and no
 template reachable), `check.templateWalksReused` an emitted unit's walk served from an earlier check round (same text,
 the headers it read unchanged), and `check.instancesRedone` a dropped file's walk done again.
+
+A header without a template is held for the walks with only the defines of names some walk has looked up (a
+register-map header comes down to its guard and includes; a header under 64K chars is held whole), so the check can
+hold every header and parse each once.
+A walk that looks up a name a header it read had dropped is walked again with that define:
+`check.templateWalksRedone` counts those, `check.headersRefiltered` the held headers read again for a name,
+`check.walkNames` the names the walks looked up, and `check.templateWalksWhole` the walks that, after 16 tries, read
+the whole headers instead. What the walks find is the same either way.
 
 The check also reports the tree's shape, numbers only, as each loop ends, for sizing a test corpus like the tree:
 `check.shape.headers`, `.headersOver1Mb`, `.headerTotalMb`, `.headerKb.p50/p95/max` (the headers read), and for each

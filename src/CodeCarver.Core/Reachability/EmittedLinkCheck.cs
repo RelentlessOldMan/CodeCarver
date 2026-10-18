@@ -99,7 +99,6 @@ public static class EmittedLinkCheck
     /// <param name="maxBytes">Files larger than this are not read (counted in FilesSkipped).</param>
     /// <param name="original">For a stage that carves INSIDE kept files: emitted relative path → the original file on
     /// disk. A function the original defines and the emitted copy doesn't was pruned, and counts as dropped.</param>
-    [ThreadStatic] static int t_reread;   // headers a template walk on this thread read again (see walkGate)
 
     static volatile Func<Dictionary<string, long>>? s_shapeNow;
 
@@ -133,10 +132,17 @@ public static class EmittedLinkCheck
         var live = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
         var dead = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
         long heldChars = 0;
+        // The names the template walks have looked up, by hash (string.GetHashCode), each with the order it came in: a
+        // non-template header is held with only the defines of these (TemplateInstances.KeepDefines). A register-map tree
+        // is nearly all #defines no walk asks for: held whole, it went past HeaderTextBudget, and every walk read and parsed
+        // again each header not held (C26: 3,007 s walking, 1,600 s reading, 1,173 s parsing). Replaced as it grows, never
+        // changed, so read without a lock; grown under headerInfo's.
+        var walkNames = new Dictionary<int, int>();
+        var walkOrder = new List<int>();
         // Each loop's time, and memory as it ends: the process's private bytes, the managed heap the last GC left, and
         // managed bytes allocated in the loop (MB). A "Max" key is kept at its largest over a stage's rounds.
         var allocatedAt = GC.GetTotalAllocatedBytes();
-        long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0;
+        long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0;
         // The tree's shape, for sizing a test corpus like it (shape.*): each header's size, each walk's include closure.
         var headerSizes = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
         var closures = new ConcurrentBag<(int Files, long Chars, int Reads, long ReadChars)>();
@@ -171,14 +177,13 @@ public static class EmittedLinkCheck
         }
         var scanGate = new CodeCarver.Core.Util.ByteGate(ScanBudget());   // see Gated
         var readGate = new CodeCarver.Core.Util.ByteGate(ReadBudget());
-        // Template walks that re-read headers the check could not hold re-parse them, a walk at a time (C20/C21: 64 walks
-        // at once re-parsing their include closures went from 12 to 21 GB in 90 s). Once a header was not held, a walk
-        // takes what the largest re-reading walk allocated before it, or the whole budget until one has: the first runs
-        // alone and sizes the rest.
+        // Template walks parse and walk their include closures, a budget at a time (C20/C21: 64 walks at once re-parsing
+        // their include closures went from 12 to 21 GB in 90 s; 1.0.294 gated only once a header was not held, and a run
+        // whose headers were all held peaked 5.1 GB locally). A walk takes what the largest walk allocated before it, or
+        // the whole budget until one has: the first runs alone and sizes the rest.
         var walkBudget = WalkBudget();
         var walkGate = new CodeCarver.Core.Util.ByteGate(walkBudget);
         long walkCost = -1;
-        var headerOverflow = false;
         // A header's first parse (kept with the header after) allocates a few times its text; walks of different units parse
         // different closures at once (C22: 16 walks at once, one parsing 402 MB of headers). Each parse takes its estimate
         // from the same budget, one at a time per thread, so the walks hold at most the budget in parses running at once.
@@ -191,7 +196,9 @@ public static class EmittedLinkCheck
             stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits; stats["parseWaits"] = parseGate.Waits;
             stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;
             stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped; stats["templateWalksReused"] = templateWalksReused;
-            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused" })
+            stats["templateWalksRedone"] = templateWalksRedone; stats["templateWalksWhole"] = templateWalksWhole; stats["headersRefiltered"] = headersRefiltered;
+            stats["walkNames"] = walkNames.Count;
+            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "walkNames" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -209,6 +216,7 @@ public static class EmittedLinkCheck
         // machine out of memory. A header not held is read again when a walk needs it.
         var headerInfo = new Dictionary<string, HeaderInfo?>(StringComparer.Ordinal);
         var headerText = new Dictionary<string, string>(StringComparer.Ordinal);
+        var heldDropped = new Dictionary<string, int[]>(StringComparer.Ordinal);   // a held header's Filtered.Dropped
         var templates = new HashSet<string>(StringComparer.Ordinal);
         var budget = HeaderTextBudget();
         // The loops below scan up to ReadAhead.Window files at once (on a network drive each read waits a round trip), and
@@ -257,24 +265,68 @@ public static class EmittedLinkCheck
             return h;
         }
         // The first look at a header stays its answer for the run. Returns the text when there is one in hand.
-        string? StoreHeader(string p, (HeaderInfo? Info, string? Text) h)
+        // A header's text as a walk reads it: a template or a small header whole, a big one with the defines of walkNames
+        // only. Dropped: the hashes of the names whose defines went (sorted); Through: how many of walkOrder were kept for.
+        (string Text, int[] Dropped, int Through) Filtered(HeaderInfo info, string text)
         {
+            if (info.Template || text.Length < FilterChars) return (text, Array.Empty<int>(), int.MaxValue);
+            var names = Volatile.Read(ref walkNames);
+            var dropped = new List<int>();
+            text = CodeCarver.Core.Preprocess.TemplateInstances.KeepDefines(text, names.ContainsKey, dropped);
+            var d = dropped.Distinct().ToArray();
+            Array.Sort(d);
+            return (text, d, names.Count);
+        }
+        static bool DropsAny(int[] dropped, IEnumerable<int> hashes)
+        {
+            if (dropped.Length == 0) return false;
+            foreach (var h in hashes) if (Array.BinarySearch(dropped, h) >= 0) return true;
+            return false;
+        }
+        void StoreHeader(string p, (HeaderInfo? Info, string? Text) h)
+        {
+            var f = h.Info is null || h.Text is null ? default : Filtered(h.Info, h.Text);
             lock (headerInfo)
             {
-                if (headerInfo.TryGetValue(p, out var had))
-                    return headerText.TryGetValue(p, out var held) ? held : had is null ? null : h.Text;
+                if (headerInfo.ContainsKey(p)) return;
                 headerInfo[p] = h.Info;
-                if (h.Info is null || h.Text is null) return null;
+                if (h.Info is null || h.Text is null) return;
                 if (h.Info.Template) templates.Add(p);
-                Hold(p, h.Text, h.Info.Template);
-                return h.Text;
+                Hold(p, f, h.Info.Template);
             }
         }
-        void Hold(string p, string text, bool template)
+        // Under headerInfo's lock. A header is held only with the defines of every name in walkNames: one filtered before
+        // the last names came in, and dropping one of them, is not.
+        void Hold(string p, (string Text, int[] Dropped, int Through) f, bool template)
         {
-            if (!template && heldChars + text.Length > budget) { headerOverflow = true; return; }
-            headerText[p] = text;
-            if (!template) heldChars += text.Length;
+            if (f.Through < walkOrder.Count && DropsAny(f.Dropped, walkOrder.Skip(f.Through))) return;
+            long size = f.Text.Length + f.Dropped.Length * (sizeof(int) / sizeof(char));
+            if (!template && heldChars + size > budget) return;
+            headerText[p] = f.Text;
+            if (f.Dropped.Length > 0) heldDropped[p] = f.Dropped;
+            if (!template) heldChars += size;
+        }
+        // Under headerInfo's lock: the names a walk looked up join walkNames, and a header held without the define of
+        // one is held no more (the next walk that wants it reads it again, with the define).
+        void Grow(IEnumerable<int> hashes)
+        {
+            List<int>? add = null;
+            foreach (var h in hashes)
+                if (!walkNames.ContainsKey(h) && (add ??= new List<int>()) is var a && !a.Contains(h)) a.Add(h);
+            if (add is null) return;
+            var next = new Dictionary<int, int>(walkNames);
+            foreach (var h in add) { next[h] = walkOrder.Count; walkOrder.Add(h); }
+            Volatile.Write(ref walkNames, next);
+            List<string>? gone = null;
+            foreach (var (p, d) in heldDropped)
+                if (DropsAny(d, add)) (gone ??= new List<string>()).Add(p);
+            foreach (var p in gone ?? new List<string>())
+            {
+                heldChars -= headerText[p].Length + heldDropped[p].Length * (sizeof(int) / sizeof(char));
+                headerText.Remove(p);
+                heldDropped.Remove(p);
+                headersRefiltered++;
+            }
         }
         HeaderInfo? Info(string p)
         {
@@ -282,19 +334,27 @@ public static class EmittedLinkCheck
             StoreHeader(p, PrepareHeader(p));
             lock (headerInfo) return headerInfo[p];
         }
-        string? ReadHeader(string p)
+        // whole: the header's text as it is (no define dropped), not held - a walk that could not settle on the names it
+        // needs reads them so.
+        (string? Text, int[] Dropped, int Through) ReadHeader(string p, bool whole)
         {
-            if (Info(p) is null) return null;
-            lock (headerInfo) if (headerText.TryGetValue(p, out var t)) return t;
-            t_reread++;
+            var none = ((string?)null, Array.Empty<int>(), int.MaxValue);
+            if (Info(p) is null) return none;
+            if (!whole)
+                lock (headerInfo)
+                    if (headerText.TryGetValue(p, out var t))
+                        return (t, heldDropped.TryGetValue(p, out var d) ? d : Array.Empty<int>(), walkOrder.Count);
             var (info, text) = ReadDirectives(p);   // not held: read again (the same text: within a run a file stays as it is)
-            if (info is null || text is null) return null;
+            if (info is null || text is null) return none;
+            if (whole) return (text, Array.Empty<int>(), int.MaxValue);
+            var f = Filtered(info, text);
             lock (headerInfo)
             {
-                if (headerText.TryGetValue(p, out var t)) return t;
-                Hold(p, text, info.Template);
+                if (headerText.TryGetValue(p, out var t))
+                    return (t, heldDropped.TryGetValue(p, out var d) ? d : Array.Empty<int>(), walkOrder.Count);
+                Hold(p, f, info.Template);
             }
-            return text;
+            return f;
         }
         // The header an #include of raw reads: a template among those of its name, else the first.
         string? Chosen(string raw)
@@ -397,38 +457,73 @@ public static class EmittedLinkCheck
         List<Definition> TemplateDefs(string text, List<(string Raw, HeaderInfo? Read)>? deps)
         {
             Interlocked.Increment(ref templateWalks);
-            var cost = Volatile.Read(ref headerOverflow) ? Interlocked.Read(ref walkCost) is var c and >= 0 ? c : walkBudget : 0;
+            var cost = Interlocked.Read(ref walkCost) is var c and >= 0 ? c : walkBudget;
             using var slot = walkGate.Take(cost);
             // After the gate: a walk waiting for room is not counted as running (C23 read 16 "running at once").
             using var part = Activity.Part("templateWalk", text.Length);
-            var (reread, start) = (t_reread, GC.GetAllocatedBytesForCurrentThread());
-            var entered = new HashSet<string>(StringComparer.Ordinal);
-            long chars = 0, readChars = 0; var reads = 0;
-            // A header not held is read again as a new string, and the walk knows a header it has walked (and its parse)
-            // by its string: each re-include of a guarded header was read, parsed and walked again with all it includes
-            // (death-lite: a unit's walk resolving 2,817 includes, 2 GB). One read per header per walk, whatever name reached it.
-            var read = new Dictionary<string, string?>(StringComparer.Ordinal);
-            var asked = deps is null ? null : new HashSet<string>(StringComparer.Ordinal);   // a dep per include name, not per #include line
-            var found = CodeCarver.Core.Preprocess.TemplateInstances.Find(text, raw =>
-                        {
-                            string? t = null;
-                            if (Chosen(raw) is { } path && !read.TryGetValue(path, out t))
-                            {
-                                read[path] = t = ReadHeader(path);
-                                if (t is not null) { reads++; readChars += t.Length; if (entered.Add(path)) chars += t.Length; }
-                            }
-                            Activity.Note(t?.Length ?? 0);
-                            if (asked?.Add(raw) == true) deps!.Add((raw, TemplateKey(raw)));
-                            return t;
-                        }, commandLineMacros, Parsing)
-                        .Select(i => new Definition(i.Name, i.Line, false, false)).ToList();
-            closures.Add((entered.Count, chars, reads, readChars));
-            if (t_reread != reread)
+            var start = GC.GetAllocatedBytesForCurrentThread();
+            List<Definition> found;
+            HashSet<string> entered;
+            long chars, readChars; int reads;
+            // The headers come with only the defines of the names walks looked up before (Filtered): the walk is the walk of
+            // the whole headers unless it looked up a name whose define one of them dropped. Then the names join walkNames
+            // and it is walked again, with those defines; past MaxRedos, with the whole headers.
+            for (var attempt = 0; ; attempt++)
             {
-                var used = GC.GetAllocatedBytesForCurrentThread() - start;
-                for (var was = Interlocked.Read(ref walkCost); used > was; was = Interlocked.Read(ref walkCost))
-                    if (Interlocked.CompareExchange(ref walkCost, used, was) == was) break;
+                var whole = attempt > MaxRedos;
+                entered = new HashSet<string>(StringComparer.Ordinal);
+                (chars, readChars, reads) = (0, 0, 0);
+                // A header not held is read again as a new string, and the walk knows a header it has walked (and its parse)
+                // by its string: each re-include of a guarded header was read, parsed and walked again with all it includes
+                // (death-lite: a unit's walk resolving 2,817 includes, 2 GB). One read per header per walk, whatever name reached it.
+                var read = new Dictionary<string, string?>(StringComparer.Ordinal);
+                var filtered = new List<(int[] Dropped, int Through)>();
+                var asked = deps is null ? null : new HashSet<string>(StringComparer.Ordinal);   // a dep per include name, not per #include line
+                deps?.Clear();
+                var lookedUp = new List<string>();
+                found = CodeCarver.Core.Preprocess.TemplateInstances.Find(text, raw =>
+                            {
+                                string? t = null;
+                                if (Chosen(raw) is { } path && !read.TryGetValue(path, out t))
+                                {
+                                    var (rt, dropped, through) = ReadHeader(path, whole);
+                                    read[path] = t = rt;
+                                    if (dropped.Length > 0) filtered.Add((dropped, through));
+                                    if (t is not null) { reads++; readChars += t.Length; if (entered.Add(path)) chars += t.Length; }
+                                }
+                                Activity.Note(t?.Length ?? 0);
+                                if (asked?.Add(raw) == true) deps!.Add((raw, TemplateKey(raw)));
+                                return t;
+                            }, commandLineMacros, Parsing, lookedUp)
+                            .Select(i => new Definition(i.Name, i.Line, false, false)).ToList();
+                if (whole) { Interlocked.Increment(ref templateWalksWhole); break; }
+                // A name looked up that a header read dropped: one walkNames did not have when that header was filtered.
+                var names = Volatile.Read(ref walkNames);
+                var hashes = new List<(int Hash, int At)>(lookedUp.Count);
+                var fresh = false;
+                foreach (var n in lookedUp)
+                {
+                    var h = string.GetHashCode(n.AsSpan());
+                    var at = names.TryGetValue(h, out var i) ? i : int.MaxValue;
+                    fresh |= at == int.MaxValue;
+                    hashes.Add((h, at));
+                }
+                var missed = false;
+                if (filtered.Count > 0)
+                {
+                    var oldest = filtered.Min(r => r.Through);
+                    var late = hashes.Where(x => x.At >= oldest).ToList();
+                    foreach (var (dropped, through) in filtered)
+                        if (late.Count > 0 && DropsAny(dropped, late.Where(x => x.At >= through).Select(x => x.Hash))) { missed = true; break; }
+                }
+                if (fresh) lock (headerInfo) Grow(hashes.Where(x => x.At == int.MaxValue).Select(x => x.Hash));
+                if (!missed) break;
+                Interlocked.Increment(ref templateWalksRedone);
             }
+            closures.Add((entered.Count, chars, reads, readChars));
+            var used = GC.GetAllocatedBytesForCurrentThread() - start;
+            for (var was = Interlocked.Read(ref walkCost); used > was; was = Interlocked.Read(ref walkCost))
+                if (Interlocked.CompareExchange(ref walkCost, used, was) == was) break;
             return found;
         }
         List<Definition> C99Defs(string text)
@@ -772,6 +867,15 @@ public static class EmittedLinkCheck
     /// cached answer is checked against, instead of holding the text).</summary>
     internal sealed record HeaderInfo(bool Template, int Length, ulong Hash);
 
+    /// <summary>Walks of a unit again with more defines (a name looked up that a header held had dropped) before it is
+    /// walked with the whole headers: each walk again goes one macro further down a chain of names.</summary>
+    const int MaxRedos = 16;
+
+    /// <summary>A header with less directive text than this is held whole. The text is in the big headers (a register
+    /// map), and a walk seldom looks up one of their defines; filtered, the small ones made almost every walk a redo
+    /// (death-lite: 2 to 4 names a unit, each from a header of a few KB).</summary>
+    const int FilterChars = 64 * 1024;
+
     /// <summary>Characters of non-template header text the check holds at once: a 32nd of the machine's memory, or
     /// CODECARVER_CHECK_HEADER_MB.</summary>
     static long HeaderTextBudget()
@@ -817,7 +921,7 @@ public static class EmittedLinkCheck
         public void Dispose() { held.Dispose(); part.Dispose(); }
     }
 
-    /// <summary>Bytes the template walks that re-read headers allocate at once: an 8th of the machine's memory or the run
+    /// <summary>Bytes the template walks allocate at once: an 8th of the machine's memory or the run
     /// limit (2.5 GB under memoryStopMb 20000), at least 256 MB, or CODECARVER_CHECK_WALK_MB.</summary>
     static long WalkBudget()
     {

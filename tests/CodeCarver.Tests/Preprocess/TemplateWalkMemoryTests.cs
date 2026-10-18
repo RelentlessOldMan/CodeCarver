@@ -73,7 +73,9 @@ public class TemplateWalkMemoryTests
                 File.WriteAllText(p, text);
                 return (rel, p);
             }
-            var emitted = RegisterHeaders(48, 4000, "WMB").Select(kv => W(kv.Key, kv.Value)).ToList();
+            var regs = RegisterHeaders(48, 4000, "WMB");
+            var named = 16 * 24 * regs.Values.First().Length >> 20;   // M chars of register headers the walks include
+            var emitted = regs.Select(kv => W(kv.Key, kv.Value)).ToList();
             emitted.Add(W("cfg.h", "#define HIDE(n) hid_##n\n"));
             emitted.Add(W("t.h", "int HIDE(den)(void) { return 0; }\n"));
             emitted.Add(W("main.c", "int hid_den(void);\nint main(void) { return hid_den(); }\n"));
@@ -89,11 +91,14 @@ public class TemplateWalkMemoryTests
                 Assert.Equal(new[] { "hid_den" }, r.Violations.Select(v => v.Name).Distinct().ToArray());
                 var alloc = r.Stats["dropped.part.templateWalk.allocatedMb"];
                 var pulled = r.Stats["dropped.part.templateWalk.pulledInMb"];   // MB of chars
-                Assert.True(pulled >= 50, $"pulled in {pulled} MB");
-                // Held: each header parsed once for all walks (about 0.8 bytes a char), then walked. Read again: the file's
-                // bytes and its string (3 bytes a char) and its parse, each walk; before C22's fixes 10 bytes a char.
-                var limit = headerMb is null ? 1.5 : 4.0;
-                Assert.True(alloc <= limit * pulled, $"header MB {headerMb ?? "default"}: walks allocated {alloc} MB for {pulled} M chars pulled in (limit {limit} a char)");
+                // The walks look up none of the register names, so each header comes to them as its guard alone.
+                Assert.True(pulled <= 1, $"pulled in {pulled} MB");
+                // Held: nothing of the headers is read or parsed again (before 1.0.295 each was held whole and parsed once,
+                // about 0.8 bytes a char). Read again: the file's bytes, its string and its directive lines (about 3 bytes
+                // a char), each walk; before C22's fixes 10 bytes a char and a parse of it all.
+                var limit = headerMb is null ? 0.05 : 4.0;
+                Assert.True(alloc <= limit * named, $"header MB {headerMb ?? "default"}: walks allocated {alloc} MB for {named} M chars of headers named (limit {limit} a char)");
+                Assert.Equal(0, r.Stats["templateWalksRedone"]);
             }
         }
         finally
