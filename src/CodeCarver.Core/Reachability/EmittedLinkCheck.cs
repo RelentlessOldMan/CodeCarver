@@ -145,6 +145,10 @@ public static class EmittedLinkCheck
         long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
         // The tree's shape, for sizing a test corpus like it (shape.*): each header's size, each walk's include closure.
         var headerSizes = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
+        // Headers spilled to the local disk (see ReadAgain), removed when the check is done.
+        var spillDir = Path.Combine(Path.GetTempPath(), $"codecarver-spill-{Environment.ProcessId}-{Guid.NewGuid():N}");
+        var spilled = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        long spillBytes = 0, spillReads = 0, spillFiles = 0;
         var closures = new ConcurrentBag<(int Files, long Chars, int Reads, long ReadChars)>();
         s_shapeNow = () => { var d = new Dictionary<string, long>(StringComparer.Ordinal); Shape(d, headerSizes.Values, closures, Interlocked.Read(ref templateWalks), Interlocked.Read(ref templateWalksSkipped)); return d; };
         void Lap(string key)
@@ -200,7 +204,9 @@ public static class EmittedLinkCheck
             stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped; stats["templateWalksReused"] = templateWalksReused;
             stats["templateWalksRedone"] = templateWalksRedone; stats["templateWalksWhole"] = templateWalksWhole; stats["headersRefiltered"] = headersRefiltered; stats["templateWalkHashHits"] = templateWalkHashHits;
             stats["walkNames"] = walkNames.Count;
-            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames" })
+            stats["headersSpilled"] = spilled.Count; stats["spillReads"] = spillReads; stats["spillMb"] = spillBytes >> 20;
+            try { if (Directory.Exists(spillDir)) Directory.Delete(spillDir, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames", "headersSpilled", "spillReads", "spillMb" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -244,6 +250,48 @@ public static class EmittedLinkCheck
             var template = CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(t);
             if (!template) t = CodeCarver.Core.Preprocess.TemplateInstances.DirectivesOnly(t);
             return (new HeaderInfo(template, t.Length, ContentHash(t)), t);
+        }
+        // A header not held is read again by each walk that includes it (a tree of macro-dense headers: 36 of 10 MB, each
+        // read 12 times, 3.6 GB over a share, normalized and cut to its directive lines each time). The first time one of
+        // SpillChars or more is read again, its directive lines go to a file on the local disk, read back as they are.
+        string? ReadSpilled(string p)
+        {
+            if (!spilled.TryGetValue(p, out var file)) return null;
+            try
+            {
+                using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read, 0, FileOptions.SequentialScan);
+                var text = string.Create((int)(fs.Length / sizeof(char)), fs, static (span, s) => s.ReadExactly(System.Runtime.InteropServices.MemoryMarshal.AsBytes(span)));
+                Interlocked.Increment(ref spillReads);
+                return text;
+            }
+            catch (IOException) { return null; }
+            catch (UnauthorizedAccessException) { return null; }
+        }
+        void Spill(string p, string text)
+        {
+            var bytes = text.Length * (long)sizeof(char);
+            if (text.Length < SpillChars || spilled.ContainsKey(p)) return;
+            if (Interlocked.Add(ref spillBytes, bytes) > SpillBudget) { Interlocked.Add(ref spillBytes, -bytes); return; }
+            var file = Path.Combine(spillDir, Interlocked.Increment(ref spillFiles) + ".txt");
+            try
+            {
+                Directory.CreateDirectory(spillDir);
+                using (var fs = new FileStream(file, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 16))
+                    fs.Write(System.Runtime.InteropServices.MemoryMarshal.AsBytes(text.AsSpan()));
+                if (spilled.TryAdd(p, file)) return;
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            Interlocked.Add(ref spillBytes, -bytes);
+            try { File.Delete(file); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        }
+        // A header's directive lines read again: from its spilled copy, else from the tree (and spilled).
+        (HeaderInfo? Info, string? Text) ReadAgain(string p)
+        {
+            if (ReadSpilled(p) is { } t) return (Info(p), t);
+            var r = ReadDirectives(p);
+            if (r.Text is not null) Spill(p, r.Text);
+            return r;
         }
         // The #include names (quoted, <>, computed) in each header looked at: which headers can bring a template in (reachTemplate).
         var headerIncludes = new ConcurrentDictionary<string, string[]>(StringComparer.Ordinal);
@@ -346,7 +394,7 @@ public static class EmittedLinkCheck
                 lock (headerInfo)
                     if (headerText.TryGetValue(p, out var t))
                         return (t, heldDropped.TryGetValue(p, out var d) ? d : Array.Empty<int>(), walkOrder.Count);
-            var (info, text) = ReadDirectives(p);   // not held: read again (the same text: within a run a file stays as it is)
+            var (info, text) = ReadAgain(p);   // not held: read again (the same text: within a run a file stays as it is)
             if (info is null || text is null) return none;
             if (whole) return (text, Array.Empty<int>(), int.MaxValue);
             var f = Filtered(info, text);
@@ -524,7 +572,7 @@ public static class EmittedLinkCheck
                         // header is read again and asked by name (death-lite: 91 of 92 such hits, each a walk done again).
                         var hits = late.Where(x => x.At >= through && Array.BinarySearch(dropped, x.Hash) >= 0).Select(x => x.Name).Distinct().ToList();
                         if (hits.Count == 0) continue;
-                        var directives = ReadDirectives(path).Text;
+                        var directives = ReadAgain(path).Text;
                         if (directives is null || CodeCarver.Core.Preprocess.TemplateInstances.DefinesAny(directives, hits)) { missed = true; break; }
                         Interlocked.Increment(ref templateWalkHashHits);
                     }
@@ -888,6 +936,11 @@ public static class EmittedLinkCheck
     /// map), and a walk seldom looks up one of their defines; filtered, the small ones made almost every walk a redo
     /// (death-lite: 2 to 4 names a unit, each from a header of a few KB).</summary>
     const int FilterChars = 64 * 1024;
+
+    /// <summary>A header's directive lines of at least this many chars, read again, are spilled to the local disk (see
+    /// ReadAgain), up to <see cref="SpillBudget"/> bytes a run.</summary>
+    const int SpillChars = 256 * 1024;
+    const long SpillBudget = 8L << 30;
 
     /// <summary>Characters of non-template header text the check holds at once: a 32nd of the machine's memory, or
     /// CODECARVER_CHECK_HEADER_MB.</summary>

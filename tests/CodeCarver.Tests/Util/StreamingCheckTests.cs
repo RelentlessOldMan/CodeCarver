@@ -252,6 +252,9 @@ public sealed class StreamingCheckTests
             Assert.Equal(new[] { "hid_den" }, reread.Violations.Select(v => v.Name).Distinct().ToArray());
             Assert.True(reread.Stats["walkCostMaxMb"] >= 1, reread.Stats["walkCostMaxMb"].ToString());
             Assert.True(reread.Stats["walkWaits"] > 0, reread.Stats["walkWaits"].ToString());
+            // regs.h, read again by each walk, comes from its copy on the local disk after the first time.
+            Assert.Equal(1, reread.Stats["headersSpilled"]);
+            Assert.True(reread.Stats["spillReads"] >= dropped.Length - 2, reread.Stats["spillReads"].ToString());
         }
         finally
         {
