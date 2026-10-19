@@ -217,6 +217,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public int DefinitionsRecoveredByScan => _recoveredByScan;
     // CODECARVER_TIMING: where the per-file parse time goes (Stopwatch ticks), and how many files parsed with errors.
     private long _tPrep, _tParse, _tScan, _tRead; private int _errorFiles;
+    // The merge, one file at a time on the calling thread, and its waits for the next file in path order: when the parse
+    // threads are idle, which of the two holds them up.
+    private long _tMerge, _tWaitHead;
     // Each pass of ProcessFile after the parse (see PassNames): a big file's time was nearly all outside the parse.
     private readonly long[] _tPass = new long[PassNames.Length];
     private static readonly string[] PassNames =
@@ -583,13 +586,19 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // Files are read and processed on ParseThreads threads at once, each into its own FileWork, and merged here one
         // at a time in path order: the graph is the one a one-file-at-a-time parse builds, in a fraction of the time.
         var threads = ParseThreads;
+        var tDone = System.Diagnostics.Stopwatch.GetTimestamp();
         foreach (var (path, w) in CodeCarver.Core.Util.ReadAhead.Map(paths,
                      p => ParseOne(p, read, fileNodeByPath, pathsByBasename, defines, closedWorldDefines), threads))
         {
+            var tGot = System.Diagnostics.Stopwatch.GetTimestamp();
+            _tWaitHead += tGot - tDone;
+            tDone = tGot;
             _tRead += w.TRead;
             if (w.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
             MergeFile(path, w, graph, functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
                       pendingMacroRefs, pendingPastes, keepNames, keepAt);
+            tDone = System.Diagnostics.Stopwatch.GetTimestamp();
+            _tMerge += tDone - tGot;
             var fileMs = w.Ms;
             var length = w.Length;
             if (timeFiles && fileMs >= 300)
@@ -620,6 +629,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _timing["parse-files.tree-sitter"] = Ms(_tParse);
         _timing["parse-files.scan"] = Ms(_tScan);
         _timing["parse-files.read"] = Ms(_tRead);
+        _timing["parse-files.merge"] = Ms(_tMerge);
+        _timing["parse-files.waitHead"] = Ms(_tWaitHead);
         _timing["files.parsed"] = parsedFiles;
         _timing["files.parsedBytes"] = parsedBytes;
         _timing["files.largestBytes"] = largestBytes;
