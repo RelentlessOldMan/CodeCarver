@@ -673,6 +673,9 @@ A walk that looks up a name a header it read had dropped is walked again with th
 `check.templateWalksRedone` counts those, `check.headersRefiltered` the held headers read again for a name,
 `check.walkNames` the names the walks looked up, and `check.templateWalksWhole` the walks that, after 16 tries, read
 the whole headers instead. What the walks find is the same either way.
+A header not held that a walk reads again (256K chars of directive lines or more) has those lines copied once to
+a temporary file on the local disk, removed when the check ends, and later walks read that copy instead of the tree:
+`check.headersSpilled`, `check.spillReads`, `check.spillMb`.
 
 The check also reports the tree's shape, numbers only, as each loop ends, for sizing a test corpus like the tree:
 `check.shape.headers`, `.headersOver1Mb`, `.headerTotalMb`, `.headerKb.p50/p95/max` (the headers read), and for each
