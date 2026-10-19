@@ -152,10 +152,13 @@ public static class TemplateInstances
     /// (a header with no macro-named head is read once per unit). <paramref name="initial"/>: macros defined before the
     /// unit (the build's command-line <c>-D</c>), so <c>int HIDE(den)(void) {</c> under <c>-D'HIDE(n)=hid_##n'</c>
     /// defines hid_den. <paramref name="parsing"/>: called with the length of each header about to be parsed for the first
-    /// time (its parse is kept with the header string), the result disposed when done: the caller can hold back parses.</summary>
+    /// time (its parse is kept with the header string), the result disposed when done: the caller can hold back parses.
+    /// <paramref name="held"/>: called once the walk is over with about what it held besides its texts and their parses
+    /// (<see cref="WalkState.HeldBytes"/>).</summary>
     public static List<(string Name, int Line)> Find(string unit, Func<string, string?> readInclude,
                                                      IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? initial = null,
-                                                     Func<int, IDisposable?>? parsing = null, List<string>? lookedUp = null)
+                                                     Func<int, IDisposable?>? parsing = null, List<string>? lookedUp = null,
+                                                     Action<long>? held = null)
     {
         var found = new List<(string, int)>();
         if (!unit.Contains('#') && (initial is null || initial.Count == 0)) return found;
@@ -169,6 +172,7 @@ public static class TemplateInstances
         var w = new WalkState(macros, ReadOnce, found) { Parsing = parsing };
         Walk(Parse(unit, false), w, unitLine: null, depth: 0, ifBase: 0);
         lookedUp?.AddRange(w.LookedUp);
+        held?.Invoke(w.HeldBytes());
         return found.Distinct().ToList();
     }
 
@@ -377,6 +381,9 @@ public static class TemplateInstances
 
         public int FromOf(int id) => _from[id];
 
+        /// <summary>About what it holds (its arrays sized to the names looked up).</summary>
+        public long Bytes => _from.Length * 4L + _has.Length * 8L + Free.Capacity * 4L + Deps.Count * 16L;
+
         public void Mark(int id)
         {
             if (id >> 6 >= _has.Length) Array.Resize(ref _has, Math.Max((id >> 6) + 1, _has.Length * 2));
@@ -504,6 +511,16 @@ public static class TemplateInstances
         /// with TNAME set, and the template instance with it (death-lite: 60% of them missed). Kept as the values each
         /// name was seen with instead, a check of a header went over every name of every header it skipped in a cycle,
         /// and theirs (death-lite: 80 million names in half a minute of one unit).</summary>
+
+        long _entryBytes;
+        /// <summary>About what the walk holds besides its texts and their parses: its frames, the walks it recorded,
+        /// the names it looked up and its trail.</summary>
+        public long HeldBytes()
+        {
+            var b = _entryBytes + _names.Count * 160L + Trail.Count * 64L + _headers.Count * 128L + _changes.Count * 4L;
+            foreach (var f in _frames) b += f.Bytes;
+            return b;
+        }
 
         public Header HeaderOf(string text, Parsed parsed)
         {
@@ -880,6 +897,7 @@ public static class TemplateInstances
             for (var i = 0; i < ids.Length; i++)
                 keys[i] = Chain(_hashes[ids[i]]) is var c && (c.Count == 0 || c[^1] < f.Start) ? Now(ids[i]).Keys : KeysOf(Resolve(_names[ids[i]], f.Start, out _, out _));
             (h.Walked ??= new List<Entry>()).Add(new Entry(ids, keys, f.Deps.ToArray()));
+            _entryBytes += 160 + ids.Length * 36L + f.Deps.Count * 8L;
         }
 
         // A define at #if depth 0 replaces the value, one inside an #if is an alternative to it (not twice the same),

@@ -58,6 +58,25 @@ public class TemplateWalkMemoryTests
     }
 
     [Fact]
+    public void TemplateWalk_ReportsWhatItHolds_NotWhatItAllocated()
+    {
+        // The link check lets walks run at once by what each holds (EmittedLinkCheck.WalkCost): the walk's own tables
+        // come to a small part of the texts it walked, and grow with the names it looked up.
+        var headers = RegisterHeaders(16, 2000, "WHB");
+        headers["cfg.h"] = "#define HIDE(n) hid_##n\n";
+        headers["t.h"] = "int HIDE(den)(void) { return WHB0_R7_OFS; }\n";
+        var unit = "#include \"cfg.h\"\n" + string.Concat(Enumerable.Range(0, 16).Select(h => $"#include \"regs/r{h}.h\"\n")) + "#include \"t.h\"\n";
+        long chars = headers.Values.Sum(t => (long)t.Length);
+        string? Read(string raw) => headers.TryGetValue(raw, out var t) ? t : null;
+
+        long held = -1;
+        var found = TemplateInstances.Find(unit, Read, held: b => held = b);
+        Assert.Contains(found, f => f.Name == "hid_den");
+        Assert.InRange(held, 1, chars / 4);
+        Assert.True(EmittedLinkCheck.WalkCost(chars, held, 0) >= 4 * chars, "a walk is charged at least its texts and their parses, twice");
+    }
+
+    [Fact]
     public void LinkCheck_TemplateWalks_AllocateAboutTheirHeaders_HeldOrReRead()
     {
         // 16 dropped units over overlapping 24-header windows of 48 register headers (each ~260 K chars), and the

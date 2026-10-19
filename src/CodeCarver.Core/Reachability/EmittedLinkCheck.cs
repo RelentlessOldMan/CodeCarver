@@ -179,8 +179,10 @@ public static class EmittedLinkCheck
         var readGate = new CodeCarver.Core.Util.ByteGate(ReadBudget());
         // Template walks parse and walk their include closures, a budget at a time (C20/C21: 64 walks at once re-parsing
         // their include closures went from 12 to 21 GB in 90 s; 1.0.294 gated only once a header was not held, and a run
-        // whose headers were all held peaked 5.1 GB locally). A walk takes what the largest walk allocated before it, or
-        // the whole budget until one has: the first runs alone and sizes the rest.
+        // whose headers were all held peaked 5.1 GB locally). A walk takes what the largest walk before it held (its texts,
+        // their parses, its own tables, the largest header it read: WalkCost), or the whole budget until one has ended: the first runs alone and
+        // sizes the rest. What a walk allocated was ten times what it held (a 546 MB tree: up to 2 GB a walk, so its 150
+        // walks ran one at a time, where three at once took the check from 253 s to 109 s and peak memory from 2.3 to 2.5 GB).
         var walkBudget = WalkBudget();
         var walkGate = new CodeCarver.Core.Util.ByteGate(walkBudget);
         long walkCost = -1;
@@ -462,8 +464,8 @@ public static class EmittedLinkCheck
             using var slot = walkGate.Take(() => Interlocked.Read(ref walkCost) is var c and >= 0 ? c : walkBudget);
             // After the gate: a walk waiting for room is not counted as running (C23 read 16 "running at once").
             using var part = Activity.Part("templateWalk", text.Length);
-            var start = GC.GetAllocatedBytesForCurrentThread();
             List<Definition> found;
+            long held = 0, largest = 0;
             HashSet<string> entered;
             long chars, readChars; int reads;
             // The headers come with only the defines of the names walks looked up before (Filtered): the walk is the walk of
@@ -491,11 +493,12 @@ public static class EmittedLinkCheck
                                     read[path] = t = rt;
                                     if (dropped.Length > 0) filtered.Add((dropped, through, path));
                                     if (t is not null) { reads++; readChars += t.Length; if (entered.Add(path)) chars += t.Length; }
+                                    if (headerSizes.TryGetValue(path, out var size)) largest = Math.Max(largest, size);
                                 }
                                 Activity.Note(t?.Length ?? 0);
                                 if (asked?.Add(raw) == true) deps!.Add((raw, TemplateKey(raw)));
                                 return t;
-                            }, commandLineMacros, Parsing, lookedUp)
+                            }, commandLineMacros, Parsing, lookedUp, b => held = b)
                             .Select(i => new Definition(i.Name, i.Line, false, false)).ToList();
                 if (whole) { Interlocked.Increment(ref templateWalksWhole); break; }
                 // A name looked up that a header read dropped: one walkNames did not have when that header was filtered.
@@ -531,7 +534,7 @@ public static class EmittedLinkCheck
                 Interlocked.Increment(ref templateWalksRedone);
             }
             closures.Add((entered.Count, chars, reads, readChars));
-            var used = GC.GetAllocatedBytesForCurrentThread() - start;
+            var used = WalkCost(chars, held, largest);
             for (var was = Interlocked.Read(ref walkCost); used > was; was = Interlocked.Read(ref walkCost))
                 if (Interlocked.CompareExchange(ref walkCost, used, was) == was) break;
             return found;
@@ -931,7 +934,12 @@ public static class EmittedLinkCheck
         public void Dispose() { held.Dispose(); part.Dispose(); }
     }
 
-    /// <summary>Bytes the template walks allocate at once: an 8th of the machine's memory or the run
+    /// <summary>What a template walk is taken to hold at once: twice its estimate (its texts as strings, their parses, and
+    /// <paramref name="state"/>, its own tables), and a header read again while it is (<paramref name="largestRead"/>
+    /// chars: the file, its normalized text and its directive lines, before the defines no walk asks for are dropped).</summary>
+    internal static long WalkCost(long chars, long state, long largestRead) => 2 * (chars * (2 + ParseBytesPerChar) + state) + largestRead * 6;
+
+    /// <summary>Bytes the template walks hold at once: an 8th of the machine's memory or the run
     /// limit (2.5 GB under memoryStopMb 20000), at least 256 MB, or CODECARVER_CHECK_WALK_MB.</summary>
     static long WalkBudget()
     {
