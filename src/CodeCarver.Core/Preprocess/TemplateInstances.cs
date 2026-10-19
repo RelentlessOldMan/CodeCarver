@@ -462,13 +462,13 @@ public static class TemplateInstances
     /// wherever they have those values again), and the headers it skipped as on the stack.</summary>
     sealed class Entry
     {
+        /// <summary>The free names, ascending: a name's place is found by a binary search (a table of them, one an entry,
+        /// was a fifth of what the check allocated: death-lite, 27 GB).</summary>
         public readonly int[] Ids;
         public readonly string[][] Keys;
         /// <summary>Where each free name's answer went back to when it last matched (kept up with the change log): what
         /// a walk that skips the header takes on.</summary>
         public readonly int[] From;
-        /// <summary>Each free name's place in <see cref="Ids"/>.</summary>
-        public readonly Dictionary<int, int> Slot;
         public readonly Header[] Deps;
         public readonly int MaxId = -1;
         /// <summary>The length of the change log when <see cref="Miss"/> was last brought up to date (-1: never).</summary>
@@ -484,8 +484,7 @@ public static class TemplateInstances
             Ids = ids;
             Keys = keys;
             From = new int[ids.Length];
-            Slot = new Dictionary<int, int>(ids.Length);
-            for (var i = 0; i < ids.Length; i++) { Slot[ids[i]] = i; MaxId = Math.Max(MaxId, ids[i]); }
+            if (ids.Length > 0) MaxId = ids[^1];
             Deps = deps;
         }
     }
@@ -860,7 +859,7 @@ public static class TemplateInstances
                 for (var slot = 0; slot < e.Ids.Length; slot++) { if (!Same(e, slot)) e.Miss.Add(slot); }
             else
                 for (var i = e.SeenAt; i < _changes.Count; i++)
-                    if (e.Slot.TryGetValue(_changes[i], out var slot))
+                    if (Array.BinarySearch(e.Ids, _changes[i]) is var slot and >= 0)
                     {
                         if (Same(e, slot)) e.Miss.Remove(slot);
                         else e.Miss.Add(slot);
@@ -875,6 +874,7 @@ public static class TemplateInstances
         {
             if (f.Cut) return;
             var ids = f.Free.ToArray();
+            Array.Sort(ids);
             var keys = new string[ids.Length][];
             // A name nothing defined since the walk started has the value it had then.
             for (var i = 0; i < ids.Length; i++)
