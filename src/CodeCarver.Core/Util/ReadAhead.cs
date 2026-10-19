@@ -117,6 +117,72 @@ public static class ReadAhead
         }
     }
 
+    /// <summary>Each item with <paramref name="read"/>'s result, in order, read ahead on <see cref="Window"/> threads
+    /// while the caller works: up to <paramref name="ahead"/> items, and past the next one only while what is held
+    /// weighs (<paramref name="weigh"/>) under <paramref name="maxWeight"/>. For reads feeding work that runs on fewer
+    /// threads (the parse: one per core, each waiting its own read on a share left the cores idle). Counts nothing in
+    /// <see cref="Activity"/>: the loop it feeds does.</summary>
+    public static IEnumerable<(T Item, R Value)> Prefetch<T, R>(IReadOnlyList<T> items, Func<T, R> read, Func<R, long> weigh,
+                                                                long maxWeight, int ahead = 8 * Window)
+    {
+        EnsureThreads();
+        var n = items.Count;
+        var results = new R[n];
+        var done = new bool[n];
+        var gate = new object();
+        int next = 0, cursor = 0;
+        long held = 0;
+        var stop = false;
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo? failed = null;
+        void Work()
+        {
+            while (true)
+            {
+                int i;
+                lock (gate)
+                {
+                    while (!stop && next < n && (next >= cursor + ahead || (next > cursor && held >= maxWeight))) Monitor.Wait(gate);
+                    if (stop || next >= n) return;
+                    i = next++;
+                }
+                R r;
+                try { r = read(items[i]); }
+                catch (Exception ex)
+                {
+                    lock (gate) { failed ??= System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex); stop = true; Monitor.PulseAll(gate); }
+                    return;
+                }
+                var w = weigh(r);
+                lock (gate) { results[i] = r; done[i] = true; held += w; Monitor.PulseAll(gate); }
+            }
+        }
+        var workers = new Task[Math.Min(Window, Math.Max(1, n))];
+        for (var w = 0; w < workers.Length; w++) workers[w] = Task.Run(Work);
+        try
+        {
+            while (cursor < n)
+            {
+                R value;
+                lock (gate)
+                {
+                    while (!done[cursor] && failed is null) Monitor.Wait(gate);
+                    failed?.Throw();
+                    value = results[cursor];
+                    results[cursor] = default!;
+                    held -= weigh(value);
+                    cursor++;
+                    Monitor.PulseAll(gate);
+                }
+                yield return (items[cursor - 1], value);
+            }
+        }
+        finally
+        {
+            lock (gate) { stop = true; Monitor.PulseAll(gate); }
+            Task.WaitAll(workers);
+        }
+    }
+
     /// <summary>Each item with <paramref name="read"/>'s result, in order, the next <see cref="Window"/> read on the
     /// thread pool. <paramref name="read"/> must be safe to call from several threads and should catch what it expects.</summary>
     public static IEnumerable<(T Item, R Value)> Map<T, R>(IEnumerable<T> items, Func<T, R> read, int window = Window)

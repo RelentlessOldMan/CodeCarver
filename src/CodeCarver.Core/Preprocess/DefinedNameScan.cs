@@ -41,6 +41,7 @@ public sealed class DefinedNameScan
         {
             using var h = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.Read);
             var length = RandomAccess.GetLength(h);
+            IoMeter.Took(path, length);
             var head = new byte[4];
             var got = ReadFully(h, head, 0);
             // UTF-16 and UTF-32 (byte-order marks FF FE, FE FF, 00 00 FE FF): decoded as the line reader decodes them.

@@ -124,4 +124,26 @@ public sealed class IoMeterTests
         }
         finally { dir.Delete(recursive: true); }
     }
+
+    [Fact]
+    public void AFileReadAgain_IsCountedAsARepeat_WithItsBytes()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "cc-repeat-" + Guid.NewGuid().ToString("N") + ".c");
+        File.WriteAllText(path, new string('x', 3 << 20));
+        try
+        {
+            var before = IoMeter.Now();
+            IoMeter.ReadAllText(path);
+            var once = IoMeter.Now();
+            IoMeter.ReadAllText(path);
+            var twice = IoMeter.Now();
+            var first = IoMeter.ReadSince(once, before).ToDictionary(x => x.Key, x => x.Value);
+            var second = IoMeter.ReadSince(twice, once).ToDictionary(x => x.Key, x => x.Value);
+            // Other tests read at the same time: lower bounds only.
+            Assert.True(first["read.mb"] >= 3);
+            Assert.True(second["read.repeat.count"] >= 1);
+            Assert.True(second["read.repeat.mb"] >= 3);
+        }
+        finally { File.Delete(path); }
+    }
 }

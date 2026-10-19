@@ -16,6 +16,7 @@ public static class BinaryText
         {
             using var read = IoMeter.Start(IoMeter.Kind.Read);
             using var s = File.OpenRead(path);
+            IoMeter.Took(path, Math.Min(s.Length, 8192));
             var buf = new byte[8192];
             var n = s.ReadAtLeast(buf, buf.Length, throwOnEndOfStream: false);
             return buf.AsSpan(0, n).IndexOf((byte)0) >= 0;
@@ -49,6 +50,7 @@ public static class BinaryText
         FileStream s;
         try { s = File.OpenRead(path); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { yield break; }
+        IoMeter.Took(path, s.Length);
         using (s)
         using (IoMeter.Start(IoMeter.Kind.Read))
         {
@@ -83,6 +85,7 @@ public static class BinaryText
         FileStream s;
         try { s = File.OpenRead(path); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return found; }
+        IoMeter.Took(path, s.Length);
         using (s)
         using (IoMeter.Start(IoMeter.Kind.Read))
         {

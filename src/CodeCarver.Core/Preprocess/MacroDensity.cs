@@ -38,6 +38,7 @@ public static class MacroDensity
             using var sr = new StreamReader(fs, System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
             var buf = new char[PrefixChars];
             int read = sr.ReadBlock(buf, 0, buf.Length);
+            CodeCarver.Core.Util.IoMeter.Took(path, Math.Max(read, 0));
             if (read <= 0) return false;
             // If we filled the buffer the file was longer than the prefix, so the last line is (probably)
             // truncated — drop it so a cut-off `#defin` can't tip the count either way.

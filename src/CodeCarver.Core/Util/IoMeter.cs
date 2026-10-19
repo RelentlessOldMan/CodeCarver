@@ -25,6 +25,19 @@ public static class IoMeter
 
     static readonly long[] Count = new long[Kinds], Ticks = new long[Kinds], MaxTicks = new long[Kinds];
     static readonly ConcurrentDictionary<long, (Kind Kind, long Start)> InFlight = new();
+    // Bytes read, and the reads of a file this process had read before and their bytes: on a share each is a trip over
+    // the network, and a step that reads again what an earlier one read is time a run could keep.
+    static long _readBytes, _repeats, _repeatBytes;
+    static readonly ConcurrentDictionary<string, byte> ReadBefore = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Counts <paramref name="bytes"/> read from <paramref name="path"/> (io.read.mb, and .repeat when it was read before).</summary>
+    public static void Took(string path, long bytes)
+    {
+        Interlocked.Add(ref _readBytes, bytes);
+        if (ReadBefore.TryAdd(path, 0)) return;
+        Interlocked.Increment(ref _repeats);
+        Interlocked.Add(ref _repeatBytes, bytes);
+    }
     static long _next;
 
     /// <summary>One wait, timed from here until it is disposed.</summary>
@@ -76,6 +89,7 @@ public static class IoMeter
         using (Start(Kind.Read))
         {
             var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 0, FileOptions.SequentialScan);
+            Took(path, fs.Length);
             try
             {
                 // Most of a tree is small files: they are read whole into a pooled buffer (in reads of up to 1 MB) and
@@ -164,7 +178,10 @@ public static class IoMeter
         else (enc, skip) = (fallback, 0);
         return enc.GetString(bytes[skip..]);
     }
-    public static byte[] ReadAllBytes(string path) { using (Start(Kind.Read)) return File.ReadAllBytes(path); }
+    public static byte[] ReadAllBytes(string path)
+    {
+        using (Start(Kind.Read)) { var b = File.ReadAllBytes(path); Took(path, b.Length); return b; }
+    }
     /// <summary>File.ReadLines, timed as one read from the open until the last line is taken (or the loop stops). The
     /// file opens here, as File.ReadLines opens it, so a missing file throws at the call and not at the loop.</summary>
     public static IEnumerable<string> ReadLines(string path) => ReadLines(path, null);
@@ -176,7 +193,7 @@ public static class IoMeter
         var start = Stopwatch.GetTimestamp();
         InFlight[id] = (Kind.Read, start);
         StreamReader reader;
-        try { reader = Open(path, encoding); }
+        try { reader = Open(path, encoding); Took(path, reader.BaseStream.Length); }
         catch { new Op(id, Kind.Read, start).Dispose(); throw; }
         finally { InFlight.TryRemove(id, out _); }
         return Timed(reader, start);
@@ -195,7 +212,8 @@ public static class IoMeter
     public static void Copy(string from, string to, bool overwrite) { using (Start(Kind.Copy)) File.Copy(from, to, overwrite); }
 
     /// <summary>The totals so far, and what is waiting now.</summary>
-    public sealed record Snapshot(long[] Count, long[] Ticks, long[] MaxTicks, int[] Waiting, long[] OldestTicks)
+    public sealed record Snapshot(long[] Count, long[] Ticks, long[] MaxTicks, int[] Waiting, long[] OldestTicks,
+                                  long ReadBytes = 0, long Repeats = 0, long RepeatBytes = 0)
     {
         /// <summary>Waits finished since <paramref name="earlier"/> (all kinds), to tell a run that moves from one that doesn't.</summary>
         public long DoneSince(Snapshot? earlier) => Count.Sum() - (earlier?.Count.Sum() ?? 0);
@@ -220,7 +238,8 @@ public static class IoMeter
             waiting[(int)kind]++;
             oldest[(int)kind] = Math.Max(oldest[(int)kind], now - start);
         }
-        return new Snapshot(count, ticks, maxTicks, waiting, oldest);
+        return new Snapshot(count, ticks, maxTicks, waiting, oldest,
+                            Interlocked.Read(ref _readBytes), Interlocked.Read(ref _repeats), Interlocked.Read(ref _repeatBytes));
     }
 
     static double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
@@ -253,6 +272,16 @@ public static class IoMeter
                 yield return (Keys[k], n, (long)Ms(now.Ticks[k] - since.Ticks[k]));
     }
 
+
+    /// <summary>Bytes read since <paramref name="since"/>, and the reads of files read before: read.mb, read.repeat.count,
+    /// read.repeat.mb (keys after io. or a step's io.&lt;step&gt;.).</summary>
+    public static IEnumerable<(string Key, long Value)> ReadSince(Snapshot now, Snapshot? since)
+    {
+        yield return ("read.mb", (now.ReadBytes - (since?.ReadBytes ?? 0)) >> 20);
+        yield return ("read.repeat.count", now.Repeats - (since?.Repeats ?? 0));
+        yield return ("read.repeat.mb", (now.RepeatBytes - (since?.RepeatBytes ?? 0)) >> 20);
+    }
+
     /// <summary>Totals for the summary since <paramref name="since"/> (the run's start): io.&lt;kind&gt;.count / .ms, and .maxMs, the slowest
     /// in this process.</summary>
     public static IEnumerable<(string Key, long Value)> Totals(Snapshot s, Snapshot? since = null)
@@ -263,5 +292,6 @@ public static class IoMeter
             yield return ($"io.{Keys[k]}.ms", (long)Ms(s.Ticks[k] - (since?.Ticks[k] ?? 0)));
             yield return ($"io.{Keys[k]}.maxMs", (long)Ms(s.MaxTicks[k]));
         }
+        foreach (var (key, value) in ReadSince(s, since)) yield return ($"io.{key}", value);
     }
 }

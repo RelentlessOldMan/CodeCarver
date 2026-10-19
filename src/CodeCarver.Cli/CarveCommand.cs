@@ -350,6 +350,8 @@ public static class CarveCommand
                 AddLong($"{prefix}io.{phase}.{kind}.count", n);
                 AddLong($"{prefix}io.{phase}.{kind}.ms", ms);
             }
+            foreach (var (key, value) in CodeCarver.Core.Util.IoMeter.ReadSince(ioNow, io))
+                if (value > 0) AddLong($"{prefix}io.{phase}.{key}", value);
             io = ioNow; cpu = cpuNow;
         }
         long _lastDone = 0, _lastIoDone = _stepIo.DoneSince(null);

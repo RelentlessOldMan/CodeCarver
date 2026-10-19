@@ -293,6 +293,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// overrides it, 1 for one at a time). The graph is the same whatever the number.</summary>
     public int ParseThreads { get; set; } =
         int.TryParse(Environment.GetEnvironmentVariable("CODECARVER_PARSE_THREADS"), out var t) && t > 0 ? t : Environment.ProcessorCount;
+    // Text read ahead of the parses, at most, in chars (2 bytes each): enough to keep many reads in flight on a share.
+    private const long ParseReadAheadChars = 32L << 20;
     private const int BudgetMinBytes = 256 * 1024;
 
     /// <summary>Per-file SYMBOL budget: the max number of definitions (functions + macros + types +
@@ -587,13 +589,25 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // at a time in path order: the graph is the one a one-file-at-a-time parse builds, in a fraction of the time.
         var threads = ParseThreads;
         var tDone = System.Diagnostics.Stopwatch.GetTimestamp();
-        foreach (var (path, w) in CodeCarver.Core.Util.ReadAhead.Map(paths,
-                     p => ParseOne(p, read, fileNodeByPath, pathsByBasename, defines, closedWorldDefines), threads))
+        // The files are read ahead on their own threads, many at once, and each parse thread takes its text as it frees
+        // up: reading inside the parse threads kept only one read per core in flight, and on a share the cores sat
+        // waiting on them. At most ParseReadAheadChars of text is held ahead of the parses.
+        CodeCarver.Core.Util.Activity.Expect(paths.Count);
+        string TimedRead(string p)
+        {
+            var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            var text = read(p);
+            Interlocked.Add(ref _tRead, System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+            return text;
+        }
+        foreach (var (file, w) in CodeCarver.Core.Util.ReadAhead.Map(
+                     CodeCarver.Core.Util.ReadAhead.Prefetch(paths, TimedRead, t => t.Length, ParseReadAheadChars),
+                     x => ParseOne(x.Item, _ => x.Value, fileNodeByPath, pathsByBasename, defines, closedWorldDefines), threads))
         {
             var tGot = System.Diagnostics.Stopwatch.GetTimestamp();
             _tWaitHead += tGot - tDone;
             tDone = tGot;
-            _tRead += w.TRead;
+            var path = file.Item;
             if (w.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
             MergeFile(path, w, graph, functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
                       pendingMacroRefs, pendingPastes, keepNames, keepAt);
