@@ -47,11 +47,28 @@ public static class BuildLogScraper
 
     public static IReadOnlyList<CompileCommand> Parse(string log) => Parse(log, null);
 
-    public static IReadOnlyList<CompileCommand> Parse(string log, ScrapeOptions? options)
+    public static IReadOnlyList<CompileCommand> Parse(string log, ScrapeOptions? options) => Scan(log, options, steps: null);
+
+    /// <summary>What a link or archive command in a text log did: <see cref="ToolStepKind.Link"/> is a compiler driver run
+    /// without <c>-c</c> (or a linker run directly), <see cref="ToolStepKind.Archive"/> an <c>ar</c> run. Arguments as
+    /// written, response files spliced in (<see cref="Incomplete"/> when one could not be read).</summary>
+    public sealed record ToolStep(ToolStepKind Kind, string Tool, IReadOnlyList<string> Arguments, string Directory, bool Incomplete);
+    public enum ToolStepKind { Link, Archive }
+
+    /// <summary>The link and archive commands of a text log (none for a compile_commands.json, which has none), with
+    /// the working directory tracked as for <see cref="Parse(string, ScrapeOptions?)"/>.</summary>
+    public static IReadOnlyList<ToolStep> ParseToolSteps(string log, ScrapeOptions? options)
+    {
+        var steps = new List<ToolStep>();
+        Scan(log, options, steps);
+        return steps;
+    }
+
+    static IReadOnlyList<CompileCommand> Scan(string log, ScrapeOptions? options, List<ToolStep>? steps)
     {
         options ??= new ScrapeOptions();
         if (string.IsNullOrEmpty(log)) return Array.Empty<CompileCommand>();
-        if (LooksLikeCompileDb(log)) return ParseCompileDb(log, options);   // compile_commands.json
+        if (LooksLikeCompileDb(log)) return steps is null ? ParseCompileDb(log, options) : Array.Empty<CompileCommand>();   // compile_commands.json
 
         var results = new List<CompileCommand>();
         // Track the working directory across lines the way the shell/make would: a standalone `cd DIR`, and
@@ -103,6 +120,13 @@ public static class BuildLogScraper
                 if (cmd.Count == 0) continue;
                 if (cmd[0] == "cd") { if (cmd.Count >= 2) { dir = CombineDir(dir, cmd[1]); alternatives = new(); } continue; }
                 var ci = DriverIndex(cmd, options, allowGeneric: true);
+                if (ci < 0 && steps is not null && ToolIndex(cmd) is var ti and >= 0 && ToolKind(cmd[ti]) is { } kind)
+                {
+                    var incomplete = false;
+                    var targs = ExpandResponseFiles(cmd.GetRange(ti + 1, cmd.Count - ti - 1), dir, options, ref incomplete, depth: 0);
+                    steps.Add(new ToolStep(kind, cmd[ti], targs, dir, incomplete));
+                    continue;
+                }
                 if (ci < 0)
                 {
                     // `sh -c '<commands>'`: the compile is one quoted word. `/bin/sh ../libtool --mode=compile gcc ...`:
@@ -130,7 +154,15 @@ public static class BuildLogScraper
                     ci = cmd.FindIndex(1, a => IsCompiler(a) || options.CompilerNames.Any(n => DriverName(a).Equals(DriverName(n), StringComparison.OrdinalIgnoreCase)));
                     if (ci < 0 || !cmd.Skip(ci + 1).Any(IsSourceFile)) continue;
                 }
-                AddCommand(results, cmd[ci], cmd.GetRange(ci + 1, cmd.Count - ci - 1), dir, file: null, options, alternatives);
+                var cargs = cmd.GetRange(ci + 1, cmd.Count - ci - 1);
+                AddCommand(results, cmd[ci], cargs, dir, file: null, options, alternatives);
+                // A driver run that doesn't stop before linking links (its sources too: `gcc main.c x.o -o app`).
+                if (steps is not null && !cargs.Any(a => a is "-c" or "-S" or "-E" or "-M" or "-MM" or "/c" or "/E" or "/P"))
+                {
+                    var incomplete = false;
+                    var largs = ExpandResponseFiles(cargs, dir, options, ref incomplete, depth: 0);
+                    steps.Add(new ToolStep(ToolStepKind.Link, cmd[ci], largs, dir, incomplete));
+                }
             }
         }
     }
@@ -235,6 +267,32 @@ public static class BuildLogScraper
         var looksLikeCompile = rest.Any(IsSourceFile)
             && rest.Any(a => a is "-c" or "/c" || a.StartsWith("-D", StringComparison.Ordinal) || a.StartsWith("-I", StringComparison.Ordinal));
         return looksLikeCompile ? i : -1;
+    }
+
+    /// <summary>Index of the program in one simple command, past environment assignments, a ninja tag and wrappers.</summary>
+    static int ToolIndex(List<string> cmd)
+    {
+        var i = 0;
+        while (i < cmd.Count)
+        {
+            var t = cmd[i];
+            if (System.Text.RegularExpressions.Regex.IsMatch(t, @"^\[\d+/\d+\]$") || System.Text.RegularExpressions.Regex.IsMatch(t, @"^[A-Za-z_][A-Za-z0-9_]*=")) { i++; continue; }
+            if (!Wrappers.Contains(DriverName(t), StringComparer.OrdinalIgnoreCase)) return i;
+            i++;
+            while (i < cmd.Count && cmd[i].StartsWith('-')) i++;
+        }
+        return -1;
+    }
+
+    /// <summary>An archiver (ar, arm-none-eabi-ar, llvm-ar, gcc-ar) or a linker run directly (ld, arm-none-eabi-ld,
+    /// ld.lld, ld.gold); null for any other program.</summary>
+    static ToolStepKind? ToolKind(string token)
+    {
+        var n = DriverName(token).ToLowerInvariant();
+        if (n is "ar" || n.EndsWith("-ar", StringComparison.Ordinal)) return ToolStepKind.Archive;
+        if (n is "ld" or "lld" or "ld.lld" or "ld.gold" or "ld.bfd" || n.EndsWith("-ld", StringComparison.Ordinal)
+            || n.EndsWith("-ld.bfd", StringComparison.Ordinal) || n.EndsWith("-ld.gold", StringComparison.Ordinal)) return ToolStepKind.Link;
+        return null;
     }
 
     static string DriverName(string token)

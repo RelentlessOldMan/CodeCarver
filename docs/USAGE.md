@@ -84,6 +84,16 @@ Every carve is sound with just `entryPoints`. Each extra input lets it carve **t
 > table `#include`d with a **non-source extension** (`#include "GenTables.inc"`, `.def`, X-macro files) is kept
 > too: those includes aren't parsed as C, but every symbol they name is retained and the file is copied into
 > the output. This is the sound over-approximation; it never drops these.
+>
+> **One exception, read from the build log's link lines.** A linker takes an object from an archive only when
+> the image refers to a symbol it defines, and the object's kept sections and `used`/constructor code come with
+> it, not otherwise. So when the log shows the `ar` command that built an archive and a link that searches it
+> (`-L dir -lname` or the archive's path), and a file's object is only in such archives, never on a link line
+> itself, its implicit and section roots hold only once the carve keeps that file: a self-registering driver the
+> image doesn't link is left out, as the linker leaves it out (reported on a `link:` line;
+> `roots.heldUntilLinked`, `roots.heldUntilLinkedReleased`, `link.links`, `link.archivesSearched`). An archive
+> linked whole (`--whole-archive`), an object no link or archive in the log names, a link with a response file
+> that can't be read, and a log without link lines keep every root as above.
 
 ## The CLI
 

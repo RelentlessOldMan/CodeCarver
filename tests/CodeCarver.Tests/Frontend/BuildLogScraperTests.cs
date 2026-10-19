@@ -293,4 +293,26 @@ public class BuildLogScraperTests
         const string json = """{ "_meta": { "manifestVersion": 1 }, "symbols": { "func_0": { "def": "src_0.c:10", "refs": [] } } }""";
         Assert.Empty(BuildLogScraper.Parse(json));
     }
+
+    [Fact]
+    public void ToolSteps_AreTheLinksAndArchives_NotTheCompiles()
+    {
+        const string log = """
+            make[1]: Entering directory '/w/fw'
+            arm-none-eabi-gcc -mthumb -Iinc -c drv/a.c -o out/a.o
+            /opt/tc/bin/arm-none-eabi-ar rcs out/libdrv.a out/a.o out/b.o
+            ccache arm-none-eabi-gcc -mthumb -T fw.ld -o out/fw.axf out/main.o -Lout -ldrv
+            arm-none-eabi-ld -o out/raw.elf out/main.o out/libdrv.a
+            gcc main.c util.o -o tool
+            echo done
+            """;
+        var steps = BuildLogScraper.ParseToolSteps(log, null);
+        Assert.Collection(steps,
+            s => { Assert.Equal(BuildLogScraper.ToolStepKind.Archive, s.Kind); Assert.Equal("/w/fw", s.Directory); Assert.Equal(new[] { "rcs", "out/libdrv.a", "out/a.o", "out/b.o" }, s.Arguments); },
+            s => { Assert.Equal(BuildLogScraper.ToolStepKind.Link, s.Kind); Assert.Contains("-ldrv", s.Arguments); },
+            s => { Assert.Equal(BuildLogScraper.ToolStepKind.Link, s.Kind); Assert.EndsWith("arm-none-eabi-ld", s.Tool); },
+            s => { Assert.Equal(BuildLogScraper.ToolStepKind.Link, s.Kind); Assert.Contains("main.c", s.Arguments); });
+        // The compiles are what they were.
+        Assert.Equal(new[] { "drv/a.c", "main.c" }, BuildLogScraper.Parse(log).Select(c => c.File));
+    }
 }

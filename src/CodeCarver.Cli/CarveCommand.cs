@@ -547,9 +547,17 @@ public static class CarveCommand
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return null; }
             },
         };
+        var linkSteps = new List<BuildLogScraper.ToolStep>();   // the logs' link and archive commands
         foreach (var bl in buildLogs.Distinct())
         {
-            var cmds = BuildLogScraper.Parse(CodeCarver.Core.Util.IoMeter.ReadAllText(bl), scrape);
+            var logText = CodeCarver.Core.Util.IoMeter.ReadAllText(bl);
+            var cmds = BuildLogScraper.Parse(logText, scrape);
+            linkSteps.AddRange(BuildLogScraper.ParseToolSteps(logText, scrape).Select(t => cv.PathMap.Count == 0 ? t : t with
+            {
+                Directory = MapPath(t.Directory),
+                Arguments = CompilerPreprocess.MapArguments(t.Arguments, MapPath)
+                    .Select(a => a.StartsWith("-L", StringComparison.Ordinal) && a.Length > 2 ? "-L" + MapPath(a[2..]) : a).ToList(),
+            }));
             // A configured build log that yields nothing is a configuration error, not "no #ifdef config" (BL3).
             if (cmds.Count == 0)
             {
@@ -2192,6 +2200,33 @@ public static class CarveCommand
         }
         RootsPart("sections");
 
+        // A linker takes an archive member only when the image refers to it, and its kept sections and used/constructor
+        // code come with it. So for a file the log's link lines take only from an archive, those roots hold once the
+        // carve keeps the file (a self-registering driver the image doesn't link stays out). Anything the log doesn't
+        // settle keeps them, as without a link line.
+        var heldUntilLinked = new Dictionary<string, List<Root>>(StringComparer.Ordinal);
+        if (linkSteps.Count > 0)
+        {
+            var links = new LinkModel(buildCmds, linkSteps,
+                d => Path.IsPathFullyQualified(d) ? d : Path.Combine(dir, d), CmdRel);
+            summary["link.links"] = links.Links;
+            summary["link.archivesSearched"] = links.ArchivesSearched;
+            bool Held(Root r) => graph.GetNode(r.Node).FilePath is { } f && links.StatusOf(f) == LinkStatus.ArchiveOnly;
+            foreach (var r in implicitRoots.Concat(sectionRoots).Where(Held))
+            {
+                var f = graph.GetNode(r.Node).FilePath!;
+                if (!heldUntilLinked.TryGetValue(f, out var l)) heldUntilLinked[f] = l = new List<Root>();
+                l.Add(r);
+            }
+            if (heldUntilLinked.Count > 0)
+            {
+                implicitRoots = implicitRoots.Where(r => !Held(r)).ToList();
+                sectionRoots = sectionRoots.Where(r => !Held(r)).ToList();
+            }
+        }
+        Func<string, IEnumerable<Root>>? HeldIn() =>
+            heldUntilLinked.Count == 0 ? null : f => heldUntilLinked.TryGetValue(f, out var l) ? l : Enumerable.Empty<Root>();
+
         // C++ constructors run on every instantiation (untraceable), so a needed one must be rooted: the
         // constructor AND whatever it calls in its init-list/body must survive (a real pugixml dangling bug).
         // Review P5: root a class's constructors only once its name appears in text that will be emitted — every
@@ -2651,10 +2686,10 @@ public static class CarveCommand
         // The reachability plan (before closing over emitted text). For C++ it includes the constructor gate over
         // the files reachability keeps, so it already roots every constructor the kept code instantiates.
         var baseGate = NewCtorGate();
-        var plan = baseGate.Gate is null
+        var plan = baseGate.Gate is null && heldUntilLinked.Count == 0
             ? ReachabilityEngine.Compute(graph, rootSet)
             : EmitClosure.Close(graph, rootSet.Concat(baseGate.Initial), (_, _) => Array.Empty<NodeId>(),
-                                constructorsIn: CtorsIn(baseGate.Gate));
+                                constructorsIn: CtorsIn(baseGate.Gate), rootsIn: HeldIn());
         var ctorRootCount = baseGate.Gate is null ? 0
             : graph.Nodes.Count(n => n.Kind == NodeKind.Function && baseGate.Gate.ReleasedTypes.Contains(n.Name) && plan.IsKept(n.Id));
         Mark("reachability");
@@ -2672,6 +2707,8 @@ public static class CarveCommand
         summary["roots.implicit"] = implicitRoots.Count;
         summary["roots.assembly"] = asmRoots.Count;
         summary["roots.linkerSection"] = sectionRoots.Count;
+        summary["roots.heldUntilLinked"] = heldUntilLinked.Values.Sum(l => l.Count);
+        summary["roots.heldUntilLinkedReleased"] = heldUntilLinked.Values.SelectMany(l => l).Count(r => plan.IsKept(r.Node));
         summary["roots.constructor"] = ctorRootCount;
         summary["roots.constructorNotRooted"] = ctorGoverned - ctorRootCount;
         summary["roots.parseFailedKeptWhole"] = forceKeepRoots.Count;
@@ -2722,7 +2759,7 @@ public static class CarveCommand
         // Stubs: per file, the bodies to replace (StubBodies). A C function the run trace never names, not a root and not
         // force-kept; with its #if-split twins (one body, several names) only when none of them ran; never one holding
         // another definition. Asked by the plan (what a stubbed body no longer uses) and the emitter alike.
-        var rootIds = rootSet.Select(r => r.Node).ToHashSet();
+        var rootIds = rootSet.Concat(heldUntilLinked.Values.SelectMany(l => l)).Select(r => r.Node).ToHashSet();
         var stubCache = new Dictionary<string, Dictionary<NodeId, StubBodies.Body>>(StringComparer.Ordinal);
         // What ran, as definitions. A trace names linker symbols; the source may write another name: an object-like
         // rename macro (`#define summon_fn real_summon`), an asm label or `#pragma redefine_extname` (an Alias node calls
@@ -2797,7 +2834,7 @@ public static class CarveCommand
             var (gate, initial) = NewCtorGate();
             sp = EmitClosure.Close(graph, rootSet.Concat(initial).Concat(checkRoots[kind]),
                 (f, kept) => FileTreeEmitter.RetainedWhenEmitted(f, defsByFile!.GetValueOrDefault(f), kept, SourceText, kind != FileLevel),
-                constructorsIn: CtorsIn(gate), stubbed: kind == Stubbed ? id => StubOf(id) is not null : null);
+                constructorsIn: CtorsIn(gate), stubbed: kind == Stubbed ? id => StubOf(id) is not null : null, rootsIn: HeldIn());
             return stagePlans[kind] = sp;
         }
         var whyPlan = PlanFor(!cv.AnalysisOnly && cv.Stages.Count > 0 ? KindOf(cv.Stages[0]) : FileLevel);
@@ -2846,6 +2883,10 @@ public static class CarveCommand
         if (sectionRoots.Count > 0)
             @out.WriteLine($"  section : {sectionRoots.Count} symbol(s) in linker KEEP()'d section(s) auto-kept: "
                               + Summarize(sectionRoots.Select(r => r.Note ?? r.Node.ToString()).Distinct().ToList()));
+        if (heldUntilLinked.Count > 0)
+            @out.WriteLine($"  link    : {heldUntilLinked.Values.Sum(l => l.Count)} kept-section/used symbol(s) in {heldUntilLinked.Count} file(s) "
+                + "the link takes only from an archive: kept only with their file "
+                + $"({heldUntilLinked.Values.SelectMany(l => l).Count(r => plan.IsKept(r.Node))} were)");
         if (traceList.Count > 0)
         {
             var traceResolved = traceRoots.Select(r => r.Note).Where(n => n is not null).Distinct().Count();

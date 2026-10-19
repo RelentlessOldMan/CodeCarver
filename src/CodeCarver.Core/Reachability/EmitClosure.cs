@@ -22,13 +22,16 @@ public static class EmitClosure
     /// write although they are unreached. Called again whenever the file gains a reached node.</param>
     /// <param name="constructorsIn">Optional: the C++ constructors a kept file's text releases
     /// (<see cref="ConstructorGate"/>); rooted as <see cref="RootKind.Constructor"/>. Called once per kept file.</param>
+    /// <param name="rootsIn">Optional: roots that hold only once their file is kept (the kept sections of a file linked from
+    /// an archive, which the linker takes only when the image refers to it). Called once per kept file.</param>
     /// <param name="stubbed">Optional: the definitions whose body the emitter replaces with a stub (<see cref="Emit.StubBodies"/>):
     /// the functions and variables only such a body used are not reached through it.</param>
     public static CarvePlan Close(CodeGraph graph, IEnumerable<Root> roots,
                                   Func<string, Func<NodeId, bool>, IEnumerable<NodeId>> retainedIn,
                                   ReachabilityOptions? options = null,
                                   Func<string, IEnumerable<NodeId>>? constructorsIn = null,
-                                  Func<NodeId, bool>? stubbed = null)
+                                  Func<NodeId, bool>? stubbed = null,
+                                  Func<string, IEnumerable<Root>>? rootsIn = null)
     {
         ArgumentNullException.ThrowIfNull(graph);
         options ??= ReachabilityOptions.Safe;
@@ -37,6 +40,7 @@ public static class EmitClosure
         var why = new Dictionary<NodeId, KeepReason>();
         var work = new Queue<NodeId>();
         var dirty = new SortedSet<string>(StringComparer.Ordinal);
+        var released = new HashSet<string>(StringComparer.Ordinal);
 
         void Seed(NodeId id, RootKind kind)
         {
@@ -71,6 +75,9 @@ public static class EmitClosure
                 if (constructorsIn is not null)
                     foreach (var id in constructorsIn(f))
                         Seed(id, RootKind.Constructor);
+                if (rootsIn is not null && released.Add(f))
+                    foreach (var r in rootsIn(f))
+                        Seed(r.Node, r.Kind);
             }
             if (work.Count == 0) break;
         }
