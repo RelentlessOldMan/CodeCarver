@@ -1562,9 +1562,13 @@ public static class TemplateInstances
         return output;
     }
 
+    // Each macro's body as tokens, kept with the macro: tokenized again at each use, its matches were an eighth of what the
+    // template walks allocated (dl150: 12 of 103 GB). By the macro object (Macro is a record: a field would be compared).
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Macro, string[]> BodyTokens = new();
+
     static List<string> Substitute(Macro m, List<List<string>> args, Func<string, Macro?> macros, HashSet<string> hide, int depth)
     {
-        var body = Token.Matches(m.Body).Select(x => x.Value).ToList();
+        var body = BodyTokens.GetValue(m, static x => Token.Matches(x.Body).Select(t => t.Value).ToArray());
         var ps = m.Params ?? new List<string>();
         int Param(string tok)
         {
@@ -1579,10 +1583,10 @@ public static class TemplateInstances
             return k < args.Count ? args[k] : new List<string>();
         }
         var outp = new List<string>();
-        for (var i = 0; i < body.Count; i++)
+        for (var i = 0; i < body.Length; i++)
         {
             var t = body[i];
-            if (t == "#" && i + 1 < body.Count && Param(body[i + 1]) is var sp and >= 0)
+            if (t == "#" && i + 1 < body.Length && Param(body[i + 1]) is var sp and >= 0)
             {
                 outp.Add("\"" + string.Join(" ", Arg(sp)).Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"");
                 i++;
@@ -1590,7 +1594,7 @@ public static class TemplateInstances
             }
             var k = Param(t);
             if (k < 0) { outp.Add(t); continue; }
-            var pasted = (i > 0 && body[i - 1] == "##") || (i + 1 < body.Count && body[i + 1] == "##");
+            var pasted = (i > 0 && body[i - 1] == "##") || (i + 1 < body.Length && body[i + 1] == "##");
             outp.AddRange(pasted ? Arg(k) : ExpandTokens(Arg(k), macros, hide, depth + 1));
         }
         // Token pasting.
