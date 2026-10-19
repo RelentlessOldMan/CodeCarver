@@ -329,7 +329,7 @@ public static class FileTreeEmitter
                                               IReadOnlyDictionary<string, long>? have = null, Dictionary<string, long>? sizes = null,
                                               IncludeScan? scan = null)
     {
-        var outRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outDir)) + Path.DirectorySeparatorChar;
+        var outRoot = CodeCarver.Core.Util.PathComparer.DirectoryPrefix(Path.GetFullPath(outDir), Path.DirectorySeparatorChar);
         foreach (var trel in IncludeClosure(written, keptFiles, droppedFiles, sourceRoot, scan))
         {
             if (have is not null && have.TryGetValue(trel, out var had))
@@ -362,7 +362,7 @@ public static class FileTreeEmitter
                                               IReadOnlyList<string> droppedFiles, string sourceRoot, IncludeScan? scan = null)
     {
         scan ??= new IncludeScan();
-        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourceRoot)) + Path.DirectorySeparatorChar;
+        var root = CodeCarver.Core.Util.PathComparer.DirectoryPrefix(Path.GetFullPath(sourceRoot), Path.DirectorySeparatorChar);
         var known = new HashSet<string>(keptFiles, CodeCarver.Core.Util.PathComparer.Default);
         foreach (var f in droppedFiles) known.Add(f);               // graph-known drops: leave dropped
         var added = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);

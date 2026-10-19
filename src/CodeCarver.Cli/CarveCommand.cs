@@ -1380,7 +1380,8 @@ public static class CarveCommand
         if (closureLang && lang is "c" or "cpp")
         {
             var rootFull = Path.GetFullPath(dir);
-            var rootUnder = Path.TrimEndingDirectorySeparator(rootFull) + Path.DirectorySeparatorChar;   // "/repo2" is not under "/repo" (RB9)
+            // "/repo2" is not under "/repo" (RB9); a drive root (X:\) keeps its one separator, or nothing was under it.
+            var rootUnder = CodeCarver.Core.Util.PathComparer.DirectoryPrefix(rootFull, Path.DirectorySeparatorChar);
             var have = paths.Select(Path.GetFullPath).ToHashSet(CodeCarver.Core.Util.PathComparer.Default);
             var gathered = new HashSet<string>(CodeCarver.Core.Util.PathComparer.Default);
             var incRe = new System.Text.RegularExpressions.Regex("^\\s*#\\s*include\\s+\"([^\"]+)\"",
@@ -1438,10 +1439,26 @@ public static class CarveCommand
                 if (!skipParse.Contains(rel) && !notBuilt.Contains(rel)) { queue.Enqueue(fullByRel[rel]); seedRel.TryAdd(fullByRel[rel], rel); }
             // An included file was read when it was found (its text is kept in refIncludes): scanned from that text.
             var foundText = new System.Collections.Concurrent.ConcurrentDictionary<string, string>(StringComparer.Ordinal);
-            string? TryRead(string full)
+            // A file this scan can't read or size has its #includes not followed: a file only it includes is then not
+            // kept, and a run over a network share disagreed with one over a copy of the tree by one such file. Each read
+            // is tried twice, and what still fails is a warning and include.readFailures, never a quiet difference.
+            var includeReadFailures = 0;
+            void ReadFailed(string full, Exception? ex)
             {
-                if (foundText.TryRemove(full, out var known)) return known;
-                try { return CodeCarver.Core.Util.IoMeter.ReadAllText(full); } catch { return null; }
+                includeReadFailures++;
+                CappedWarn("includeRead", $"{Path.GetRelativePath(dir, full).Replace('\\', '/')}: could not be read{(ex is null ? "" : $" ({ex.GetType().Name})")} "
+                    + "to follow its quoted #includes — a non-code file only it includes is not kept as code (it is still copied); check it is readable and run again");
+            }
+            static T Twice<T>(Func<T> read)
+            {
+                try { return read(); }
+                catch (IOException) { Thread.Sleep(250); return read(); }   // a network drive's hiccup: once more
+            }
+            (string? Text, Exception? Error) TryRead(string full)
+            {
+                if (foundText.TryRemove(full, out var known)) return (known, null);
+                try { return (Twice(() => CodeCarver.Core.Util.IoMeter.ReadAllText(full)), null); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return (null, ex); }
             }
             while (queue.Count > 0)
             {
@@ -1450,7 +1467,7 @@ public static class CarveCommand
                 queue.Clear();
                 foreach (var (fromFull, read) in CodeCarver.Core.Util.ReadAhead.Map(batch, TryRead))
                 {
-                    if (read is not { } text) continue;
+                    if (read.Text is not { } text) { ReadFailed(fromFull, read.Error); continue; }
                     var fromDir = Path.GetDirectoryName(fromFull) ?? dir;
                     if (seedRel.Remove(fromFull, out var seedOf))
                     {
@@ -1496,15 +1513,15 @@ public static class CarveCommand
                         }
                         foreach (var target in cands)
                         {
-                            if (have.Contains(target) || !gathered.Add(target) || !File.Exists(target)) continue;
-                            if (SafeLength(target) > maxParseBytes) continue;   // vanished/locked: long.MaxValue, skipped (RB4)
-                            string itext;
-                            try { itext = CodeCarver.Core.Util.IoMeter.ReadAllText(target); }
-                            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                            {
-                                err.WriteLine($"  warn    : could not read included {Path.GetFileName(target)} ({ex.GetType().Name}) — not scanned; check it is in the carved tree");
-                                continue;
-                            }
+                            // The candidates come from directory listings or the tree walk: they exist. No second
+                            // existence check here (on a share a hiccup there dropped the file with no word).
+                            if (have.Contains(target) || !gathered.Add(target)) continue;
+                            long tlen;
+                            try { tlen = Twice(() => SafeLength(target) is var l && l != long.MaxValue ? l : new FileInfo(target).Length); }
+                            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { ReadFailed(target, ex); continue; }
+                            if (tlen > maxParseBytes) continue;   // too big to scan: copied as it is
+                            var (read2, readErr) = TryRead(target);
+                            if (read2 is not { } itext) { ReadFailed(target, readErr); continue; }
                             refIncludes.Add((Path.GetRelativePath(dir, target).Replace('\\', '/'), itext));
                             foundText[target] = itext;
                             queue.Enqueue(target); // an .inc may include another
@@ -1512,9 +1529,11 @@ public static class CarveCommand
                     }
                 }
             }
+            summary["include.readFailures"] = includeReadFailures;
         }
 
         FlushCappedWarn("include");
+        FlushCappedWarn("includeRead");
 
         using ICarveFrontEnd fe = lang switch
         {
@@ -1802,7 +1821,7 @@ public static class CarveCommand
                 {
                     if (!Directory.Exists(d)) { missingDirs++; continue; }
                     // A dir that contains the root (-I.. ) would mean the whole disk: its top level only.
-                    var holdsRoot = rootFull.StartsWith(Path.TrimEndingDirectorySeparator(d) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+                    var holdsRoot = rootFull.StartsWith(CodeCarver.Core.Util.PathComparer.DirectoryPrefix(d, Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase);
                     var opt = new EnumerationOptions { RecurseSubdirectories = !holdsRoot, IgnoreInaccessible = true };
                     var inDir = Directory.EnumerateFiles(d, "*", opt).Where(f => Path.GetExtension(f).Length > 0).Select(Path.GetFullPath).Where(Wanted).ToList();
                     foreach (var (f, read) in CodeCarver.Core.Util.ReadAhead.Map(inDir, ReadOutside)) ScanRead(f, read);
@@ -2961,7 +2980,7 @@ public static class CarveCommand
         // definitions are in files the build never compiled (notes, not failures).
         // The source tree doesn't change during the run (the output is outside it): what the check read from it in one
         // round or stage serves the next.
-        var sourceRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir)) + Path.DirectorySeparatorChar;
+        var sourceRoot = CodeCarver.Core.Util.PathComparer.DirectoryPrefix(Path.GetFullPath(dir), Path.DirectorySeparatorChar);
         // The tree's quoted includes, read once for every emit of the run (check rounds, stages).
         var includeScan = new FileTreeEmitter.IncludeScan();
         var linkCache = new LinkCheckCache(p =>

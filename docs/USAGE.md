@@ -697,6 +697,12 @@ example, to build it). `tools/mirror/mirror.ps1` (Windows, robocopy) and `tools/
 rsync) do both copies. Each copies only files whose size or last-write time differs, so after the first time
 a copy moves only what changed.
 
+Where the tree lives never changes what is kept: a run over the share, over a copy, or with the tree as a drive root
+(`X:\`) keeps the same files. The one thing that can differ is a file the share fails to give. Each read is tried
+twice, and a source or `#include`d file whose quoted `#include`s still can't be read is a warning (`could not be read
+to follow its quoted #includes`), counted in `include.readFailures` (0 when every file was read). A non-zero count
+means that run may keep less than one that read everything: run it again.
+
 The flow, with the tree at `R:\Prj` on the share:
 
 ```
