@@ -24,7 +24,7 @@ public sealed class ResolvedCarve
     public List<string> VaryingDefines = new();
     public List<string> BuildTraceFiles = new();
     public bool EveryBuildTraced;                  // every selected build has a build trace: its opens cover the whole build
-    public bool UnparsedHeaderCache = true;        // [advanced] reuse the last run's names from unchanged big headers
+    public string? CacheDirectory;                 // [advanced] cacheEnabled: where the big headers' names are kept between runs; null: no cache
     public string? MirrorOf;                       // [advanced] the carve root must match this tree (a local copy of a share)
     public bool SkipFilesNotBuilt = true;          // [advanced] then: code files no build opened are never read or parsed
     public bool PlaceholderFiles = true;           // [advanced] a dropped file the build compiled is emitted as a stand-in
@@ -126,7 +126,7 @@ public static class CarveResolver
         var selectedBuilds = buildNames.Where(b => cfg.Builds.ContainsKey(b)).ToList();
         r.EveryBuildTraced = selectedBuilds.Count > 0 && selectedBuilds.All(b => cfg.Builds[b].BuildTraceFiles.Count > 0);
         r.SkipFilesNotBuilt = cfg.SkipFilesNotBuilt;
-        r.UnparsedHeaderCache = cfg.UnparsedHeaderCache;
+        r.CacheDirectory = cfg.CacheEnabled ? cfg.CacheDirectory : null;
         r.MirrorOf = cfg.MirrorOf;
         r.PlaceholderFiles = cfg.PlaceholderFiles;
         var traced = runNames.Where(rn => cfg.Runs.TryGetValue(rn, out var x) && x.RunTraceFiles.Count > 0).ToList();

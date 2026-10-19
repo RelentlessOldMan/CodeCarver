@@ -204,6 +204,18 @@ public static class CarveCommand
         { err.WriteLine($"outputDirectory must be OUTSIDE the source tree (source '{Path.GetFullPath(dir)}' overlaps '{outputFull}')."); return 2; }
         if (File.Exists(outputFull))
         { err.WriteLine($"outputDirectory '{outputFull}' is a file, not a directory."); return 2; }
+        // [advanced] cacheEnabled: the cacheDirectory is written by the run, so never inside the tree it reads, and it
+        // must be usable before the work, not found unwritable at the end of a long run.
+        if (cv.CacheDirectory is { } cacheDir)
+        {
+            if (OutputPath.Overlaps(dir, cacheDir))
+            { err.WriteLine($"cacheDirectory must be OUTSIDE the source tree (source '{Path.GetFullPath(dir)}' overlaps '{cacheDir}')."); return 2; }
+            if (File.Exists(cacheDir))
+            { err.WriteLine($"cacheDirectory '{cacheDir}' is a file, not a directory."); return 2; }
+            try { Directory.CreateDirectory(cacheDir); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            { err.WriteLine($"cacheDirectory '{cacheDir}' can't be created ({ex.GetType().Name}: {ex.Message})."); return 2; }
+        }
         // Never replace a directory CodeCarver did not create (review O1): each stage writes <base>/carved and
         // <base>/codecarver; an existing non-empty one is only ours if <base> carries the output marker. Checked
         // before any work so a long analysis can't end by destroying someone's files.
@@ -290,7 +302,7 @@ public static class CarveCommand
         // of storing it, and record only the ROOT COUNT — never the names. (Redact() is a further backstop for any
         // stray path in free text like exception messages.)
         // Strings from THIS run that free text (exception messages) could carry: scrubbed at write time (D1).
-        diag.AddSensitive(roots.Concat(new[] { dir, Path.GetFullPath(dir), configPath, outputDirectory, outputFull })
+        diag.AddSensitive(roots.Concat(new[] { dir, Path.GetFullPath(dir), configPath, outputDirectory, outputFull, cv.CacheDirectory ?? "" })
             .Concat(buildLogs).Concat(traceList).Concat(buildFileTraces).Concat(runFileTraces).Concat(defineSpecs)
             .Concat(cv.ForceKeepFiles).Concat(cv.ExcludeDirectories));
         diag.Set("commandLine", SanitizeCommandLine(args));
@@ -1934,9 +1946,22 @@ public static class CarveCommand
             CodeCarver.Core.Util.ReadAhead.EnsureThreads();
             long slowestMs = 0, slowestBytes = 0, unreadable = 0, fromCache = 0, fromCacheBytes = 0;
             // What the last run read from these headers, for the ones unchanged since (size and last-write time): a
-            // rerun over the same tree reads none of them again. Kept beside the stage outputs, which a run replaces.
-            var cachePath = Path.Combine(outputFull, CacheDirName, "unparsed-headers.bin");
-            var cache = cv.UnparsedHeaderCache && unparsedToRead.Count > 0 ? new CodeCarver.Core.Preprocess.DefinedNameCache(cachePath, condIdents) : null;
+            // rerun over the same tree reads none of them again. Only with [advanced] cacheEnabled, in the cacheDirectory
+            // folder of this tree (the one a mirror copies: a run over the copy and one over the tree share it), so a new
+            // output directory doesn't quietly start with none and two trees never answer for each other.
+            string? cachePath = null;
+            if (cv.CacheDirectory is { } cdir && unparsedToRead.Count > 0)
+            {
+                var tree = cv.MirrorOf ?? dir;
+                var treeCache = CodeCarver.Core.Preprocess.DefinedNameCache.TreeDirectory(cdir, tree);
+                cachePath = Path.Combine(treeCache, "unparsed-headers.bin");
+                try { Directory.CreateDirectory(treeCache); File.WriteAllText(Path.Combine(treeCache, "tree.txt"), Path.GetFullPath(tree) + Environment.NewLine); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                err.WriteLine($"  config  : header cache for this tree: {treeCache}");
+            }
+            var cache = cachePath is not null ? new CodeCarver.Core.Preprocess.DefinedNameCache(cachePath, condIdents) : null;
+            if (cv.CacheDirectory is null && unparsedToRead.Count > 0)
+                err.WriteLine($"  config  : no header cache ([advanced] cacheEnabled) -> the {unparsedToRead.Count:N0} unparsed header(s) ({unparsedToRead.Sum(SizeOf) / (1024 * 1024):N0} MB) are read again on every run");
             Parallel.ForEach(System.Collections.Concurrent.Partitioner.Create(unparsedToRead, System.Collections.Concurrent.EnumerablePartitionerOptions.NoBuffering),
                 new ParallelOptions { MaxDegreeOfParallelism = CodeCarver.Core.Util.ReadAhead.Window }, rel =>
             {
@@ -1971,7 +1996,7 @@ public static class CarveCommand
             summary["world.unparsedHeadersFromCacheBytes"] = fromCacheBytes;
             if (fromCache > 0)
                 err.WriteLine($"  config  : {fromCache:N0} of {unparsedToRead.Count:N0} unparsed header(s) unchanged since the last run -> names reused, not read ({fromCacheBytes / (1024 * 1024):N0} MB)");
-            if (cache is not null && !cache.Save(cachePath))
+            if (cache is not null && !cache.Save(cachePath!))
                 err.WriteLine($"  warn    : could not write the unparsed-header cache '{cachePath}' (the next run reads them all again)");
             PreParsePart("unparsedHeaders");
             err.WriteLine($"  config  : {ambientMacros.Count:N0} macro name(s) #defined in the tree stay unknown unless the build defines them");
@@ -3474,6 +3499,7 @@ public static class CarveCommand
             sb.AppendLine($"allowUnmatchedTraces = {(cv.AllowUnmatchedTraces ? "true" : "false")}");
             sb.AppendLine($"pruneGarbage = {(pruneGarbage ? "true" : "false")}");
             if (cv.MirrorOf is { } mo) sb.AppendLine($"mirrorOf = {Q(mo)}");
+            if (cv.CacheDirectory is { } cdo) { sb.AppendLine("cacheEnabled = true"); sb.AppendLine($"cacheDirectory = {Q(cdo)}"); }
             if (cv.PathMap.Count > 0)
                 sb.AppendLine("pathMap = [" + string.Join(", ", cv.PathMap.Select(m => $"{{ from = {Q(m.From)}, to = {Q(m.To)} }}")) + "]");
             return sb.ToString();
@@ -3774,9 +3800,6 @@ public static class CarveCommand
     /// distance ≤ 2 among names of similar length.</summary>
     /// <summary>Deletes what an earlier check round wrote that this round did not, so the stage tree is the one a fresh
     /// emit writes. A larger plan writes the same files and more, so this is rarely anything.</summary>
-    /// <summary>Under outputDirectory: what one run keeps for the next (see [advanced] unparsedHeaderCache).</summary>
-    internal const string CacheDirName = ".codecarver-cache";
-
     /// <summary>The first 16 hex digits of the SHA-256 of a file list, sorted: two runs with the same value kept or wrote
     /// the same files, which equal counts alone don't show (a faster version must not change what it keeps).</summary>
     internal static string ListSha(IEnumerable<string> rels)

@@ -169,7 +169,8 @@ A stage may also set `stubUnexecuted = true` (with `carveSourceFileContents = tr
 | `pathMap = [{ from = "/build/agent/repo", to = "." }]` | none | rewrites a path prefix captured elsewhere (CI agent, other drive, WSL vs Windows) onto the carve root. `to` is relative to the carve root. Applies to trace paths and to compile commands (directory, file, `-I`, response files) |
 | `allowUnmatchedTraces = true` | `false` | a file trace with no path under the carve root becomes a warning instead of exit 2 |
 | `memoryStopMb = 20000` | none | stop the run when its private memory passes this many MB: it writes `<outputDirectory>/codecarver/stopped-summary.txt` (the summary so far, plus `stop.*` keys) and exits 4. `0` or unset: never stop |
-| `unparsedHeaderCache = false` | `true` | read the big and dense headers the parser skips on every run. By default a run keeps the `#if`-tested names each one defines in `<outputDirectory>/.codecarver-cache/`, and the next run reuses them for every such header whose size and last-write time are unchanged (`world.unparsedHeadersFromCache`, `world.unparsedHeadersFromCacheBytes`) instead of reading it again |
+| `cacheEnabled = true` | `false` | keep what a run reads from the big and dense headers the parser skips (the `#if`-tested names each one defines), so a later run reuses it for every such header whose size and last-write time are unchanged instead of reading it again (`world.unparsedHeadersFromCache`, `world.unparsedHeadersFromCacheBytes`). Needs `cacheDirectory`; without it the run stops (exit 2). Off: every run reads them all and says how much |
+| `cacheDirectory = "C:/carver-cache"` | none | where caches go, outside the source tree; one directory can serve every carve on the machine. Each tree gets its own folder in it, named after the tree's last folder plus a hash of its full path, with a `tree.txt` holding that path; the run prints the folder it uses. The tree is `mirrorOf` when set, else the carve root, so a run over a copy and one over the tree itself share a cache when `mirrorOf` names the tree exactly as those runs' carve root does. Carves of one tree with different settings share it too; nothing in it ever answers for another tree. Safe to delete |
 | `mirrorOf = "//server/share/tree"` | none | the carve root is a local copy of this tree: the run first compares the two by listing and stops (exit 2) if any file is missing, extra, or differs in size or last-write time. See [Carving a local copy](#carving-a-local-copy-of-a-tree-on-a-share) |
 | `pruneGarbage = false` | `true` | keep every non-input too (VCS metadata, IDE scratch, logs, editor backups, make `.d` dependency files) |
 
@@ -216,7 +217,6 @@ typo'd path can't silently carve with less config than intended.
     warnings.txt           every repeated warning in full (the console shows the first 20 per category); names paths
     summary.txt / .json    numbers only — no path, file name or symbol
   .codecarver-output       marker: this directory was written by CodeCarver
-  .codecarver-cache/       what one run keeps for the next (see [advanced] unparsedHeaderCache); safe to delete
 ```
 
 With `analysisOnly = true` there is no `carved/` and no `resolved-config.toml`; the other reports are written
@@ -768,7 +768,8 @@ what the check covered and cost: `mirror.files`, `mirror.differences`, `mirror.l
   `stageN.unchangedFiles` counts these. Only identical bytes keep a time, so a file that did change always
   looks changed to the copy.
 
-`.codecarver-cache/` sits in the output directory, so the next run reuses it. Each mirror script makes its
+With `[advanced] cacheEnabled`, a run over the copy reuses the header cache of runs over the share, and the other
+way round (see `cacheDirectory`). Each mirror script makes its
 target an exact copy, deleting files the source no longer has. So the first copy refuses a non-empty target
 it didn't make (`-Force` overrides), and it leaves `<target>.mirror-of.txt` beside the target so later copies
 go ahead.

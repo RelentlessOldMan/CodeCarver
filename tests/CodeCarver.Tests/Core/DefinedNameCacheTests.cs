@@ -43,16 +43,49 @@ public sealed class DefinedNameCacheTests : IDisposable
     }
 
     [Fact]
-    public void Save_KeepsOnlyWhatThisRunAsked_AndItsAnswerSet()
+    public void Save_KeepsWhatThisRunDidNotTouch_AndEachAnswerWhole()
     {
         Write(Set("FEAT_A", "FEAT_B"), ("one.h", 1, 1, new[] { "FEAT_A", "FEAT_B" }), ("two.h", 2, 2, new[] { "FEAT_B" }));
-        // A run that wants only FEAT_A and asks about one.h: the cache it leaves answers for FEAT_A, about one.h only.
+        // A run that wants only FEAT_A and asks about one.h: the cache it leaves still answers the wider run, about both.
         var c = new DefinedNameCache(PathOf, Set("FEAT_A"));
         Assert.Equal(new[] { "FEAT_A" }, c.TryGet("one.h", 1, 1));
         Assert.True(c.Save(PathOf));
-        Assert.Null(new DefinedNameCache(PathOf, Set("FEAT_A")).TryGet("two.h", 2, 2));
-        Assert.Null(new DefinedNameCache(PathOf, Set("FEAT_A", "FEAT_B")).TryGet("one.h", 1, 1));
-        Assert.Equal(new[] { "FEAT_A" }, new DefinedNameCache(PathOf, Set("FEAT_A")).TryGet("one.h", 1, 1));
+        var wide = new DefinedNameCache(PathOf, Set("FEAT_A", "FEAT_B"));
+        Assert.Equal(new[] { "FEAT_A", "FEAT_B" }, wide.TryGet("one.h", 1, 1));
+        Assert.Equal(new[] { "FEAT_B" }, wide.TryGet("two.h", 2, 2));
+    }
+
+    [Fact]
+    public void TwoCarves_WithOtherNames_TakingTurns_BothStayWarm()
+    {
+        // Carve X asks about FEAT_A, carve Y about FEAT_C, over the same unchanged header; then each again.
+        Write(Set("FEAT_A"), ("big.h", 5, 5, new[] { "FEAT_A" }));
+        var y = new DefinedNameCache(PathOf, Set("FEAT_C"));
+        Assert.Null(y.TryGet("big.h", 5, 5));   // Y has to read it once
+        y.Put("big.h", 5, 5, new[] { "FEAT_C" });
+        Assert.True(y.Save(PathOf));
+        Assert.Equal(new[] { "FEAT_A" }, new DefinedNameCache(PathOf, Set("FEAT_A")).TryGet("big.h", 5, 5));
+        Assert.Equal(new[] { "FEAT_C" }, new DefinedNameCache(PathOf, Set("FEAT_C")).TryGet("big.h", 5, 5));
+        // Changed since: the old answer is not merged into the new one.
+        var z = new DefinedNameCache(PathOf, Set("FEAT_D"));
+        z.Put("big.h", 6, 6, new[] { "FEAT_D" });
+        Assert.True(z.Save(PathOf));
+        Assert.Null(new DefinedNameCache(PathOf, Set("FEAT_A")).TryGet("big.h", 6, 6));
+    }
+
+    [Fact]
+    public void EachTree_HasItsOwnFolder_OneTree_OneFolderHoweverItEnds()
+    {
+        var root = Path.Combine(_dir, "caches");
+        var a = DefinedNameCache.TreeDirectory(root, Path.Combine(_dir, "trees", "prj"));
+        Assert.Equal(a, DefinedNameCache.TreeDirectory(root, Path.Combine(_dir, "trees", "prj") + Path.DirectorySeparatorChar));
+        Assert.NotEqual(a, DefinedNameCache.TreeDirectory(root, Path.Combine(_dir, "other", "prj")));
+        Assert.StartsWith(Path.Combine(root, "prj-"), a);   // lower-case on Windows, as named elsewhere
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.Equal(a, DefinedNameCache.TreeDirectory(root, Path.Combine(_dir, "TREES", "PRJ").Replace('\\', '/')));
+            Assert.StartsWith(Path.Combine(root, "root-"), DefinedNameCache.TreeDirectory(root, @"V:\"));
+        }
     }
 
     [Fact]

@@ -25,7 +25,8 @@ public sealed class CarveTomlConfig
     public bool AllowUnmatchedTraces;
     public bool PlaceholderFiles = true;                      // a dropped file the build compiled is emitted as a stand-in
     public bool SkipFilesNotBuilt = true;                     // with a build trace for every build: never read code it didn't open
-    public bool UnparsedHeaderCache = true;                   // reuse what the last run read from the big headers it did not parse
+    public bool CacheEnabled;                                 // keep what a run read from the big headers it did not parse, for the next run (in CacheDirectory)
+    public string? CacheDirectory;                            // where that cache lives; required when CacheEnabled
     public string? MirrorOf;                                  // the tree the carve root is a copy of: the run first checks they match
     public bool PruneGarbage = true;                          // drop VCS/IDE scratch, logs, dep files (false = keep everything)                         // a trace with no in-tree path is a warning, not an error
 }
@@ -72,7 +73,7 @@ public static class ConfigLoader
     public sealed record Result(CarveTomlConfig? Config, IReadOnlyList<string> Errors, IReadOnlyList<string> Warnings);
 
     private static readonly string[] TopKeys = { "outputDirectory", "analysisOnly", "common", "builds", "runs", "stages", "use", "advanced" };
-    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "memoryStopMb", "maxSymbolsPerFile", "pathMap", "allowUnmatchedTraces", "pruneGarbage", "skipFilesNotBuilt", "placeholderFiles", "unparsedHeaderCache", "mirrorOf" };
+    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "memoryStopMb", "maxSymbolsPerFile", "pathMap", "allowUnmatchedTraces", "pruneGarbage", "skipFilesNotBuilt", "placeholderFiles", "cacheEnabled", "cacheDirectory", "unparsedHeaderCache", "mirrorOf" };
     private static readonly string[] CommonKeys =
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
@@ -100,6 +101,7 @@ public static class ConfigLoader
         string R(string p) => string.IsNullOrWhiteSpace(p) || Path.IsPathFullyQualified(p) ? p : Path.GetFullPath(Path.Combine(baseDir, p));
         if (cfg.OutputDirectory is { } o) cfg.OutputDirectory = R(o);
         if (cfg.MirrorOf is { } m) cfg.MirrorOf = R(m);
+        if (cfg.CacheDirectory is { } cd) cfg.CacheDirectory = R(cd);
         if (cfg.Common.EntryPointsFile is { } e) cfg.Common.EntryPointsFile = R(e);
         foreach (var b in cfg.Builds.Values)
         {
@@ -214,7 +216,16 @@ public static class ConfigLoader
             cfg.AllowUnmatchedTraces = GetBool(adv, "allowUnmatchedTraces", "[advanced]", ctx) ?? false;
             cfg.PruneGarbage = GetBool(adv, "pruneGarbage", "[advanced]", ctx) ?? true;
             cfg.SkipFilesNotBuilt = GetBool(adv, "skipFilesNotBuilt", "[advanced]", ctx) ?? true;
-            cfg.UnparsedHeaderCache = GetBool(adv, "unparsedHeaderCache", "[advanced]", ctx) ?? true;
+            cfg.CacheDirectory = GetString(adv, "cacheDirectory", "[advanced]", ctx);
+            cfg.CacheEnabled = GetBool(adv, "cacheEnabled", "[advanced]", ctx) ?? false;
+            // The cache used to sit in the output directory, on unless turned off: a new output directory started with
+            // none and read tens of GB again. Now it is on only when asked for, and where the config says.
+            if (cfg.CacheEnabled && string.IsNullOrWhiteSpace(cfg.CacheDirectory))
+                ctx.Errors.Add("[advanced]: cacheEnabled = true needs cacheDirectory = \"<dir>\": where the cache is kept between runs.");
+            if (!cfg.CacheEnabled && cfg.CacheDirectory is not null)
+                warnings.Add("[advanced]: cacheDirectory is set but cacheEnabled is not true: no cache is used.");
+            if (adv.ContainsKey("unparsedHeaderCache"))
+                ctx.Errors.Add("[advanced]: 'unparsedHeaderCache' is gone: set cacheEnabled = true and cacheDirectory = \"<dir>\" to use the header cache (it is off without them).");
             cfg.MirrorOf = GetString(adv, "mirrorOf", "[advanced]", ctx);
             cfg.PlaceholderFiles = GetBool(adv, "placeholderFiles", "[advanced]", ctx) ?? true;
             if (adv.TryGetValue("pathMap", out var pm))
@@ -254,7 +265,7 @@ public static class ConfigLoader
         # Inputs and options live here, so the command line stays short. Relative paths are relative to THIS
         # file's directory; globs (excludeDirectories, forceKeepFiles) are relative to the source dir.
         # Rarely needed: analysisOnly = true (top level: plan + reports, no carved tree) and an [advanced]
-        # section (maxParseBytes, parseTimeout, memoryStopMb, maxSymbolsPerFile, pathMap, allowUnmatchedTraces, pruneGarbage, skipFilesNotBuilt, placeholderFiles, unparsedHeaderCache, mirrorOf) — see USAGE.md.
+        # section (maxParseBytes, parseTimeout, memoryStopMb, maxSymbolsPerFile, pathMap, allowUnmatchedTraces, pruneGarbage, skipFilesNotBuilt, placeholderFiles, cacheEnabled, cacheDirectory, mirrorOf) — see USAGE.md.
 
         # Where the carved project + reports go — must be OUTSIDE the source tree. CodeCarver manages a
         # carved/ + codecarver/ layout under it, and never replaces an existing directory it did not create.
