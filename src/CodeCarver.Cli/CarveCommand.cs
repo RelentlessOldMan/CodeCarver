@@ -1312,6 +1312,9 @@ public static class CarveCommand
         // the macro pre-pass) take what they need from that read rather than reading every file again (on a share each
         // read waits a round trip, and a big tree is read whole each time). By rel, each parsed file the scan read.
         var seeded = new Dictionary<string, (string[] SourceIncludes, string[] Quoted, int Computed)>(StringComparer.Ordinal);
+        // The tree's quoted includes, for every emit of the run (check rounds, stages): the include scan's read gives each
+        // parsed file's, so the emit doesn't read the file (or its copy, from the output) again.
+        var includeScan = new FileTreeEmitter.IncludeScan();
         // So does the roots step's search for symbols placed in a section a linker script KEEPs: when the tree has a
         // linker script, each scanned file's placements, by rel (only files that have one).
         bool IsLinkerScript(string p) => Path.GetExtension(p).ToLowerInvariant() is ".ld" or ".lds" or ".ldscript";
@@ -1502,6 +1505,7 @@ public static class CarveCommand
                         var (q, computed) = macroFactsWanted ? QuotedIncludes(text) : (Array.Empty<string>(), 0);
                         if (macroFactsWanted) ScanMacroNames(text, seedDefined, seedCond, seedOf);
                         seeded[seedOf] = (sourceIncludes, q, computed);
+                        includeScan.Know(seedOf, text);
                         if (sectionsWanted && LinkerSectionRootProvider.SectionPlacements(text).ToArray() is { Length: > 0 } placed)
                             seededSections[seedOf] = placed;
                     }
@@ -3132,8 +3136,6 @@ public static class CarveCommand
         // The source tree doesn't change during the run (the output is outside it): what the check read from it in one
         // round or stage serves the next.
         var sourceRoot = CodeCarver.Core.Util.PathComparer.DirectoryPrefix(Path.GetFullPath(dir), Path.DirectorySeparatorChar);
-        // The tree's quoted includes, read once for every emit of the run (check rounds, stages).
-        var includeScan = new FileTreeEmitter.IncludeScan();
         var linkCache = new LinkCheckCache(p =>
         {
             try { return Path.GetFullPath(p).StartsWith(sourceRoot, StringComparison.OrdinalIgnoreCase); }

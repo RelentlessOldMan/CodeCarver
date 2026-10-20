@@ -429,6 +429,15 @@ public static class FileTreeEmitter
     {
         internal readonly System.Collections.Concurrent.ConcurrentDictionary<string, string[]> Includes = new(CodeCarver.Core.Util.PathComparer.Default);
         internal readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> Exists = new(CodeCarver.Core.Util.PathComparer.Default);
+
+        /// <summary>The quoted includes of <paramref name="rel"/>, from <paramref name="text"/> that a scan before the
+        /// emit already read: the emit then reads neither the source nor its copy for them (on a share every emit read
+        /// each copy back). A text that could be over the 8 MB a read takes is left to the read, so the answer is the
+        /// one the read would give.</summary>
+        public void Know(string rel, string text)
+        {
+            if (text.Length * 3L <= 8 * 1024 * 1024) Includes.TryAdd(rel, LocalInclude.Matches(text).Select(m => m.Groups[1].Value).ToArray());
+        }
     }
 
     /// <summary>A C/C++ header — its definitions are API/inline/template code any translation unit may
