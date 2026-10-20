@@ -34,7 +34,11 @@ definition looked for in the tree's text; `roots.check.*` says how many files th
 `linkFlags`, `generatedCode` and `binaries` (the tree's prebuilt binaries searched for its function and global names).
 `stageN.time.<step>.ms` splits one stage's share of `emit`: `emit` (writing the tree), `check` (the link check of what was
 written), `rootsForMissing` and `replan` (these four summed over `stageN.checkRounds`, the emit-and-check rounds), `copyInfrastructure`,
-`stats`, `verify`, `buildOutputCases`, `placeholders`, `headerCarve` and `promoteAndArtifacts`.
+`stats`, `verify`, `buildOutputCases`, `placeholders`, `headerCarve`, `promote` (putting the written tree in place of the
+output directory; `stageN.promote.<part>.ms` splits it: `clearReadOnly`, `keepUnchangedTimes` (comparing with the
+previous output, when there is one), `move`, `replaceInPlace` and `deletePrior`, for the parts that ran) and `artifacts`
+(the report, manifest and summary in `codecarver/`). `roots.sections.filesRead` is how many files the `sections` part
+read itself; the rest it took from the include scan's read.
 `stageN` is a stage's position in that run, least aggressive first: with no `--stage` and stages `safe` and `max`,
 `max` is `stage1`; run alone with `--stage max`, it is `stage0`. `stageN.carveSourceFileContents` and
 `stageN.carveHeaderFileContents` say which stage it is.

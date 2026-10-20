@@ -148,11 +148,12 @@ public sealed class StagedOutput : IDisposable
     public void Promote()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        ClearReadOnlyTree(Dir); // carved output must be writable (Perforce read-only sources; in-place fallback; backup deletion)
-        if (Directory.Exists(_finalOut)) UnchangedFiles = KeepUnchangedTimes(Dir, _finalOut);
+        // carved output must be writable (Perforce read-only sources; in-place fallback; backup deletion)
+        Part("clearReadOnly", () => ClearReadOnlyTree(Dir));
+        if (Directory.Exists(_finalOut)) Part("keepUnchangedTimes", () => UnchangedFiles = KeepUnchangedTimes(Dir, _finalOut));
         if (!Directory.Exists(_finalOut))
         {
-            PromoteStaging(Dir, _finalOut); // fresh out: move staging into place
+            Part("move", () => PromoteStaging(Dir, _finalOut)); // fresh out: move staging into place
             _promoted = true;
             ReleaseLock();
             return;
@@ -161,10 +162,10 @@ public sealed class StagedOutput : IDisposable
         // A prior --out exists (the CLI has already confirmed it's a CodeCarver output — carries the marker —
         // so replacing it is authorized). Preferred path: atomic swap — move it aside, move staging in.
         var backup = _finalOut + $".ccold-{_token}";
-        if (Directory.Exists(backup)) TryDelete(backup);
+        if (Directory.Exists(backup)) Part("deletePrior", () => TryDelete(backup));
         try
         {
-            MoveWithRetry(_finalOut, backup);
+            Part("move", () => MoveWithRetry(_finalOut, backup));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -174,15 +175,15 @@ public sealed class StagedOutput : IDisposable
             // — overwrite the staged files and delete the ones the new carve dropped. Not atomic (a crash
             // mid-replace can leave a mix), but it's only reached when the atomic swap physically can't run,
             // and it restores the pre-atomic "just works with a shell open in the dir" behavior (eval-#9).
-            ReplaceInPlace(Dir, _finalOut);
-            TryDelete(Dir);
+            Part("replaceInPlace", () => ReplaceInPlace(Dir, _finalOut));
+            Part("deletePrior", () => TryDelete(Dir));
             _promoted = true;
             ReleaseLock();
             return;
         }
         try
         {
-            PromoteStaging(Dir, _finalOut); // staging -> final: retry, then copy-fallback
+            Part("move", () => PromoteStaging(Dir, _finalOut)); // staging -> final: retry, then copy-fallback
         }
         catch
         {
@@ -192,8 +193,19 @@ public sealed class StagedOutput : IDisposable
             throw;
         }
         _promoted = true;
-        TryDelete(backup); // prior output no longer needed
+        Part("deletePrior", () => TryDelete(backup)); // prior output no longer needed
         ReleaseLock();
+    }
+
+    /// <summary>After <see cref="Promote"/>: milliseconds each part took (clearReadOnly, keepUnchangedTimes, move,
+    /// replaceInPlace, deletePrior), for the parts that ran. On a share each is a walk of the tree.</summary>
+    public Dictionary<string, long> PromoteMs { get; } = new(StringComparer.Ordinal);
+
+    private void Part(string name, Action body)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        try { body(); }
+        finally { PromoteMs[name] = PromoteMs.GetValueOrDefault(name) + sw.ElapsedMilliseconds; }
     }
 
     /// <summary>
@@ -415,7 +427,13 @@ public sealed class StagedOutput : IDisposable
     /// meant to be edited/built, and read-only outputs also break the in-place fallback and backup deletion.</summary>
     private static void ClearReadOnlyTree(string dir)
     {
-        try { foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories)) ClearReadOnly(f); }
+        // The listing carries each file's attributes: only a read-only file costs a call (on a share each is a round trip).
+        try
+        {
+            foreach (var f in new DirectoryInfo(dir).EnumerateFiles("*", SearchOption.AllDirectories))
+                if ((f.Attributes & FileAttributes.ReadOnly) != 0)
+                    try { f.Attributes &= ~FileAttributes.ReadOnly; } catch { /* best effort */ }
+        }
         catch { /* best effort */ }
     }
 }

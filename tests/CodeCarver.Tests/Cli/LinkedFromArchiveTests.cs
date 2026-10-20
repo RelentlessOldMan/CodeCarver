@@ -72,5 +72,8 @@ public class LinkedFromArchiveTests
         Assert.Equal(0, t.Carve().Code);
         Assert.True(t.Kept("b.c"));
         Assert.DoesNotContain("roots.heldUntilLinked = 1", t.Summary);
+        // The KEEP'd-section search took every file's placements from the include scan's read, reading none again.
+        Assert.Contains("roots.sections.filesRead = 0", t.Summary);
+        Assert.Contains("stage0.promote.move.ms", t.Summary);
     }
 }

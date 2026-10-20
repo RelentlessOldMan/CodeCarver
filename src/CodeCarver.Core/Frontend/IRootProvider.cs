@@ -137,6 +137,12 @@ public sealed class LinkerSectionRootProvider : IRootProvider
 
     private readonly IEnumerable<string> _sourceTexts;
     private readonly IReadOnlyList<string> _linkerScriptTexts;
+    private readonly IEnumerable<IEnumerable<(string Symbol, string Section)>>? _placements;
+
+    /// <summary>From each source file's <see cref="SectionPlacements"/>, found while its text was read for something
+    /// else, so the tree isn't read a second time. In the order the texts would come.</summary>
+    public LinkerSectionRootProvider(IEnumerable<IEnumerable<(string Symbol, string Section)>> placements, IEnumerable<string> linkerScriptTexts)
+        : this(Array.Empty<string>(), linkerScriptTexts) => _placements = placements;
 
     public LinkerSectionRootProvider(IEnumerable<string> sourceTexts, IEnumerable<string> linkerScriptTexts)
     {
@@ -156,8 +162,8 @@ public sealed class LinkerSectionRootProvider : IRootProvider
 
         // symbol name -> the section it is placed in that a linker script KEEPs.
         var wanted = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var text in _sourceTexts)
-            foreach (var (symbol, section) in SectionPlacements(text))
+        foreach (var placements in _placements ?? _sourceTexts.Select(SectionPlacements))
+            foreach (var (symbol, section) in placements)
                 if (!wanted.ContainsKey(symbol) && kept.Any(re => re.IsMatch(section)))
                     wanted[symbol] = section;
 
@@ -205,7 +211,7 @@ public sealed class LinkerSectionRootProvider : IRootProvider
 
     /// <summary>(symbol, section) for every <c>__attribute__((section("x")))</c> placement, resolving the
     /// decorated symbol whether the attribute leads or trails the declaration.</summary>
-    private static IEnumerable<(string Symbol, string Section)> SectionPlacements(string text)
+    public static IEnumerable<(string Symbol, string Section)> SectionPlacements(string text)
     {
         if (!text.Contains("__attribute", StringComparison.Ordinal) && !text.Contains("[[", StringComparison.Ordinal)) yield break;
         foreach (var b in Attributes.Blocks(text))

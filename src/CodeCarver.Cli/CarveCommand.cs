@@ -1312,6 +1312,11 @@ public static class CarveCommand
         // the macro pre-pass) take what they need from that read rather than reading every file again (on a share each
         // read waits a round trip, and a big tree is read whole each time). By rel, each parsed file the scan read.
         var seeded = new Dictionary<string, (string[] SourceIncludes, string[] Quoted, int Computed)>(StringComparer.Ordinal);
+        // So does the roots step's search for symbols placed in a section a linker script KEEPs: when the tree has a
+        // linker script, each scanned file's placements, by rel (only files that have one).
+        bool IsLinkerScript(string p) => Path.GetExtension(p).ToLowerInvariant() is ".ld" or ".lds" or ".ldscript";
+        var sectionsWanted = lang is "c" or "cpp" && treeFiles.Any(p => IsLinkerScript(p) && !Excluded(p));
+        var seededSections = new Dictionary<string, (string Symbol, string Section)[]>(StringComparer.Ordinal);
         var srcExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++" };
         var macroFactsWanted = defines is not null && closedWorld && closureLang;
         var seedDefined = new HashSet<string>(StringComparer.Ordinal);
@@ -1497,6 +1502,8 @@ public static class CarveCommand
                         var (q, computed) = macroFactsWanted ? QuotedIncludes(text) : (Array.Empty<string>(), 0);
                         if (macroFactsWanted) ScanMacroNames(text, seedDefined, seedCond, seedOf);
                         seeded[seedOf] = (sourceIncludes, q, computed);
+                        if (sectionsWanted && LinkerSectionRootProvider.SectionPlacements(text).ToArray() is { Length: > 0 } placed)
+                            seededSections[seedOf] = placed;
                     }
                     foreach (System.Text.RegularExpressions.Match m in incRe.Matches(text))
                     {
@@ -1604,13 +1611,22 @@ public static class CarveCommand
         // The tree's own build scripts (makefiles, shell scripts, linker scripts...): their -D renames and link flags
         // count even when no build log was given.
         // Also the C source templates the build fills in (table.c.in, config.h.in): see GeneratedCode.
-        var buildFiles = lang is "c" or "cpp"
-            ? treeFiles.Select(p => (Rel: Path.GetRelativePath(dir, p).Replace('\\', '/'), Path: p))
-                .Where(f => (IsScript(f) || GeneratedCode.IsTemplate(f.Rel)) && !Excluded(f.Path) && SafeLength(f.Path) <= maxParseBytes).ToList()
-            : new List<(string Rel, string Path)>();
+        var buildFiles = new List<(string Rel, string Path)>();
+        var shebang = new HashSet<string>(StringComparer.Ordinal);   // extensionless files starting with "#!", by path
+        if (lang is "c" or "cpp")
+        {
+            var cands = treeFiles.Select(p => (Rel: Path.GetRelativePath(dir, p).Replace('\\', '/'), Path: p))
+                .Where(f => (LinkFlags.IsBuildScript(f.Rel) || GeneratedCode.IsTemplate(f.Rel) || Path.GetExtension(f.Rel).Length == 0)
+                            && !Excluded(f.Path) && SafeLength(f.Path) <= maxParseBytes).ToList();
+            // Each extensionless file is opened for its first two bytes: many at a time, as each open over a share waits.
+            var bare = cands.Where(f => !LinkFlags.IsBuildScript(f.Rel) && !GeneratedCode.IsTemplate(f.Rel)).Select(f => f.Path).ToList();
+            var isShebang = CodeCarver.Core.Util.ReadAhead.Each(bare, Shebang);
+            for (var i = 0; i < bare.Count; i++) if (isShebang[i]) shebang.Add(bare[i]);
+            buildFiles = cands.Where(f => IsScript(f) || GeneratedCode.IsTemplate(f.Rel)).ToList();
+        }
         var buildScripts = buildFiles.Where(IsScript).ToList();
         // A build script by name, or an extensionless file starting with "#!" (a generator: tools/mkhooks).
-        bool IsScript((string Rel, string Path) f) => LinkFlags.IsBuildScript(f.Rel) || (Path.GetExtension(f.Rel).Length == 0 && Shebang(f.Path));
+        bool IsScript((string Rel, string Path) f) => LinkFlags.IsBuildScript(f.Rel) || (Path.GetExtension(f.Rel).Length == 0 && shebang.Contains(f.Path));
         static bool Shebang(string path)
         {
             try
@@ -1621,8 +1637,23 @@ public static class CarveCommand
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return false; }
         }
         var templates = buildFiles.Where(f => GeneratedCode.IsTemplate(f.Rel)).ToList();
+        // Build scripts and templates are read by several steps (macros here; link flags, generated code and the files
+        // the build names later): read once, many at a time, as each read over a share waits a round trip. Held while
+        // they total 256 MB or less; past that, or for a file that failed here, each step reads its own.
+        var buildFileText = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (buildFiles.Sum(f => SafeLength(f.Path)) <= 256L << 20)
+        {
+            var texts = CodeCarver.Core.Util.ReadAhead.Each(buildFiles, f =>
+            {
+                try { return CodeCarver.Core.Util.IoMeter.ReadAllText(f.Path); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
+            });
+            for (var i = 0; i < buildFiles.Count; i++)
+                if (texts[i] is { } t) buildFileText[buildFiles[i].Path] = t;
+        }
+        string BuildFileText(string p) => buildFileText.TryGetValue(p, out var t) ? t : SafeRead(p);
         var commandLineMacros = CodeCarver.Core.Preprocess.CommandLineMacros.FromSpecs(
-            buildCmds.SelectMany(c => c.Defines).Concat(buildScripts.SelectMany(f => CodeCarver.Core.Preprocess.CommandLineMacros.SpecsInScript(SafeRead(f.Path)))));
+            buildCmds.SelectMany(c => c.Defines).Concat(buildScripts.SelectMany(f => CodeCarver.Core.Preprocess.CommandLineMacros.SpecsInScript(BuildFileText(f.Path)))));
 
         if (fe is TreeSitterFrontEnd tsfe)
         {
@@ -2183,7 +2214,7 @@ public static class CarveCommand
         if (lang is "c" or "cpp")
         {
             var linkerScripts = treeFiles
-                .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".ld" or ".lds" or ".ldscript")
+                .Where(IsLinkerScript)
                 .Where(p => !Excluded(p)).Where(p => SafeLength(p) <= maxParseBytes)
                 .Select(SafeRead).ToList();
             if (linkerScripts.Count > 0)
@@ -2194,8 +2225,18 @@ public static class CarveCommand
                 // scan: skip the big/dense headers (skipParse) — ReadRel returns "" for them, they carry no
                 // section attributes, and re-reading + regex-scanning them here was a second full-tree pass over
                 // exactly the multi-MB files skipParse exists to avoid (the ~20 GB / 70+ min blowup shape).
-                var srcTexts = parseRels.Where(r => !skipParse.Contains(r)).Select(ReadRel);
-                sectionRoots = new LinkerSectionRootProvider(srcTexts, linkerScripts).Discover(graph).ToList();
+                // The include scan kept each file's placements from its own read: only a file it didn't read is read here.
+                var reread = 0;
+                IEnumerable<(string Symbol, string Section)> Placements(string rel)
+                {
+                    if (seededSections.TryGetValue(rel, out var placed)) return placed;
+                    if (seeded.ContainsKey(rel)) return Array.Empty<(string, string)>();
+                    reread++;
+                    return LinkerSectionRootProvider.SectionPlacements(ReadRel(rel));
+                }
+                var placements = parseRels.Where(r => !skipParse.Contains(r)).Select(Placements);
+                sectionRoots = new LinkerSectionRootProvider(placements, linkerScripts).Discover(graph).ToList();
+                summary["roots.sections.filesRead"] = reread;
             }
         }
         RootsPart("sections");
@@ -2497,6 +2538,9 @@ public static class CarveCommand
 
         // Assembly startup (.s/.S) references C handlers by name (vector table `.word Handler`) — root them.
         RootsPart("outsideHeaders");
+        var asmText = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // AsmTexts
+        long asmTextChars = 0;
+        Dictionary<string, List<string>>? asmByName = null;   // BySuffix
         var asmRoots = new List<Root>();
         var asmFilesInTree = new List<string>();   // every in-scope assembly file (verify reads their symbols)
         if (lang is "c" or "cpp")
@@ -2526,11 +2570,12 @@ public static class CarveCommand
             {
                 // What the startup code includes names handlers too; a C header's prototypes would root everything it
                 // declares, so only its assembler directives count.
-                var asmTexts = asmPaths.Select(SafeRead).ToList();
-                foreach (var inc in AsmIncludes(asmPaths))
+                var asmTexts = AsmTexts(asmPaths).ToList();
+                var asmIncs = AsmIncludes(asmPaths);
+                foreach (var (inc, text) in asmIncs.Zip(AsmTexts(asmIncs)))
                     asmTexts.Add(Path.GetExtension(inc).ToLowerInvariant() is ".h" or ".hh" or ".hpp" or ".hxx"
-                        ? string.Join('\n', SafeRead(inc).Split('\n').Where(l => l.TrimStart().StartsWith('.')))
-                        : SafeRead(inc));
+                        ? string.Join('\n', text.Split('\n').Where(l => l.TrimStart().StartsWith('.')))
+                        : text);
                 asmRoots = new AsmReferenceRootProvider(asmTexts).Discover(graph).ToList();
             }
             // Every assembly file is copied whole, so the headers it includes are kept whole (review S1, D10).
@@ -2550,28 +2595,68 @@ public static class CarveCommand
             var includeRe = new System.Text.RegularExpressions.Regex(@"^[ \t]*(?:#[ \t]*include|\.include)[ \t]*[""<]([^"">\r\n]+)["">]",
                 System.Text.RegularExpressions.RegexOptions.Multiline);
             var seen = new HashSet<string>(asmPaths, StringComparer.OrdinalIgnoreCase);
-            var queue = new Queue<string>(seen);
+            var queue = new List<string>(seen);
             var found = new List<string>();
             while (queue.Count > 0)
             {
-                var path = queue.Dequeue();
-                if (SafeLength(path) > maxParseBytes) continue;
-                foreach (System.Text.RegularExpressions.Match m in includeRe.Matches(SafeRead(path)))
-                {
-                    var raw = m.Groups[1].Value.Trim().Replace('\\', '/');
-                    string? beside = null;
-                    try { beside = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(path) ?? dir, raw)); } catch { }
-                    var inTree = beside is not null && !Path.GetRelativePath(dir, beside).StartsWith("..", StringComparison.Ordinal);
-                    var hits = inTree && File.Exists(beside) && !Excluded(beside!)
-                        ? new List<string> { beside! }
-                        : treeFiles.Where(p => !Excluded(p) && ("/" + p.Replace('\\', '/')).EndsWith("/" + raw.TrimStart('.', '/'), StringComparison.OrdinalIgnoreCase)).ToList();
-                    foreach (var hit in hits)
-                        if (seen.Add(hit)) { queue.Enqueue(hit); found.Add(hit); }
-                }
+                // Everything queued, read at once; scanned in queue order, so what it adds is queued as before.
+                var batch = queue.Where(p => SafeLength(p) <= maxParseBytes).ToList();
+                queue = new List<string>();
+                foreach (var (path, text) in batch.Zip(AsmTexts(batch)))
+                    foreach (System.Text.RegularExpressions.Match m in includeRe.Matches(text))
+                    {
+                        var raw = m.Groups[1].Value.Trim().Replace('\\', '/');
+                        string? beside = null;
+                        try { beside = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(path) ?? dir, raw)); } catch { }
+                        var inTree = beside is not null && !Path.GetRelativePath(dir, beside).StartsWith("..", StringComparison.Ordinal);
+                        var hits = inTree && fileLookup.Exists(beside!) && !Excluded(beside!)
+                            ? new List<string> { beside! }
+                            : BySuffix(raw.TrimStart('.', '/'));
+                        foreach (var hit in hits)
+                            if (seen.Add(hit)) { queue.Add(hit); found.Add(hit); }
+                    }
             }
             return found;
         }
-
+        // In-tree files whose path ends with the include's spelling, found through their file name.
+        List<string> BySuffix(string tail)
+        {
+            if (asmByName is null)
+            {
+                asmByName = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var p in treeFiles)
+                {
+                    var bn = Path.GetFileName(p);
+                    if (!asmByName.TryGetValue(bn, out var l)) asmByName[bn] = l = new List<string>();
+                    l.Add(p);
+                }
+            }
+            return asmByName.TryGetValue(Path.GetFileName(tail), out var named)
+                ? named.Where(p => !Excluded(p) && ("/" + p.Replace('\\', '/')).EndsWith("/" + tail, StringComparison.OrdinalIgnoreCase)).ToList()
+                : new List<string>();
+        }
+        // Assembly files and what they include are read by the roots and by the include walk: each read once, many at a
+        // time (a share's round trips), and held while they total 256 MB or less.
+        string[] AsmTexts(IReadOnlyList<string> files)
+        {
+            var texts = CodeCarver.Core.Util.ReadAhead.Each(files, p =>
+            {
+                lock (asmText) if (asmText.TryGetValue(p, out var t)) return t;
+                try { return CodeCarver.Core.Util.IoMeter.ReadAllText(p); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
+            });
+            var result = new string[files.Count];
+            for (var i = 0; i < files.Count; i++)
+            {
+                result[i] = texts[i] ?? SafeRead(files[i]);   // failed: read alone, warned once
+                if (texts[i] is { } t && !asmText.ContainsKey(files[i]) && asmTextChars + t.Length <= 128L << 20)
+                {
+                    asmText[files[i]] = t;
+                    asmTextChars += t.Length;
+                }
+            }
+            return result;
+        }
         // forceKeepFiles (review K1): resolve each glob once. A forced code file is an ExplicitFile root, so its
         // callees and includes come with it; a forced .cmm seeds the .cmm closure; everything forced is copied
         // even when the carve dropped it.
@@ -2605,7 +2690,7 @@ public static class CarveCommand
             }
             foreach (var (rel, p) in buildScripts)
             {
-                var text = SafeRead(p);
+                var text = BuildFileText(p);
                 foreach (var (n, l) in LinkFlags.RequiredSymbols(text, LinkFlags.IsLinkerScript(rel)))
                     linkUses.Add((n, rel, l));
                 wrapped.UnionWith(LinkFlags.WrappedSymbols(text));
@@ -2623,9 +2708,9 @@ public static class CarveCommand
         if (lang is "c" or "cpp")
         {
             foreach (var (rel, p) in buildScripts)
-                foreach (var (n, l) in GeneratedCode.Calls(SafeRead(p), template: false)) genUses.Add((n, rel, l));
+                foreach (var (n, l) in GeneratedCode.Calls(BuildFileText(p), template: false)) genUses.Add((n, rel, l));
             foreach (var (rel, p) in templates)
-                foreach (var (n, l) in GeneratedCode.Calls(SafeRead(p), template: true)) genUses.Add((n, rel, l));
+                foreach (var (n, l) in GeneratedCode.Calls(BuildFileText(p), template: true)) genUses.Add((n, rel, l));
         }
         var genNames = genUses.Select(u => u.Name).ToHashSet(StringComparer.Ordinal);
         var genRoots = genUses.Count > 0
@@ -3412,7 +3497,7 @@ public static class CarveCommand
             var texts = new List<string>();
             foreach (var (_, p) in buildScripts)
             {
-                var text = SafeRead(p);
+                var text = BuildFileText(p);
                 texts.Add(text);
                 foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(text, @"[\w.+\-]+"))
                 {
@@ -3764,6 +3849,8 @@ public static class CarveCommand
                 diag.SetFailure(ex);
                 return 1;
             }
+            foreach (var (part, ms) in staged.PromoteMs) summary[$"{summaryStage}.promote.{part}.ms"] = ms;
+            Step("promote");
 
             infraEarlier ??= (outDir, infra.Files.Where(r => !exts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)))
                                                   .ToHashSet(StringComparer.Ordinal));
@@ -3813,7 +3900,7 @@ public static class CarveCommand
             WriteArtifact(Path.Combine(ccDir, "resolved-config.toml"), ResolvedConfigToml(stage), "config");
             WriteDecisions(ccDir, stage.Name, splan);
             WriteRepro(ccDir, splan);
-            Step("promoteAndArtifacts");
+            Step("artifacts");
             WriteSummary(ccDir);
         }
         Mark("emit");
