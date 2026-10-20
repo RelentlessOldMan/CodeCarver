@@ -142,7 +142,7 @@ public static class EmittedLinkCheck
         // Each loop's time, and memory as it ends: the process's private bytes, the managed heap the last GC left, and
         // managed bytes allocated in the loop (MB). A "Max" key is kept at its largest over a stage's rounds.
         var allocatedAt = GC.GetTotalAllocatedBytes();
-        long filesRead = 0, fromCache = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
+        long filesRead = 0, fromCache = 0, headersHandedOn = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
         // The tree's shape, for sizing a test corpus like it (shape.*): each header's size, each walk's include closure.
         var headerSizes = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
         // Headers spilled to the local disk (see ReadAgain), removed when the check is done.
@@ -198,7 +198,7 @@ public static class EmittedLinkCheck
         LinkCheckResult Done(IReadOnlyList<LinkViolation> v)
         {
             Lap("rest");
-            stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["instancesRedone"] = instancesRedone;
+            stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["headersHandedOn"] = headersHandedOn; stats["instancesRedone"] = instancesRedone;
             stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits; stats["parseWaits"] = parseGate.Waits;
             stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;
             stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped; stats["templateWalksReused"] = templateWalksReused;
@@ -206,7 +206,7 @@ public static class EmittedLinkCheck
             stats["walkNames"] = walkNames.Count;
             stats["headersSpilled"] = spilled.Count; stats["spillReads"] = spillReads; stats["spillMb"] = spillBytes >> 20;
             try { if (Directory.Exists(spillDir)) Directory.Delete(spillDir, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
-            foreach (var k in new[] { "filesRead", "fromCache", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames", "headersSpilled", "spillReads", "spillMb" })
+            foreach (var k in new[] { "filesRead", "fromCache", "headersHandedOn", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames", "headersSpilled", "spillReads", "spillMb" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -232,19 +232,54 @@ public static class EmittedLinkCheck
         // So a file waits until the bytes being scanned fit ScanBudget (scanGate); small files never wait.
         R Gated<R>(string path, Func<R> scan, CodeCarver.Core.Util.ByteGate? gate = null)
         {
-            long size;
-            try { size = new FileInfo(path).Length; }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { size = 0; }
+            // A header's size is known once the header pass read it (a Latin-1 character per byte): asked of the file
+            // again, each was a round trip on a share.
+            if (!headerSizes.TryGetValue(path, out var size))
+                try { size = new FileInfo(path).Length; }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { size = 0; }
             using ((gate ?? scanGate).Take(size))
             using (Activity.Working(size))
                 return scan();
         }
-        (HeaderInfo? Info, string? Text) ReadDirectives(string p)
+        // The header pass reads every emitted and dropped header before the scans read each one again (on a share, a round
+        // trip and its bytes each). A header's scan asks nothing of the header pass (only a unit's template walk does), so
+        // the pass hands on what it read: a dropped header's own scan, an emitted header's text (up to EarlyHeldBytes,
+        // as Latin-1 bytes). A big one is left to its scan (a scan holds many times its file, and here would run outside
+        // the scan budget).
+        var droppedHeaderPaths = droppedList.Where(d => IsHeader(d.Rel)).Select(d => d.Path).ToHashSet(StringComparer.Ordinal);
+        var emittedHeaderPaths = emittedList.Where(e => IsHeader(e.Rel)).Select(e => e.Path).ToHashSet(StringComparer.Ordinal);
+        var droppedEarly = new ConcurrentDictionary<string, DroppedEntry>(StringComparer.Ordinal);
+        var emittedEarly = new ConcurrentDictionary<string, byte[]>(StringComparer.Ordinal);
+        long earlyHeld = 0;
+        void HandOn(string p, string t)
+        {
+            if (t.Length > EarlyChars) return;
+            if (droppedHeaderPaths.Contains(p))
+            {
+                if (Cached(p) && cache!.Dropped.ContainsKey("h|" + p)) return;
+                using var scanPart = Activity.Part("dropped.scan", t.Length);
+                var own = Scan(t, header: true, declarators: false, definerMacros);
+                // A header is never template-walked (TemplateGate is for units): only its own definitions count.
+                droppedEarly[p] = new DroppedEntry
+                {
+                    Definitions = own.Definitions, FunctionMacros = own.FunctionMacros,
+                    HasInclude = false, MacroHead = false, HasDefine = false, MayHead = false,
+                    Includes = Array.Empty<string>(), C99 = new List<Definition>(),
+                };
+            }
+            else if (emittedHeaderPaths.Contains(p))
+            {
+                if (Interlocked.Add(ref earlyHeld, t.Length) <= EarlyHeldBytes) emittedEarly[p] = System.Text.Encoding.Latin1.GetBytes(t);
+                else Interlocked.Add(ref earlyHeld, -t.Length);
+            }
+        }
+        (HeaderInfo? Info, string? Text) ReadDirectives(string p, bool handOn = false)
         {
             using var part = Activity.Part("headerRead");
             Interlocked.Increment(ref filesRead);
             var t = TryRead(p, maxBytes);
             if (t is null) return (null, null);
+            if (handOn) HandOn(p, t);
             headerSizes.TryAdd(p, t.Length);
             t = CodeCarver.Core.Preprocess.SourceText.Normalize(t);
             var template = CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(t);
@@ -304,7 +339,7 @@ public static class EmittedLinkCheck
                 headerIncludes[p] = had;
                 return (hit.Info, hit.TemplateText);
             }
-            var h = ReadDirectives(p);
+            var h = ReadDirectives(p, handOn: true);
             var includes = h.Text is null ? Array.Empty<string>() : CodeCarver.Core.Preprocess.TemplateInstances.IncludeNames(h.Text);
             headerIncludes[p] = includes;
             if (cached)
@@ -621,6 +656,11 @@ public static class EmittedLinkCheck
             string? text = null;
             DroppedEntry? e;
             if (cached && cache!.Dropped.TryGetValue(key, out e)) Interlocked.Increment(ref fromCache);
+            else if (header && droppedEarly.TryRemove(f.Path, out var early))
+            {
+                Interlocked.Increment(ref headersHandedOn);
+                e = cached ? cache!.Dropped.GetOrAdd(key, early) : early;
+            }
             else
             {
                 Interlocked.Increment(ref filesRead);
@@ -769,7 +809,14 @@ public static class EmittedLinkCheck
         (ScanResult Scan, bool[]? Map)? ScanEmitted((string Rel, string Path) f)
         {
             string? text;
-            using (Activity.Part("emitted.read")) text = TryRead(f.Path, maxBytes);
+            if (emittedEarly.TryRemove(f.Path, out var early))
+            {
+                Interlocked.Increment(ref headersHandedOn);
+                Interlocked.Add(ref earlyHeld, -early.Length);
+                text = System.Text.Encoding.Latin1.GetString(early);
+            }
+            else
+                using (Activity.Part("emitted.read")) text = TryRead(f.Path, maxBytes);
             if (text is null) return null;
             bool[]? map;
             using (Activity.Part("emitted.deadLines", text.Length)) map = deadLines?.Invoke(f.Rel, text);
@@ -942,6 +989,11 @@ public static class EmittedLinkCheck
     const int SpillChars = 256 * 1024;
     const long SpillBudget = 8L << 30;
 
+    /// <summary>A header of up to this many chars that the header pass read is handed on to its scan (see HandOn); the
+    /// emitted headers' text held for that, at most <see cref="EarlyHeldBytes"/>.</summary>
+    const int EarlyChars = 1 << 20;
+    const long EarlyHeldBytes = 256L << 20;
+
     /// <summary>Characters of non-template header text the check holds at once: a 32nd of the machine's memory, or
     /// CODECARVER_CHECK_HEADER_MB.</summary>
     static long HeaderTextBudget()
@@ -1033,15 +1085,10 @@ public static class EmittedLinkCheck
     {
         try
         {
-            // Metered (io.read, and per step in the summary): the check reads the sources too, often on a share.
-            using (CodeCarver.Core.Util.IoMeter.Start(CodeCarver.Core.Util.IoMeter.Kind.Read))
-            {
-                var fi = new FileInfo(path);
-                if (!fi.Exists || fi.Length > maxBytes) return null;
-            }
             // Latin-1 is byte-transparent: identifiers are ASCII, and no byte sequence can fail to decode. IoMeter's
-            // read decodes once into the string (File.ReadAllText held it twice, in 4 KB reads).
-            return CodeCarver.Core.Util.IoMeter.ReadAllText(path, System.Text.Encoding.Latin1);
+            // read decodes once into the string (File.ReadAllText held it twice, in 4 KB reads), and takes the size limit
+            // from the open file (a size asked first was a round trip of its own on a share, and was metered as a read).
+            return CodeCarver.Core.Util.IoMeter.ReadAllText(path, System.Text.Encoding.Latin1, maxBytes);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
     }

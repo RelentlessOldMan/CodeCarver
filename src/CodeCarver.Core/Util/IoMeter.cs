@@ -84,11 +84,16 @@ public static class IoMeter
     }
 
     public static string ReadAllText(string path) => ReadAllText(path, null);
-    public static string ReadAllText(string path, Encoding? encoding)
+    public static string ReadAllText(string path, Encoding? encoding) => ReadAllText(path, encoding, long.MaxValue)!;
+
+    /// <summary>The text, or null for a file over <paramref name="maxBytes"/>: the size comes from the open file, where
+    /// asking for it first cost a round trip of its own on a share.</summary>
+    public static string? ReadAllText(string path, Encoding? encoding, long maxBytes)
     {
         using (Start(Kind.Read))
         {
             var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 0, FileOptions.SequentialScan);
+            if (fs.Length > maxBytes) { fs.Dispose(); return null; }
             Took(path, fs.Length);
             try
             {
