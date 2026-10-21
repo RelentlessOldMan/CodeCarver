@@ -3833,6 +3833,7 @@ public static class CarveCommand
                     summary[$"{summaryStage}.headerCarve.bytesBefore"] = hc.BytesBefore;
                     summary[$"{summaryStage}.headerCarve.bytesAfter"] = hc.BytesAfter;
                     summary[$"{summaryStage}.headerCarve.definesDropped"] = hc.DefinesDropped;
+                    summary[$"{summaryStage}.headerCarve.passes"] = hc.Passes;
                     carvedBytes -= hc.BytesBefore - hc.BytesAfter;
                     var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
                     @out.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} kept, {hc.DefinesDropped:N0} dropped; "

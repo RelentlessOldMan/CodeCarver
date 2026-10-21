@@ -3,7 +3,11 @@ using System.Text;
 namespace CodeCarver.Core.Emit;
 
 /// <summary>Outcome of carving big headers: bytes before/after and how many #defines were kept vs dropped.</summary>
-public sealed record HeaderCarveResult(long BytesBefore, long BytesAfter, int DefinesKept, int DefinesDropped);
+public sealed record HeaderCarveResult(long BytesBefore, long BytesAfter, int DefinesKept, int DefinesDropped)
+{
+    /// <summary>Reads of the big headers the fixpoint took (each pass reads every one).</summary>
+    public int Passes { get; init; }
+}
 
 /// <summary>
 /// EXPERIMENTAL header carving: strips unused <c>#define</c> macros from the giant auto-generated register
@@ -36,6 +40,9 @@ public static class HeaderCarver
     {
         var bigSet = new HashSet<string>(bigHeaderRels, StringComparer.OrdinalIgnoreCase);
         var bigFull = bigHeaderRels.Select(r => Path.Combine(outDir, r)).ToList();
+        // Files are read on many threads (one at a time, a work-scale output of 47 GB and GBs of big headers read
+        // again each pass took hours); what they found is folded in in file order, so the result is the same.
+        CodeCarver.Core.Util.Activity.Begin("files read for the header carve");
 
         // 1. Seed: every identifier used by kept code that ISN'T one of the carved headers. That is the set
         //    of names the compiled output could reference; a define outside its closure is unreachable.
@@ -50,81 +57,155 @@ public static class HeaderCarver
         var pastes = new Pastes();
         // Hidden files count (a .config, a dot-named generated header): only the system ones are skipped.
         var walk = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.System };
+        var candidates = Directory.EnumerateFiles(outDir, "*", walk)
+            .Where(f => !bigSet.Contains(Path.GetRelativePath(outDir, f).Replace('\\', '/'))).ToList();
         var seedFiles = new List<string>();
-        foreach (var f in Directory.EnumerateFiles(outDir, "*", walk))
+        foreach (var (i, seen) in CodeCarver.Core.Util.ReadAhead.Ordered(candidates, SeedScan, CodeCarver.Core.Util.ReadAhead.Window))
         {
-            var rel = Path.GetRelativePath(outDir, f).Replace('\\', '/');
-            if (bigSet.Contains(rel) || LooksBinary(f)) continue;
-            seedFiles.Add(f);
-            foreach (var line in LogicalLines(f))
-            {
-                AddIdentifiers(needed, line);
-                pastes.Learn(line, fragments);
-                pastes.LearnObject(line);
-            }
+            if (seen.Names is null) continue;   // binary
+            seedFiles.Add(candidates[i]);
+            needed.UnionWith(seen.Names);
+            // Only a line with a '#' can define or paste.
+            foreach (var line in seen.HashLines) { pastes.Learn(line, fragments); pastes.LearnObject(line); }
         }
         // A paste macro's own call sites name the pieces (`CAT(UART, 2)` builds UART2): learned macros first,
         // in the big headers too, then the calls.
-        foreach (var path in bigFull)
-            foreach (var (_, text, kind) in EnumerateLogicalLines(path))
-                if (kind == LineKind.Define) pastes.Learn(text, literals: null);   // its literal pieces count once it's wanted
+        foreach (var (_, defines) in CodeCarver.Core.Util.ReadAhead.Ordered(bigFull, FunctionLikeDefines, CodeCarver.Core.Util.ReadAhead.Window))
+            foreach (var text in defines) pastes.Learn(text, literals: null);   // its literal pieces count once it's wanted
         if (pastes.Any)
-            foreach (var f in seedFiles)
-                foreach (var line in LogicalLines(f))
-                    pastes.AddCallArguments(line, fragments);
+            foreach (var (_, lines) in CodeCarver.Core.Util.ReadAhead.Ordered(seedFiles, f => LogicalLines(f).Where(pastes.NamesPaster).ToList(), CodeCarver.Core.Util.ReadAhead.Window))
+                foreach (var line in lines) pastes.AddCallArguments(line, fragments);
 
-        // A define is wanted if the code references its name, OR a paste fragment could build that name.
+        // A define is wanted if the code references its name, OR a paste fragment could build that name. Only the
+        // lengths some fragment has are tried (every prefix and suffix of every define name was a string each).
+        var fragmentLengths = Array.Empty<int>();
+        void FreezeFragments() => fragmentLengths = fragments.Select(f => f.Length).Distinct().Order().ToArray();
         bool Wanted(string name)
         {
             if (needed.Contains(name) || ReadBySystemHeaders(name)) return true;
             if (fragments.Count <= 64)
                 return fragments.Any(fr => name.StartsWith(fr, StringComparison.Ordinal) || name.EndsWith(fr, StringComparison.Ordinal));
-            for (var k = 1; k <= name.Length; k++)
+            foreach (var k in fragmentLengths)
+            {
+                if (k > name.Length) break;
                 if (fragments.Contains(name[..k]) || fragments.Contains(name[^k..])) return true;
+            }
             return false;
         }
 
-        // 2. Fixpoint: grow `needed` with the bodies of wanted defines and all #if-condition identifiers,
-        //    streaming each header per pass. Terminates because `needed` only grows and is finite. Passes
-        //    ≈ the deepest define-dependency chain (small for register maps).
+        // 2. Fixpoint: grow `needed` with the bodies of wanted defines and all #if-condition identifiers.
+        //    Terminates because `needed` only grows and is finite. Passes ≈ the deepest define-dependency chain
+        //    (small for register maps).
         //    The header's own non-#define lines (typedefs, enums, inline functions) are kept verbatim, so the
         //    names they use are needed too; and a kept define that pastes (##) can form further names.
-        bool grew = true;
-        while (grew)
+        //    Headers are read in batches on many threads against what is needed so far, and what they hand back is
+        //    folded in in order. The first pass takes every kept line; a later one only the defines wanted, but those
+        //    taken two passes back (a name taken in a pass may have been passed over in a batch before it became
+        //    wanted; the pass after takes every line of it). When the paste macros grew, a call or a define taken
+        //    before can build more: the next pass takes every line again.
+        var batches = Batches(bigFull, 256L << 20);
+        var done = new HashSet<string>(StringComparer.Ordinal);
+        var takenBefore = new HashSet<string>(StringComparer.Ordinal);
+        var passes = 0;
+        for (var all = true; ;)
         {
-            grew = false;
-            foreach (var path in bigFull)
-                foreach (var (name, text, kind) in EnumerateLogicalLines(path))
-                {
-                    if (kind == LineKind.Define && (name is null || !Wanted(name))) continue;
-                    // Kept verbatim (not a define) or kept as wanted: what it names is needed, and what its pastes
-                    // and paste-macro calls can build.
-                    grew |= AddIdentifiers(needed, text);
-                    var n = fragments.Count;
-                    if (kind == LineKind.Define) pastes.Learn(text, fragments);
-                    pastes.AddCallArguments(text, fragments);
-                    if (kind == LineKind.Define && name is not null) pastes.ExpandDefine(name, text, fragments);
-                    grew |= fragments.Count != n;
-                }
+            passes++;
+            var grew = false;
+            var taken = new HashSet<string>(StringComparer.Ordinal);
+            var pastesAt = pastes.Version;
+            foreach (var batch in batches)
+            {
+                FreezeFragments();
+                var skip = all ? null : done;
+                foreach (var lines in CodeCarver.Core.Util.ReadAhead.Each(batch, path => KeptLines(path, all, skip, Wanted)))
+                    foreach (var (name, text, kind) in lines)
+                    {
+                        // Kept verbatim (not a define) or kept as wanted: what it names is needed, and what its pastes
+                        // and paste-macro calls can build.
+                        grew |= AddIdentifiers(needed, text);
+                        var n = fragments.Count;
+                        if (kind == LineKind.Define) pastes.Learn(text, fragments);
+                        pastes.AddCallArguments(text, fragments);
+                        if (kind == LineKind.Define && name is not null) { pastes.ExpandDefine(name, text, fragments); taken.Add(name); }
+                        grew |= fragments.Count != n;
+                    }
+            }
+            all = pastes.Version != pastesAt;
+            grew |= all;
+            done.UnionWith(takenBefore);
+            takenBefore = taken;
+            if (!grew) break;
         }
 
         // 3. Emit: rewrite each header, dropping #defines whose name isn't wanted (and their continuations).
-        long before = 0, after = 0;
-        var kept = 0;
-        var dropped = 0;
-        foreach (var path in bigFull)
+        FreezeFragments();
+        var rewritten = CodeCarver.Core.Util.ReadAhead.Each(bigFull, path =>
         {
-            before += new FileInfo(path).Length;
+            var before = new FileInfo(path).Length;
             var tmp = path + ".carve.tmp";
+            int kept = 0, dropped = 0;
             RewriteDroppingUnneeded(path, tmp, Wanted, ref kept, ref dropped);
             // A read-only source copy (Perforce) must not make the replace throw.
             var attrs = File.GetAttributes(path);
             if ((attrs & FileAttributes.ReadOnly) != 0) File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
             File.Delete(path);
             File.Move(tmp, path);
-            after += new FileInfo(path).Length;
+            return (Before: before, After: new FileInfo(path).Length, Kept: kept, Dropped: dropped);
+        });
+        return new HeaderCarveResult(rewritten.Sum(r => r.Before), rewritten.Sum(r => r.After), rewritten.Sum(r => r.Kept), rewritten.Sum(r => r.Dropped)) { Passes = passes };
+    }
+
+    /// <summary>A seed file's identifiers and its logical lines with a '#' (null names: a binary file).</summary>
+    private static (HashSet<string>? Names, List<string> HashLines) SeedScan(string path)
+    {
+        if (LooksBinary(path)) return (null, new List<string>());
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var hashLines = new List<string>();
+        foreach (var line in LogicalLines(path))
+        {
+            AddIdentifiers(names, line);
+            if (line.Contains('#')) hashLines.Add(line);
         }
-        return new HeaderCarveResult(before, after, kept, dropped);
+        return (names, hashLines);
+    }
+
+    /// <summary>A big header's function-like #defines: the paste macros are learned from them.</summary>
+    private static List<string> FunctionLikeDefines(string path)
+    {
+        var list = new List<string>();
+        foreach (var (_, text, kind) in EnumerateLogicalLines(path))
+            if (kind == LineKind.Define && Pastes.FunctionLike(text).Name is not null) list.Add(text);
+        return list;
+    }
+
+    /// <summary>A pass's lines of one big header: every non-define line when <paramref name="all"/>, and each wanted
+    /// define (but those named in <paramref name="skip"/>).</summary>
+    private static List<(string? Name, string Text, LineKind Kind)> KeptLines(string path, bool all, HashSet<string>? skip, Func<string, bool> wanted)
+    {
+        var list = new List<(string?, string, LineKind)>();
+        foreach (var (name, text, kind) in EnumerateLogicalLines(path))
+        {
+            if (kind != LineKind.Define) { if (all) list.Add((name, text, kind)); continue; }
+            if (name is null || skip?.Contains(name) == true || !wanted(name)) continue;
+            list.Add((name, text, kind));
+        }
+        return list;
+    }
+
+    /// <summary>The headers in runs of about <paramref name="bytes"/> each, in order.</summary>
+    private static List<List<string>> Batches(List<string> paths, long bytes)
+    {
+        var batches = new List<List<string>>();
+        var cur = new List<string>();
+        long size = 0;
+        foreach (var p in paths)
+        {
+            cur.Add(p);
+            size += new FileInfo(p).Length;
+            if (size >= bytes) { batches.Add(cur); cur = new List<string>(); size = 0; }
+        }
+        if (cur.Count > 0) batches.Add(cur);
+        return batches;
     }
 
     private enum LineKind { Define, Conditional, Other }
@@ -369,6 +450,25 @@ public static class HeaderCarver
         private readonly HashSet<string> pasters = new(StringComparer.Ordinal);
         public bool Any => pasters.Count > 0;
 
+        /// <summary>Grows when a paste macro or an expanded argument name is learned: calls and defines read before may
+        /// then build more names.</summary>
+        public int Version => pasters.Count + expanded.Count;
+
+        /// <summary>Does <paramref name="text"/> name a paste macro (a line <see cref="AddCallArguments"/> could learn
+        /// from)? Reads only; safe beside it.</summary>
+        public bool NamesPaster(string text)
+        {
+            var i = 0;
+            while (i < text.Length)
+            {
+                if (!IsIdentStart(text[i]) || (i > 0 && IsIdentChar(text[i - 1]))) { i++; continue; }
+                var s = i;
+                while (i < text.Length && IsIdentChar(text[i])) i++;
+                if (pasters.Contains(text[s..i])) return true;
+            }
+            return false;
+        }
+
         /// <summary>Learn a logical line: a function-like #define that pastes a parameter becomes a paster; its literal
         /// paste pieces go to <paramref name="literals"/> (null: not yet, the define isn't known to be wanted).</summary>
         public void Learn(string text, HashSet<string>? literals)
@@ -493,7 +593,7 @@ public static class HeaderCarver
         /// <summary>Name, parameters and body of a function-like <c>#define NAME(params) body</c>, or a null name.</summary>
         /// <summary>Name, parameters, body and variadic parameter (<c>__VA_ARGS__</c>, or <c>args</c> for GNU's
         /// <c>args...</c>; null when not variadic) of a function-like <c>#define NAME(params) body</c>, or a null name.</summary>
-        private static (string? Name, HashSet<string> Params, string Body, string? Variadic) FunctionLike(string text)
+        internal static (string? Name, HashSet<string> Params, string Body, string? Variadic) FunctionLike(string text)
         {
             var none = (default(string), new HashSet<string>(), "", default(string));
             if (!IsDefineDirective(text.TrimStart())) return none;
