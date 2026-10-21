@@ -43,6 +43,10 @@ $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $ex = Join-Path $repo "examples/$Example"
 $src = Join-Path $ex 'src'
 $sdk = Join-Path $ex 'sdk'
+# A file whose name is not ASCII is checked in under an ASCII name outside src (a Perforce server without Unicode
+# rejects the name) and takes its real name here: cafe.c.in is src/caf<e-acute>.c (ignored by git).
+$cafe = Join-Path $ex 'cafe.c.in'
+if (Test-Path $cafe) { Copy-Item $cafe (Join-Path $src "caf$([char]0xE9).c") -Force }
 # oracle.txt: "binary <name>", "dropped <rel>" and "placeholder <rel>" (checked with log + trace, every stage).
 $checks = @(Get-Content -Encoding utf8 (Join-Path $ex 'oracle.txt') | Where-Object { $_ -match '^\w+ ' } | ForEach-Object { $k, $v = $_ -split ' ', 2; [pscustomobject]@{ Kind = $k; Rel = $v } })
 $bin = ($checks | Where-Object Kind -eq 'binary' | Select-Object -First 1).Rel

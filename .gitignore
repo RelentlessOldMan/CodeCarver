@@ -56,3 +56,6 @@ examples/*/out/
 
 # Filled-in TOML presets carry real repo paths/roots too
 presets/*.toml
+
+# Made from examples/hellbuild/cafe.c.in by the tests and the oracle (a non-ASCII name is not checked in)
+examples/hellbuild/src/caf*.c

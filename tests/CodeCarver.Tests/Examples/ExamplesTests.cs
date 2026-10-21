@@ -271,6 +271,7 @@ public sealed class ExamplesTests
             {
                 var dir = work.Sub(example);
                 TempDir.CopyTree(Path.Combine(TestRepo.Root, "examples", example), dir);
+                ExampleRun.RealNames(dir);
                 ToLf(dir);
                 var cfg = Path.Combine(dir, configName);
                 if (configText is not null) File.WriteAllText(cfg, configText);

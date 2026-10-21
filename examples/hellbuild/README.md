@@ -30,10 +30,13 @@ carves from `inputs/` on every push, and CI runs the whole oracle on Linux befor
 | Compiles behind a compiler-cache wrapper, a libtool-like launcher (`/bin/sh ltwrap --mode=compile ...`) and `sh -c '...'` | The compile, with its `-D`, is not the first word on the line, or is a single quoted word. | `tools/`, `lt.c`, `shc.c` |
 | Quiet rules (`  CC q1.o`) and a makefile naming a source only by its stem: `$(addsuffix .o,q1 q2)` | No command at all. An unreached `q2.c` still has to exist. | `quiet/` |
 | A response file the build writes and then loses; a compile through a symlink in the build directory | The `-D` and the source name are unreadable, or the path points outside the tree. | `rsp.c`, `linked/` |
-| File names with a non-ASCII letter, a quote and a space: `café.c`, `it's here.c` | The log quotes them, and strace escapes them. | |
+| File names with a non-ASCII letter, a quote and a space: `café.c`, `it's here.c` | The log quotes them, and strace escapes them. | `cafe.c.in` |
 | A line-continued recipe, CMake-style `[ 42%]` progress lines | Noise. | `Makefile` |
 
 The first five rows and `it's here.c` each broke a carve when they went in: a silent miss, a carved build that
 failed, a false verify failure, or a decoy kept. The response file, the symlink, `café.c` and the noise were
 already handled.
+
+`café.c` is checked in as `cafe.c.in`, outside `src`: a Perforce server without Unicode rejects a non-ASCII file
+name. The tests and the oracle copy it to `src/café.c` before they carve or build.
 Add the next build horror the same way: make the program's output depend on it, and run the oracle.

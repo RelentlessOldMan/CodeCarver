@@ -15,6 +15,7 @@ internal class ExampleRun : IDisposable
         _work = new TempDir($"cc-{example}-");
         Dir = _work.Sub(example);
         TempDir.CopyTree(Path.Combine(TestRepo.Root, "examples", example), Dir);
+        RealNames(Dir);
         var cfg = Path.Combine(Dir, "carve.toml");
         if (buildSection is not null)
         {
@@ -34,4 +35,12 @@ internal class ExampleRun : IDisposable
         && File.ReadAllText(Carved(stage, rel)).Contains("Placeholder written by CodeCarver");
     public string Summary(string stage) => File.ReadAllText(Path.Combine(Dir, "out", stage, "codecarver", "summary.txt"));
     public void Dispose() => _work.Dispose();
+
+    /// <summary>A file whose name is not ASCII is checked in under an ASCII name outside src (a Perforce server without
+    /// Unicode rejects the name) and takes its real name in each copy: examples/hellbuild/cafe.c.in is src/café.c.</summary>
+    public static void RealNames(string exampleDir)
+    {
+        var cafe = Path.Combine(exampleDir, "cafe.c.in");
+        if (File.Exists(cafe)) File.Move(cafe, Path.Combine(exampleDir, "src", "café.c"));
+    }
 }
