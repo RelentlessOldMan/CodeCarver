@@ -411,6 +411,18 @@ public static class CarveCommand
             var mb = (now - Interlocked.Exchange(ref allocatedAt, now)) / (1024 * 1024);
             return mb;
         }
+        // What the run still holds as a step ends: the managed heap after a full collection (MB). A peak says how much a
+        // step had, not what it kept for the steps after; at work a stop in the check could not say whether the check or
+        // an earlier step held the memory. The collections cost time (mem.liveGc.ms, all of them).
+        long _liveGcMs = 0;
+        long LiveMb()
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: false);
+            var live = GC.GetTotalMemory(false) / (1024 * 1024);
+            summary["mem.liveGc.ms"] = _liveGcMs += sw.ElapsedMilliseconds;
+            return live;
+        }
         long TakePeakMb()
         {
             long now;
@@ -504,7 +516,8 @@ public static class CarveCommand
             if (beat)
                 err.WriteLine($"  working : {(int)inStep.TotalMinutes} min into the step after '{after}'"
                     + (CodeCarver.Core.Util.Activity.Describe() is { } got ? $": {got} so far" : "") + $" (run {Clock(runAt)})"
-                    + Environment.NewLine + $"  memory  : {_memoryNow}");
+                    + Environment.NewLine + $"  memory  : {_memoryNow}"
+                    + (CodeCarver.Core.Util.HeldMeter.Describe() is { } held ? Environment.NewLine + $"  held    : {held}" : ""));
             if (report is not null)
             {
                 err.WriteLine(report);
@@ -516,6 +529,7 @@ public static class CarveCommand
             var peak = TakePeakMb();
             summary[$"mem.{phase}.peakMb"] = Math.Max(peak, summary.TryGetValue($"mem.{phase}.peakMb", out var pw) && pw is long pl ? pl : 0L);
             summary[$"mem.{phase}.allocatedMb"] = TakeAllocatedMb() + (summary.TryGetValue($"mem.{phase}.allocatedMb", out var aw) && aw is long al ? al : 0L);
+            summary[$"mem.{phase}.liveMb"] = LiveMb();
             CpuAndIo("", phase, ref _phaseIo, ref _phaseCpu);
             Progress(phase);
             if (_timing) err.WriteLine($"  timing  : {phase,-14} {_tsw.ElapsedMilliseconds,7} ms");
@@ -3377,6 +3391,12 @@ public static class CarveCommand
             snap["stop.privateMb"] = priv / MB;
             snap["stop.workingSetMb"] = workingSet / MB;
             snap["stop.managedMb"] = GC.GetTotalMemory(false) / MB;
+            var gcInfo = GC.GetGCMemoryInfo();
+            snap["stop.heapMb"] = gcInfo.HeapSizeBytes / MB;                 // the heap as the last collection left it
+            snap["stop.heapFragmentedMb"] = gcInfo.FragmentedBytes / MB;
+            snap["stop.gcCommittedMb"] = gcInfo.TotalCommittedBytes / MB;
+            // What each part of the run says it holds (HeldMeter): the check's texts, scans and walks running, its tables.
+            foreach (var (k, v) in CodeCarver.Core.Util.HeldMeter.Now()) snap[$"stop.{k}"] = v;
             if (machine is { } m) { snap["stop.machineFreeMb"] = m.Free / MB; if (m.CommitFree >= 0) snap["stop.commitRoomMb"] = m.CommitFree / MB; }
             if (CodeCarver.Core.Util.Activity.Describe() is { } got) snap["stop.count"] = got;
             var (inFlight, largest) = CodeCarver.Core.Util.Activity.InHand;
@@ -3685,6 +3705,8 @@ public static class CarveCommand
                 summary[mkey] = Math.Max(peak, summary.TryGetValue(mkey, out var mw) && mw is long ml ? ml : 0L);
                 var akey = $"{summaryStage}.mem.{step}.allocatedMb";
                 summary[akey] = TakeAllocatedMb() + (summary.TryGetValue(akey, out var aw) && aw is long al ? al : 0L);
+                var lkey = $"{summaryStage}.mem.{step}.liveMb";   // the largest over the check rounds
+                summary[lkey] = Math.Max(LiveMb(), summary.TryGetValue(lkey, out var lw) && lw is long ll ? ll : 0L);
                 Progress($"{(stage.Name.Length == 0 ? "stage" : stage.Name)} {step}");
                 var key = $"{summaryStage}.time.{step}.ms";
                 summary[key] = (summary.TryGetValue(key, out var was) && was is long w ? w : 0L) + stageClock.ElapsedMilliseconds;

@@ -132,6 +132,7 @@ public static class EmittedLinkCheck
         var live = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
         var dead = new Dictionary<string, (string Rel, int Line)>(StringComparer.Ordinal);
         long heldChars = 0;
+        IDisposable? heldNow = null;   // what the check holds, for the heartbeat and a memory stop (HeldMeter)
         // The names the template walks have looked up, by hash (string.GetHashCode), each with the order it came in: a
         // non-template header is held with only the defines of these (TemplateInstances.KeepDefines). A register-map tree
         // is nearly all #defines no walk asks for: held whole, it went past HeaderTextBudget, and every walk read and parsed
@@ -157,6 +158,9 @@ public static class EmittedLinkCheck
             try { using var self = System.Diagnostics.Process.GetCurrentProcess(); stats[key + ".privateMaxMb"] = self.PrivateMemorySize64 >> 20; }
             catch (InvalidOperationException) { }
             stats[key + ".heapMaxMb"] = GC.GetGCMemoryInfo().HeapSizeBytes >> 20;
+            // ...and what is still live as it ends (a full collection): what the loop kept for the loops after.
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: false);
+            stats[key + ".liveMaxMb"] = GC.GetTotalMemory(false) >> 20;
             var now = GC.GetTotalAllocatedBytes();
             stats[key + ".allocatedMb"] = (now - allocatedAt) >> 20;
             allocatedAt = now;
@@ -176,7 +180,7 @@ public static class EmittedLinkCheck
             Shape(stats, headerSizes.Values, closures, templateWalks, templateWalksSkipped);
             phase.Restart();
             // Handed out as each loop ends, so a run stopped inside the check still has the loops before.
-            foreach (var k in new[] { key + "Ms", key + ".privateMaxMb", key + ".heapMaxMb", key + ".allocatedMb" }
+            foreach (var k in new[] { key + "Ms", key + ".privateMaxMb", key + ".heapMaxMb", key + ".liveMaxMb", key + ".allocatedMb" }
                          .Concat(stats.Keys.Where(k => k.StartsWith("held.", StringComparison.Ordinal) || k.StartsWith("shape.", StringComparison.Ordinal) || k.StartsWith(key + ".part.", StringComparison.Ordinal))).ToList())
                 if (stats.TryGetValue(k, out var v)) report?.Invoke(k, v);
         }
@@ -199,6 +203,7 @@ public static class EmittedLinkCheck
         LinkCheckResult Done(IReadOnlyList<LinkViolation> v)
         {
             Lap("rest");
+            heldNow?.Dispose();
             stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["headersHandedOn"] = headersHandedOn; stats["scansOutsideBudget"] = scansOutsideBudget; stats["instancesRedone"] = instancesRedone;
             stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits; stats["parseWaits"] = parseGate.Waits;
             stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;
@@ -283,6 +288,18 @@ public static class EmittedLinkCheck
             Interlocked.Increment(ref headersHandedOn);
             return System.Text.Encoding.Latin1.GetString(bytes);
         }
+        // Read from the heartbeat thread while the loops run: counters and counts only.
+        heldNow = CodeCarver.Core.Util.HeldMeter.Register("check", () => new KeyValuePair<string, long>[]
+        {
+            new("headerTextMb", Interlocked.Read(ref heldChars) * 2 >> 20), new("headersHeld", headerText.Count),
+            new("headerInfos", headerInfo.Count), new("templates", templates.Count), new("headerSizes", headerSizes.Count),
+            new("handedOnMb", Interlocked.Read(ref handedOnHeld) >> 20), new("handedOn", handedOn.Count),
+            new("scanningMb", scanGate.Used >> 20), new("readingMb", readGate.Used >> 20),
+            new("walkingMb", walkGate.Used >> 20), new("parsingMb", parseGate.Used >> 20), new("walkCostMb", Math.Max(0, Interlocked.Read(ref walkCost)) >> 20),
+            new("droppedDefs", droppedDefs.Count), new("uses", live.Count + dead.Count), new("macroCalls", macroCalls.Count),
+            new("cacheDropped", cache?.Dropped.Count ?? 0), new("cacheOriginals", cache?.Originals.Count ?? 0),
+            new("spilledMb", Interlocked.Read(ref spillBytes) >> 20),
+        });
         (HeaderInfo? Info, string? Text) ReadDirectives(string p, bool handOn = false)
         {
             using var part = Activity.Part("headerRead");

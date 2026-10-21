@@ -652,12 +652,18 @@ commit before the machine runs out). Watch private memory, not the working set: 
 Windows pages the process out and its working set looks small while its memory still grows. The summary
 carries `mem.<step>.peakMb` and `stageN.mem.<step>.peakMb` (private memory), and over the whole run
 `mem.run.peakPrivateMb`, `mem.run.peakWorkingSetMb`, `mem.run.minMachineFreeMb` and `mem.run.minCommitRoomMb`.
+What a step keeps, not only what it peaked at: as each step ends the run collects the heap in full and records what
+is still live, `mem.<step>.liveMb` and `stageN.mem.<step>.liveMb` (the collections together: `mem.liveGc.ms`), and
+each link check loop records `check.<loop>.liveMaxMb`. A step whose live memory jumps is the one holding it. While a
+step runs, a `held    :` line follows the `memory  :` line with what each part of the run says it holds now: for the
+link check, header text held (`headerTextMb`), text handed on to its scans (`handedOnMb`), the work running under each
+budget (`scanningMb`, `readingMb`, `walkingMb`, `parsingMb`) and its tables (`headerInfos`, `droppedDefs`, `uses`, ...).
 
 `[advanced] memoryStopMb` stops a run whose private memory passes it, before it runs the machine out of memory.
 A `memory  : STOPPED` line names the step, and `<outputDirectory>/codecarver/stopped-summary.txt` holds every
 summary key written so far, the run's memory keys, and `stop.reason`, `stop.afterStep`, `stop.minutesInStep`,
 `stop.runSeconds`, `stop.count`, `stop.privateMb`, `stop.workingSetMb`, `stop.managedMb`, `stop.machineFreeMb`,
-`stop.commitRoomMb`, and `stop.inHandKb` / `stop.largestFileInStepKb` (the files being scanned when it stopped,
+`stop.commitRoomMb`, `stop.heapMb` / `stop.heapFragmentedMb` / `stop.gcCommittedMb` (the heap as the last collection left it), `stop.held.<part>.<what>` (the `held    :` numbers as it stopped), and `stop.inHandKb` / `stop.largestFileInStepKb` (the files being scanned when it stopped,
 and the largest the step had started); numbers only, like `summary.txt`. The exit code is 4. Every run deletes that file when it
 starts, so one that exists is the last run's.
 

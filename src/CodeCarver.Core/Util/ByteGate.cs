@@ -14,6 +14,9 @@ public sealed class ByteGate
 
     public ByteGate(long limit) => _limit = limit;
 
+    /// <summary>Bytes taken now: the work running under this budget (see HeldMeter).</summary>
+    public long Used { get { lock (_gate) return _used; } }
+
     /// <summary>Times a piece of work waited for room.</summary>
     public long Waits => Interlocked.Read(ref _waits);
     long _waits;

@@ -52,12 +52,19 @@ public class LinkCheckHeldMemoryTests
             static long Live() { GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); return GC.GetTotalMemory(true); }
             var baseline = Live();
             long afterHeaders = -1;
+            Dictionary<string, long> heldNow = new();
             var r = EmittedLinkCheck.Run(emitted, droppedFiles, report: (k, _) =>
             {
                 // The header pass is done (its workers idle) and no scan has run: what is live now is held for the scans.
-                if (k == "headersMs") afterHeaders = Live() - baseline;
+                if (k != "headersMs") return;
+                afterHeaders = Live() - baseline;
+                // A memory stop and the heartbeat read what the check says it holds while it runs.
+                heldNow = CodeCarver.Core.Util.HeldMeter.Now().ToDictionary(kv => kv.Key, kv => kv.Value);
             });
             Assert.Equal(0, r.Stats["scansOutsideBudget"]);
+            Assert.Equal(400, heldNow["held.check.headerInfos"]);
+            Assert.InRange(heldNow["held.check.handedOnMb"], 0, 2);
+            Assert.DoesNotContain(CodeCarver.Core.Util.HeldMeter.Now(), kv => kv.Key.StartsWith("held.check.", StringComparison.Ordinal));   // gone when it ends
             Assert.InRange(r.Stats["held.handedOnMaxMb"], 0, 2);
             // The budgets (2 MB) and the per-header tables (names, sizes, hashes: a few hundred bytes a header). The scans
             // of these headers keep about a byte a char of definitions; 1.0.317 held those from here on.
