@@ -142,7 +142,7 @@ public static class EmittedLinkCheck
         // Each loop's time, and memory as it ends: the process's private bytes, the managed heap the last GC left, and
         // managed bytes allocated in the loop (MB). A "Max" key is kept at its largest over a stage's rounds.
         var allocatedAt = GC.GetTotalAllocatedBytes();
-        long filesRead = 0, fromCache = 0, headersHandedOn = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
+        long filesRead = 0, fromCache = 0, headersHandedOn = 0, scansOutsideBudget = 0, handedOnHeld = 0, handedOnMax = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
         // The tree's shape, for sizing a test corpus like it (shape.*): each header's size, each walk's include closure.
         var headerSizes = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
         // Headers spilled to the local disk (see ReadAgain), removed when the check is done.
@@ -168,6 +168,7 @@ public static class EmittedLinkCheck
             stats["held.droppedDefsMax"] = droppedDefs.Count;
             stats["held.macroCallsMax"] = macroCalls.Count;
             stats["held.usesMax"] = live.Count + dead.Count;
+            stats["held.handedOnMaxMb"] = Interlocked.Read(ref handedOnMax) >> 20;   // header text handed on to the scans
             // What each part of the loop's per-file work allocated (Activity.Part): the loop's own, reset as the next begins.
             foreach (var (pk, pv) in Activity.Parts())
                 if (pk.StartsWith("part.", StringComparison.Ordinal) && !pk.EndsWith(".inFlight", StringComparison.Ordinal)) stats[$"{key}.{pk}"] = pv;
@@ -198,7 +199,7 @@ public static class EmittedLinkCheck
         LinkCheckResult Done(IReadOnlyList<LinkViolation> v)
         {
             Lap("rest");
-            stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["headersHandedOn"] = headersHandedOn; stats["instancesRedone"] = instancesRedone;
+            stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["headersHandedOn"] = headersHandedOn; stats["scansOutsideBudget"] = scansOutsideBudget; stats["instancesRedone"] = instancesRedone;
             stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits; stats["parseWaits"] = parseGate.Waits;
             stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;
             stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped; stats["templateWalksReused"] = templateWalksReused;
@@ -206,7 +207,7 @@ public static class EmittedLinkCheck
             stats["walkNames"] = walkNames.Count;
             stats["headersSpilled"] = spilled.Count; stats["spillReads"] = spillReads; stats["spillMb"] = spillBytes >> 20;
             try { if (Directory.Exists(spillDir)) Directory.Delete(spillDir, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
-            foreach (var k in new[] { "filesRead", "fromCache", "headersHandedOn", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames", "headersSpilled", "spillReads", "spillMb" })
+            foreach (var k in new[] { "filesRead", "fromCache", "headersHandedOn", "scansOutsideBudget", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames", "headersSpilled", "spillReads", "spillMb" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -237,41 +238,50 @@ public static class EmittedLinkCheck
             if (!headerSizes.TryGetValue(path, out var size))
                 try { size = new FileInfo(path).Length; }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { size = 0; }
-            using ((gate ?? scanGate).Take(size))
-            using (Activity.Working(size))
-                return scan();
+            var was = t_gate;
+            t_gate = gate ?? scanGate;
+            try
+            {
+                using (t_gate.Take(size))
+                using (Activity.Working(size))
+                    return scan();
+            }
+            finally { t_gate = was; }
+        }
+        // Every scan in the check runs under the scan budget: 1.0.317 scanned dropped headers in the header pass, under the
+        // read budget (16 times as much at once), and a work run went from 13 GB to a stop at 21. Counted, and a test
+        // requires none.
+        ScanResult BudgetedScan(string text, bool header, bool declarators = true, CodeCarver.Core.Preprocess.DefinerMacros.Set? definerMacros = null)
+        {
+            if (!ReferenceEquals(t_gate, scanGate)) Interlocked.Increment(ref scansOutsideBudget);
+            return Scan(text, header, declarators, definerMacros);
         }
         // The header pass reads every emitted and dropped header before the scans read each one again (on a share, a round
-        // trip and its bytes each). A header's scan asks nothing of the header pass (only a unit's template walk does), so
-        // the pass hands on what it read: a dropped header's own scan, an emitted header's text (up to EarlyHeldBytes,
-        // as Latin-1 bytes). A big one is left to its scan (a scan holds many times its file, and here would run outside
-        // the scan budget).
-        var droppedHeaderPaths = droppedList.Where(d => IsHeader(d.Rel)).Select(d => d.Path).ToHashSet(StringComparer.Ordinal);
-        var emittedHeaderPaths = emittedList.Where(e => IsHeader(e.Rel)).Select(e => e.Path).ToHashSet(StringComparer.Ordinal);
-        var droppedEarly = new ConcurrentDictionary<string, DroppedEntry>(StringComparer.Ordinal);
-        var emittedEarly = new ConcurrentDictionary<string, byte[]>(StringComparer.Ordinal);
-        long earlyHeld = 0;
+        // trip and its bytes each), so it hands on the text it read (as Latin-1 bytes, a byte a character), at most
+        // HandedOnBudget in all: a header past that is read again by its scan. Only text is handed on, never a scan: the
+        // scans run in their own loops under the scan budget (1.0.317 scanned each dropped header here and held every
+        // scan until its loop, outside any budget: on a tree of small register maps, many times the headers' bytes and a
+        // run stopped at 21 GB).
+        var handOnPaths = droppedList.Concat(emittedList).Where(f => IsHeader(f.Rel)).Select(f => f.Path).ToHashSet(StringComparer.Ordinal);
+        var handedOn = new ConcurrentDictionary<string, byte[]>(StringComparer.Ordinal);
+        var handOnBudget = HandedOnBudget();
         void HandOn(string p, string t)
         {
-            if (t.Length > EarlyChars) return;
-            if (droppedHeaderPaths.Contains(p))
-            {
-                if (Cached(p) && cache!.Dropped.ContainsKey("h|" + p)) return;
-                using var scanPart = Activity.Part("dropped.scan", t.Length);
-                var own = Scan(t, header: true, declarators: false, definerMacros);
-                // A header is never template-walked (TemplateGate is for units): only its own definitions count.
-                droppedEarly[p] = new DroppedEntry
-                {
-                    Definitions = own.Definitions, FunctionMacros = own.FunctionMacros,
-                    HasInclude = false, MacroHead = false, HasDefine = false, MayHead = false,
-                    Includes = Array.Empty<string>(), C99 = new List<Definition>(),
-                };
-            }
-            else if (emittedHeaderPaths.Contains(p))
-            {
-                if (Interlocked.Add(ref earlyHeld, t.Length) <= EarlyHeldBytes) emittedEarly[p] = System.Text.Encoding.Latin1.GetBytes(t);
-                else Interlocked.Add(ref earlyHeld, -t.Length);
-            }
+            if (t.Length > EarlyChars || !handOnPaths.Contains(p)) return;
+            if (Cached(p) && cache!.Dropped.ContainsKey("h|" + p)) return;
+            var held = Interlocked.Add(ref handedOnHeld, t.Length);
+            if (held > handOnBudget) { Interlocked.Add(ref handedOnHeld, -t.Length); return; }
+            handedOn[p] = System.Text.Encoding.Latin1.GetBytes(t);
+            for (var m = Interlocked.Read(ref handedOnMax); held > m; m = Interlocked.Read(ref handedOnMax))
+                if (Interlocked.CompareExchange(ref handedOnMax, held, m) == m) break;
+        }
+        // A header's text the header pass handed on, taken (and its bytes given back), or null.
+        string? TakeHandedOn(string p)
+        {
+            if (!handedOn.TryRemove(p, out var bytes)) return null;
+            Interlocked.Add(ref handedOnHeld, -bytes.Length);
+            Interlocked.Increment(ref headersHandedOn);
+            return System.Text.Encoding.Latin1.GetString(bytes);
         }
         (HeaderInfo? Info, string? Text) ReadDirectives(string p, bool handOn = false)
         {
@@ -656,20 +666,19 @@ public static class EmittedLinkCheck
             string? text = null;
             DroppedEntry? e;
             if (cached && cache!.Dropped.TryGetValue(key, out e)) Interlocked.Increment(ref fromCache);
-            else if (header && droppedEarly.TryRemove(f.Path, out var early))
-            {
-                Interlocked.Increment(ref headersHandedOn);
-                e = cached ? cache!.Dropped.GetOrAdd(key, early) : early;
-            }
             else
             {
-                Interlocked.Increment(ref filesRead);
-                using (Activity.Part("dropped.read")) text = TryRead(f.Path, maxBytes);
+                if (header) text = TakeHandedOn(f.Path);
+                if (text is null)
+                {
+                    Interlocked.Increment(ref filesRead);
+                    using (Activity.Part("dropped.read")) text = TryRead(f.Path, maxBytes);
+                }
                 e = null;
                 if (text is not null)
                 {
                     using var scanPart = Activity.Part("dropped.scan", text.Length);
-                    var own = Scan(text, header, declarators: false, definerMacros);
+                    var own = BudgetedScan(text, header, declarators: false, definerMacros);
                     e = new DroppedEntry
                     {
                         Definitions = own.Definitions,
@@ -749,14 +758,14 @@ public static class EmittedLinkCheck
                 Interlocked.Increment(ref filesRead);
                 otext = TryRead(op, maxBytes);
                 oe = otext is null ? null
-                    : new OriginalEntry(otext.Length, ContentHash(otext), Scan(otext, header, declarators: false, definerMacros).Definitions);
+                    : new OriginalEntry(otext.Length, ContentHash(otext), BudgetedScan(otext, header, declarators: false, definerMacros).Definitions);
                 if (cached) oe = cache!.Originals.GetOrAdd(key, oe);
             }
             if (oe is null) return null;
             var etext = TryRead(f.Path, maxBytes);
             if (etext is null) return null;
             if (otext is not null ? otext == etext : etext.Length == oe.Length && ContentHash(etext) == oe.Hash) return null;
-            var kept = Scan(etext, header, declarators: false, definerMacros).Definitions.Select(d => d.Name).ToHashSet(StringComparer.Ordinal);
+            var kept = BudgetedScan(etext, header, declarators: false, definerMacros).Definitions.Select(d => d.Name).ToHashSet(StringComparer.Ordinal);
             return oe.Definitions.Where(d => !kept.Contains(d.Name)).ToList();
         }
         Lap("dropped");
@@ -808,20 +817,14 @@ public static class EmittedLinkCheck
         var anyWrap = wrapped is { Count: > 0 } && droppedDefs.Keys.Any(k => k.StartsWith("__wrap_", StringComparison.Ordinal));
         (ScanResult Scan, bool[]? Map)? ScanEmitted((string Rel, string Path) f)
         {
-            string? text;
-            if (emittedEarly.TryRemove(f.Path, out var early))
-            {
-                Interlocked.Increment(ref headersHandedOn);
-                Interlocked.Add(ref earlyHeld, -early.Length);
-                text = System.Text.Encoding.Latin1.GetString(early);
-            }
-            else
+            var text = TakeHandedOn(f.Path);
+            if (text is null)
                 using (Activity.Part("emitted.read")) text = TryRead(f.Path, maxBytes);
             if (text is null) return null;
             bool[]? map;
             using (Activity.Part("emitted.deadLines", text.Length)) map = deadLines?.Invoke(f.Rel, text);
             ScanResult s;
-            using (Activity.Part("emitted.scan", text.Length)) s = IsAssembly(f.Rel) ? ScanAssembly(text) : Scan(text, IsHeader(f.Rel), definerMacros: definerMacros);
+            using (Activity.Part("emitted.scan", text.Length)) s = IsAssembly(f.Rel) ? ScanAssembly(text) : BudgetedScan(text, IsHeader(f.Rel), definerMacros: definerMacros);
             using (Activity.Part("emitted.instances", text.Length)) s.Definitions.AddRange(Instances(f.Rel, text));
             Renamed(s);
             // A use is read below only for a name a dropped file defines, a static pruned from this file, or a wrapped
@@ -989,10 +992,12 @@ public static class EmittedLinkCheck
     const int SpillChars = 256 * 1024;
     const long SpillBudget = 8L << 30;
 
-    /// <summary>A header of up to this many chars that the header pass read is handed on to its scan (see HandOn); the
-    /// emitted headers' text held for that, at most <see cref="EarlyHeldBytes"/>.</summary>
+    /// <summary>A header of up to this many chars that the header pass read is handed on to its scan (see HandOn).</summary>
     const int EarlyChars = 1 << 20;
-    const long EarlyHeldBytes = 256L << 20;
+
+    /// <summary>Bytes of header text the header pass holds for the scans at most: 256 MB, or CODECARVER_CHECK_HANDON_MB.</summary>
+    static long HandedOnBudget() =>
+        long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_CHECK_HANDON_MB"), out var mb) && mb >= 0 ? mb << 20 : 256L << 20;
 
     /// <summary>Characters of non-template header text the check holds at once: a 32nd of the machine's memory, or
     /// CODECARVER_CHECK_HEADER_MB.</summary>
@@ -1317,6 +1322,8 @@ public static class EmittedLinkCheck
         finally { t_scanning = false; }
     }
 
+    /// <summary>The gate the check's work on this thread runs under (see Gated, BudgetedScan).</summary>
+    [ThreadStatic] static CodeCarver.Core.Util.ByteGate? t_gate;
     [ThreadStatic] static bool t_scanning;
 
     /// <summary>The scans running at once, held to an eighth of the machine's memory (BudgetBytes) at a cost per character.</summary>
