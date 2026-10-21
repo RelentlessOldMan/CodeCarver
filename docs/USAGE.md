@@ -654,7 +654,14 @@ carries `mem.<step>.peakMb` and `stageN.mem.<step>.peakMb` (private memory), and
 `mem.run.peakPrivateMb`, `mem.run.peakWorkingSetMb`, `mem.run.minMachineFreeMb` and `mem.run.minCommitRoomMb`.
 What a step keeps, not only what it peaked at: as each step ends the run collects the heap in full and records what
 is still live, `mem.<step>.liveMb` and `stageN.mem.<step>.liveMb` (the collections together: `mem.liveGc.ms`), and
-each link check loop records `check.<loop>.liveMaxMb`. A step whose live memory jumps is the one holding it. While a
+each link check loop records `check.<loop>.liveMaxMb`. A step whose live memory jumps is the one holding it. The roots
+step records each of its parts too (`mem.roots.<part>.liveMb`). A step that keeps 1 GB or more than the one before
+(`CODECARVER_HEAP_TYPES_MB=N` sets it, 0: never) also says what it kept: the run starts itself again to walk its heap
+while it waits (the walk holds none of the run's memory: `mem.heapWalk.leftMb`), and
+`heap    :` lines and `heap.<step>.<n>` keys give the 15 biggest .NET types and the types referring to them
+(CodeCarver's own type names, never what a string holds). A walk stops after 3 minutes (a line says it was cut
+short). A memory stop walks the heap too, the run held still meanwhile (`heap.stop.<n>`). A walk of a
+few million objects takes 15 to 25 seconds. While a
 step runs, a `held    :` line follows the `memory  :` line with what each part of the run says it holds now: for the
 link check, header text held (`headerTextMb`), text handed on to its scans (`handedOnMb`), the work running under each
 budget (`scanningMb`, `readingMb`, `walkingMb`, `parsingMb`) and its tables (`headerInfos`, `droppedDefs`, `uses`, ...).

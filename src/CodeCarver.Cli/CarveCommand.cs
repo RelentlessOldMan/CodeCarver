@@ -414,13 +414,37 @@ public static class CarveCommand
         // What the run still holds as a step ends: the managed heap after a full collection (MB). A peak says how much a
         // step had, not what it kept for the steps after; at work a stop in the check could not say whether the check or
         // an earlier step held the memory. The collections cost time (mem.liveGc.ms, all of them).
-        long _liveGcMs = 0;
-        long LiveMb()
+        // A step that kept CODECARVER_HEAP_TYPES_MB (default 1024; 0: never) more than the one before also says what it
+        // kept: the heap's biggest types and what refers to them (heap.<step>.<n>, and on the console).
+        long _liveGcMs = 0, _lastLiveMb = 0;
+        var _heapTypesMb = long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_HEAP_TYPES_MB"), out var htm) ? htm : 1024;
+        void HeapTypesTo(string where, IDictionary<string, object?> into, TimeSpan? budget = null)
+        {
+            var i = 0;
+            foreach (var line in HeapTypes.OfThisProcess(15, budget ?? TimeSpan.FromMinutes(3)))
+            {
+                into[$"heap.{where}.{++i:D2}"] = line;
+                err.WriteLine($"  heap    : {where}: {line}");
+            }
+        }
+        long LiveMb(string where)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: false);
             var live = GC.GetTotalMemory(false) / (1024 * 1024);
             summary["mem.liveGc.ms"] = _liveGcMs += sw.ElapsedMilliseconds;
+            if (_heapTypesMb > 0 && live - _lastLiveMb >= _heapTypesMb)
+            {
+                err.WriteLine($"  heap    : {where} kept {live - _lastLiveMb:N0} MB more (live {live:N0} MB); what the heap holds:");
+                HeapTypesTo(where, summary);
+                // What the walk itself left live (it must not hold memory for the steps after): the largest of the walks.
+                GC.WaitForPendingFinalizers();
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: false);
+                var after = GC.GetTotalMemory(false) / (1024 * 1024);
+                summary["mem.heapWalk.leftMb"] = Math.Max(after - live, summary.TryGetValue("mem.heapWalk.leftMb", out var hw) && hw is long hl ? hl : 0L);
+                live = after;
+            }
+            _lastLiveMb = live;
             return live;
         }
         long TakePeakMb()
@@ -529,7 +553,7 @@ public static class CarveCommand
             var peak = TakePeakMb();
             summary[$"mem.{phase}.peakMb"] = Math.Max(peak, summary.TryGetValue($"mem.{phase}.peakMb", out var pw) && pw is long pl ? pl : 0L);
             summary[$"mem.{phase}.allocatedMb"] = TakeAllocatedMb() + (summary.TryGetValue($"mem.{phase}.allocatedMb", out var aw) && aw is long al ? al : 0L);
-            summary[$"mem.{phase}.liveMb"] = LiveMb();
+            summary[$"mem.{phase}.liveMb"] = LiveMb(phase);
             CpuAndIo("", phase, ref _phaseIo, ref _phaseCpu);
             Progress(phase);
             if (_timing) err.WriteLine($"  timing  : {phase,-14} {_tsw.ElapsedMilliseconds,7} ms");
@@ -2086,6 +2110,7 @@ public static class CarveCommand
         void RootsPart(string part)
         {
             summary[$"time.roots.{part}.ms"] = rootsSw.ElapsedMilliseconds;
+            summary[$"mem.roots.{part}.liveMb"] = LiveMb($"roots.{part}");   // which part of the roots keeps memory
             rootsSw.Restart();
             CpuAndIo("roots.", part, ref rootsIo, ref rootsCpu);
             Progress($"roots {part}");
@@ -3406,6 +3431,8 @@ public static class CarveCommand
             foreach (var (k, v) in CodeCarver.Core.Util.Activity.Parts()) snap[$"stop.{k}"] = v;
             // The tree's shape as far as the link check got (numbers only).
             foreach (var (k, v) in CodeCarver.Core.Reachability.EmittedLinkCheck.ShapeSoFar()) snap[$"stop.{k}"] = v;
+            // What the heap holds as it stops: its biggest types and what refers to them (heap.stop.<n>).
+            if (_heapTypesMb > 0) HeapTypesTo("stop", snap!);   // the run is held still while it is walked
             snap["exitCode"] = StoppedForMemoryExit;
             err.WriteLine($"memory  : STOPPED - private memory {priv / MB:N0} MB passed memoryStopMb = {_memoryStop / MB:N0} in the step after '{step}' (run {Clock(runAt)})");
             err.WriteLine($"  memory  : {MemoryLine(priv, workingSet, machine)}");
@@ -3414,7 +3441,7 @@ public static class CarveCommand
                 Directory.CreateDirectory(Path.GetDirectoryName(stoppedSummaryPath)!);
                 var marker = Path.Combine(outputFull, StagedOutput.MarkerName);
                 if (!File.Exists(marker)) File.WriteAllText(marker, "CodeCarver output area.\n");
-                File.WriteAllText(stoppedSummaryPath, "# CodeCarver summary of a run STOPPED for memory - numbers only: no path, file name or symbol. Safe to send back.\n"
+                File.WriteAllText(stoppedSummaryPath, "# CodeCarver summary of a run STOPPED for memory - numbers only: no path, file name or symbol (heap.* lines name CodeCarver's own .NET types). Safe to send back.\n"
                     + string.Concat(snap.Select(kv => $"{kv.Key} = {SummaryValue(kv.Value)}\n")));
                 err.WriteLine($"  summary : {stoppedSummaryPath}");
             }
@@ -3706,7 +3733,7 @@ public static class CarveCommand
                 var akey = $"{summaryStage}.mem.{step}.allocatedMb";
                 summary[akey] = TakeAllocatedMb() + (summary.TryGetValue(akey, out var aw) && aw is long al ? al : 0L);
                 var lkey = $"{summaryStage}.mem.{step}.liveMb";   // the largest over the check rounds
-                summary[lkey] = Math.Max(LiveMb(), summary.TryGetValue(lkey, out var lw) && lw is long ll ? ll : 0L);
+                summary[lkey] = Math.Max(LiveMb($"{summaryStage}.{step}"), summary.TryGetValue(lkey, out var lw) && lw is long ll ? ll : 0L);
                 Progress($"{(stage.Name.Length == 0 ? "stage" : stage.Name)} {step}");
                 var key = $"{summaryStage}.time.{step}.ms";
                 summary[key] = (summary.TryGetValue(key, out var was) && was is long w ? w : 0L) + stageClock.ElapsedMilliseconds;

@@ -7,6 +7,7 @@
 
   <ItemGroup>
     <!-- TOML config parser (human-friendly config format for the carve config file). -->
+    <PackageReference Include="Microsoft.Diagnostics.Runtime" Version="4.2.751201" />
     <PackageReference Include="Tomlyn" Version="0.17.0" />
   </ItemGroup>
 

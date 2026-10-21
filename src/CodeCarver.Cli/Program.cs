@@ -12,6 +12,9 @@ using CodeCarver.Core.Roots;
 System.Globalization.CultureInfo.DefaultThreadCurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
 System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.InvariantCulture;
 
+// Started by a run to walk that run's heap (HeapTypes): no command of its own.
+if (HeapTypes.RunAsChild()) return 0;
+
 var cmd = args.Length > 0 ? args[0] : "help";
 switch (cmd)
 {
