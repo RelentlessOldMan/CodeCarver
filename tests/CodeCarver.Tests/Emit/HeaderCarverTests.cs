@@ -524,6 +524,39 @@ public class HeaderCarverTests
         Assert.DoesNotContain("x1F_REG", carved);
     }
 
+    /// <summary>The summary says why each define was kept: its name is used, or the shortest piece it starts or ends
+    /// with, by length. A define kept for a piece counts as that, not as a name (its own line names it).</summary>
+    [Fact]
+    public void Carve_CountsWhyEachDefineWasKept()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdr-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "app.c"), """
+                #include "chip.h"
+                #define CAT(a, b) a##b
+                int u(void){ return USED + CAT(V, 1) + CAT(UARTX, 2); }
+                """);
+            File.WriteAllText(Path.Combine(dir, "chip.h"), """
+                #define USED 1
+                #define VREG (BASE_V + 1)
+                #define UARTX_CR 3
+                #define BASE_V 4
+                #define OTHER 5
+                """);
+            var keys = new Dictionary<string, long>();
+            var res = HeaderCarver.Carve(dir, new[] { "chip.h" }, partDone: (k, v) => keys[k] = v);
+            Assert.Equal(1, res.DefinesDropped);   // OTHER
+            Assert.Equal(2, keys["keptByName"]);   // USED, and BASE_V from VREG's body
+            Assert.Equal(1, keys["keptByPiece1"]); // VREG, for V
+            Assert.Equal(1, keys["keptByPiece4plus"]); // UARTX_CR, for UARTX
+            Assert.Equal(0, keys["keptByPiece2"] + keys["keptByPiece3"] + keys["keptBySystemHeaders"]);
+            Assert.Equal(1, keys["pieces1"]);
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
     /// <summary>An argument expands to its body before the paste, but only a body's first and last tokens can join it:
     /// <c>#define PORT ((t)U)</c> builds no name from U. Every definition counts, however many.</summary>
     [Fact]

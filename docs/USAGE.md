@@ -653,6 +653,12 @@ many paste macros, forwarding macros, names and paste pieces it has learned; the
 `fixpoint`, `emit`), `.<part>.ms`, `.cpuMs` (all threads), `.allocatedMb` (memory it allocated), `.privateMb` (the
 process's private memory as it ended) and `.liveMb` (what is still live after it, from a full collection). A memory
 stop's `stopped-summary.txt` carries those of the parts that finished.
+Why the header carve kept each define, counted: `stageN.headerCarve.keptByName` (code or a kept define names it),
+`.keptBySystemHeaders` (a reserved or well-known config name), and `.keptByPiece1`, `.keptByPiece2`, `.keptByPiece3`,
+`.keptByPiece4plus` (its name starts or ends with a paste piece, by the shortest such piece's length: a paste could
+build it). `.pieces` is how many paste pieces there are, `.pieces1` to `.pieces3` how many have 1 to 3 characters.
+A carve that drops nothing says which rule kept everything: a one-character piece matches every name that starts or
+ends with that character.
 
 Memory is measured on every run. Each `working :` line is followed by a `memory  :` line: the process's private
 memory and working set, and the machine's free memory and commit room (how much more every process together may

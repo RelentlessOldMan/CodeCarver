@@ -11,6 +11,8 @@ namespace CodeCarver.Tests.Reachability;
 /// every scan until the dropped loop: a work run went from 13 GB to a stop at 21. A tree of small register-map
 /// headers, the budgets made small: every scan must run under the scan budget, and when the header pass ends (the
 /// check's report) a full collection measures what is held for the scans.
+/// The bound is on what more headers add, not the total: the process holds about 10 MB the first check sets up whatever
+/// the tree (buffers, caches, the 2 MB handed on), so a total bound failed on every run, the right code included.
 /// </summary>
 [Collection(nameof(TemplateWalkMemoryTests))]
 public class LinkCheckHeldMemoryTests
@@ -22,16 +24,39 @@ public class LinkCheckHeldMemoryTests
     [InlineData(false)]   // emitted
     public void LinkCheck_HoldsBetweenLoops_ItsBudgets_NotTheTree(bool dropped)
     {
-        var root = Path.Combine(Path.GetTempPath(), "cc-held-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(Path.Combine(root, "regs"));
         var was = Budgets.Select(Environment.GetEnvironmentVariable).ToArray();
         try
         {
+            // Little held past the header pass: no header text (HEADER_MB 0), 2 MB handed on.
+            Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", "0");
+            Environment.SetEnvironmentVariable("CODECARVER_CHECK_HANDON_MB", "2");
+            Held(dropped, 200);   // what the first check sets up, whatever the tree
+            var (small, _) = Held(dropped, 200);
+            var (large, chars) = Held(dropped, 400);
+            // The per-header tables (names, sizes, hashes: a few hundred bytes a header) for the 200 more. The scans of
+            // these headers keep about a byte a char of definitions (about 70 KB a header); 1.0.317 held those from here on.
+            var limit = chars / 2 / 20;
+            Assert.True(large - small <= limit,
+                $"200 more headers held {(large - small) >> 10} KB more past the header pass (limit {limit >> 10} KB; {small >> 10} KB at 200, {large >> 10} KB at 400)");
+        }
+        finally
+        {
+            for (var i = 0; i < Budgets.Length; i++) Environment.SetEnvironmentVariable(Budgets[i], was[i]);
+        }
+    }
+
+    /// <summary>What a check of <paramref name="headers"/> register-map headers holds past its header pass, and their chars.</summary>
+    static (long Held, long Chars) Held(bool dropped, int headers)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cc-held-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "regs"));
+        try
+        {
             (string, string) W(string rel, string text) { var p = Path.Combine(root, rel); File.WriteAllText(p, text); return (rel, p); }
-            // 400 register-map headers (~70 K chars each): each under the hand-on size.
+            // Register-map headers (~70 K chars each): each under the hand-on size.
             var regs = new List<(string, string)>();
             long chars = 0;
-            for (var h = 0; h < 400; h++)
+            for (var h = 0; h < headers; h++)
             {
                 var sb = new StringBuilder($"#ifndef HM_R{h}_H\n#define HM_R{h}_H\n");
                 for (var k = 0; k < 1000; k++) sb.Append($"#define HM{h}_REG_{k:D5}_ADDR (HM{h}_BASE + 0x{k * 4:X}u)\n");
@@ -46,9 +71,6 @@ public class LinkCheckHeldMemoryTests
             if (!dropped) emitted.AddRange(regs);
             var droppedFiles = dropped ? regs : new List<(string, string)>();
 
-            // Little held past the header pass: no header text (HEADER_MB 0), 2 MB handed on.
-            Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", "0");
-            Environment.SetEnvironmentVariable("CODECARVER_CHECK_HANDON_MB", "2");
             static long Live() { GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect(); return GC.GetTotalMemory(true); }
             var baseline = Live();
             long afterHeaders = -1;
@@ -62,19 +84,15 @@ public class LinkCheckHeldMemoryTests
                 heldNow = CodeCarver.Core.Util.HeldMeter.Now().ToDictionary(kv => kv.Key, kv => kv.Value);
             });
             Assert.Equal(0, r.Stats["scansOutsideBudget"]);
-            Assert.Equal(400, heldNow["held.check.headerInfos"]);
+            Assert.Equal(headers, heldNow["held.check.headerInfos"]);
             Assert.InRange(heldNow["held.check.handedOnMb"], 0, 2);
             Assert.DoesNotContain(CodeCarver.Core.Util.HeldMeter.Now(), kv => kv.Key.StartsWith("held.check.", StringComparison.Ordinal));   // gone when it ends
             Assert.InRange(r.Stats["held.handedOnMaxMb"], 0, 2);
-            // The budgets (2 MB) and the per-header tables (names, sizes, hashes: a few hundred bytes a header). The scans
-            // of these headers keep about a byte a char of definitions; 1.0.317 held those from here on.
-            var limit = (2L << 20) + chars / 20;
-            Assert.True(afterHeaders <= limit, $"{afterHeaders >> 10} KB held past the header pass (limit {limit >> 10} KB)");
             GC.KeepAlive(regs);
+            return (afterHeaders, chars);
         }
         finally
         {
-            for (var i = 0; i < Budgets.Length; i++) Environment.SetEnvironmentVariable(Budgets[i], was[i]);
             try { Directory.Delete(root, true); } catch { }
         }
     }

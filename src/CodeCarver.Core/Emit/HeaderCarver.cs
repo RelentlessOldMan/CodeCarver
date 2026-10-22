@@ -138,17 +138,32 @@ public static class HeaderCarver
             fragmentHashes = fragments.Select(f => f.GetHashCode()).ToHashSet();
         }
         bool IsFragment(ReadOnlySpan<char> s) => fragmentHashes.Contains(string.GetHashCode(s)) && fragments.Contains(s.ToString());
-        bool Wanted(string name)
+        bool Wanted(string name) => needed.Contains(name) || ReadBySystemHeaders(name) || PieceLength(name) > 0;
+        // The length of the shortest piece the name starts or ends with, 0 when none.
+        int PieceLength(string name)
         {
-            if (needed.Contains(name) || ReadBySystemHeaders(name)) return true;
             if (fragments.Count <= 64)
-                return fragments.Any(fr => name.StartsWith(fr, StringComparison.Ordinal) || name.EndsWith(fr, StringComparison.Ordinal));
+                return fragments.Where(fr => fr.Length > 0 && (name.StartsWith(fr, StringComparison.Ordinal) || name.EndsWith(fr, StringComparison.Ordinal)))
+                                .Select(fr => fr.Length).DefaultIfEmpty(0).Min();
             foreach (var k in fragmentLengths)
             {
                 if (k > name.Length) break;
-                if (IsFragment(name.AsSpan(0, k)) || IsFragment(name.AsSpan(name.Length - k))) return true;
+                if (k > 0 && (IsFragment(name.AsSpan(0, k)) || IsFragment(name.AsSpan(name.Length - k)))) return k;
             }
-            return false;
+            return 0;
+        }
+        // Why the emit kept each define: its name is needed, the compiler's headers read it, or the shortest piece it
+        // starts or ends with (1, 2, 3, 4 or more characters). A carve that drops nothing says which.
+        long keptByName = 0, keptBySystem = 0;
+        var keptByPiece = new long[5];
+        bool WantedCounted(string name)
+        {
+            if (needed.Contains(name)) { Interlocked.Increment(ref keptByName); return true; }
+            if (ReadBySystemHeaders(name)) { Interlocked.Increment(ref keptBySystem); return true; }
+            var k = PieceLength(name);
+            if (k == 0) return false;
+            Interlocked.Increment(ref keptByPiece[Math.Min(k, 4)]);
+            return true;
         }
 
         // 2. Fixpoint: grow `needed` with the bodies of wanted defines and all #if-condition identifiers.
@@ -209,7 +224,7 @@ public static class HeaderCarver
             var tmp = path + ".carve.tmp";
             int kept = 0, dropped = 0;
             var pasteNames = new HashSet<string>(StringComparer.Ordinal);
-            RewriteDroppingUnneeded(path, tmp, Wanted, ref kept, ref dropped, name => { if (pastes.IsPaster(name)) pasteNames.Add(name); });
+            RewriteDroppingUnneeded(path, tmp, WantedCounted, ref kept, ref dropped, name => { if (pastes.IsPaster(name)) pasteNames.Add(name); });
             // A read-only source copy (Perforce) must not make the replace throw.
             var attrs = File.GetAttributes(path);
             if ((attrs & FileAttributes.ReadOnly) != 0) File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
@@ -218,6 +233,14 @@ public static class HeaderCarver
             return (Before: before, After: new FileInfo(path).Length, Kept: kept, Dropped: dropped, Pasters: pasteNames);
         });
         PartDone("emit");
+        if (partDone is not null)
+        {
+            partDone("keptByName", keptByName);
+            partDone("keptBySystemHeaders", keptBySystem);
+            for (var k = 1; k <= 4; k++) partDone(k < 4 ? $"keptByPiece{k}" : "keptByPiece4plus", keptByPiece[k]);
+            partDone("pieces", fragments.Count);
+            for (var k = 1; k <= 3; k++) partDone($"pieces{k}", fragments.Count(f => f.Length == k));
+        }
         CodeCarver.Core.Util.Activity.Doing(null);
         return new HeaderCarveResult(rewritten.Sum(r => r.Before), rewritten.Sum(r => r.After), rewritten.Sum(r => r.Kept), rewritten.Sum(r => r.Dropped))
         {
@@ -281,7 +304,9 @@ public static class HeaderCarver
                 continue;
             }
             if (name is null || skip?.Contains(name) == true || !wanted(name)) continue;
-            AddNewIdentifiers(names, needed, text);
+            // Not its own name: it is wanted already, and stays so (the pieces only grow). Held as needed, it was one more
+            // name per kept define, and a define kept for a piece looked kept by name.
+            AddNewIdentifiers(names, needed, text, except: name);
             Pastes.AddLiteralPieces(text, literal);
             // Only a define whose body names a paste macro passes it pieces (the paste macros are all known by now, a
             // forwarding macro that reaches one among them): the rest skip the scanner's copies of their text.
@@ -1068,11 +1093,12 @@ public static class HeaderCarver
     }
 
     /// <summary>Add each C identifier in <paramref name="text"/> not in <paramref name="known"/> to <paramref name="set"/>.</summary>
-    private static void AddNewIdentifiers(HashSet<string> set, HashSet<string> known, string text)
+    private static void AddNewIdentifiers(HashSet<string> set, HashSet<string> known, string text, string? except = null)
     {
         var i = 0;
         while (NextIdentifier(text, ref i, out var start))
         {
+            if (except is not null && text.AsSpan(start, i - start).SequenceEqual(except)) continue;
             var id = text[start..i];
             if (!known.Contains(id)) set.Add(id);
         }
