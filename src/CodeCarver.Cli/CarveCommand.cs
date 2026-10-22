@@ -1896,7 +1896,7 @@ public static class CarveCommand
                     if (!Directory.Exists(d)) { missingDirs++; continue; }
                     // A dir that contains the root (-I.. ) would mean the whole disk: its top level only.
                     var holdsRoot = rootFull.StartsWith(CodeCarver.Core.Util.PathComparer.DirectoryPrefix(d, Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase);
-                    var opt = new EnumerationOptions { RecurseSubdirectories = !holdsRoot, IgnoreInaccessible = true };
+                    var opt = new EnumerationOptions { RecurseSubdirectories = !holdsRoot, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.System };
                     var inDir = Directory.EnumerateFiles(d, "*", opt).Where(f => Path.GetExtension(f).Length > 0).Select(Path.GetFullPath).Where(Wanted).ToList();
                     foreach (var (f, read) in CodeCarver.Core.Util.ReadAhead.Map(inDir, ReadOutside)) ScanRead(f, read);
                 }

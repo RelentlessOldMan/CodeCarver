@@ -41,6 +41,22 @@ public sealed class MacroWorldTests
         AssertFeatKept(t, t.Carve());
     }
 
+    /// <summary>A header the Windows Hidden attribute hides is read like any other: only System files are skipped, as in
+    /// the tree's own walk.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void HiddenHeaderOutsideTheRoot_FoundThroughAnIncludeDir(bool hidden)
+    {
+        using var t = Tree("");
+        t.WOut("sdk/inc/cfg.h", "#define FEAT 1\n");
+        var header = Path.Combine(t.Outside("sdk/inc"), "cfg.h");
+        if (hidden && OperatingSystem.IsWindows()) File.SetAttributes(header, File.GetAttributes(header) | FileAttributes.Hidden);
+        var inc = "-I" + t.Outside("sdk/inc");
+        t.Compile("main.c", inc).Compile("feat.c", inc).Compile("plain.c", inc);
+        AssertFeatKept(t, t.Carve());
+    }
+
     /// <summary>The macro is tested only on a continuation line of the #if.</summary>
     [Fact]
     public void HeaderOutsideTheRoot_MacroTestedOnAContinuationLine()
