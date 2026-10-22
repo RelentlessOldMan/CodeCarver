@@ -16,7 +16,33 @@ public static class Activity
     /// <summary>Starts counting a new step: <paramref name="what"/> names what is counted ("files copied").</summary>
     public static void Begin(string what = "files", long total = -1)
     {
-        lock (Gate) { _what = what; _total = total; _summed = false; Interlocked.Exchange(ref _done, 0); Interlocked.Exchange(ref _bytes, 0); Interlocked.Exchange(ref _largest, 0); _parts.Clear(); Interlocked.Exchange(ref _ready, 0); }
+        lock (Gate) { _what = what; _total = total; _summed = false; Interlocked.Exchange(ref _done, 0); Interlocked.Exchange(ref _bytes, 0); Interlocked.Exchange(ref _largest, 0); _parts.Clear(); Interlocked.Exchange(ref _ready, 0); _doing = null; _doingDetail = null; }
+    }
+
+    // ---- which part of a step runs now: a step whose count stops moving says where it is (a header carve sat at
+    // 6,580 of 37,916 files for 100 min with nothing saying it was learning paste macros, not reading) ----
+
+    static string? _doing;
+    static Func<string>? _doingDetail;
+    static long _doingAt;
+
+    /// <summary>The step's work is now <paramref name="what"/> ("learning paste macros"); <paramref name="detail"/>, read
+    /// by the heartbeat, says how far it has got in numbers. Null: nothing named.</summary>
+    public static void Doing(string? what, Func<string>? detail = null)
+    {
+        lock (Gate) { _doing = what; _doingDetail = detail; _doingAt = System.Diagnostics.Stopwatch.GetTimestamp(); }
+    }
+
+    /// <summary>"learning paste macros for 12 min: 3,021 paste macros, 41,200 forwarding macros", or null.</summary>
+    public static string? DescribeDoing()
+    {
+        string? what; Func<string>? detail; long at;
+        lock (Gate) { what = _doing; detail = _doingDetail; at = _doingAt; }
+        if (what is null) return null;
+        var took = System.Diagnostics.Stopwatch.GetElapsedTime(at);
+        string? more = null;
+        try { more = detail?.Invoke(); } catch (InvalidOperationException) { }   // read beside the work: a torn count is fine, a throw isn't
+        return $"{what} for {(took.TotalMinutes >= 1 ? $"{(int)took.TotalMinutes} min" : $"{(int)took.TotalSeconds} s")}" + (more is null ? "" : $": {more}");
     }
 
     // ---- what the memory goes to, per part of a step's work (C20/C21: 9 GB in 90 s with 0.5 MB of files in hand) ----

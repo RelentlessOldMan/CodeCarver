@@ -179,6 +179,63 @@ public class HeaderCarverTests
         Assert.DoesNotContain("Q5", carved);
     }
 
+    /// <summary>Forwarding macros read before the paste macro they reach become paste macros when it is learned, however
+    /// long the chain; one redefined to stop forwarding does not.</summary>
+    [Fact]
+    public void Carve_ForwardingChainsLearnedBeforeThePaster()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define A3(x) A2(x)
+            #define A2(x) A1(x)
+            #define A1(x) CAT(x, 7)
+            #define B(x) CAT(x, 1)
+            #define B(x) other(x)
+            #define CAT(a, b) a##b
+            int u(void){ return A3(TIMER) + B(QSPI); }
+            """, """
+            #define TIMER7 1
+            #define QSPI1 2
+            #define SPI3 3
+            """);
+        Assert.Contains("#define TIMER7 1", carved);
+        Assert.DoesNotContain("QSPI1", carved);
+        Assert.DoesNotContain("SPI3", carved);
+    }
+
+    /// <summary>Thousands of paste macros among tens of thousands of forwarding macros: each new paste macro rescanned
+    /// every forwarding macro learned before it, and a work tree's header carve stopped moving for hours.</summary>
+    [Fact]
+    public void Carve_ManyPasteAndForwardingMacros_FinishInSeconds()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdrm-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            for (var f = 0; f < 200; f++)
+            {
+                var sb = new System.Text.StringBuilder();
+                for (var i = 0; i < 200; i++) sb.Append($"#define FWD_{f}_{i}(x) helper_{f}_{i}(x, 1)\n");
+                for (var i = 0; i < 15; i++) sb.Append($"#define PST_{f}_{i}(a, b) a##b##_{f}_{i}\n");
+                File.WriteAllText(Path.Combine(dir, $"m{f}.h"), sb.ToString());
+            }
+            File.WriteAllText(Path.Combine(dir, "app.c"), "#include \"chip.h\"\nint u(void){ return REG_A; }\n");
+            File.WriteAllText(Path.Combine(dir, "chip.h"), "#define REG_A 1\n#define REG_B 2\n");
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var res = HeaderCarver.Carve(dir, new[] { "chip.h" });
+            // The old rescan took over 25 min here (stopped); a throttled one-core debug run takes seconds.
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(60),
+                $"took {sw.Elapsed.TotalSeconds:N0} s: {string.Join(", ", res.PartMs.Select(p => $"{p.Part} {p.Ms} ms"))}");
+            Assert.Equal(3000, res.PasteMacros);
+            Assert.Equal(40000, res.ForwardingMacros);
+            Assert.Contains(res.PartMs, p => p.Part == "seed");
+            var carved = File.ReadAllText(Path.Combine(dir, "chip.h"));
+            Assert.Contains("REG_A", carved);
+            Assert.DoesNotContain("REG_B", carved);
+        }
+        finally { TempDir.Delete(dir); }
+    }
+
     /// <summary>A dropped #define must not take half a comment with it, and a #define inside a comment is text.</summary>
     [Fact]
     public void Carve_RespectsBlockComments()

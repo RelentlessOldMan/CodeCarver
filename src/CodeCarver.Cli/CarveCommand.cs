@@ -495,6 +495,7 @@ public static class CarveCommand
                     {
                         $"watchdog: {why} ({Span(inStep)} into the step after '{after}', run {Clock(runAt)})",
                         $"  count   : {CodeCarver.Core.Util.Activity.Describe() ?? "nothing counted in this step"}",
+                        $"  doing   : {CodeCarver.Core.Util.Activity.DescribeDoing() ?? "no part of the step named"}",
                         $"  cpu     : {cpuShare:P0} of one core over the last {Span(runAt - cpuFrom)} ({Environment.ProcessorCount} cores)",
                         $"  memory  : {_memoryNow}; {GC.GetTotalMemory(false) / 1e6:N0} MB managed",
                         $"  threads : {self.Threads.Count} in the process; pool {ThreadPool.ThreadCount} threads, {maxWorkers - freeWorkers} busy, {ThreadPool.PendingWorkItemCount:N0} queued",
@@ -516,6 +517,7 @@ public static class CarveCommand
             if (beat)
                 err.WriteLine($"  working : {(int)inStep.TotalMinutes} min into the step after '{after}'"
                     + (CodeCarver.Core.Util.Activity.Describe() is { } got ? $": {got} so far" : "") + $" (run {Clock(runAt)})"
+                    + (CodeCarver.Core.Util.Activity.DescribeDoing() is { } doing ? Environment.NewLine + $"  doing   : {doing}" : "")
                     + Environment.NewLine + $"  memory  : {_memoryNow}"
                     + (CodeCarver.Core.Util.HeldMeter.Describe() is { } held ? Environment.NewLine + $"  held    : {held}" : ""));
             if (report is not null)
@@ -3406,6 +3408,7 @@ public static class CarveCommand
             foreach (var (k, v) in CodeCarver.Core.Util.HeldMeter.Now()) snap[$"stop.{k}"] = v;
             if (machine is { } m) { snap["stop.machineFreeMb"] = m.Free / MB; if (m.CommitFree >= 0) snap["stop.commitRoomMb"] = m.CommitFree / MB; }
             if (CodeCarver.Core.Util.Activity.Describe() is { } got) snap["stop.count"] = got;
+            if (CodeCarver.Core.Util.Activity.DescribeDoing() is { } doing) snap["stop.doing"] = doing;
             var (inFlight, largest) = CodeCarver.Core.Util.Activity.InHand;
             snap["stop.inHandKb"] = inFlight >> 10;          // files being scanned when it stopped
             snap["stop.largestFileInStepKb"] = largest >> 10;
@@ -3863,6 +3866,9 @@ public static class CarveCommand
                     summary[$"{summaryStage}.headerCarve.bytesAfter"] = hc.BytesAfter;
                     summary[$"{summaryStage}.headerCarve.definesDropped"] = hc.DefinesDropped;
                     summary[$"{summaryStage}.headerCarve.passes"] = hc.Passes;
+                    summary[$"{summaryStage}.headerCarve.pasteMacros"] = hc.PasteMacros;
+                    summary[$"{summaryStage}.headerCarve.forwardingMacros"] = hc.ForwardingMacros;
+                    foreach (var (part, ms) in hc.PartMs) summary[$"{summaryStage}.headerCarve.{part}.ms"] = ms;
                     carvedBytes -= hc.BytesBefore - hc.BytesAfter;
                     var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
                     @out.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} kept, {hc.DefinesDropped:N0} dropped; "

@@ -645,6 +645,11 @@ verdict — busy computing, waiting on a slow drive, or idle on something not co
 symbol, goes into the `--diag` package too, and repeats every 15 minutes while the step stays like that; it
 never stops the run. The summary carries the run's totals: `io.<list|read|copy|launch>.count`, `.ms` (time
 spent waiting, summed over threads) and `.maxMs`, and `watchdog.reports`.
+A step of several parts says which runs now in a `doing   :` line after `working :` and in the watchdog block: the
+part, how long it has run, and its own numbers. The header carve names its parts (reading the kept files, learning
+paste macros from the big headers, reading paste-macro calls, each pass over the big headers, rewriting them) with how
+many paste macros, forwarding macros, names and paste pieces it has learned; the summary carries
+`stageN.headerCarve.pasteMacros`, `.forwardingMacros` and `.<seed|bigDefines|pasteCalls|fixpoint|emit>.ms`.
 
 Memory is measured on every run. Each `working :` line is followed by a `memory  :` line: the process's private
 memory and working set, and the machine's free memory and commit room (how much more every process together may
@@ -662,7 +667,7 @@ budget (`scanningMb`, `readingMb`, `walkingMb`, `parsingMb`) and its tables (`he
 `[advanced] memoryStopMb` stops a run whose private memory passes it, before it runs the machine out of memory.
 A `memory  : STOPPED` line names the step, and `<outputDirectory>/codecarver/stopped-summary.txt` holds every
 summary key written so far, the run's memory keys, and `stop.reason`, `stop.afterStep`, `stop.minutesInStep`,
-`stop.runSeconds`, `stop.count`, `stop.privateMb`, `stop.workingSetMb`, `stop.managedMb`, `stop.machineFreeMb`,
+`stop.runSeconds`, `stop.count`, `stop.doing`, `stop.privateMb`, `stop.workingSetMb`, `stop.managedMb`, `stop.machineFreeMb`,
 `stop.commitRoomMb`, `stop.heapMb` / `stop.heapFragmentedMb` / `stop.gcCommittedMb` (the heap as the last collection left it), `stop.held.<part>.<what>` (the `held    :` numbers as it stopped), and `stop.inHandKb` / `stop.largestFileInStepKb` (the files being scanned when it stopped,
 and the largest the step had started); numbers only, like `summary.txt`. The exit code is 4. Every run deletes that file when it
 starts, so one that exists is the last run's.

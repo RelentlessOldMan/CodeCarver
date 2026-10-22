@@ -7,6 +7,13 @@ public sealed record HeaderCarveResult(long BytesBefore, long BytesAfter, int De
 {
     /// <summary>Reads of the big headers the fixpoint took (each pass reads every one).</summary>
     public int Passes { get; init; }
+
+    /// <summary>Paste macros and forwarding macros (a function-like define whose body calls another) learned.</summary>
+    public int PasteMacros { get; init; }
+    public int ForwardingMacros { get; init; }
+
+    /// <summary>Milliseconds per part: seed, bigDefines, pasteCalls, fixpoint, emit.</summary>
+    public IReadOnlyList<(string Part, long Ms)> PartMs { get; init; } = Array.Empty<(string, long)>();
 }
 
 /// <summary>
@@ -43,6 +50,9 @@ public static class HeaderCarver
         // Files are read on many threads (one at a time, a work-scale output of 47 GB and GBs of big headers read
         // again each pass took hours); what they found is folded in in file order, so the result is the same.
         CodeCarver.Core.Util.Activity.Begin("files read for the header carve");
+        var partMs = new List<(string, long)>();
+        var partClock = System.Diagnostics.Stopwatch.StartNew();
+        void PartDone(string part) { partMs.Add((part, partClock.ElapsedMilliseconds)); partClock.Restart(); }
 
         // 1. Seed: every identifier used by kept code that ISN'T one of the carved headers. That is the set
         //    of names the compiled output could reference; a define outside its closure is unreachable.
@@ -60,6 +70,8 @@ public static class HeaderCarver
         var candidates = Directory.EnumerateFiles(outDir, "*", walk)
             .Where(f => !bigSet.Contains(Path.GetRelativePath(outDir, f).Replace('\\', '/'))).ToList();
         var seedFiles = new List<string>();
+        string Learned() => $"{pastes.Counts.Pasters:N0} paste macros, {pastes.Counts.Callers:N0} forwarding macros, {needed.Count:N0} names, {fragments.Count:N0} paste pieces";
+        CodeCarver.Core.Util.Activity.Doing("reading the kept files for names and paste macros", Learned);
         foreach (var (i, seen) in CodeCarver.Core.Util.ReadAhead.Ordered(candidates, SeedScan, CodeCarver.Core.Util.ReadAhead.Window))
         {
             if (seen.Names is null) continue;   // binary
@@ -68,10 +80,14 @@ public static class HeaderCarver
             // Only a line with a '#' can define or paste.
             foreach (var line in seen.HashLines) { pastes.Learn(line, fragments); pastes.LearnObject(line); }
         }
+        PartDone("seed");
         // A paste macro's own call sites name the pieces (`CAT(UART, 2)` builds UART2): learned macros first,
         // in the big headers too, then the calls.
+        CodeCarver.Core.Util.Activity.Doing("learning paste macros from the big headers", Learned);
         foreach (var (_, defines) in CodeCarver.Core.Util.ReadAhead.Ordered(bigFull, FunctionLikeDefines, CodeCarver.Core.Util.ReadAhead.Window))
             foreach (var text in defines) pastes.Learn(text, literals: null);   // its literal pieces count once it's wanted
+        PartDone("bigDefines");
+        CodeCarver.Core.Util.Activity.Doing("reading paste-macro calls in the kept files", Learned);
         if (pastes.Any)
             foreach (var (_, lines) in CodeCarver.Core.Util.ReadAhead.Ordered(seedFiles, f => LogicalLines(f).Where(pastes.NamesPaster).ToList(), CodeCarver.Core.Util.ReadAhead.Window))
                 foreach (var line in lines) pastes.AddCallArguments(line, fragments);
@@ -103,6 +119,7 @@ public static class HeaderCarver
         //    taken two passes back (a name taken in a pass may have been passed over in a batch before it became
         //    wanted; the pass after takes every line of it). When the paste macros grew, a call or a define taken
         //    before can build more: the next pass takes every line again.
+        PartDone("pasteCalls");
         var batches = Batches(bigFull, 256L << 20);
         var done = new HashSet<string>(StringComparer.Ordinal);
         var takenBefore = new HashSet<string>(StringComparer.Ordinal);
@@ -110,6 +127,7 @@ public static class HeaderCarver
         for (var all = true; ;)
         {
             passes++;
+            CodeCarver.Core.Util.Activity.Doing($"reading the big headers for what they need, pass {passes}", Learned);
             var grew = false;
             var taken = new HashSet<string>(StringComparer.Ordinal);
             var pastesAt = pastes.Version;
@@ -137,7 +155,9 @@ public static class HeaderCarver
             if (!grew) break;
         }
 
+        PartDone("fixpoint");
         // 3. Emit: rewrite each header, dropping #defines whose name isn't wanted (and their continuations).
+        CodeCarver.Core.Util.Activity.Doing("rewriting the big headers", Learned);
         FreezeFragments();
         var rewritten = CodeCarver.Core.Util.ReadAhead.Each(bigFull, path =>
         {
@@ -152,7 +172,12 @@ public static class HeaderCarver
             File.Move(tmp, path);
             return (Before: before, After: new FileInfo(path).Length, Kept: kept, Dropped: dropped);
         });
-        return new HeaderCarveResult(rewritten.Sum(r => r.Before), rewritten.Sum(r => r.After), rewritten.Sum(r => r.Kept), rewritten.Sum(r => r.Dropped)) { Passes = passes };
+        PartDone("emit");
+        CodeCarver.Core.Util.Activity.Doing(null);
+        return new HeaderCarveResult(rewritten.Sum(r => r.Before), rewritten.Sum(r => r.After), rewritten.Sum(r => r.Kept), rewritten.Sum(r => r.Dropped))
+        {
+            Passes = passes, PasteMacros = pastes.Counts.Pasters, ForwardingMacros = pastes.Counts.Callers, PartMs = partMs,
+        };
     }
 
     /// <summary>A seed file's identifiers and its logical lines with a '#' (null names: a binary file).</summary>
@@ -447,8 +472,15 @@ public static class HeaderCarver
     private sealed class Pastes
     {
         private readonly Dictionary<string, string> callers = new(StringComparer.Ordinal);   // name -> body, may forward
+        // Name -> the forwarding macros whose body named it (a body since replaced may still be listed: checked on use).
+        // A new paster wakes only those: rescanning every forwarding macro for each new paster took hours at work
+        // (tens of thousands of each), the header carve's seed stuck at 6,580 of 37,916 files.
+        private readonly Dictionary<string, List<string>> calledBy = new(StringComparer.Ordinal);
         private readonly HashSet<string> pasters = new(StringComparer.Ordinal);
         public bool Any => pasters.Count > 0;
+
+        /// <summary>Paste macros and forwarding macros learned so far (for the heartbeat).</summary>
+        public (int Pasters, int Callers) Counts => (pasters.Count, callers.Count);
 
         /// <summary>Grows when a paste macro or an expanded argument name is learned: calls and defines read before may
         /// then build more names.</summary>
@@ -486,11 +518,18 @@ public static class HeaderCarver
                 if (afterComma && piece == variadic) continue;   // `, ##__VA_ARGS__` (a logging macro) builds no name
                 else if (parms.Contains(piece)) pastesParam = true;
                 else literals?.Add(piece);
-            if (pastesParam) { if (pasters.Add(name)) Propagate(); return; }
+            if (pastesParam) { MakePaster(name); return; }
             if (parms.Count > 0 && body.Contains('('))
             {
                 callers[name] = body;
-                if (CallsPaster(body)) { pasters.Add(name); Propagate(); }
+                var ids = new HashSet<string>(StringComparer.Ordinal);
+                AddIdentifiers(ids, body);
+                foreach (var id in ids)
+                {
+                    if (!calledBy.TryGetValue(id, out var by)) calledBy[id] = by = new List<string>();
+                    by.Add(name);
+                }
+                if (ids.Overlaps(pasters)) MakePaster(name);
             }
         }
 
@@ -573,21 +612,30 @@ public static class HeaderCarver
             }
         }
 
-        private bool CallsPaster(string body)
+        /// <summary><paramref name="name"/> is a paster, and so is every forwarding macro whose body calls one.</summary>
+        private void MakePaster(string name)
         {
-            var ids = new HashSet<string>(StringComparer.Ordinal);
-            AddIdentifiers(ids, body);
-            return ids.Overlaps(pasters);
+            if (!pasters.Add(name)) return;
+            var work = new Stack<string>();
+            work.Push(name);
+            while (work.TryPop(out var p))
+                if (calledBy.TryGetValue(p, out var by))
+                    foreach (var caller in by)
+                        if (!pasters.Contains(caller) && NamesWord(callers[caller], p) && pasters.Add(caller)) work.Push(caller);
         }
 
-        private void Propagate()
+        /// <summary>Is <paramref name="word"/> one of the identifiers <see cref="AddIdentifiers"/> finds in <paramref name="text"/>?</summary>
+        private static bool NamesWord(string text, string word)
         {
-            for (var grew = true; grew;)
+            var i = 0;
+            while (i < text.Length)
             {
-                grew = false;
-                foreach (var (name, body) in callers)
-                    if (!pasters.Contains(name) && CallsPaster(body)) { pasters.Add(name); grew = true; }
+                if (!IsIdentStart(text[i])) { i++; continue; }
+                var start = i;
+                while (i < text.Length && IsIdentChar(text[i])) i++;
+                if (text.AsSpan(start, i - start).SequenceEqual(word)) return true;
             }
+            return false;
         }
 
         /// <summary>Name, parameters and body of a function-like <c>#define NAME(params) body</c>, or a null name.</summary>
