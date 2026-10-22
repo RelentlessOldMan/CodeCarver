@@ -414,37 +414,13 @@ public static class CarveCommand
         // What the run still holds as a step ends: the managed heap after a full collection (MB). A peak says how much a
         // step had, not what it kept for the steps after; at work a stop in the check could not say whether the check or
         // an earlier step held the memory. The collections cost time (mem.liveGc.ms, all of them).
-        // A step that kept CODECARVER_HEAP_TYPES_MB (default 1024; 0: never) more than the one before also says what it
-        // kept: the heap's biggest types and what refers to them (heap.<step>.<n>, and on the console).
-        long _liveGcMs = 0, _lastLiveMb = 0;
-        var _heapTypesMb = long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_HEAP_TYPES_MB"), out var htm) ? htm : 1024;
-        void HeapTypesTo(string where, IDictionary<string, object?> into, TimeSpan? budget = null)
-        {
-            var i = 0;
-            foreach (var line in HeapTypes.OfThisProcess(15, budget ?? TimeSpan.FromMinutes(3)))
-            {
-                into[$"heap.{where}.{++i:D2}"] = line;
-                err.WriteLine($"  heap    : {where}: {line}");
-            }
-        }
+        long _liveGcMs = 0;
         long LiveMb(string where)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: false);
             var live = GC.GetTotalMemory(false) / (1024 * 1024);
             summary["mem.liveGc.ms"] = _liveGcMs += sw.ElapsedMilliseconds;
-            if (_heapTypesMb > 0 && live - _lastLiveMb >= _heapTypesMb)
-            {
-                err.WriteLine($"  heap    : {where} kept {live - _lastLiveMb:N0} MB more (live {live:N0} MB); what the heap holds:");
-                HeapTypesTo(where, summary);
-                // What the walk itself left live (it must not hold memory for the steps after): the largest of the walks.
-                GC.WaitForPendingFinalizers();
-                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: false);
-                var after = GC.GetTotalMemory(false) / (1024 * 1024);
-                summary["mem.heapWalk.leftMb"] = Math.Max(after - live, summary.TryGetValue("mem.heapWalk.leftMb", out var hw) && hw is long hl ? hl : 0L);
-                live = after;
-            }
-            _lastLiveMb = live;
             return live;
         }
         long TakePeakMb()
@@ -2613,12 +2589,13 @@ public static class CarveCommand
             {
                 // What the startup code includes names handlers too; a C header's prototypes would root everything it
                 // declares, so only its assembler directives count.
-                var asmTexts = AsmTexts(asmPaths).ToList();
+                // Streamed: the provider takes each text's names and lets it go. Held in a list, every assembly file and
+                // what it includes stayed live for the rest of the run (a work run kept 9 GB from here to its stop).
                 var asmIncs = AsmIncludes(asmPaths);
-                foreach (var (inc, text) in asmIncs.Zip(AsmTexts(asmIncs)))
-                    asmTexts.Add(Path.GetExtension(inc).ToLowerInvariant() is ".h" or ".hh" or ".hpp" or ".hxx"
-                        ? string.Join('\n', text.Split('\n').Where(l => l.TrimStart().StartsWith('.')))
-                        : text);
+                var asmTexts = AsmTexts(asmPaths).Select(t => t.Text).Concat(AsmTexts(asmIncs).Select(t =>
+                    Path.GetExtension(t.Path).ToLowerInvariant() is ".h" or ".hh" or ".hpp" or ".hxx"
+                        ? string.Join('\n', t.Text.Split('\n').Where(l => l.TrimStart().StartsWith('.')))
+                        : t.Text));
                 asmRoots = new AsmReferenceRootProvider(asmTexts).Discover(graph).ToList();
             }
             // Every assembly file is copied whole, so the headers it includes are kept whole (review S1, D10).
@@ -2642,10 +2619,10 @@ public static class CarveCommand
             var found = new List<string>();
             while (queue.Count > 0)
             {
-                // Everything queued, read at once; scanned in queue order, so what it adds is queued as before.
+                // Everything queued, read ahead; scanned in queue order, so what it adds is queued as before.
                 var batch = queue.Where(p => SafeLength(p) <= maxParseBytes).ToList();
                 queue = new List<string>();
-                foreach (var (path, text) in batch.Zip(AsmTexts(batch)))
+                foreach (var (path, text) in AsmTexts(batch))
                     foreach (System.Text.RegularExpressions.Match m in includeRe.Matches(text))
                     {
                         var raw = m.Groups[1].Value.Trim().Replace('\\', '/');
@@ -2678,27 +2655,27 @@ public static class CarveCommand
                 ? named.Where(p => !Excluded(p) && ("/" + p.Replace('\\', '/')).EndsWith("/" + tail, StringComparison.OrdinalIgnoreCase)).ToList()
                 : new List<string>();
         }
-        // Assembly files and what they include are read by the roots and by the include walk: each read once, many at a
-        // time (a share's round trips), and held while they total 256 MB or less.
-        string[] AsmTexts(IReadOnlyList<string> files)
+        // Assembly files and what they include are read by the include walk and by the roots: many at a time (a share's
+        // round trips), in order, and what is read ahead held under 256 MB. Texts totalling 128M chars are kept for the
+        // second read and let go when this part ends. Read all at once, a batch of the tree's assembly was held whole.
+        IEnumerable<(string Path, string Text)> AsmTexts(IReadOnlyList<string> files)
         {
-            var texts = CodeCarver.Core.Util.ReadAhead.Each(files, p =>
+            foreach (var (p, read) in CodeCarver.Core.Util.ReadAhead.Prefetch(files, p =>
             {
                 lock (asmText) if (asmText.TryGetValue(p, out var t)) return t;
                 try { return CodeCarver.Core.Util.IoMeter.ReadAllText(p); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
-            });
-            var result = new string[files.Count];
-            for (var i = 0; i < files.Count; i++)
+            }, t => (t?.Length ?? 0) * 2L, maxWeight: 256L << 20))
             {
-                result[i] = texts[i] ?? SafeRead(files[i]);   // failed: read alone, warned once
-                if (texts[i] is { } t && !asmText.ContainsKey(files[i]) && asmTextChars + t.Length <= 128L << 20)
-                {
-                    asmText[files[i]] = t;
-                    asmTextChars += t.Length;
-                }
+                if (read is { } t)
+                    lock (asmText)
+                        if (!asmText.ContainsKey(p) && asmTextChars + t.Length <= 128L << 20)
+                        {
+                            asmText[p] = t;
+                            asmTextChars += t.Length;
+                        }
+                yield return (p, read ?? SafeRead(p));   // failed: read alone, warned once
             }
-            return result;
         }
         // forceKeepFiles (review K1): resolve each glob once. A forced code file is an ExplicitFile root, so its
         // callees and includes come with it; a forced .cmm seeds the .cmm closure; everything forced is copied
@@ -2713,6 +2690,11 @@ public static class CarveCommand
             err.WriteLine(n == 0 ? $"  warn    : forceKeepFiles '{glob}' matched no file (a bare pattern like '*.inc' searches all subdirectories)"
                                  : $"  force   : forceKeepFiles '{glob}' -> {n} file(s) kept");
         }
+        // The roots are found: the texts kept for a second read and the tree by file name go.
+        asmText.Clear();
+        asmText.TrimExcess();
+        asmTextChars = 0;
+        asmByName = null;
         RootsPart("asmAndForceKeep");
         var forcedGraphFiles = forcedRel.Where(r => fullByRel.ContainsKey(r)).ToList();
         var forcedRoots = forcedGraphFiles.Count > 0
@@ -3431,8 +3413,6 @@ public static class CarveCommand
             foreach (var (k, v) in CodeCarver.Core.Util.Activity.Parts()) snap[$"stop.{k}"] = v;
             // The tree's shape as far as the link check got (numbers only).
             foreach (var (k, v) in CodeCarver.Core.Reachability.EmittedLinkCheck.ShapeSoFar()) snap[$"stop.{k}"] = v;
-            // What the heap holds as it stops: its biggest types and what refers to them (heap.stop.<n>).
-            if (_heapTypesMb > 0) HeapTypesTo("stop", snap!);   // the run is held still while it is walked
             snap["exitCode"] = StoppedForMemoryExit;
             err.WriteLine($"memory  : STOPPED - private memory {priv / MB:N0} MB passed memoryStopMb = {_memoryStop / MB:N0} in the step after '{step}' (run {Clock(runAt)})");
             err.WriteLine($"  memory  : {MemoryLine(priv, workingSet, machine)}");
@@ -3441,7 +3421,7 @@ public static class CarveCommand
                 Directory.CreateDirectory(Path.GetDirectoryName(stoppedSummaryPath)!);
                 var marker = Path.Combine(outputFull, StagedOutput.MarkerName);
                 if (!File.Exists(marker)) File.WriteAllText(marker, "CodeCarver output area.\n");
-                File.WriteAllText(stoppedSummaryPath, "# CodeCarver summary of a run STOPPED for memory - numbers only: no path, file name or symbol (heap.* lines name CodeCarver's own .NET types). Safe to send back.\n"
+                File.WriteAllText(stoppedSummaryPath, "# CodeCarver summary of a run STOPPED for memory - numbers only: no path, file name or symbol. Safe to send back.\n"
                     + string.Concat(snap.Select(kv => $"{kv.Key} = {SummaryValue(kv.Value)}\n")));
                 err.WriteLine($"  summary : {stoppedSummaryPath}");
             }
