@@ -55,10 +55,14 @@ File-level (drop whole unneeded files) is always the sound floor. Two independen
 | `carveSourceFileContents` | also remove unreached **functions and data tables** within kept C/C++ files | aggressive — **always build-verify** |
 | `carveHeaderFileContents` | also strip unused `#define`s from **big** kept headers: those over `maxParseBytes`, or macro-dense headers of 1 MB or more. Ordinary headers are never rewritten. It runs after the infrastructure copy, and keeps every `#define` that assembly, linker scripts or other text files in the output use | aggressive — **always build-verify** |
 
-Intra-file carving is where the big wins are (e.g. carving AES to encrypt-only drops the inverse S-box
-table) — validated to compile on cJSON, zlib, Lua, SQLite, printf and tiny-AES-c, but treat it as "verify
-by building it." Define named **`[stages.NAME]`** blocks to emit several aggressiveness tiers in one run
-(`--stage` picks one; omit it to run them all, each into `outputDirectory/<stage>/`).
+Intra-file carving removes source (e.g. carving AES to encrypt-only drops the inverse S-box table) and is
+validated to compile on cJSON, zlib, Lua, SQLite, printf and tiny-AES-c, but treat it as "verify by building
+it." It does not make the image smaller when the link already drops unreferenced sections (`-Wl,--gc-sections`
+with `-ffunction-sections -fdata-sections`, the usual embedded setup): the linker was leaving out the same
+functions. There the two tiers worth running are a file-level one and one with both toggles on, which also
+shrinks the big headers. Define named **`[stages.NAME]`** blocks to emit several tiers in one run (`--stage`
+picks one; omit it to run them all, each into `outputDirectory/<stage>/`); the template `codecarver init` writes suggests `safe`
+and `max`.
 
 **File-level output is closed over what it emits.** A kept file is written whole, so functions in it that no
 root reaches are still in the output, and whatever *they* call must be there too or the tree won't link.

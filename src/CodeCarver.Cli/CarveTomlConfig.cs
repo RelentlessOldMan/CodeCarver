@@ -312,9 +312,6 @@ public static class ConfigLoader
         # [stages.safe]
         # carveSourceFileContents = false
         # carveHeaderFileContents = false
-        # [stages.aggressive]
-        # carveSourceFileContents = true
-        # carveHeaderFileContents = false
         # [stages.max]
         # carveSourceFileContents = true
         # carveHeaderFileContents = true
