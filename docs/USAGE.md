@@ -649,7 +649,10 @@ A step of several parts says which runs now in a `doing   :` line after `working
 part, how long it has run, and its own numbers. The header carve names its parts (reading the kept files, learning
 paste macros from the big headers, reading paste-macro calls, each pass over the big headers, rewriting them) with how
 many paste macros, forwarding macros, names and paste pieces it has learned; the summary carries
-`stageN.headerCarve.pasteMacros`, `.forwardingMacros` and `.<seed|bigDefines|pasteCalls|fixpoint|emit>.ms`.
+`stageN.headerCarve.pasteMacros`, `.forwardingMacros` and, for each part (`seed`, `bigDefines`, `pasteCalls`,
+`fixpoint`, `emit`), `.<part>.ms`, `.cpuMs` (all threads), `.allocatedMb` (memory it allocated), `.privateMb` (the
+process's private memory as it ended) and `.liveMb` (what is still live after it, from a full collection). A memory
+stop's `stopped-summary.txt` carries those of the parts that finished.
 
 Memory is measured on every run. Each `working :` line is followed by a `memory  :` line: the process's private
 memory and working set, and the machine's free memory and commit room (how much more every process together may

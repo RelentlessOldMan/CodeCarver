@@ -51,6 +51,29 @@ internal sealed class TreeCarve : IDisposable
     public (int Code, string Out, string Err) Carve(string entry = "main", string extraToml = "", bool log = true, string common = "",
                                                    string languages = "\"c\"")
     {
+        var cfg = WriteConfig(entry, extraToml, log, common, languages);
+        var so = new StringWriter(); var se = new StringWriter();
+        var code = CarveCommand.Run(new[] { "carve", Src, "--config", cfg }, so, se);
+        return (code, so.ToString(), se.ToString());
+    }
+
+    /// <summary><see cref="Carve"/> in a codecarver process of its own: its CPU time and memory are the carve's alone,
+    /// not the test host's (other tests run there at once).</summary>
+    public (int Code, string Out, string Err) CarveInProcessOfItsOwn(string extraToml = "")
+    {
+        var cfg = WriteConfig("main", extraToml, true, "", "\"c\"");
+        var exe = Path.Combine(AppContext.BaseDirectory, OperatingSystem.IsWindows() ? "codecarver.exe" : "codecarver");
+        var psi = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
+        foreach (var a in new[] { "carve", Src, "--config", cfg }) psi.ArgumentList.Add(a);
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        var err = p.StandardError.ReadToEndAsync();
+        var o = p.StandardOutput.ReadToEnd();
+        p.WaitForExit();
+        return (p.ExitCode, o, err.Result);
+    }
+
+    string WriteConfig(string entry, string extraToml, bool log, string common, string languages)
+    {
         var sb = new System.Text.StringBuilder();
         sb.Append($"outputDirectory = \"{F(Path.Combine(Root, "out"))}\"\n[common]\nentryPoints = [\"{entry}\"]\nlanguages = [{languages}]\n{common}");
         if (log || TracePaths is not null) sb.Append("[builds.b]\n");
@@ -67,9 +90,7 @@ internal sealed class TreeCarve : IDisposable
         sb.Append(extraToml);
         var cfg = Path.Combine(Root, "carve.toml");
         File.WriteAllText(cfg, sb.ToString());
-        var so = new StringWriter(); var se = new StringWriter();
-        var code = CarveCommand.Run(new[] { "carve", Src, "--config", cfg }, so, se);
-        return (code, so.ToString(), se.ToString());
+        return cfg;
     }
 
     public string CarvedPath(string rel) => Path.Combine(Root, "out", "carved", rel);

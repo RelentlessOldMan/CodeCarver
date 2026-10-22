@@ -74,6 +74,42 @@ public class HeaderCarverTests
     }
 
     [Fact]
+    public void Carve_ANumberNamesNothing()
+    {
+        // 0x1Fu is one token, not 0 then the name x1Fu: every register value was read as a name, millions of them in a
+        // big header's needed set.
+        var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdrn-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "app.c"), """
+                #include "chip.h"
+                int use(void){ return REG_A + (int)(1.5e+3f) + 0b101; }
+                """);
+            File.WriteAllText(Path.Combine(dir, "chip.h"), """
+                #define REG_A (0x1Fu + OFS)
+                #define OFS 4
+                #define x1Fu 1
+                #define e3f 2
+                #define b101 3
+                """);
+
+            HeaderCarver.Carve(dir, new[] { "chip.h" });
+            var carved = File.ReadAllText(Path.Combine(dir, "chip.h"));
+
+            Assert.Contains("#define REG_A", carved);
+            Assert.Contains("#define OFS", carved);   // the name after the number
+            Assert.DoesNotContain("#define x1Fu", carved);
+            Assert.DoesNotContain("#define e3f", carved);
+            Assert.DoesNotContain("#define b101", carved);
+        }
+        finally
+        {
+            TempDir.Delete(dir);
+        }
+    }
+
+    [Fact]
     public void Carve_KeepsTokenPasteTargets_TheParseBlindSpot()
     {
         // If code builds a define name with ## (REG_##n##_BASE), the concrete define (REG_1_BASE) never
@@ -141,7 +177,10 @@ public class HeaderCarverTests
         }
     }
 
-    static string CarveOne(string appC, string chipH, IEnumerable<string>? extraNames = null, System.Text.Encoding? appEncoding = null)
+    static string CarveOne(string appC, string chipH, IEnumerable<string>? extraNames = null, System.Text.Encoding? appEncoding = null) =>
+        CarveOneWithResult(appC, chipH, extraNames, appEncoding).Carved;
+
+    static (string Carved, HeaderCarveResult Result) CarveOneWithResult(string appC, string chipH, IEnumerable<string>? extraNames = null, System.Text.Encoding? appEncoding = null)
     {
         var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdr-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
@@ -150,8 +189,8 @@ public class HeaderCarverTests
             if (appEncoding is null) File.WriteAllText(Path.Combine(dir, "app.c"), appC);
             else File.WriteAllText(Path.Combine(dir, "app.c"), appC, appEncoding);
             File.WriteAllText(Path.Combine(dir, "chip.h"), chipH);
-            HeaderCarver.Carve(dir, new[] { "chip.h" }, extraNames);
-            return File.ReadAllText(Path.Combine(dir, "chip.h")).Replace("\r\n", "\n");
+            var res = HeaderCarver.Carve(dir, new[] { "chip.h" }, extraNames);
+            return (File.ReadAllText(Path.Combine(dir, "chip.h")).Replace("\r\n", "\n"), res);
         }
         finally { TempDir.Delete(dir); }
     }
@@ -180,7 +219,8 @@ public class HeaderCarverTests
     }
 
     /// <summary>Forwarding macros read before the paste macro they reach become paste macros when it is learned, however
-    /// long the chain; one redefined to stop forwarding does not.</summary>
+    /// long the chain; one redefined to stop forwarding still is one: any definition makes it one, in any order (the
+    /// other definition may be the one an #if picks).</summary>
     [Fact]
     public void Carve_ForwardingChainsLearnedBeforeThePaster()
     {
@@ -199,7 +239,7 @@ public class HeaderCarverTests
             #define SPI3 3
             """);
         Assert.Contains("#define TIMER7 1", carved);
-        Assert.DoesNotContain("QSPI1", carved);
+        Assert.Contains("#define QSPI1 2", carved);
         Assert.DoesNotContain("SPI3", carved);
     }
 
@@ -226,8 +266,8 @@ public class HeaderCarverTests
             // The old rescan took over 25 min here (stopped); a throttled one-core debug run takes seconds.
             Assert.True(sw.Elapsed < TimeSpan.FromSeconds(60),
                 $"took {sw.Elapsed.TotalSeconds:N0} s: {string.Join(", ", res.PartMs.Select(p => $"{p.Part} {p.Ms} ms"))}");
-            Assert.Equal(3000, res.PasteMacros);
-            Assert.Equal(40000, res.ForwardingMacros);
+            Assert.Equal(0, res.PasteMacros);         // counted only where defined in a carved header
+            Assert.Equal(0, res.ForwardingMacros);
             Assert.Contains(res.PartMs, p => p.Part == "seed");
             var carved = File.ReadAllText(Path.Combine(dir, "chip.h"));
             Assert.Contains("REG_A", carved);
@@ -382,6 +422,186 @@ public class HeaderCarverTests
         Assert.Contains("#define USED 1", carved);
         Assert.DoesNotContain("CH_n", carved);
         Assert.DoesNotContain("nVIC", carved);
+    }
+
+    /// <summary>An object-like define whose body ends in a paste macro is one (<c>F(a, b)</c> calls it), whichever is read
+    /// first; one whose body only names it inside parentheses, or doesn't end in it, is not.</summary>
+    [Fact]
+    public void Carve_ObjectLikeAliasOfAPasteMacro_IsOne()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define JOIN JOIN_IMPL
+            #define WRAP (CAT)
+            #define AFTER CAT(AQ, BQ) + 1
+            int u(void){ return JOIN(UART, 3) + ALIAS(TIMER, 4) + WRAP(SPI, 5) + AFTER(QSPI, 6); }
+            """, """
+            #define JOIN_IMPL(a, b) a##b
+            #define ALIAS prefix CAT
+            #define CAT(a, b) a##b
+            #define UART3 1
+            #define TIMER4 2
+            #define SPI5 3
+            #define QSPI6 4
+            #define AQ_REG 5
+            #define BQ_REG 6
+            """);
+        Assert.Contains("#define UART3 1", carved);
+        Assert.Contains("#define TIMER4 2", carved);
+        Assert.DoesNotContain("SPI5", carved);
+        Assert.DoesNotContain("QSPI6", carved);
+        Assert.Contains("#define AQ_REG 5", carved);   // the call in AFTER's own body passes AQ and BQ
+        Assert.Contains("#define BQ_REG 6", carved);
+    }
+
+    /// <summary>An argument list runs to its matching ')' over lines and #if branches: every branch's arguments count.</summary>
+    [Fact]
+    public void Carve_PasteCallSpanningLinesAndBranches_PassesEveryArgument()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define CAT(a, b) a##b
+            int u(void){ return CAT(PFX,
+            #if BOARD
+                MIDA) +
+            #else
+                MIDB) +
+            #endif
+                0; }
+            int v(void){ return f(
+                LONE); }
+            """, """
+            #define PFX_REG 1
+            #define MIDA_REG 2
+            #define MIDB_REG 3
+            #define LONE_REG 4
+            """);
+        Assert.Contains("#define PFX_REG 1", carved);
+        Assert.Contains("#define MIDA_REG 2", carved);
+        Assert.Contains("#define MIDB_REG 3", carved);
+        Assert.DoesNotContain("LONE_REG", carved);
+    }
+
+    /// <summary>A paste macro passed as an argument (<c>APPLY(CAT, HOA, 2)</c>) pastes the call's other arguments; a call
+    /// of what a paste builds (<c>CAT(FWD_, 7)(CMP)</c>) passes its arguments to it.</summary>
+    [Fact]
+    public void Carve_HigherOrderAndComputedPasteCalls_PassTheirArguments()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define CAT(a, b) a##b
+            #define APPLY(m, a, b) m(a, b)
+            #define FWD_7(x) x##_SEL
+            int u(void){ return APPLY(CAT, HOA, 2) + CAT(FWD_, 7)(CMP) + APPLY(g, NOPE, 3); }
+            """, """
+            #define HOA2 1
+            #define CMP_SEL 2
+            #define NOPE3 3
+            """);
+        Assert.Contains("#define HOA2 1", carved);
+        Assert.Contains("#define CMP_SEL 2", carved);
+        Assert.DoesNotContain("NOPE3", carved);
+    }
+
+    /// <summary>Any identifier next to a ## is a piece, one letter included; a number never is.</summary>
+    [Fact]
+    public void Carve_PastePieces_AnyIdentifierLengthButNoNumbers()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define CAT(a, b) a##b
+            #define ONE Q##W
+            int u(void){ return ONE + CAT(V, 0x1F); }
+            """, """
+            #define Q1 1
+            #define VREG 2
+            #define x1F_REG 3
+            #define W_REG 4
+            """);
+        Assert.Contains("#define Q1 1", carved);
+        Assert.Contains("#define VREG 2", carved);
+        Assert.Contains("#define W_REG 4", carved);
+        Assert.DoesNotContain("x1F_REG", carved);
+    }
+
+    /// <summary>An argument expands to its body before the paste, but only a body's first and last tokens can join it:
+    /// <c>#define PORT ((t)U)</c> builds no name from U. Every definition counts, however many.</summary>
+    [Fact]
+    public void Carve_ArgumentExpansion_OnlyBodyEdgesArePieces()
+    {
+        var app = new System.Text.StringBuilder("""
+            #include "chip.h"
+            #define CAT(a, b) a##b
+            #define PORT ((t)U)
+            #define EDGE LEFT mid RIGHT
+
+            """);
+        for (var i = 0; i < 20; i++) app.Append($"#if B == {i}\n#define MANY BODY{i}X\n#endif\n");
+        app.Append("int u(void){ return CAT(PORT, 1) + CAT(EDGE, 2) + CAT(MANY, 3); }\n");
+        var carved = CarveOne(app.ToString(), """
+            #define U1 1
+            #define LEFT2 2
+            #define RIGHT2 3
+            #define mid2 4
+            #define BODY19X_3 5
+            """);
+        Assert.DoesNotContain("#define U1", carved);
+        Assert.Contains("#define LEFT2 2", carved);
+        Assert.Contains("#define RIGHT2 3", carved);
+        Assert.DoesNotContain("mid2", carved);
+        Assert.Contains("#define BODY19X_3 5", carved);   // the 20th body (16 were kept before)
+    }
+
+    /// <summary>The counts are of names defined in the carved header; whether one is a paste macro is judged from every
+    /// definition, a paste macro defined only in a kept file included.</summary>
+    [Fact]
+    public void Carve_CountsPasteAndForwardingMacrosDefinedInTheCarvedHeaders()
+    {
+        var (_, res) = CarveOneWithResult("""
+            #include "chip.h"
+            #define CAT(a, b) a##b
+            int u(void){ return 0; }
+            """, """
+            #define FWD(a) CAT(a, 1)
+            #define TBL_0(x) ((x) + TBL_1)
+            #define OWN(a) a##_x
+            #define ALIAS FWD
+            #define PLAIN 3
+            """);
+        Assert.Equal(3, res.PasteMacros);         // FWD, OWN, ALIAS (CAT is defined outside it)
+        Assert.Equal(2, res.ForwardingMacros);    // FWD, TBL_0
+        Assert.Equal(5, res.DefinesKept + res.DefinesDropped);
+    }
+
+    /// <summary>Up to 64 paste pieces a define name is tried against each piece; past 64, against its prefixes and
+    /// suffixes of the lengths some piece has. Both ways keep the same defines: names starting or ending with a
+    /// piece, a piece equal to the name, never a piece in the middle.</summary>
+    [Theory]
+    [InlineData(63)]
+    [InlineData(64)]
+    [InlineData(65)]
+    [InlineData(66)]
+    public void Carve_PieceLookup_SameAtTheCrossover(int pieces)
+    {
+        var app = new System.Text.StringBuilder("#include \"chip.h\"\n#define CAT(a, b) a##b\n");
+        app.Append("int u(void){ return CAT(HEADP, 1) + CAT(TAILP, 2) + CAT(EXACTP, 2)");
+        for (var i = 3; i < pieces; i++) app.Append($" + CAT(PX{i}, 0)");
+        app.Append("; }\n");
+        var carved = CarveOne(app.ToString(), """
+            #define HEADP_REG 1
+            #define REG_TAILP 2
+            #define EXACTP 3
+            #define MID_HEADP_X 4
+            #define NONE_REG 5
+            #define PX5_LAST 6
+
+            """);
+        Assert.Contains("#define HEADP_REG 1", carved);
+        Assert.Contains("#define REG_TAILP 2", carved);
+        Assert.Contains("#define EXACTP 3", carved);
+        Assert.DoesNotContain("MID_HEADP_X", carved);
+        Assert.DoesNotContain("NONE_REG", carved);
+        Assert.Contains("#define PX5_LAST 6", carved);
     }
 
     /// <summary>A UTF-16 source (with a byte-order mark) is text: the macros it uses are counted.</summary>

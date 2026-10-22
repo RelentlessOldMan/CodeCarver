@@ -115,12 +115,13 @@ bug fixed against the corpus, not a corpus case removed.
 
 1. A name is a **paste macro** if any of its definitions anywhere pastes a parameter (`a##b`, not
    `, ##__VA_ARGS__`), or forwards to a paste macro: by a function-like body that calls one, or an object-like
-   alias (`#define F CAT`). Order does not matter; a later definition only adds.
+   define whose body's last token is one (`#define F CAT`: `F(a, b)` calls it; `#define F (CAT)` does not). Order does not matter; a later definition only adds.
 2. **Pieces**: every identifier beside a `##` (any length; numbers are not pieces); every identifier among the
    arguments of a paste-macro call in kept text, a call spanning lines included; a paste macro passed as an
    argument (`APPLY(CAT, A, 2)`) makes the enclosing call's argument identifiers pieces; in a computed call
-   (`CAT(FWD_, 7)(x)`) the trailing arguments count too; and what each argument identifier expands to through
-   object-like defines, every body, transitively.
+   (`CAT(FWD_, 7)(x)`) the trailing arguments count too; and, for each argument identifier, the first and last
+   token of every body of its object-like defines when that token is an identifier (an argument passed on is
+   expanded, and `##` joins only the boundary tokens), each expanded the same way, transitively.
    Pieces come only from kept text outside the big headers, the big headers' non-define lines, and the bodies of
    **wanted** big-header defines (a define never kept is never expanded); rule 1 uses every definition. A
    define's own parameters are never pieces: its call sites supply them. An argument list runs to its matching

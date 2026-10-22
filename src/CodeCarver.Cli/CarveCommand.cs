@@ -3864,14 +3864,14 @@ public static class CarveCommand
                     var elsewhere = new HashSet<string>(outsideNames, StringComparer.Ordinal);
                     foreach (var spec in buildCmds.SelectMany(c => c.Defines).Concat(defineSpecs))
                         foreach (var m in Identifier.EnumerateMatches(spec)) elsewhere.Add(spec.Substring(m.Index, m.Length));
-                    var hc = HeaderCarver.Carve(stageDir, keptBig, elsewhere);
+                    var hc = HeaderCarver.Carve(stageDir, keptBig, elsewhere, (key, value) => summary[$"{summaryStage}.headerCarve.{key}"] = value);
                     summary[$"{summaryStage}.headerCarve.bytesBefore"] = hc.BytesBefore;
                     summary[$"{summaryStage}.headerCarve.bytesAfter"] = hc.BytesAfter;
+                    summary[$"{summaryStage}.headerCarve.definesKept"] = hc.DefinesKept;
                     summary[$"{summaryStage}.headerCarve.definesDropped"] = hc.DefinesDropped;
                     summary[$"{summaryStage}.headerCarve.passes"] = hc.Passes;
                     summary[$"{summaryStage}.headerCarve.pasteMacros"] = hc.PasteMacros;
                     summary[$"{summaryStage}.headerCarve.forwardingMacros"] = hc.ForwardingMacros;
-                    foreach (var (part, ms) in hc.PartMs) summary[$"{summaryStage}.headerCarve.{part}.ms"] = ms;
                     carvedBytes -= hc.BytesBefore - hc.BytesAfter;
                     var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
                     @out.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} kept, {hc.DefinesDropped:N0} dropped; "
