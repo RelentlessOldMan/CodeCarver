@@ -467,7 +467,10 @@ public static class CarveCommand
             var workingSet = self.WorkingSet64;
             var machine = CodeCarver.Core.Util.SystemMemory.Now();
             NoteMemory(priv, workingSet, machine);
-            _memoryNow = MemoryLine(priv, workingSet, machine);
+            // In memoryStopMb's own unit (MB of 1,048,576 bytes): work read "private 20.4 GB" (10^9) as past a 20,000 MB
+            // stop it had not reached.
+            _memoryNow = MemoryLine(priv, workingSet, machine)
+                + (_memoryStop > 0 ? $"; {priv / (1024 * 1024):N0} of memoryStopMb {_memoryStop / (1024 * 1024):N0} MB" : "");
             if (_memoryStop > 0 && priv > _memoryStop && Interlocked.Exchange(ref _stopping, 1) == 0)
                 StopForMemory(priv, workingSet, machine, runAt);
             _cpu.Enqueue((runAt, self.TotalProcessorTime));

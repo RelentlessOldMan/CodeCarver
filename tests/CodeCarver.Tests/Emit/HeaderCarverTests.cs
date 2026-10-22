@@ -236,6 +236,35 @@ public class HeaderCarverTests
         finally { TempDir.Delete(dir); }
     }
 
+    /// <summary>A big header of tens of thousands of paste macros and forwarding macros: each forwarding macro learned
+    /// was checked against every paste macro known (a set overlap that walks the other set), and a work tree's big
+    /// headers, over a million of each, took hours.</summary>
+    [Fact]
+    public void Carve_BigHeaderOfPasteAndForwardingMacros_FinishesInSeconds()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdrb-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var sb = new System.Text.StringBuilder();
+            for (var i = 0; i < 60000; i++) sb.Append($"#define PST_{i}(a, b) a##b##_{i}\n");
+            for (var i = 0; i < 60000; i++) sb.Append($"#define FWD_{i}(x) helper_{i}(x, 1)\n");
+            sb.Append("#define REG_A 1\n#define REG_B 2\n");
+            File.WriteAllText(Path.Combine(dir, "chip.h"), sb.ToString());
+            File.WriteAllText(Path.Combine(dir, "app.c"), "#include \"chip.h\"\nint u(void){ return REG_A; }\n");
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var res = HeaderCarver.Carve(dir, new[] { "chip.h" });
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(60),
+                $"took {sw.Elapsed.TotalSeconds:N0} s: {string.Join(", ", res.PartMs.Select(p => $"{p.Part} {p.Ms} ms"))}");
+            Assert.Equal(60000, res.PasteMacros);
+            Assert.Equal(60000, res.ForwardingMacros);
+            var carved = File.ReadAllText(Path.Combine(dir, "chip.h"));
+            Assert.Contains("REG_A", carved);
+            Assert.DoesNotContain("REG_B", carved);
+        }
+        finally { TempDir.Delete(dir); }
+    }
+
     /// <summary>A dropped #define must not take half a comment with it, and a #define inside a comment is text.</summary>
     [Fact]
     public void Carve_RespectsBlockComments()

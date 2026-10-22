@@ -524,12 +524,16 @@ public static class HeaderCarver
                 callers[name] = body;
                 var ids = new HashSet<string>(StringComparer.Ordinal);
                 AddIdentifiers(ids, body);
+                // Not ids.Overlaps(pasters): that walks every paster for each forwarding macro (1.5M of each at work:
+                // the big headers' paste macros took hours).
+                var callsPaster = false;
                 foreach (var id in ids)
                 {
                     if (!calledBy.TryGetValue(id, out var by)) calledBy[id] = by = new List<string>();
                     by.Add(name);
+                    callsPaster |= pasters.Contains(id);
                 }
-                if (ids.Overlaps(pasters)) MakePaster(name);
+                if (callsPaster) MakePaster(name);
             }
         }
 

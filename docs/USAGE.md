@@ -654,7 +654,9 @@ many paste macros, forwarding macros, names and paste pieces it has learned; the
 Memory is measured on every run. Each `working :` line is followed by a `memory  :` line: the process's private
 memory and working set, and the machine's free memory and commit room (how much more every process together may
 commit before the machine runs out). Watch private memory, not the working set: when the machine runs short,
-Windows pages the process out and its working set looks small while its memory still grows. The summary
+Windows pages the process out and its working set looks small while its memory still grows. Its GB are 10^9
+bytes; with `memoryStopMb` set the line ends with private memory in that setting's own MB (1,048,576 bytes), as
+`; 19,455 of memoryStopMb 20,000 MB`, so "20.4 GB" is not past a stop of 20,000. The summary
 carries `mem.<step>.peakMb` and `stageN.mem.<step>.peakMb` (private memory), and over the whole run
 `mem.run.peakPrivateMb`, `mem.run.peakWorkingSetMb`, `mem.run.minMachineFreeMb` and `mem.run.minCommitRoomMb`.
 What a step keeps, not only what it peaked at: as each step ends the run collects the heap in full and records what
