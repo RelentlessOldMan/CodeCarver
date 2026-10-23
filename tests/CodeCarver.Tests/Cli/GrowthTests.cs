@@ -19,6 +19,9 @@ public sealed class GrowthTests(ITestOutputHelper output)
     const double MaxGrowth = 6.0;
     const long MsFloor = 300;    // a step under this at 4N is noise, not growth
     const long MbFloor = 64;
+    // CPU time is counted in scheduler ticks over every thread: a step of 60-90 ms at N reads 30 ms either way on a
+    // shared runner (CI: 60 -> 380, 94 -> 578, both linear locally). A quadratic step still fails: 16x of 60 is 960.
+    const long MsSlack = 150;
 
     [Fact]
     public void EveryStep_GrowsAtMostLinearly()
@@ -29,13 +32,14 @@ public sealed class GrowthTests(ITestOutputHelper output)
         var fails = new List<string>();
         foreach (var (key, b) in big)
         {
-            var floor = key.EndsWith("ms", StringComparison.OrdinalIgnoreCase) ? MsFloor : MbFloor;
+            var ms = key.EndsWith("ms", StringComparison.OrdinalIgnoreCase);
+            var floor = ms ? MsFloor : MbFloor;
             if (b < floor) continue;
             checkedKeys++;
             var s = Math.Max(small.GetValueOrDefault(key), floor / 8);   // a step near 0 at N: its 4N value is what counts
             var g = (double)b / s;
             output.WriteLine($"{key}: {s} -> {b} ({g:N1}x)");
-            if (g > MaxGrowth) fails.Add($"{key}: {s} -> {b} ({g:N1}x)");
+            if (b > MaxGrowth * s + (ms ? MsSlack : 0)) fails.Add($"{key}: {s} -> {b} ({g:N1}x)");
         }
         Assert.True(checkedKeys >= 3, $"only {checkedKeys} steps were big enough to measure: grow the tree");
         Assert.True(fails.Count == 0, "worse than linear from N to 4N:\n" + string.Join("\n", fails));

@@ -31,13 +31,21 @@ public class LinkCheckHeldMemoryTests
             Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", "0");
             Environment.SetEnvironmentVariable("CODECARVER_CHECK_HANDON_MB", "2");
             Held(dropped, 200);   // what the first check sets up, whatever the tree
-            var (small, _) = Held(dropped, 200);
-            var (large, chars) = Held(dropped, 400);
-            // The per-header tables (names, sizes, hashes: a few hundred bytes a header) for the 200 more. The scans of
-            // these headers keep about a byte a char of definitions (about 70 KB a header); 1.0.317 held those from here on.
-            var limit = chars / 2 / 20;
-            Assert.True(large - small <= limit,
-                $"200 more headers held {(large - small) >> 10} KB more past the header pass (limit {limit >> 10} KB; {small >> 10} KB at 200, {large >> 10} KB at 400)");
+            // The live heap is the process's: a test of another collection allocating meanwhile moves it by megabytes
+            // (CI, ubuntu: -2,582 KB at 200). Held scans add about 14 MB for the 200 more on every try, so the best of
+            // three still fails them.
+            var tries = new List<string>();
+            for (var attempt = 0; attempt < 3; attempt++)
+            {
+                var (small, _) = Held(dropped, 200);
+                var (large, chars) = Held(dropped, 400);
+                // The per-header tables (names, sizes, hashes: a few hundred bytes a header) for the 200 more. The scans of
+                // these headers keep about a byte a char of definitions (about 70 KB a header); 1.0.317 held those from here on.
+                var limit = chars / 2 / 20;
+                if (large - small <= limit) return;
+                tries.Add($"{(large - small) >> 10} KB more (limit {limit >> 10} KB; {small >> 10} KB at 200, {large >> 10} KB at 400)");
+            }
+            Assert.Fail("200 more headers held more past the header pass on every try:\n" + string.Join("\n", tries));
         }
         finally
         {
