@@ -59,12 +59,13 @@ internal sealed class TreeCarve : IDisposable
 
     /// <summary><see cref="Carve"/> in a codecarver process of its own: its CPU time and memory are the carve's alone,
     /// not the test host's (other tests run there at once).</summary>
-    public (int Code, string Out, string Err) CarveInProcessOfItsOwn(string extraToml = "")
+    public (int Code, string Out, string Err) CarveInProcessOfItsOwn(string extraToml = "", IReadOnlyDictionary<string, string>? env = null)
     {
         var cfg = WriteConfig("main", extraToml, true, "", "\"c\"");
         var exe = Path.Combine(AppContext.BaseDirectory, OperatingSystem.IsWindows() ? "codecarver.exe" : "codecarver");
         var psi = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (var a in new[] { "carve", Src, "--config", cfg }) psi.ArgumentList.Add(a);
+        foreach (var (k, v) in env ?? new Dictionary<string, string>()) psi.Environment[k] = v;
         using var p = System.Diagnostics.Process.Start(psi)!;
         var err = p.StandardError.ReadToEndAsync();
         var o = p.StandardOutput.ReadToEnd();

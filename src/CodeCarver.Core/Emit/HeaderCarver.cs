@@ -15,6 +15,12 @@ public sealed record HeaderCarveResult(long BytesBefore, long BytesAfter, int De
 
     /// <summary>Milliseconds per part: seed, bigDefines, pasteCalls, fixpoint, emit.</summary>
     public IReadOnlyList<(string Part, long Ms)> PartMs { get; init; } = Array.Empty<(string, long)>();
+
+    /// <summary>The part the carve gave up in, past its memory limit (the headers are left whole); null when it finished.</summary>
+    public string? AbandonedIn { get; init; }
+
+    /// <summary>Private memory (MB) when it gave up.</summary>
+    public long AbandonedPrivateMb { get; init; }
 }
 
 /// <summary>
@@ -52,6 +58,82 @@ public static class HeaderCarver
     public static HeaderCarveResult Carve(string outDir, IReadOnlyCollection<string> bigHeaderRels, IEnumerable<string>? extraNames = null,
                                           Action<string, long>? partDone = null, IEnumerable<string>? elsewhereDefines = null)
     {
+        // Past its memory limit the carve gives up before it rewrites a header, so they stay whole (as a carve that drops
+        // nothing leaves them) and the run goes on: work's 1.0.330 max stage stopped the whole run at 20 GB in the
+        // fixpoint, when its paste pieces grew from 0.5M to 4.5M between two passes.
+        var limit = new MemoryLimit(LimitBytes());
+        var part = "seed";
+        try { return CarveWithin(outDir, bigHeaderRels, extraNames, partDone, elsewhereDefines, limit, p => part = p); }
+        catch (Exception ex) when (OverLimit(ex) is { } over)
+        {
+            CodeCarver.Core.Util.Activity.Doing(null);
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);   // what the carve held, back
+            long bytes = 0;
+            foreach (var rel in bigHeaderRels) bytes += new FileInfo(Path.Combine(outDir, rel)).Length;
+            partDone?.Invoke("abandoned", 1);
+            partDone?.Invoke("abandonedPrivateMb", over.PrivateBytes / (1024 * 1024));
+            partDone?.Invoke("limitMb", limit.Bytes / (1024 * 1024));
+            return new HeaderCarveResult(bytes, bytes, 0, 0) { AbandonedIn = part, AbandonedPrivateMb = over.PrivateBytes / (1024 * 1024) };
+        }
+    }
+
+    /// <summary>The most private memory the header carve may reach: nine tenths of memoryStopMb (or of the machine when
+    /// none is set), or CODECARVER_HEADER_CARVE_MB.</summary>
+    static long LimitBytes() =>
+        long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_HEADER_CARVE_MB"), out var mb) && mb >= 0
+            ? mb * 1024 * 1024 : CodeCarver.Core.Util.MemoryGate.BudgetBytes() / 10 * 9;
+
+    static OverMemoryLimit? OverLimit(Exception ex) => ex switch
+    {
+        OverMemoryLimit o => o,
+        AggregateException a => a.InnerExceptions.Select(OverLimit).FirstOrDefault(o => o is not null),
+        _ => null,
+    };
+
+    private sealed class OverMemoryLimit(long privateBytes) : Exception("the header carve passed its memory limit")
+    {
+        public long PrivateBytes { get; } = privateBytes;
+    }
+
+    /// <summary>
+    /// Private memory against the carve's limit, looked at a few times a second from any thread. Past it, one full
+    /// compacting collection (much of a pass's memory is garbage the GC has not handed back yet); still past, the carve
+    /// ends (<see cref="OverMemoryLimit"/>).
+    /// </summary>
+    private sealed class MemoryLimit(long bytes)
+    {
+        public long Bytes { get; } = bytes;
+        private readonly object gate = new();
+        private long nextAt;
+
+        public void Check()
+        {
+            if (Bytes <= 0 || System.Diagnostics.Stopwatch.GetTimestamp() < Volatile.Read(ref nextAt)) return;
+            lock (gate)
+            {
+                var now = System.Diagnostics.Stopwatch.GetTimestamp();
+                if (now < nextAt) return;
+                Volatile.Write(ref nextAt, now + System.Diagnostics.Stopwatch.Frequency / 5);
+                if (Private() <= Bytes) return;
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                var after = Private();
+                if (after > Bytes) throw new OverMemoryLimit(after);
+                // Collected back under: not again for a while (a carve near its limit must not spend its time collecting).
+                Volatile.Write(ref nextAt, System.Diagnostics.Stopwatch.GetTimestamp() + 2 * System.Diagnostics.Stopwatch.Frequency);
+            }
+        }
+
+        private static long Private()
+        {
+            using var p = System.Diagnostics.Process.GetCurrentProcess();
+            return p.PrivateMemorySize64;
+        }
+    }
+
+    private static HeaderCarveResult CarveWithin(string outDir, IReadOnlyCollection<string> bigHeaderRels, IEnumerable<string>? extraNames,
+                                                 Action<string, long>? partDone, IEnumerable<string>? elsewhereDefines, MemoryLimit limit,
+                                                 Action<string> inPart)
+    {
         var bigSet = new HashSet<string>(bigHeaderRels, StringComparer.OrdinalIgnoreCase);
         var bigFull = bigHeaderRels.Select(r => Path.Combine(outDir, r)).ToList();
         // Files are read on many threads (one at a time, a work-scale output of 47 GB and GBs of big headers read
@@ -84,6 +166,7 @@ public static class HeaderCarver
                 using (var p = System.Diagnostics.Process.GetCurrentProcess()) partCpuAt = (long)p.TotalProcessorTime.TotalMilliseconds;   // not the collection
             }
             partClock.Restart();
+            inPart(part switch { "seed" => "bigDefines", "bigDefines" => "pasteCalls", "pasteCalls" => "fixpoint", _ => "emit" });
         }
 
         // 1. Seed: every identifier used by kept code that ISN'T one of the carved headers. That is the set
@@ -110,6 +193,7 @@ public static class HeaderCarver
         CodeCarver.Core.Util.Activity.Doing("reading the kept files for names and paste macros", Learned);
         foreach (var (i, seen) in CodeCarver.Core.Util.ReadAhead.Ordered(candidates, SeedScan, CodeCarver.Core.Util.ReadAhead.Window))
         {
+            limit.Check();
             if (seen.Names is null) continue;   // binary
             seedFiles.Add(candidates[i]);
             needed.UnionWith(seen.Names);
@@ -133,13 +217,19 @@ public static class HeaderCarver
         // in the big headers too, then the calls.
         CodeCarver.Core.Util.Activity.Doing("learning paste macros from the big headers", Learned);
         foreach (var (_, defines) in CodeCarver.Core.Util.ReadAhead.Ordered(bigFull, PasteDefines, CodeCarver.Core.Util.ReadAhead.Window))
+        {
+            limit.Check();
             foreach (var def in defines) pastes.Learn(def, big: true);   // its literal pieces count once it's wanted
+        }
         pastes.Resolve();
         PartDone("bigDefines");
         CodeCarver.Core.Util.Activity.Doing("reading paste-macro calls in the kept files", Learned);
         if (pastes.Any)
             foreach (var (_, found) in CodeCarver.Core.Util.ReadAhead.Ordered(seedFiles, f => ScanCalls(pastes, f), CodeCarver.Core.Util.ReadAhead.Window))
+            {
+                limit.Check();
                 foreach (var (piece, side) in found) pastes.AddPiece(piece, side, fragments);
+            }
         if (pastes.Any && elsewhere.Count > 0)
         {
             var calls = new CallScanner(pastes);
@@ -234,6 +324,9 @@ public static class HeaderCarver
             var grew = false;
             var taken = new HashSet<string>(StringComparer.Ordinal);
             var pastesAt = pastes.Version;
+            // Where this pass's new pieces came from (work's 1.0.330 run went from 0.5M pieces in pass 1 to 4.5M in pass 2,
+            // and stopped at 20 GB in pass 3, with no part's numbers to say which source).
+            long fromLiteral = 0, fromExpansion = 0, fromCalls = 0, expandedDefines = 0;
             foreach (var batch in batches)
             {
                 FreezeFragments();
@@ -241,17 +334,42 @@ public static class HeaderCarver
                 // Nothing is added to what is needed, the pieces or the paste macros while a batch is read, so each
                 // reader hands back only what its file adds, not its lines: work's first pass held its kept lines' text,
                 // a batch at a time, and stopped at 20 GB.
-                foreach (var take in CodeCarver.Core.Util.ReadAhead.Each(batch, path => Take(path, all, skip, Wanted, needed, pastes)))
+                foreach (var take in CodeCarver.Core.Util.ReadAhead.Each(batch, path => Take(path, all, skip, Wanted, needed, pastes, limit)))
                 {
+                    limit.Check();
                     var n = fragments.Count;
                     // Kept verbatim (not a define) or kept as wanted: what it names is needed, and what its pastes
                     // and paste-macro calls can build.
                     foreach (var name in take.Names) grew |= needed.Add(name);
                     fragments.UnionWith(take.LiteralPieces);
-                    foreach (var (name, edges) in take.Defines) { pastes.ExpandDefine(name, edges, fragments); taken.Add(name); }
+                    var m = fragments.Count;
+                    fromLiteral += m - n;
+                    foreach (var (name, edges) in take.Defines)
+                    {
+                        if (edges is not null) expandedDefines++;
+                        pastes.ExpandDefine(name, edges, fragments);
+                        taken.Add(name);
+                    }
+                    fromExpansion += fragments.Count - m;
+                    m = fragments.Count;
                     foreach (var (piece, side) in take.CallPieces) pastes.AddPiece(piece, side, fragments);
+                    fromCalls += fragments.Count - m;
                     grew |= fragments.Count != n;
                 }
+            }
+            if (partDone is not null)
+            {
+                var at = $"pass{passes}";
+                partDone($"{at}.ms", partClock.ElapsedMilliseconds);
+                partDone($"{at}.names", needed.Count);
+                partDone($"{at}.pieces", fragments.Count);
+                partDone($"{at}.piecesFromLiteral", fromLiteral);
+                partDone($"{at}.piecesFromExpansion", fromExpansion);
+                partDone($"{at}.piecesFromCalls", fromCalls);
+                partDone($"{at}.definesTaken", taken.Count);
+                partDone($"{at}.definesExpanded", expandedDefines);
+                partDone($"{at}.expandedNames", pastes.ExpandedCount);
+                using (var p = System.Diagnostics.Process.GetCurrentProcess()) partDone($"{at}.privateMb", p.PrivateMemorySize64 / (1024 * 1024));
             }
             all = pastes.Version != pastesAt;
             grew |= all;
@@ -338,14 +456,17 @@ public static class HeaderCarver
     /// their literal paste pieces, the pieces their paste-macro calls pass, and each define's name with the names at the
     /// edges of its body (an object-like define's expansion can be a piece). Read on many threads at once: nothing it
     /// reads changes until the batch is read.</summary>
-    private static FileTake Take(string path, bool all, HashSet<string>? skip, Func<string, bool> wanted, HashSet<string> needed, Pastes pastes)
+    private static FileTake Take(string path, bool all, HashSet<string>? skip, Func<string, bool> wanted, HashSet<string> needed, Pastes pastes,
+                                 MemoryLimit limit)
     {
+        var lines = 0;
         var names = new HashSet<string>(StringComparer.Ordinal);
         var literal = new PieceSets();
         var defines = new List<(string, Pastes.EdgeLists?)>();
         var calls = pastes.Any ? new CallScanner(pastes) : null;
         foreach (var (name, text, kind) in EnumerateLogicalLines(path))
         {
+            if ((++lines & 0xFFFF) == 0) limit.Check();
             if (kind != LineKind.Define)
             {
                 if (!all) continue;
@@ -937,6 +1058,9 @@ public static class HeaderCarver
 
         /// <summary>Grows when an argument name's expansion is learned: defines read before may then build more.</summary>
         public int Version => pasters.Count + expandStart.Count + expandEnd.Count;
+
+        /// <summary>Argument names whose expansion counts, at either side (for the summary).</summary>
+        public int ExpandedCount => expandStart.Count + expandEnd.Count;
 
         public bool IsPaster(string name) => pasters.ContainsKey(name);
 

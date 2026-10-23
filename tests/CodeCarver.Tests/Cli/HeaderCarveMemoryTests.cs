@@ -44,6 +44,28 @@ public sealed class HeaderCarveMemoryTests(ITestOutputHelper output)
             $"the fixpoint allocated {perPass:N1} MB per MB of header per pass (at most {MaxAllocatedPerHeaderMbPerPass})");
     }
 
+    /// <summary>Past its memory limit the header carve gives up and leaves the big headers whole; the run still ends well
+    /// (work's 1.0.330 max stage stopped the whole run at its memory stop instead).</summary>
+    [Fact]
+    public void OverItsLimit_LeavesTheHeadersWhole()
+    {
+        using var t = new TreeCarve();
+        Generate(t);
+        var r = t.CarveInProcessOfItsOwn("[stages.max]\ncarveSourceFileContents = true\ncarveHeaderFileContents = true\n"
+            + "[advanced]\nmemoryStopMb = 4000\n", new Dictionary<string, string> { ["CODECARVER_HEADER_CARVE_MB"] = "1" });
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        var stage = Directory.GetDirectories(Path.Combine(t.Root, "out"))
+            .Single(d => File.Exists(Path.Combine(d, "codecarver", "summary.txt"))
+                         && File.ReadAllText(Path.Combine(d, "codecarver", "summary.txt")).Contains("headerCarve.abandoned"));
+        var summary = File.ReadAllText(Path.Combine(stage, "codecarver", "summary.txt"));
+        Assert.Matches(@"(?m)^stage\d+\.headerCarve\.abandoned = 1\r?$", summary);
+        Assert.Matches(@"(?m)^stage\d+\.headerCarve\.abandonedIn = \w+\r?$", summary);
+        Assert.Contains("passed its memory limit", r.Err);
+        for (var hd = 0; hd < 4; hd++)
+            Assert.Equal(File.ReadAllText(Path.Combine(t.Src, "inc", $"gen{hd}.h")),
+                         File.ReadAllText(Path.Combine(stage, "carved", "inc", $"gen{hd}.h")));
+    }
+
     /// <summary>Big headers of paste macros, forwarders to them, register defines (some whose names a paste argument
     /// expands) and struct lines; C files calling the paste macros.</summary>
     static void Generate(TreeCarve t)

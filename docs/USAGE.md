@@ -669,6 +669,20 @@ the rest on). `.pastedUnknownEnds` counts the names starting `__` that
 nothing defines (a compiler's own macro, `__SIZEOF_INT__`) passed to a paste macro: its value is not in the text,
 so while it is above 0 any name with a piece at its start counts as matched at its end. A paste of `__LINE__` or
 `__COUNTER__` likewise lets any name ending in a digit match at its end.
+Each pass over the big headers also writes `.passN.ms`, `.names`, `.pieces`, where that pass's new pieces came from
+(`.piecesFromLiteral`: `##` operands of the defines it took; `.piecesFromExpansion`: the edges of the defines a paste
+argument names; `.piecesFromCalls`: paste-macro calls in those defines), `.definesTaken`, `.definesExpanded`,
+`.expandedNames` and `.privateMb`, each as the pass ends.
+The header carve has a memory limit of its own: nine tenths of `memoryStopMb` (of the machine's memory when that is
+not set). Past it, after one full collection, it gives up before it rewrites any header: the big headers stay whole,
+the stage goes on, a `warn    :` line says so, and the summary carries `.abandoned = 1`, `.abandonedIn` (the part it
+was in), `.abandonedPrivateMb` and `.limitMb`. The run is not stopped for it. `CODECARVER_HEADER_CARVE_MB=N` sets
+the limit (`0`: none).
+
+What the stage's output is made of: `stageN.bytesAfter.code.<ext>.bytes` and `.files` (code files the build needs,
+headers after the header carve) and `stageN.bytesAfter.infrastructure.<ext>.bytes` and `.files` (other files kept
+whole), each for the twelve largest extensions by bytes, the rest as `other`; a file with no extension counts as
+`none`, and one whose extension is not one to eight lower-case letters or digits as `other`.
 
 Memory is measured on every run. Each `working :` line is followed by a `memory  :` line: the process's private
 memory and working set, and the machine's free memory and commit room (how much more every process together may

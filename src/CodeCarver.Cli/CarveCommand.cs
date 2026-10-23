@@ -3840,6 +3840,8 @@ public static class CarveCommand
                 @out.WriteLine($"  excluded: {infra.Garbage.Count:N0} non-input file(s) NOT copied ({infra.GarbageBytes:N0} B) — VCS/scratch/editor (forceKeepFiles to keep)");
             foreach (var w in infra.Warnings) err.WriteLine($"  warn    : {w}");
 
+            // The size of each code file this stage wrote, for the summary's split by extension.
+            var codeSizes = new Dictionary<string, long>(res.Sizes ?? new Dictionary<string, long>(), CodeCarver.Core.Util.PathComparer.Default);
             var placeholders = PlaceholderTus(splan);
             foreach (var ph in placeholders)
             {
@@ -3848,6 +3850,7 @@ public static class CarveCommand
                 var text = PlaceholderText(ph);
                 File.WriteAllText(target, text);
                 carvedBytes += text.Length;
+                codeSizes[ph] = text.Length;
             }
             if (placeholders.Count > 0)
                 @out.WriteLine($"  placeholders: {placeholders.Count:N0} dropped file(s) the build compiled written as stand-ins (build files that list them keep working)");
@@ -3882,6 +3885,14 @@ public static class CarveCommand
                     summary[$"{summaryStage}.headerCarve.pasteMacros"] = hc.PasteMacros;
                     summary[$"{summaryStage}.headerCarve.forwardingMacros"] = hc.ForwardingMacros;
                     carvedBytes -= hc.BytesBefore - hc.BytesAfter;
+                    if (hc.BytesAfter != hc.BytesBefore)
+                        foreach (var rel in keptBig) codeSizes[rel] = new FileInfo(Path.Combine(stageDir, rel)).Length;
+                    if (hc.AbandonedIn is { } abandonedIn)
+                    {
+                        summary[$"{summaryStage}.headerCarve.abandonedIn"] = abandonedIn;
+                        err.WriteLine($"  warn    : the header carve passed its memory limit in its {abandonedIn} ({hc.AbandonedPrivateMb:N0} MB private) "
+                            + $"and left the {keptBig.Count} big header(s) whole; the rest of the stage goes on");
+                    }
                     var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;
                     @out.WriteLine($"  headers : {keptBig.Count} big header(s) carved — {hc.DefinesKept:N0} kept, {hc.DefinesDropped:N0} dropped; "
                         + $"{hc.BytesBefore:N0} B -> {hc.BytesAfter:N0} B ({hpct:0%} smaller)");
@@ -3917,6 +3928,12 @@ public static class CarveCommand
             summary[$"{summaryStage}.infrastructureSlowestBytes"] = infra.SlowestBytes;
             summary[$"{summaryStage}.emittedCodeBytes"] = res.BytesWritten;
             summary[$"{summaryStage}.garbageFilesExcluded"] = infra.Garbage.Count;
+            // What the output's bytes are: code the build needs and infrastructure kept whole, each by extension.
+            WriteByExtension(summary, $"{summaryStage}.bytesAfter.code",
+                codeSizes.GroupBy(kv => Path.GetExtension(kv.Key).ToLowerInvariant(), StringComparer.Ordinal)
+                         .Select(g => (g.Key, g.Count(), g.Sum(kv => kv.Value))));
+            WriteByExtension(summary, $"{summaryStage}.bytesAfter.infrastructure",
+                (infra.ByExtension ?? new Dictionary<string, (int, long)>()).Select(kv => (kv.Key, kv.Value.Files, kv.Value.Bytes)));
             @out.WriteLine($"  buckets : {buildRequiredFiles.Count:N0} required-to-build + {infra.Count:N0} infrastructure kept, "
                 + $"{splan.DroppedFiles.Count:N0} dead-code" + (infra.Garbage.Count > 0 ? $" + {infra.Garbage.Count:N0} auto-excluded" : "") + " file(s) removed");
 
@@ -4173,6 +4190,36 @@ public static class CarveCommand
         if (s < 3600) return $"~{s / 60}m {s % 60:00}s";
         return $"~{s / 3600}h {(s % 3600) / 60:00}m";
     }
+
+    /// <summary>
+    /// Files and bytes by extension under <paramref name="prefix"/> (<c>.h.bytes</c>, <c>.h.files</c>): the twelve largest
+    /// by bytes, the rest as <c>other</c>. An extension that is not short letters and digits counts as <c>other</c>, and no
+    /// extension as <c>none</c>, so a key never carries a name from the tree.
+    /// </summary>
+    static void WriteByExtension(IDictionary<string, object?> summary, string prefix, IEnumerable<(string Ext, int Files, long Bytes)> rows)
+    {
+        var byName = new Dictionary<string, (int Files, long Bytes)>(StringComparer.Ordinal);
+        foreach (var (ext, files, bytes) in rows)
+        {
+            var name = ext.Length == 0 ? "none" : SafeExtension.IsMatch(ext) ? ext[1..] : "other";
+            byName[name] = byName.TryGetValue(name, out var had) ? (had.Files + files, had.Bytes + bytes) : (files, bytes);
+        }
+        var ordered = byName.OrderByDescending(kv => kv.Value.Bytes).ThenBy(kv => kv.Key, StringComparer.Ordinal).ToList();
+        var shown = ordered.Where(kv => kv.Key != "other").Take(12).ToList();
+        var rest = ordered.Except(shown).ToList();
+        foreach (var (name, (files, bytes)) in shown)
+        {
+            summary[$"{prefix}.{name}.bytes"] = bytes;
+            summary[$"{prefix}.{name}.files"] = files;
+        }
+        if (rest.Count > 0)
+        {
+            summary[$"{prefix}.other.bytes"] = rest.Sum(kv => kv.Value.Bytes);
+            summary[$"{prefix}.other.files"] = rest.Sum(kv => kv.Value.Files);
+        }
+    }
+
+    static readonly System.Text.RegularExpressions.Regex SafeExtension = new(@"^\.[a-z0-9]{1,8}$");
 
     static string Summarize(IReadOnlyList<string> files, int max = 12)
         => files.Count <= max

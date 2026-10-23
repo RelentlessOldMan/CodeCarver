@@ -14,7 +14,8 @@ public sealed record EmitResult(int FilesWritten, long BytesWritten, IReadOnlyLi
     /// <summary>Function bodies replaced by a stub (<see cref="StubBodies"/>).</summary>
     public int StubbedFunctions { get; init; }
 
-    /// <summary>The size of each written file, by its relative path: what a later check round can keep (file-level emit).</summary>
+    /// <summary>The size of each written file, by its relative path: what a later check round can keep (file-level emit), and
+    /// the summary's split of the bytes by extension.</summary>
     public IReadOnlyDictionary<string, long>? Sizes { get; init; }
 }
 
@@ -188,17 +189,19 @@ public static class FileTreeEmitter
             // A locked/vanished file must not sink the whole emit (review RB5) — same tolerance as Emit.
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         });
+        var sizes = new Dictionary<string, long>(CodeCarver.Core.Util.PathComparer.Default);
         for (var i = 0; i < kept.Count; i++)
         {
             if (done[i].Bytes < 0) continue;
             bytes += done[i].Bytes;
             written.Add(kept[i]);
+            sizes[kept[i]] = done[i].Bytes;
             stubbedFunctions += done[i].Stubs;
             if (done[i].Cut > 0) { prunedFiles++; prunedBytes += done[i].Cut; }
         }
 
-        CopyUnscannedIncludes(plan.KeptFiles, plan.DroppedFiles, sourceRoot, outDir, written, ref bytes, scan: scan);
-        return new EmitResult(written.Count, bytes, written, prunedFiles, prunedBytes) { StubbedFunctions = stubbedFunctions };
+        CopyUnscannedIncludes(plan.KeptFiles, plan.DroppedFiles, sourceRoot, outDir, written, ref bytes, sizes: sizes, scan: scan);
+        return new EmitResult(written.Count, bytes, written, prunedFiles, prunedBytes) { StubbedFunctions = stubbedFunctions, Sizes = sizes };
     }
 
     /// <summary>

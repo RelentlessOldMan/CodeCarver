@@ -12,6 +12,9 @@ public readonly record struct InfraEmitResult(
     /// <summary>The longest single copy and that file's bytes: near the whole step's time, one big file held it up.</summary>
     public long SlowestMs { get; init; }
     public long SlowestBytes { get; init; }
+
+    /// <summary>Files and bytes copied, by lower-case extension ("" for none).</summary>
+    public IReadOnlyDictionary<string, (int Files, long Bytes)> ByExtension { get; init; } = new Dictionary<string, (int, long)>();
 }
 
 /// <summary>
@@ -107,6 +110,7 @@ public static class InfrastructureEmitter
             return (rel, null, copied, false);
         }
 
+        var byExt = new Dictionary<string, (int Files, long Bytes)>(StringComparer.Ordinal);
         var selected = Select(sourceRoot, alreadyEmittedRel, droppedCodeFilesRel, excludeDirs, auxGlobs, pruneGarbage, observed, warnings, treeFiles).ToList();
         foreach (var r in CodeCarver.Core.Util.ReadAhead.Each(selected, CopyOne))
         {
@@ -116,10 +120,13 @@ public static class InfrastructureEmitter
             bytes += r.Bytes;
             files.Add(r.Rel);
             count++;
+            var ext = Path.GetExtension(r.Rel).ToLowerInvariant();
+            byExt[ext] = byExt.TryGetValue(ext, out var had) ? (had.Files + 1, had.Bytes + r.Bytes) : (1, r.Bytes);
         }
         files.Sort(StringComparer.Ordinal);
         garbage.Sort(StringComparer.Ordinal);
-        return new InfraEmitResult(count, bytes, files, warnings, garbage, garbageBytes) { SlowestMs = slowestMs, SlowestBytes = slowestBytes };
+        return new InfraEmitResult(count, bytes, files, warnings, garbage, garbageBytes)
+            { SlowestMs = slowestMs, SlowestBytes = slowestBytes, ByExtension = byExt };
     }
 
     /// <summary>The shared keep-by-default selection: every file under <paramref name="sourceRoot"/> that is
