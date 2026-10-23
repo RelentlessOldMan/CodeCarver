@@ -114,7 +114,8 @@ bug fixed against the corpus, not a corpus case removed.
 ### Header-carve rules the truth is built from
 
 1. A name is a **paste macro** if any of its definitions anywhere pastes a parameter (`a##b`, not
-   `, ##__VA_ARGS__`), or forwards to a paste macro: by a function-like body that calls one, or an object-like
+   `, ##__VA_ARGS__`), or forwards to a paste macro: by a function-like body that holds a `(` and names one, called or not
+   (`#define MYCAT(a) APPLY2(CAT, a)` forwards to CAT), or an object-like
    define whose body's last token is one (`#define F CAT`: `F(a, b)` calls it; `#define F (CAT)` does not). Order does not matter; a later definition only adds.
 2. **Pieces**: every identifier beside a `##` (any length), and every number beside one made only of identifier
    characters (`1`, `0x1F`, `2u`; not `1.5`); every identifier and such number among the arguments of a

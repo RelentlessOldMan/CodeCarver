@@ -1,11 +1,11 @@
 CodeSpawner generator vendored into this repo.
 
-generatorVersion : 1.4.3            (`codespawner version` prints 1.4.3; the manifest's _meta.generatorVersion)
-peProductVersion : 1.4.3
+generatorVersion : 1.4.4            (`codespawner version` prints 1.4.4; the manifest's _meta.generatorVersion)
+peProductVersion : 1.4.4
 manifestVersion  : 1
 sourceRepo       : https://github.com/RelentlessOldMan/CodeSpawner
-sourceCommit     : 4d119eefe541f85bf8d73b8d7b8a64d68fee711d  ("Release v1.4.3", 2026-10-22)
-sha256           : b3a6fdc869285f6c50fc867ee4e89fc37715a0a523981f3da3e52c449b876949  (codespawner.exe, 6064640 bytes)
+sourceCommit     : f80af490f54422a1f7d2658cb4b32d69a128d0bb  ("Release v1.4.4", 2026-10-22)
+sha256           : f37348a1df5840e90b72eb73b2fa8fc0f470a9198d767cfd87e2ed71bb9c2aaa  (codespawner.exe, 6067712 bytes)
 signed           : no (Authenticode: NotSigned) - verify the sha256 above before running a re-vendored copy
 licence          : MIT (Copyright (c) 2026 RelentlessOldMan), per LICENSE in the source repo at that commit
 vendoredFrom     : a local CodeSpawner checkout (published release build)
