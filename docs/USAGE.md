@@ -659,10 +659,16 @@ process's private memory as it ended) and `.liveMb` (what is still live after it
 stop's `stopped-summary.txt` carries those of the parts that finished.
 Why the header carve kept each define, counted: `stageN.headerCarve.keptByName` (code or a kept define names it),
 `.keptBySystemHeaders` (a reserved or well-known config name), and `.keptByPiece1`, `.keptByPiece2`, `.keptByPiece3`,
-`.keptByPiece4plus` (its name starts or ends with a paste piece, by the shortest such piece's length: a paste could
-build it). `.pieces` is how many paste pieces there are, `.pieces1` to `.pieces3` how many have 1 to 3 characters.
-A carve that drops nothing says which rule kept everything: a one-character piece matches every name that starts or
-ends with that character.
+`.keptByPiece4plus` (its name starts with a paste piece that can begin a pasted name and ends with one that can end
+it, by the shorter of the two pieces' lengths: a paste could build it). A piece's side comes from where the paste
+puts it: in `HWB_##blk##_r##n##_VAL`, `HWB_` only begins a name, `_VAL` only ends one, and `_r`, or an argument
+passed for `blk` or `n`, does neither. `.startPieces` and `.endPieces` count the pieces of each side, `.pieces`
+those of either, and `.pieces1` to `.pieces3` how many of those have 1 to 3 characters. `.droppedOneEndPiece`
+counts the defines dropped although a piece starts or ends their name (only one end matched: nothing could paste
+the rest on). `.pastedUnknownEnds` counts the names starting `__` that
+nothing defines (a compiler's own macro, `__SIZEOF_INT__`) passed to a paste macro: its value is not in the text,
+so while it is above 0 any name with a piece at its start counts as matched at its end. A paste of `__LINE__` or
+`__COUNTER__` likewise lets any name ending in a digit match at its end.
 
 Memory is measured on every run. Each `working :` line is followed by a `memory  :` line: the process's private
 memory and working set, and the machine's free memory and commit room (how much more every process together may

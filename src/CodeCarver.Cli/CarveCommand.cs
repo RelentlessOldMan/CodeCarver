@@ -1769,16 +1769,21 @@ public static class CarveCommand
         var outsideNames = new HashSet<string>(StringComparer.Ordinal);   // identifiers in headers read outside the root
         // Review M1: their #define lines that may make a keep or register macro (function-like, or not a plain value).
         var outsideDefines = new System.Text.StringBuilder();
+        // Every #define they hold, for the header carve: a paste macro, or what a paste's argument expands to.
+        var outsideDefineTexts = new HashSet<string>(StringComparer.Ordinal);
         var outsideDefineRe = new System.Text.RegularExpressions.Regex(@"^[ \t]*#[ \t]*define[ \t]+[A-Za-z_]\w*(?<fn>\()?(?:\\r?\n|[^\r\n])*",
             System.Text.RegularExpressions.RegexOptions.Multiline);
         void OutsideDefines(string text)
         {
             if (!text.Contains("define", StringComparison.Ordinal)) return;
             foreach (System.Text.RegularExpressions.Match m in outsideDefineRe.Matches(text))
+            {
+                outsideDefineTexts.Add(m.Value);
                 if (m.Groups["fn"].Success || !m.ValueSpan.ContainsAny("0123456789") || m.ValueSpan.Contains("__attribute__", StringComparison.Ordinal)
                     || m.ValueSpan.Contains("__declspec", StringComparison.Ordinal) || m.ValueSpan.Contains("[[", StringComparison.Ordinal)
                     || m.ValueSpan.Contains("ragma", StringComparison.Ordinal))
                     outsideDefines.Append(m.ValueSpan).Append('\n');
+            }
         }
         // What ExternalIncluders reads of each outside header the macro scan already read: not read a second time.
         var outsideIncludeLines = new Dictionary<string, List<string>>(CodeCarver.Core.Util.PathComparer.Default);
@@ -3864,7 +3869,11 @@ public static class CarveCommand
                     var elsewhere = new HashSet<string>(outsideNames, StringComparer.Ordinal);
                     foreach (var spec in buildCmds.SelectMany(c => c.Defines).Concat(defineSpecs))
                         foreach (var m in Identifier.EnumerateMatches(spec)) elsewhere.Add(spec.Substring(m.Index, m.Length));
-                    var hc = HeaderCarver.Carve(stageDir, keptBig, elsewhere, (key, value) => summary[$"{summaryStage}.headerCarve.{key}"] = value);
+                    // The -D values as #define lines ("F(a)=body" -> "#define F(a) body", "N" -> "#define N 1").
+                    var elsewhereDefines = new List<string>(outsideDefineTexts);
+                    foreach (var spec in buildCmds.SelectMany(c => c.Defines).Concat(defineSpecs).Distinct(StringComparer.Ordinal))
+                        elsewhereDefines.Add(spec.IndexOf('=') is var eq and > 0 ? $"#define {spec[..eq]} {spec[(eq + 1)..]}" : $"#define {spec} 1");
+                    var hc = HeaderCarver.Carve(stageDir, keptBig, elsewhere, (key, value) => summary[$"{summaryStage}.headerCarve.{key}"] = value, elsewhereDefines);
                     summary[$"{summaryStage}.headerCarve.bytesBefore"] = hc.BytesBefore;
                     summary[$"{summaryStage}.headerCarve.bytesAfter"] = hc.BytesAfter;
                     summary[$"{summaryStage}.headerCarve.definesKept"] = hc.DefinesKept;
