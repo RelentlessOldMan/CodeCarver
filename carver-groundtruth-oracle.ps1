@@ -11,10 +11,10 @@
 # The correctness corpora live in TestHole (small, ~200 KB each), reproducible from their recipes there.
 # -Corpus may be a full path, or a name resolved under $env:CODECARVER_TESTHOLE (local dir or share):
 #   ./carver-groundtruth-oracle.ps1 -Corpus carve_r25                      # $env:CODECARVER_TESTHOLE\carve_r25
-#   ./carver-groundtruth-oracle.ps1 -Corpus C:\path\to\TestHole\carve_r75
+#   ./carver-groundtruth-oracle.ps1 -Corpus C:\path\to\corpora\carve_r75
 #   ./carver-groundtruth-oracle.ps1 -Corpus <tree> -Root func_0,func_7 -ExpectedReachableFrac 0.5
 # NOTE: these graded corpora need CodeSpawner >= 1.0.9 to (re)generate (the --oracle-* knobs, indirectEdges,
-# reachable-frac dial, indirectTruthSha). The exe vendored in this repo (tools\codespawner) is 1.0.9; the
+# reachable-frac dial, indirectTruthSha). The exe vendored in this repo (tools\codespawner) is 1.4.2; the
 # indirectTruthSha read-side verify self-tests against the shipped golden vector before trusting a recompute.
 [CmdletBinding()]
 param(

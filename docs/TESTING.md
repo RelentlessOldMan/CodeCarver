@@ -193,9 +193,19 @@ bug fixed against the corpus, not a corpus case removed.
 | Hostile input | CRLF/LF mix, BOMs, UTF-16, Latin-1, NUL bytes before and after 8 KB, unterminated comments, empty files, a long line (a length dial); junction loops and long paths opt-in | 1.3.2 + 3 |
 | Network read | the T3 run from a local share path; compile db with relative paths; `treeSha` | 1 |
 
-Phase 1 (CodeSpawner 1.4.0) is the header-carve family plus a scaled seed tree; phases 2 and 3 follow. Carver
-pins the new CodeSpawner version in `tools/codespawner` and adds the T2 script (carve with header contents
-carved, then check the truth, counts and compile). Sizes and generation times at 0.01, 0.1 and 1, the per-step
+Phase 1 (CodeSpawner 1.4.0) is the header-carve family plus a scaled seed tree; phases 2 and 3 follow.
+`tools/codespawner` pins the generator (see its `GENERATOR_VERSION`), and `tools/firmware-truth/firmware-truth.ps1`
+is the T2 check:
+1. It generates the corpus (or takes one with `-Corpus`) and runs `codespawner verify`, so a stale copy fails before
+   the carve.
+2. It carves `fw/` twice, with every file forced kept and only header contents carved: the truth is about the header
+   carve alone.
+3. It fails on a missing must-keep define or file, a kept must-drop define, an exact count that differs, a
+   `definesDropped` or `bytesAfter` outside its bounds, two carves that differ, or a unit that doesn't compile
+   against the carved tree. Each compiler is run with the db's flags plus `-Wall -Werror -fsyntax-only`
+   (`-RequireCompilers` fails when gcc or clang is missing).
+
+For T3, pass `-Scale 0.1`. Sizes and generation times at 0.01, 0.1 and 1, the per-step
 case details and the hostile-file list are in CodeSpawner's `manifest-schema.md` under `firmware`.
 
 ## Running
