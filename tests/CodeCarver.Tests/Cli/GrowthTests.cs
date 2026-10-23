@@ -28,21 +28,36 @@ public sealed class GrowthTests(ITestOutputHelper output)
     {
         var small = Measure(1);
         var big = Measure(4);
-        var checkedKeys = 0;
-        var fails = new List<string>();
-        foreach (var (key, b) in big)
+        // A step that grows worse than linear does so on every carve; a runner's stall lands on one. CPU time includes the
+        // kernel's, and emit's file writes read 7x on one carve (CI: stage0.cpu.emit.ms 171 -> 1218) and 4x on the next.
+        // So a failing step is measured again, at most twice, and its smallest numbers count.
+        for (var attempt = 0; ; attempt++)
         {
-            var ms = key.EndsWith("ms", StringComparison.OrdinalIgnoreCase);
-            var floor = ms ? MsFloor : MbFloor;
-            if (b < floor) continue;
-            checkedKeys++;
-            var s = Math.Max(small.GetValueOrDefault(key), floor / 8);   // a step near 0 at N: its 4N value is what counts
-            var g = (double)b / s;
-            output.WriteLine($"{key}: {s} -> {b} ({g:N1}x)");
-            if (b > MaxGrowth * s + (ms ? MsSlack : 0)) fails.Add($"{key}: {s} -> {b} ({g:N1}x)");
+            var checkedKeys = 0;
+            var fails = new List<string>();
+            foreach (var (key, b) in big)
+            {
+                var ms = key.EndsWith("ms", StringComparison.OrdinalIgnoreCase);
+                var floor = ms ? MsFloor : MbFloor;
+                if (b < floor) continue;
+                checkedKeys++;
+                var s = Math.Max(small.GetValueOrDefault(key), floor / 8);   // a step near 0 at N: its 4N value is what counts
+                var g = (double)b / s;
+                output.WriteLine($"{key}: {s} -> {b} ({g:N1}x)");
+                if (b > MaxGrowth * s + (ms ? MsSlack : 0)) fails.Add($"{key}: {s} -> {b} ({g:N1}x)");
+            }
+            Assert.True(checkedKeys >= 3, $"only {checkedKeys} steps were big enough to measure: grow the tree");
+            if (fails.Count == 0) return;
+            Assert.True(attempt < 2, "worse than linear from N to 4N on three measurements:\n" + string.Join("\n", fails));
+            output.WriteLine("measuring again: " + string.Join("; ", fails));
+            Lower(small, Measure(1));
+            Lower(big, Measure(4));
         }
-        Assert.True(checkedKeys >= 3, $"only {checkedKeys} steps were big enough to measure: grow the tree");
-        Assert.True(fails.Count == 0, "worse than linear from N to 4N:\n" + string.Join("\n", fails));
+    }
+
+    static void Lower(Dictionary<string, long> best, Dictionary<string, long> got)
+    {
+        foreach (var (k, v) in got) best[k] = best.TryGetValue(k, out var o) ? Math.Min(o, v) : v;
     }
 
     /// <summary>Each step's time (ms) and allocated and live memory (MB), the smaller of two carves.</summary>
@@ -52,8 +67,8 @@ public sealed class GrowthTests(ITestOutputHelper output)
         for (var run = 0; run < 2; run++)
         {
             var got = Carve(n);
-            if (best is null) { best = got; continue; }
-            foreach (var (k, v) in got) best[k] = best.TryGetValue(k, out var o) ? Math.Min(o, v) : v;
+            if (best is null) best = got;
+            else Lower(best, got);
         }
         return best!;
     }

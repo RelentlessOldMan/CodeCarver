@@ -105,6 +105,8 @@ public static class EmittedLinkCheck
     /// <summary>The running (or last) check's shape.* numbers so far: a run stopped inside a loop still has them.</summary>
     public static IReadOnlyDictionary<string, long> ShapeSoFar() => s_shapeNow?.Invoke() ?? new Dictionary<string, long>();
 
+    static Func<Dictionary<string, long>> Frozen(Dictionary<string, long> shape) => () => new(shape, StringComparer.Ordinal);
+
     public static LinkCheckResult Run(
         IEnumerable<(string Rel, string Path)> emitted,
         IEnumerable<(string Rel, string Path)> dropped,
@@ -204,6 +206,11 @@ public static class EmittedLinkCheck
         {
             Lap("rest");
             heldNow?.Dispose();
+            // A stop after the check still reads its shape, from a copy: the live delegate shares this closure and kept every
+            // table of the check live until the next check.
+            var shape = new Dictionary<string, long>(StringComparer.Ordinal);
+            Shape(shape, headerSizes.Values, closures, templateWalks, templateWalksSkipped);
+            s_shapeNow = Frozen(shape);
             stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["headersHandedOn"] = headersHandedOn; stats["scansOutsideBudget"] = scansOutsideBudget; stats["instancesRedone"] = instancesRedone;
             stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits; stats["parseWaits"] = parseGate.Waits;
             stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;

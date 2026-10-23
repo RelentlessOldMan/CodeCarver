@@ -31,14 +31,14 @@ public class LinkCheckHeldMemoryTests
             Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", "0");
             Environment.SetEnvironmentVariable("CODECARVER_CHECK_HANDON_MB", "2");
             Held(dropped, 200);   // what the first check sets up, whatever the tree
-            // The live heap is the process's: a test of another collection allocating meanwhile moves it by megabytes
-            // (CI, ubuntu: -2,582 KB at 200). Held scans add about 14 MB for the 200 more on every try, so the best of
-            // three still fails them.
+            // The live heap is the process's, so it is measured up to three times. Held scans add about 14 MB for the 200
+            // more on every try, so the best of three still fails them. (Through 1.0.334 each check kept the one before it
+            // live until it began, and freed it under this one's baseline: -2,582 KB at 200 on CI. See below.)
             var tries = new List<string>();
             for (var attempt = 0; attempt < 3; attempt++)
             {
-                var (small, _) = Held(dropped, 200);
-                var (large, chars) = Held(dropped, 400);
+                var (small, _, _) = Held(dropped, 200);
+                var (large, chars, _) = Held(dropped, 400);
                 // The per-header tables (names, sizes, hashes: a few hundred bytes a header) for the 200 more. The scans of
                 // these headers keep about a byte a char of definitions (about 70 KB a header); 1.0.317 held those from here on.
                 var limit = chars / 2 / 20;
@@ -53,8 +53,43 @@ public class LinkCheckHeldMemoryTests
         }
     }
 
+    /// <summary>
+    /// The check holds nothing once it returns. A memory stop reads the last check's shape numbers, and the delegate that
+    /// gave them shared the check's closure: it kept every table of the check live until the next check (5 MB more after
+    /// 400 dropped register headers than after 200, all of it the dropped names). The caller's report is in that closure
+    /// too, so a report that holds an object tells whether anything still holds the closure, with no heap noise.
+    /// </summary>
+    [Fact]
+    public void LinkCheck_HoldsNothing_AfterItReturns()
+    {
+        var gone = CheckOnce();
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+        Assert.False(gone.IsAlive, "the check's closure is still live after it returned");
+        Assert.NotEmpty(EmittedLinkCheck.ShapeSoFar());   // a memory stop still has the last check's shape
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    static WeakReference CheckOnce()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "cc-held-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            (string, string) W(string rel, string text) { var p = Path.Combine(root, rel); File.WriteAllText(p, text); return (rel, p); }
+            var emitted = new List<(string, string)> { W("main.c", "#include \"r.h\"\nint main(void) { return 0; }\n") };
+            var dropped = new List<(string, string)> { W("r.h", "#define HM_REG_A 1\nint hm_get(void) { return 0; }\n") };
+            var sentinel = new object();
+            EmittedLinkCheck.Run(emitted, dropped, report: (_, _) => GC.KeepAlive(sentinel));
+            return new WeakReference(sentinel);
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
     /// <summary>What a check of <paramref name="headers"/> register-map headers holds past its header pass, and their chars.</summary>
-    static (long Held, long Chars) Held(bool dropped, int headers)
+    static (long Held, long Chars, long After) Held(bool dropped, int headers)
     {
         var root = Path.Combine(Path.GetTempPath(), "cc-held-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(Path.Combine(root, "regs"));
@@ -97,7 +132,8 @@ public class LinkCheckHeldMemoryTests
             Assert.DoesNotContain(CodeCarver.Core.Util.HeldMeter.Now(), kv => kv.Key.StartsWith("held.check.", StringComparison.Ordinal));   // gone when it ends
             Assert.InRange(r.Stats["held.handedOnMaxMb"], 0, 2);
             GC.KeepAlive(regs);
-            return (afterHeaders, chars);
+            r = null;
+            return (afterHeaders, chars, Live() - baseline);
         }
         finally
         {
