@@ -702,6 +702,39 @@ public class HeaderCarverTests
             Assert.DoesNotContain($"#define {dropped} ", carved);
     }
 
+    /// <summary>A paste macro's sides are per parameter: <c>SUF2(a, b) a##SFX##b</c> puts its first argument only at
+    /// the start of a name and its second only at the end, so <c>SUF2(K, L)</c> builds KSFX and SFXL but never
+    /// LSFX or SFXK. A forwarder gives each parameter the sides of the argument it passes it as (<c>FWD(p, q)</c>
+    /// swaps them), and one passing a parameter to a macro that calls a paste macro it names (<c>APPLY2(SUF2, a)</c>)
+    /// gives it every side of that paste macro. The sides were one union per macro: L ended and started both.</summary>
+    [Fact]
+    public void Carve_PieceSides_PerParameter()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define SUF2(a, b) a##SFX##b
+            #define FWD(p, q) SUF2(q, p)
+            #define APPLY2(f, x) f(x, Z)
+            #define MYCAT(a) APPLY2(SUF2, a)
+            int u(void){ return SUF2(K, L) + FWD(M, N) + MYCAT(W); }
+            """, """
+            #define KSFX 1
+            #define SFXL 2
+            #define NSFX 3
+            #define SFXM 4
+            #define WSFX 5
+            #define SFXW 6
+            #define LSFX 10
+            #define SFXK 11
+            #define MSFX 12
+            #define SFXN 13
+            """);
+        foreach (var kept in new[] { "KSFX", "SFXL", "NSFX", "SFXM", "WSFX", "SFXW" })
+            Assert.Contains($"#define {kept} ", carved);
+        foreach (var dropped in new[] { "LSFX", "SFXK", "MSFX", "SFXN" })
+            Assert.DoesNotContain($"#define {dropped} ", carved);
+    }
+
     /// <summary>The summary says why each define was kept: its name is used, or the shorter of the pieces it starts and
     /// ends with, by length. A define kept for a piece counts as that, not as a name (its own line names it). One a
     /// piece starts or ends but not both is dropped, and counted.</summary>
