@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Runtime.CompilerServices;
 using CodeCarver.Core.Util;
 
 namespace CodeCarver.Core.Emit;
@@ -497,11 +499,16 @@ public static partial class HeaderCarver
         }
     }
 
-    private const byte EvUse = 0, EvChain = 1, EvCalled = 2, EvNamed = 3;
+    private const byte EvUse = 0, EvChain = 1, EvCalled = 2, EvNamed = 3, EvLeft = 4;
 
     /// <summary>One event of a stream. A computed call (<c>CAT(F, 7)(x)</c>) has its <paramref name="Head"/>: the call whose
-    /// result it calls (its callee, -1 if computed too, and its arguments).</summary>
-    private readonly record struct UseEvent(byte Kind, int Id, List<XTok>[]? Args, bool Pool, bool Eof, int[]? Ops, (int Callee, List<XTok>[] Args)? Head = null);
+    /// result it calls. A call open across a directive is <paramref name="Crossed"/>: its arguments hold every branch's
+    /// tokens. <see cref="EvLeft"/>: a paste macro left last in a branch, which a <c>(</c> after the <c>#endif</c> calls.</summary>
+    private readonly record struct UseEvent(byte Kind, int Id, List<XTok>[]? Args, bool Pool, bool Eof, int[]? Ops, UseHead? Head = null, bool Crossed = false);
+
+    /// <summary>The call a computed call calls the result of: its callee (-1 if computed too, with its own head), its
+    /// arguments, and whether they hold several branches' tokens.</summary>
+    private sealed record UseHead(int Callee, List<XTok>[] Args, UseHead? Head, bool Crossed);
 
     /// <summary>What one file's streams found, in order, its names local to it: read on many threads, folded in in file
     /// order (<see cref="UseEngine.Fold"/>).</summary>
@@ -549,7 +556,7 @@ public static partial class HeaderCarver
             public int Open;                          // its ( in the buffer
             public bool Marked, Computed, Crossed, Template;
             public int Depth;                         // parentheses open inside the current argument
-            public (int Callee, List<XTok>[] Args)? Head; // a computed call: the use whose result it calls
+            public UseHead? Head;                    // a computed call: the use whose result it calls
             public Frame Clone() => (Frame)MemberwiseClone();
         }
 
@@ -558,7 +565,9 @@ public static partial class HeaderCarver
             public readonly List<Frame> Frames = new();
             public int BufLen;
             public bool LastClosedUse;
-            public (int Callee, List<XTok>[] Args)? LastUse;
+            public UseHead? LastUse;
+            public bool HasPending;
+            public int Pending;
         }
 
         private PpDefine? prm;
@@ -567,7 +576,7 @@ public static partial class HeaderCarver
         private readonly List<XTok> buf = new();       // the tokens since the outermost open call
         private int pending = OpOther;                 // a name not yet known to be called (a name id or OpParam)
         private bool hasPending, lastClosedUse;
-        private (int Callee, List<XTok>[] Args)? lastUse;   // the use that just closed, when lastClosedUse
+        private UseHead? lastUse;                     // the use that just closed, when lastClosedUse
         private readonly List<int> chain = new();      // the ## chain being read: its operands
         private bool afterHash;
         private int last = OpOther;                    // the previous token as a ## operand
@@ -675,16 +684,17 @@ public static partial class HeaderCarver
             }
         }
 
-        // A name that was not called: inside a call it is passed (a paste macro passed marks the call), outside one named.
+        // A name that was not called: inside a call it is passed (a paste macro passed marks every open call: a call of
+        // ID(CAT) passes CAT on to the call around it), outside one named.
         private void FinalizePending()
         {
             if (!hasPending) return;
             hasPending = false;
             if (pending < 0) return;
-            if (Top is { } t)
+            if (frames.Count > 0)
             {
                 ev.Mark(EvCalled, pending);
-                if (ev.IsPaster(pending)) t.Marked = true;
+                if (ev.IsPaster(pending)) foreach (var f in frames) f.Marked = true;
             }
             else ev.Mark(EvNamed, pending);
         }
@@ -716,8 +726,9 @@ public static partial class HeaderCarver
                 if (!template)
                 {
                     var args = Split(inner);
-                    ev.Events.Add(new UseEvent(EvUse, f.Callee, args, f.Computed || f.Crossed, eof, null, f.Computed ? f.Head : null));
-                    if (!f.Crossed) lastUse = (f.Callee, args);
+                    var head = f.Computed ? f.Head : null;
+                    ev.Events.Add(new UseEvent(EvUse, f.Callee, args, f.Computed || f.Crossed, eof, null, head, f.Crossed));
+                    lastUse = new UseHead(f.Callee, args, head, f.Crossed);
                 }
             }
             if (frames.Count == 0) buf.RemoveRange(Floor, buf.Count - Floor);
@@ -727,10 +738,11 @@ public static partial class HeaderCarver
         private int Floor => conds.Count > 0 ? Math.Min(conds[^1].BufLen, buf.Count) : 0;
 
         /// <summary>A conditional directive: <c>#if</c>-family opens, <c>#elif</c>/<c>#else</c> restarts from the state
-        /// at the <c>#if</c>, <c>#endif</c> goes on from the last branch. A call open across one has its own pool.</summary>
+        /// at the <c>#if</c>, <c>#endif</c> goes on from the last branch. A call open across one has its own pool. A name
+        /// not yet known to be called stays so: a <c>(</c> after the directive calls it (<c>CAT</c>, <c>#if A</c>,
+        /// <c>(HW_, 7)</c>).</summary>
         public void Directive(PpLine kind)
         {
-            FinalizePending();
             FlushChain();
             afterHash = hasLast = false;
             foreach (var f in frames) f.Crossed = true;
@@ -740,17 +752,30 @@ public static partial class HeaderCarver
                     conds.Add(Snapshot());
                     break;
                 case PpLine.Else:
-                    if (conds.Count > 0) Restore(conds[^1]);
+                    if (conds.Count > 0)
+                    {
+                        // A paste macro last in the branch ending: a ( after the #endif calls it, with what we can't see.
+                        if (hasPending && frames.Count == 0 && ev.IsPaster(pending)) ev.Events.Add(new UseEvent(EvLeft, pending, null, false, false, null));
+                        FinalizePending();
+                        Restore(conds[^1]);
+                    }
                     break;
                 case PpLine.EndIf:
-                    if (conds.Count > 0) conds.RemoveAt(conds.Count - 1);
+                    if (conds.Count > 0)
+                    {
+                        // A call open since the #if was passed a paste macro in an earlier branch: it still was.
+                        var s = conds[^1];
+                        for (var k = 0; k < Math.Min(frames.Count, s.Frames.Count); k++)
+                            if (frames[k].Open == s.Frames[k].Open) frames[k].Marked |= s.Frames[k].Marked;
+                        conds.RemoveAt(conds.Count - 1);
+                    }
                     break;
             }
         }
 
         private State Snapshot()
         {
-            var s = new State { LastClosedUse = lastClosedUse, LastUse = lastUse, BufLen = buf.Count };
+            var s = new State { LastClosedUse = lastClosedUse, LastUse = lastUse, BufLen = buf.Count, HasPending = hasPending, Pending = pending };
             foreach (var f in frames) s.Frames.Add(f.Clone());
             return s;
         }
@@ -768,11 +793,16 @@ public static partial class HeaderCarver
                 if (inner.Exists(t => t.K == XTok.Param)) continue;
                 ev.Events.Add(new UseEvent(EvUse, f.Callee, Split(inner), true, true, null));
             }
+            // A call open at the #if passed a paste macro in this branch: it was passed one whatever branch is compiled.
+            for (var k = 0; k < Math.Min(frames.Count, s.Frames.Count); k++)
+                if (frames[k].Open == s.Frames[k].Open) s.Frames[k].Marked |= frames[k].Marked;
             frames = new List<Frame>(s.Frames.Count);
             foreach (var f in s.Frames) frames.Add(f.Clone());
             if (frames.Count == 0 && buf.Count > s.BufLen) buf.RemoveRange(s.BufLen, buf.Count - s.BufLen);
             lastClosedUse = s.LastClosedUse;
             lastUse = s.LastUse;
+            hasPending = s.HasPending;
+            pending = s.Pending;
         }
 
         /// <summary>End of the stream: open calls are closed top-down, used with what they have. An object-like body's
@@ -818,8 +848,9 @@ public static partial class HeaderCarver
     }
 
     /// <summary>One logical line of a file's stream: a conditional directive moves it, text is its tokens, another
-    /// directive or a define is not in it. Every line carries the block comment it leaves open.</summary>
-    private static void StreamLine(UseTracker t, string line, ref bool inBlock, List<PpToken> toks)
+    /// directive or a define is not in it. Every line carries the block comment it leaves open. An <c>#if</c> or
+    /// <c>#elif</c> condition is a stream of its own (<paramref name="cond"/>): <c>#if XCAT(CFG_, 1)</c> builds CFG_1.</summary>
+    private static void StreamLine(UseTracker t, UseTracker cond, string line, ref bool inBlock, List<PpToken> toks)
     {
         var kind = ClassifyLine(line, inBlock);
         toks.Clear();
@@ -828,6 +859,13 @@ public static partial class HeaderCarver
         {
             case PpLine.Cond or PpLine.Else or PpLine.EndIf:
                 t.Directive(kind);
+                // # and the directive's name, then the condition (#ifdef, #else and #endif have no calls)
+                if (kind is PpLine.Cond or PpLine.Else && toks.Count > 2 && line.AsSpan(toks[1].Start, toks[1].Len) is "if" or "elif")
+                {
+                    cond.Begin(null);
+                    for (var k = 2; k < toks.Count; k++) cond.Token(toks[k].Kind, line.AsSpan(toks[k].Start, toks[k].Len));
+                    cond.End();
+                }
                 return;
             case PpLine.Text:
                 foreach (var k in toks) t.Token(k.Kind, line.AsSpan(k.Start, k.Len));
@@ -863,7 +901,7 @@ public static partial class HeaderCarver
                 inBlock = def.EndsInComment;
                 continue;
             }
-            StreamLine(main, line, ref inBlock, toks);
+            StreamLine(main, body, line, ref inBlock, toks);
         }
         main.End();
         return ev.Events.Count > 0 ? ev : null;
@@ -1049,8 +1087,9 @@ public static partial class HeaderCarver
 
             public void Union(Val o)
             {
-                First.UnionWith(o.First);
-                Last.UnionWith(o.Last);
+                // (the sets' own enumerators: HashSet.UnionWith takes any IEnumerable and boxes one a call)
+                UnionAll(First, o.First);
+                UnionAll(Last, o.Last);
                 Empty |= o.Empty;
             }
         }
@@ -1069,6 +1108,7 @@ public static partial class HeaderCarver
             public bool Computed;
             public readonly List<int> Callees = new();
             public List<XTok>[] Args = Array.Empty<List<XTok>>();
+            public List<List<XTok>[]>? Forms;   // its arguments re-split at the commas a name expands to, if any
             public readonly Val V = new();
             public bool Inst;
         }
@@ -1078,8 +1118,8 @@ public static partial class HeaderCarver
             public bool Wild;
             public int Callee;
             public List<XTok>[] Args = Array.Empty<List<XTok>>();
-            public bool Pool, Eof;
-            public (int Callee, List<XTok>[] Args)? Head;
+            public bool Pool, Eof, Crossed;
+            public UseHead? Head;
         }
 
         private sealed class WorkLimit() : Exception("one paste use expands past the work limit");
@@ -1212,7 +1252,15 @@ public static partial class HeaderCarver
             foreach (var key in asked.Keys)
                 if (facts.Pasters.Contains(key)) (done ??= new()).Add(key);
             if (done is not null)
-                foreach (var key in done) { asked.Remove(key); tried.Add(key); }
+                foreach (var key in done) Tried(key);
+        }
+
+        /// <summary>A name every batch has been asked for: its defines are all read, so no use waits on it.</summary>
+        private void Tried(ulong key)
+        {
+            asked.Remove(key);
+            tried.Add(key);
+            if (idByKey.TryGetValue(key, out var id)) waiting.Remove(id);
         }
 
         /// <summary>A batch of the big headers is about to be read: its number.</summary>
@@ -1222,6 +1270,9 @@ public static partial class HeaderCarver
         public void Capture(ulong key, string text)
         {
             if (!texts.TryGetValue(key, out var l)) texts[key] = l = new List<string>(1);
+            // A define repeated word for word (the same alias in each of 250 headers) is one body: each copy was
+            // instantiated again, 250 times a use.
+            if (l.Contains(text)) return;
             l.Add(text);
             Captured++;
             if (!idByKey.TryGetValue(key, out var id)) return;
@@ -1238,7 +1289,7 @@ public static partial class HeaderCarver
             foreach (var (key, at) in asked)
                 if (serial - at + 1 >= batches) (doneAsking ??= new()).Add(key);
             if (doneAsking is not null)
-                foreach (var key in doneAsking) { asked.Remove(key); tried.Add(key); }
+                foreach (var key in doneAsking) Tried(key);
             Drain();
         }
 
@@ -1278,7 +1329,7 @@ public static partial class HeaderCarver
             Tick?.Invoke();
             misses = new HashSet<int>();
             if (r.Wild) WildUseCore(r.Callee);
-            else UseCore(r.Callee, r.Args, r.Pool, r.Eof, r.Head);
+            else UseCore(r.Callee, r.Args, r.Pool, r.Eof, r.Crossed, r.Head);
             foreach (var id in misses)
             {
                 if (!waiting.TryGetValue(id, out var l)) waiting[id] = l = new();
@@ -1307,19 +1358,24 @@ public static partial class HeaderCarver
                         var ops = x.Ops!.Select(G).ToArray();
                         if (chainSeen.Add(string.Join(',', ops))) LiteralChain(ops);
                         break;
+                    case EvLeft:
+                        LeftUse(G(x.Id));
+                        break;
                     case EvUse:
                         var callee = x.Id >= 0 ? G(x.Id) : -1;
                         var args = MapArgs(x.Args!);
-                        (int Callee, List<XTok>[] Args)? head = x.Head is { } h ? (h.Callee >= 0 ? G(h.Callee) : -1, MapArgs(h.Args)) : null;
-                        var sig = Signature(callee, args, x.Pool, x.Eof);
-                        if (head is { } hd) sig += "@" + Signature(hd.Callee, hd.Args, false, false);
+                        var head = MapHead(x.Head);
+                        var sig = Signature(callee, args, x.Pool, x.Eof) + (x.Crossed ? "x" : "");
+                        for (var hd = head; hd is not null; hd = hd.Head) sig += "@" + Signature(hd.Callee, hd.Args, hd.Crossed, false);
                         if (!useSeen.Add(sig)) break;
-                        var rec = new UseRec { Callee = callee, Args = args, Pool = x.Pool, Eof = x.Eof, Head = head };
+                        var rec = new UseRec { Callee = callee, Args = args, Pool = x.Pool, Eof = x.Eof, Crossed = x.Crossed, Head = head };
                         uses.Add(rec);
                         dirty.Add(rec);
                         break;
                 }
             }
+
+            UseHead? MapHead(UseHead? h) => h is null ? null : new UseHead(h.Callee >= 0 ? G(h.Callee) : -1, MapArgs(h.Args), MapHead(h.Head), h.Crossed);
 
             List<XTok>[] MapArgs(List<XTok>[] from)
             {
@@ -1361,7 +1417,15 @@ public static partial class HeaderCarver
 
         private void WildUse(int id)
         {
-            if (!IsPaster(id) || Has(id, BitCalled) || !wildDone.Add(id)) return;
+            if (!IsPaster(id) || Has(id, BitCalled)) return;
+            LeftUse(id);
+        }
+
+        /// <summary>A paste macro called with arguments we can't see (left last in an <c>#if</c> branch, a <c>(</c> after the
+        /// <c>#endif</c>): one use with every argument a wildcard, called elsewhere or not.</summary>
+        private void LeftUse(int id)
+        {
+            if (!IsPaster(id) || !wildDone.Add(id)) return;
             var rec = new UseRec { Wild = true, Callee = id };
             uses.Add(rec);
             dirty.Add(rec);
@@ -1385,9 +1449,12 @@ public static partial class HeaderCarver
         private int noPool;                        // > 0 while expanding a name: its body's uses are its own stream's
         private List<XTok>[]? eofArgs;             // a call left open at the end: its missing arguments are wildcards
 
-        private void UseCore(int callee, List<XTok>[] args, bool pool, bool eof, (int Callee, List<XTok>[] Args)? head = null)
+        private void UseCore(int callee, List<XTok>[] args, bool pool, bool eof, bool crossed = false, UseHead? head = null)
         {
             work = 0;
+            depth = 0;
+            expLow = int.MaxValue;   // a use cut short by the work limit can leave these set
+            expGrew = false;
             ResetPool();
             try
             {
@@ -1395,15 +1462,18 @@ public static partial class HeaderCarver
                 {
                     PoolArgs(args);
                     if (eof) poolAnyE = true;   // its later arguments are unknown: they can end a name
-                    // A computed call calls the last token of its head's result: each name that can be is called too.
-                    if (head is { Callee: >= 0 } h)
+                    if (head is not null)
                     {
+                        // A computed call calls the last token of its head's result: each name that can be is called too.
                         Val hv;
                         noPool++;
-                        try { hv = Instantiate(h.Callee, h.Args); }
+                        try { hv = HeadResult(head); }
                         finally { noPool--; }
-                        CallResult(hv, args);
+                        foreach (var e in hv.Last.ToArray())
+                            if (e.IsExact && Instantiable(e.Pre, args)) InstantiateEach(e.Pre, args, eof, crossed);
                     }
+                    // Its callee's body too: the pieces of REGX(n) = CAT(REG_, n) are in no argument.
+                    else if (callee >= 0) InstantiateEach(callee, args, eof, crossed);
                 }
                 else if (callee >= 0)
                 {
@@ -1413,13 +1483,89 @@ public static partial class HeaderCarver
             }
             catch (WorkLimit)
             {
-                // Too wide to instantiate: the use's own pool (sound, wider).
+                // Too wide to instantiate: the use's own pool (sound, wider). Its expansions get a budget of their own (the
+                // spent one threw again from here); past that too, the pool takes any name.
                 OverWork++;
                 ResetPool();
-                PoolArgs(args);
+                work = 0;
+                try { PoolArgs(args); }
+                catch (WorkLimit) { poolOn = poolAnyS = poolAnyE = true; }
             }
             finally { eofArgs = null; }
             FinishPool();
+        }
+
+        /// <summary>What a computed call's head gives: its callee instantiated, or for a computed head each name its own
+        /// head's result can end in (<c>CAT(A, B)(x)(y)</c>).</summary>
+        private Val HeadResult(UseHead h)
+        {
+            if (h.Callee >= 0) return InstantiateEach(h.Callee, h.Args, false, h.Crossed);
+            var v = new Val();
+            if (h.Head is null) return v;
+            foreach (var e in HeadResult(h.Head).Last)
+                if (e.IsExact && Instantiable(e.Pre, h.Args)) v.Union(InstantiateEach(e.Pre, h.Args, false, h.Crossed));
+            return v;
+        }
+
+        private const int BranchFormCap = 64;
+
+        /// <summary>Instantiates a call; a call open across an <c>#if</c> holds every branch's tokens, so it is also
+        /// instantiated with each argument one of its names (<c>REGX(1 2)</c> from <c>1</c> and <c>2</c> in two branches:
+        /// REGX(1), REGX(2)); past <see cref="BranchFormCap"/> forms, with wildcards.</summary>
+        private Val InstantiateEach(int q, List<XTok>[] args, bool eof, bool crossed)
+        {
+            Val? v = null;
+            foreach (var a in crossed ? BranchForms(args) : [args])
+            {
+                eofArgs = eof ? a : null;
+                Join(ref v, Instantiate(q, a));
+            }
+            eofArgs = null;
+            return v ?? new Val();
+        }
+
+        /// <summary>Adds a fresh result to <paramref name="acc"/>, taking it whole as the first: a name with one define
+        /// copied each result into a new pair of sets.</summary>
+        private static void Join(ref Val? acc, Val r)
+        {
+            if (acc is null) acc = r;
+            else acc.Union(r);
+        }
+
+        private static List<List<XTok>[]> BranchForms(List<XTok>[] args)
+        {
+            var opts = new List<List<XTok>>[args.Length];
+            long total = 1;
+            for (var i = 0; i < args.Length && total <= BranchFormCap; i++)
+            {
+                var o = new List<List<XTok>> { args[i] };
+                if (args[i].Count > 1)
+                {
+                    var seen = new HashSet<(byte, int)>();
+                    foreach (var t in args[i])
+                        if (t.K is XTok.Ident or XTok.Num or XTok.Wild && seen.Add((t.K, t.Id))) o.Add([t]);
+                }
+                opts[i] = o;
+                total *= o.Count;
+            }
+            if (total > BranchFormCap)
+            {
+                var wild = new List<XTok>[args.Length];
+                for (var i = 0; i < wild.Length; i++) wild[i] = [new XTok(XTok.Wild, WildAny)];
+                return [args, wild];
+            }
+            var forms = new List<List<XTok>[]>();
+            var idx = new int[args.Length];
+            while (true)
+            {
+                var f = new List<XTok>[args.Length];
+                for (var i = 0; i < f.Length; i++) f[i] = opts[i][idx[i]];
+                forms.Add(f);
+                var k = args.Length - 1;
+                while (k >= 0 && ++idx[k] == opts[k].Count) idx[k--] = 0;
+                if (k < 0) break;
+            }
+            return forms;
         }
 
         private void LiteralChain(int[] ops)
@@ -1442,22 +1588,39 @@ public static partial class HeaderCarver
 
         private Val Instantiate(int callee, List<XTok>[] args)
         {
-            var v = new Val();
-            if (!active.Add(callee)) return v;
+            Val? v = null;
+            // A deep instantiation (an argument's own uses reset what is active: R(x) = XCAT(R(x), _a) goes on) gives up
+            // as too wide, before the stack does.
+            if (depth >= DepthMax || !RuntimeHelpers.TryEnsureSufficientExecutionStack()) throw new WorkLimit();
+            if (!active.Add(callee)) return new Val();
+            depth++;
             try
             {
                 foreach (var t in Templates(callee))
                 {
-                    if (t.IsFunc) { v.Union(Interp(t, Bind(t, args))); continue; }
+                    if (t.IsFunc) { Join(ref v, Interp(t, Bind(t, args))); continue; }
                     // an object-like define called: its body, and its last name called with the arguments
-                    v.Union(Interp(t, null));
+                    Join(ref v, Interp(t, null));
                     if (t.Body.Length > 0 && t.Body[^1].K == XTok.Ident && Instantiable(t.Body[^1].Id, args))
-                        v.Union(Instantiate(t.Body[^1].Id, args));
+                        Join(ref v, Instantiate(t.Body[^1].Id, args));
                 }
             }
-            finally { active.Remove(callee); }
-            return v;
+            finally { active.Remove(callee); depth--; }
+            return v ?? new Val();
         }
+
+        private static void UnionAll(HashSet<El> to, List<El> from)
+        {
+            foreach (var e in from) to.Add(e);
+        }
+
+        private static void UnionAll(HashSet<El> to, HashSet<El> from)
+        {
+            foreach (var e in from) to.Add(e);
+        }
+
+        private const int DepthMax = 200;
+        private int depth;
 
         private List<XTok>[] Bind(Tpl t, List<XTok>[] args)
         {
@@ -1502,17 +1665,32 @@ public static partial class HeaderCarver
                 return v;
             }
 
+            // Scratch a body at a time, rented: pass 2 of a header carve instantiates each call again with its defines read,
+            // and these arrays were most of what it allocated.
+            var ints = ArrayPool<int>.Shared.Rent(4 * n);
+            try
+            {
+                return InterpCore(t, a, b, n, v, ints);
+            }
+            finally { ArrayPool<int>.Shared.Return(ints); }
+        }
+
+        private Val InterpCore(Tpl t, List<XTok>[]? a, XTok[] b, int n, Val v, int[] ints)
+        {
             // ## chains
-            var chainEnd = new int[n];
-            var chainStart = new int[n];
-            Array.Fill(chainEnd, -1);
-            Array.Fill(chainStart, -1);
-            var chainSet = new HashSet<El>?[n];
-            var chainEps = new bool[n];
-            var ops = new List<int>();
+            var chainEnd = ints.AsSpan(0, n);
+            var chainStart = ints.AsSpan(n, n);
+            chainEnd.Fill(-1);
+            chainStart.Fill(-1);
+            HashSet<El>?[]? chainSet = null;
+            bool[]? chainEps = null;
+            HashSet<El>?[]? chainFirst = null;   // a several-token argument at a chain's start: what the body starts with
+            HashSet<El>?[]? chainLast = null;
+            List<int>? ops = null;
             for (var k = 0; k + 2 < n;)
             {
                 if (b[k + 1].K != XTok.Hash || b[k].K == XTok.Hash) { k++; continue; }
+                ops ??= new List<int>();
                 ops.Clear();
                 var j = k;
                 ops.Add(j);
@@ -1520,43 +1698,48 @@ public static partial class HeaderCarver
                 if (ops.Count == 2 && b[k].K == XTok.Comma && b[j].K == XTok.Param && t.Variadic && b[j].Id == t.NParams - 1) { k = j + 1; continue; }
                 chainEnd[k] = j;
                 chainStart[j] = k;
-                chainSet[k] = Chain(b, ops, a, out chainEps[k]);
+                chainSet ??= new HashSet<El>?[n];
+                chainEps ??= new bool[n];
+                chainFirst ??= new HashSet<El>?[n];
+                chainLast ??= new HashSet<El>?[n];
+                chainSet[k] = Chain(b, ops, a, out chainEps[k], out chainFirst[k], out chainLast[k]);
                 k = j + 1;
             }
 
             // calls, nested ones included
-            var open = new int[n];
-            Array.Fill(open, -1);
-            var stack = new Stack<int>();
+            var open = ints.AsSpan(2 * n, n);
+            open.Fill(-1);
+            Stack<int>? stack = null;
             for (var k = 0; k < n; k++)
             {
-                if (b[k].K == XTok.LParen) stack.Push(k);
-                else if (b[k].K == XTok.RParen && stack.Count > 0) open[k] = stack.Pop();
+                if (b[k].K == XTok.LParen) (stack ??= new Stack<int>()).Push(k);
+                else if (b[k].K == XTok.RParen && stack is { Count: > 0 }) open[k] = stack.Pop();
             }
-            var close = new int[n];
-            Array.Fill(close, -1);
+            var close = ints.AsSpan(3 * n, n);
+            close.Fill(-1);
             for (var k = 0; k < n; k++) if (open[k] >= 0) close[open[k]] = k;
-            var sites = new Site?[n];
+            Site?[]? sites = null;
             for (var k = 1; k < n; k++)
             {
                 if (b[k].K != XTok.LParen || close[k] < 0) continue;
                 var p = k - 1;
                 var chainCallee = chainStart[p] >= 0;
-                var computed = !chainCallee && b[p].K == XTok.RParen && open[p] >= 0 && sites[open[p]] is { Inst: true };
+                var computed = !chainCallee && b[p].K == XTok.RParen && open[p] >= 0 && sites?[open[p]] is { Inst: true };
                 if (!chainCallee && !computed && b[p].K != XTok.Ident && b[p].K != XTok.Param) continue;
                 var unknown = false;
                 var inner = Subst(b, k + 1, close[k], a, ref unknown);
                 var site = new Site { Close = close[k], Computed = computed, Args = UseTracker.Split(inner) };
-                sites[k] = site;
+                if (!unknown && !computed) site.Forms = CommaForms(inner, site.Args);
+                (sites ??= new Site?[n])[k] = site;
                 if (computed)
                 {
-                    if (!unknown) { PoolArgs(site.Args); CallResult(sites[open[p]]!.V, site.Args); site.Inst = true; }
+                    if (!unknown) { PoolArgs(site.Args); CallResult(sites![open[p]]!.V, site.Args); site.Inst = true; }
                     continue;
                 }
                 if (chainCallee)
                 {
                     if (unknown) continue;
-                    foreach (var e in chainSet[chainStart[p]]!)
+                    foreach (var e in chainSet![chainStart[p]]!)
                     {
                         if (e.IsExact) Call(site, e.Pre);
                         else if (!e.IsEps) { PoolArgs(site.Args); site.Inst = true; }
@@ -1575,6 +1758,28 @@ public static partial class HeaderCarver
                 else if (pv.Count > 0) { PoolArgs(site.Args); site.Inst = true; }
             }
 
+            // A call the body leaves open (OPENF(x) = CAT(x,): the rest of its arguments come after the body, unseen, so
+            // they are wildcards.
+            if (stack is not null && (a is not null || !t.IsFunc))
+                foreach (var k in stack)
+                {
+                    if (k == 0) continue;
+                    var p = k - 1;
+                    var unknown = false;
+                    var inner = Subst(b, k + 1, n, a, ref unknown);
+                    if (unknown) continue;
+                    var args = UseTracker.Split(inner);
+                    args[^1].Add(new XTok(XTok.Wild, WildAny));   // the last argument goes on after the body
+                    var callees = new List<int>();
+                    if (chainStart[p] >= 0) { foreach (var e in chainSet![chainStart[p]]!) if (e.IsExact) callees.Add(e.Pre); }
+                    else if (b[p].K == XTok.Ident) callees.Add(b[p].Id);
+                    else if (b[p].K == XTok.Param && a is not null && a[b[p].Id] is [{ K: XTok.Ident } pv]) callees.Add(pv.Id);
+                    var savedEof = eofArgs;
+                    eofArgs = args;
+                    try { foreach (var q in callees) if (Instantiable(q, args)) Instantiate(q, args); }
+                    finally { eofArgs = savedEof; }
+                }
+
             // the body's edges, walking in from each end
             var all = true;
             var x = 0;
@@ -1583,16 +1788,17 @@ public static partial class HeaderCarver
                 if (chainEnd[x] >= 0)
                 {
                     var e = chainEnd[x];
-                    if (e + 1 < n && sites[e + 1] is { } cs) { all &= SiteEdges(v.First, cs, false); x = cs.Close + 1; continue; }
-                    var set = chainSet[x]!;
+                    if (chainFirst![x] is { } cf) UnionAll(v.First, cf);
+                    if (e + 1 < n && sites?[e + 1] is { } cs) { all &= SiteEdges(v.First, cs, false); x = cs.Close + 1; continue; }
+                    var set = chainSet![x]!;
                     if (set.Count == 0) { all = false; break; }
                     foreach (var el in set) { v.First.Add(el); if (el.IsExact) AddExp(v.First, el.Pre, false); }
-                    all &= chainEps[x];
+                    all &= chainEps![x];
                     x = e + 1;
                     continue;
                 }
                 var tk = b[x];
-                if ((tk.K == XTok.Ident || tk.K == XTok.Param) && x + 1 < n && sites[x + 1] is { } s)
+                if ((tk.K == XTok.Ident || tk.K == XTok.Param) && x + 1 < n && sites?[x + 1] is { } s)
                 {
                     if (s.Callees.Count == 0 && !s.Inst) { all = false; break; }
                     all &= SiteEdges(v.First, s, false);
@@ -1614,10 +1820,11 @@ public static partial class HeaderCarver
                 if (chainStart[x] >= 0)
                 {
                     var st = chainStart[x];
-                    var set = chainSet[st]!;
+                    if (chainLast![st] is { } cl) UnionAll(v.Last, cl);
+                    var set = chainSet![st]!;
                     if (set.Count == 0) { all = false; break; }
                     foreach (var el in set) { v.Last.Add(el); if (el.IsExact) AddExp(v.Last, el.Pre, true); }
-                    all &= chainEps[st];
+                    all &= chainEps![st];
                     x = st - 1;
                     continue;
                 }
@@ -1625,7 +1832,7 @@ public static partial class HeaderCarver
                 if (tk.K == XTok.RParen)
                 {
                     var o = open[x];
-                    if (o < 0 || sites[o] is not { Computed: false } s || (s.Callees.Count == 0 && !s.Inst)) { all = false; break; }
+                    if (o < 0 || sites?[o] is not { Computed: false } s || (s.Callees.Count == 0 && !s.Inst)) { all = false; break; }
                     all &= SiteEdges(v.Last, s, true);
                     var p = o - 1;
                     x = chainStart[p] >= 0 ? chainStart[p] - 1 : p - 1;
@@ -1649,9 +1856,117 @@ public static partial class HeaderCarver
         private void Call(Site site, int q)
         {
             site.Callees.Add(q);
-            if (!Instantiable(q, site.Args)) return;
-            site.V.Union(Instantiate(q, site.Args));
-            site.Inst = true;
+            foreach (var args in site.Forms ?? [site.Args])
+            {
+                if (!Instantiable(q, args)) continue;
+                site.V.Union(Instantiate(q, args));
+                site.Inst = true;
+            }
+        }
+
+        private const int CommaFormMax = 64, CommaDepthMax = 8;
+
+        /// <summary>A call's arguments as the preprocessor splits them once its names expand: a name whose define holds a
+        /// comma (<c>PIN_LED = PORT, 5</c>) passed through a forwarder gives two arguments (<c>XCAT(PIN_LED)</c> is
+        /// <c>CAT(PORT, 5)</c>). Null when no argument name expands to a comma; past <see cref="CommaFormMax"/> forms,
+        /// null with the arguments pooled. Function-like names that expand to commas are not followed.</summary>
+        private List<List<XTok>[]>? CommaForms(List<XTok> inner, List<XTok>[] args)
+        {
+            var some = false;
+            var d0 = 0;
+            for (var i = 0; i < inner.Count && !some; i++)
+            {
+                var t = inner[i];
+                if (t.K == XTok.LParen) d0++;
+                else if (t.K == XTok.RParen) d0--;
+                else if (d0 == 0 && t.K == XTok.Ident && t.Exp && !(i + 1 < inner.Count && inner[i + 1].K == XTok.LParen))
+                    some = ExpandsToComma(t.Id, 0);
+            }
+            if (!some) return null;
+            var forms = new List<List<XTok>[]>();
+            var over = false;
+            var any = false;
+            Forms(inner, 0, 0);
+            if (over) { PoolArgs(args); return null; }
+            return any ? forms : null;
+
+            void Forms(List<XTok> toks, int from, int level)
+            {
+                if (over) return;
+                var depth = 0;
+                for (var i = 0; i < toks.Count; i++)
+                {
+                    var t = toks[i];
+                    if (t.K == XTok.LParen) depth++;
+                    else if (t.K == XTok.RParen) depth--;
+                    if (i < from || depth != 0 || t.K != XTok.Ident || !t.Exp || level >= CommaDepthMax) continue;
+                    if (i + 1 < toks.Count && toks[i + 1].K == XTok.LParen) continue;
+                    var alts = CommaAlts(t.Id, out var plain, 0);
+                    if (alts is null) continue;
+                    any = true;
+                    foreach (var alt in alts)
+                    {
+                        var next = new List<XTok>(toks.Count + alt.Count);
+                        next.AddRange(toks.Take(i));
+                        next.AddRange(alt);
+                        next.AddRange(toks.Skip(i + 1));
+                        Forms(next, i, level + 1);
+                    }
+                    if (plain) Forms(toks, i + 1, level);
+                    return;
+                }
+                if (forms.Count >= CommaFormMax) { over = true; return; }
+                forms.Add(UseTracker.Split(toks));
+            }
+        }
+
+        private bool ExpandsToComma(int id, int level)
+        {
+            foreach (var t in Templates(id))
+            {
+                if (t.IsFunc) continue;
+                var b = t.Body;
+                if (TopComma(b)) return true;
+                if (b.Length == 1 && b[0].K == XTok.Ident && level < CommaDepthMax && ExpandsToComma(b[0].Id, level + 1)) return true;
+            }
+            return false;
+        }
+
+        private static bool TopComma(XTok[] b)
+        {
+            var depth = 0;
+            foreach (var x in b)
+            {
+                if (x.K == XTok.LParen) depth++;
+                else if (x.K == XTok.RParen) depth--;
+                else if (x.K == XTok.Comma && depth == 0) return true;
+            }
+            return false;
+        }
+
+        /// <summary>The bodies of a name that expand to a top-level comma, followed through aliases; null if none can.
+        /// <paramref name="plain"/>: some define of it gives no comma.</summary>
+        private List<List<XTok>>? CommaAlts(int id, out bool plain, int level)
+        {
+            plain = false;
+            List<List<XTok>>? alts = null;
+            var any = false;
+            foreach (var t in Templates(id))
+            {
+                any = true;
+                if (t.IsFunc) { plain = true; continue; }
+                var b = t.Body;
+                if (!TopComma(b) && !(b.Length == 1 && b[0].K == XTok.Ident && level < CommaDepthMax && ExpandsToComma(b[0].Id, level + 1)))
+                {
+                    plain = true;
+                    continue;
+                }
+                var alt = new List<XTok>(b.Length);
+                foreach (var x in b) alt.Add(x.K == XTok.Hash ? new XTok(XTok.Other) : new XTok(x.K, x.Id, true));
+                (alts ??= new()).Add(alt);
+            }
+            if (!any) plain = true;
+            return alts;
         }
 
         /// <summary>One token of a body's edge walk; false stops the walk.</summary>
@@ -1667,7 +1982,7 @@ public static partial class HeaderCarver
                 case XTok.Param:
                     if (a is null) return true;
                     var s = EdgeSet(a[tk.Id], last, forceExp: true);
-                    to.UnionWith(s);
+                    UnionAll(to, s);
                     all &= s.Contains(El.Eps);
                     return true;
                 case XTok.Hash:
@@ -1699,16 +2014,18 @@ public static partial class HeaderCarver
                     if (t.K == XTok.Ident) { AddId(to, t.Id); AddExp(to, t.Id, last); }
                     else if (t.K == XTok.Num) AddId(to, t.Id);
                 }
-            to.UnionWith(last ? s.V.Last : s.V.First);
+            UnionAll(to, last ? s.V.Last : s.V.First);
             return empty;
         }
 
         /// <summary>A chain's names: a literal operand gives itself, a parameter its argument (the last token for a left
         /// slot, the first for a right one, both for an interior one); over <see cref="ProductCap"/> the use's pool takes
         /// the first and last slots. Unknown parameters: the literal operands, nothing built.</summary>
-        private HashSet<El> Chain(XTok[] b, List<int> ops, List<XTok>[]? a, out bool eps)
+        private HashSet<El> Chain(XTok[] b, List<int> ops, List<XTok>[]? a, out bool eps, out HashSet<El>? outFirst,
+            out HashSet<El>? outLast)
         {
             eps = false;
+            outFirst = outLast = null;
             var n = ops.Count;
             var slots = new List<El>[n];
             var unbound = false;
@@ -1722,27 +2039,30 @@ public static partial class HeaderCarver
                     if (a is null) { unbound = true; slots[i] = new List<El>(); continue; }
                     var s = new HashSet<El>();
                     HashSet<El>? lastSide = null, firstSide = null;
-                    if (i < n - 1) s.UnionWith(lastSide = EdgeSet(a[tk.Id], last: true, forceExp: false));
-                    if (i > 0) s.UnionWith(firstSide = EdgeSet(a[tk.Id], last: false, forceExp: false));
+                    if (i < n - 1) UnionAll(s, lastSide = EdgeSet(a[tk.Id], last: true, forceExp: false));
+                    if (i > 0) UnionAll(s, firstSide = EdgeSet(a[tk.Id], last: false, forceExp: false));
                     slots[i] = s.ToList();
                     // An interior argument of several tokens splits the chain: its first token ends the name on its
                     // left, its last starts the one on its right (HWB_##blk##_r with blk = T x: HWB_T and x_r).
                     if (lastSide is not null && firstSide is not null && MaybeTokens(a[tk.Id]))
                         (breaks ??= new()).Add((i, firstSide.ToList(), lastSide.ToList()));
+                    // At the chain's start or end, its far token is the body's edge there (x##_r with x = A B: A B_r).
+                    else if (i == 0 && n > 1 && MaybeTokens(a[tk.Id])) outFirst = EdgeSet(a[tk.Id], last: false, forceExp: false);
+                    else if (i == n - 1 && n > 1 && MaybeTokens(a[tk.Id])) outLast = EdgeSet(a[tk.Id], last: true, forceExp: false);
                 }
                 else return new HashSet<El>();   // a non-name operand builds nothing
             }
             if (unbound)
             {
                 var lit = new HashSet<El>();
-                foreach (var s in slots) lit.UnionWith(s);
+                foreach (var s in slots) UnionAll(lit, s);
                 return lit;
             }
             var made = Product(slots);
             if (made is null)
             {
                 made = new HashSet<El>(slots[0]);
-                made.UnionWith(slots[^1]);
+                UnionAll(made, slots[^1]);
             }
             else eps = made.Contains(El.Eps);
             if (breaks is not null) Segments(slots, breaks, made);
@@ -1770,8 +2090,8 @@ public static partial class HeaderCarver
                     for (var k = st.At + 1; k < en.At; k++) seg[k - st.At] = slots[k];
                     seg[^1] = en.Set;
                     var part = Product(seg);
-                    if (part is null) { made.UnionWith(seg[0]); made.UnionWith(seg[^1]); }
-                    else made.UnionWith(part);
+                    if (part is null) { UnionAll(made, seg[0]); UnionAll(made, seg[^1]); }
+                    else UnionAll(made, part);
                 }
         }
 
@@ -1896,10 +2216,11 @@ public static partial class HeaderCarver
                             else if (t.K == XTok.Num) AddId(s, t.Id);
                         }
                         var empty = Emptyable(ct.Id);
-                        if (Instantiable(ct.Id, args))
+                        foreach (var form in CommaForms(inner, args) ?? [args])
                         {
-                            var cv = Instantiate(ct.Id, args);
-                            s.UnionWith(last ? cv.Last : cv.First);
+                            if (!Instantiable(ct.Id, form)) continue;
+                            var cv = Instantiate(ct.Id, form);
+                            UnionAll(s, last ? cv.Last : cv.First);
                             empty |= cv.Empty;
                         }
                         all &= empty;
@@ -1995,7 +2316,7 @@ public static partial class HeaderCarver
         private void AddExp(HashSet<El> to, int id, bool last)
         {
             var e = Expand(id);
-            to.UnionWith(last ? e.Last : e.First);
+            UnionAll(to, last ? e.Last : e.First);
         }
 
         private readonly Dictionary<int, Val> expMemo = new();
@@ -2005,28 +2326,87 @@ public static partial class HeaderCarver
         // end was unread expanded each link twice (its first and last edges), 2^40 times.
         private readonly Dictionary<int, Val> expPartial = new();
         private HashSet<int>? partialFor;
+        // The names of a define cycle (A = B x in one #if branch, B = A y in the other) while its first name is expanded:
+        // each one's value so far, the stack depth its cycle reaches, and whether this round has computed it. Without
+        // them no name in a cycle was kept, and 16 names in one cycle took a minute: each was expanded once per path.
+        private readonly Dictionary<int, (Val V, int Low, bool Done)> expCyc = new();
+        private readonly List<int> expCycOrder = new();
+        private bool expGrew;
 
         /// <summary>A name's expansion edges (not the name itself): every body of it, with parameters unknown,
-        /// transitively. Kept once complete: nothing below it on the expansion stack was cut short, and every define it
-        /// met was read.</summary>
+        /// transitively. Kept once complete: every define it met was read. A cycle is solved at its first name, whose
+        /// rounds compute each name in it once until none grows; a name met again inside its own expansion gives its
+        /// value so far (the least fixpoint: every path through the cycle, a superset of what the preprocessor does).</summary>
         private Val Expand(int id)
         {
             if (expMemo.TryGetValue(id, out var m)) return m;
             if (!ReferenceEquals(partialFor, misses)) { expPartial.Clear(); partialFor = misses; }
             if (expPartial.TryGetValue(id, out m)) { missCount++; return m; }
-            if (expAt.TryGetValue(id, out var at)) { expLow = Math.Min(expLow, at); return new Val(); }
+            var inCyc = expCyc.TryGetValue(id, out var cyc);
+            if (expAt.TryGetValue(id, out var at)) { expLow = Math.Min(expLow, at); return inCyc ? cyc.V : new Val(); }
+            if (inCyc && cyc.Done) { expLow = Math.Min(expLow, cyc.Low); return cyc.V; }
             var depth = expAt.Count;
             expAt[id] = depth;
             var savedLow = expLow;
-            expLow = int.MaxValue;
             var savedActive = active;
-            active = new HashSet<int>();
+            var savedGrew = expGrew;
             var missesAt = missCount;
+            var mark = expCycOrder.Count;
             noPool++;
-            var v = new Val();
             try
             {
-                foreach (var t in Templates(id)) v.Union(Interp(t, null));
+                while (true)
+                {
+                    expLow = int.MaxValue;
+                    expGrew = false;
+                    active = new HashSet<int>();
+                    Val? jv = null;
+                    foreach (var t in Templates(id)) Join(ref jv, Interp(t, null));
+                    var v = jv ?? new Val();
+                    if (expLow < depth)
+                    {
+                        // inside a cycle whose first name is further up the stack: that one's rounds finish it
+                        var grew = CycNote(id, v, expLow);
+                        expGrew = savedGrew || grew;
+                        expLow = Math.Min(savedLow, expLow);
+                        return v;
+                    }
+                    if (expLow > depth && expCycOrder.Count == mark)
+                    {
+                        (missCount == missesAt ? expMemo : expPartial)[id] = v;
+                        expGrew = savedGrew;
+                        expLow = savedLow;
+                        return v;
+                    }
+                    var rootGrew = CycNote(id, v, depth);
+                    if (expGrew || rootGrew)
+                    {
+                        // another round: each name of the cycle again, from the values so far
+                        for (var i = mark; i < expCycOrder.Count; i++)
+                        {
+                            var x = expCycOrder[i];
+                            expCyc[x] = expCyc[x] with { Done = false };
+                        }
+                        continue;
+                    }
+                    var to = missCount == missesAt ? expMemo : expPartial;
+                    for (var i = mark; i < expCycOrder.Count; i++)
+                    {
+                        var x = expCycOrder[i];
+                        to[x] = expCyc[x].V;
+                        expCyc.Remove(x);
+                    }
+                    expCycOrder.RemoveRange(mark, expCycOrder.Count - mark);
+                    expGrew = savedGrew;
+                    expLow = savedLow;
+                    return to[id];
+                }
+            }
+            catch
+            {
+                for (var i = mark; i < expCycOrder.Count; i++) expCyc.Remove(expCycOrder[i]);
+                expCycOrder.RemoveRange(mark, expCycOrder.Count - mark);
+                throw;
             }
             finally
             {
@@ -2034,9 +2414,21 @@ public static partial class HeaderCarver
                 active = savedActive;
                 expAt.Remove(id);
             }
-            if (expLow >= depth) (missCount == missesAt ? expMemo : expPartial)[id] = v;
-            expLow = Math.Min(savedLow, expLow);
-            return v;
+        }
+
+        /// <summary>Records a cycle name's value this round (never smaller than its last); true if it grew.</summary>
+        private bool CycNote(int id, Val v, int low)
+        {
+            if (expCyc.TryGetValue(id, out var o))
+            {
+                var (f, l, e) = (o.V.First.Count, o.V.Last.Count, o.V.Empty);
+                v.Union(o.V);
+                expCyc[id] = (v, Math.Min(low, o.Low), true);
+                return v.First.Count > f || v.Last.Count > l || v.Empty != e;
+            }
+            expCyc[id] = (v, low, true);
+            expCycOrder.Add(id);
+            return v.First.Count > 0 || v.Last.Count > 0 || v.Empty;
         }
 
         // ---- building ----

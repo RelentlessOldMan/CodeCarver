@@ -374,6 +374,8 @@ public static partial class HeaderCarver
         engine = null;
         texts = null!;
         facts = null!;
+        done = null!;
+        takenBefore = null!;
         // 3. Emit: rewrite each header, dropping #defines whose name isn't wanted (and their continuations).
         CodeCarver.Core.Util.Activity.Doing("rewriting the big headers", Learned);
         var rewritten = CodeCarver.Core.Util.ReadAhead.Each(bigFull, path =>
@@ -424,7 +426,7 @@ public static partial class HeaderCarver
     private static void AddText(Dictionary<ulong, List<string>> texts, ulong key, string text)
     {
         if (!texts.TryGetValue(key, out var l)) texts[key] = l = new List<string>(1);
-        l.Add(text);
+        if (!l.Contains(text)) l.Add(text);   // a define repeated word for word is one body
     }
 
     /// <summary>A seed file's identifiers, what its defines say (rule 1), and their texts (null names: a binary file).</summary>
@@ -484,7 +486,7 @@ public static partial class HeaderCarver
             {
                 if (!first) continue;
                 AddNewIdentifiers(names, needed, text);
-                StreamLine(main!, text, ref inBlock, toks);
+                StreamLine(main!, bodies, text, ref inBlock, toks);
                 continue;
             }
             inBlock = false;
@@ -566,7 +568,7 @@ public static partial class HeaderCarver
         var inComment = Comment.None;
         while ((line = r.ReadLine()) is not null)
         {
-            line = Digraphs(line);
+            line = CommentsBlanked(Digraphs(line));
             var commented = inComment != Comment.None;   // a #define inside a comment is comment text
             var (isDefine, isCond) = commented ? (false, false) : Directive(line);
             inComment = CommentOpenAfter(line, inComment);
@@ -577,7 +579,7 @@ public static partial class HeaderCarver
                 var sb = new StringBuilder(line);
                 while (EndsWithContinuation(line) && (line = r.ReadLine()) is not null)
                 {
-                    line = Digraphs(line);
+                    line = CommentsBlanked(Digraphs(line));
                     sb.Append('\n').Append(line);
                     inComment = CommentOpenAfter(line, inComment);
                 }
@@ -600,7 +602,7 @@ public static partial class HeaderCarver
         string? line;
         while ((line = r.ReadLine()) is not null)
         {
-            line = Digraphs(line);
+            line = CommentsBlanked(Digraphs(line));
             if (EndsWithContinuation(line)) { sb.Append(line).Append('\n'); continue; }
             if (sb.Length == 0) { yield return line; continue; }
             sb.Append(line);
@@ -608,6 +610,34 @@ public static partial class HeaderCarver
             sb.Clear();
         }
         if (sb.Length > 0) yield return sb.ToString();
+    }
+
+    /// <summary>A directive line with the closed comments before its <c>#</c> and between the <c>#</c> and its keyword
+    /// blanked: a comment is a space, so <c>/* c */ #define X</c> and <c># /* c */ define X</c> are defines. Only for
+    /// reading.</summary>
+    internal static string CommentsBlanked(string line)
+    {
+        var i = 0;
+        while (i < line.Length && char.IsWhiteSpace(line[i])) i++;
+        if (i >= line.Length || (line[i] != '#' && !(line[i] == '/' && i + 1 < line.Length && line[i + 1] == '*'))) return line;
+        char[]? c = null;
+        var hash = false;
+        while (i < line.Length)
+        {
+            if (char.IsWhiteSpace(line[i])) { i++; continue; }
+            if (line[i] == '/' && i + 1 < line.Length && line[i + 1] == '*')
+            {
+                var end = line.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                if (end < 0) break;
+                c ??= line.ToCharArray();
+                for (var k = i; k < end + 2; k++) c[k] = ' ';
+                i = end + 2;
+                continue;
+            }
+            if (line[i] == '#' && !hash) { hash = true; i++; continue; }
+            break;
+        }
+        return hash && c is not null ? new string(c) : line;
     }
 
     /// <summary>A line read as C reads it: <c>%:</c> is <c>#</c> and <c>%:%:</c> is <c>##</c> (a define, a paste). Only
@@ -650,7 +680,8 @@ public static partial class HeaderCarver
         while (e.MoveNext())
         {
             var (line, eol) = e.Current;
-            if (inComment == Comment.None && IsDefineDirective(line.TrimStart()))
+            var view = inComment == Comment.None ? CommentsBlanked(Digraphs(line)) : line;
+            if (inComment == Comment.None && IsDefineDirective(view.TrimStart()))
             {
                 // Read the whole (possibly multi-line) define, then decide.
                 define.Clear();
@@ -663,7 +694,7 @@ public static partial class HeaderCarver
                     define.Add((cont, eol));
                     inComment = CommentOpenAfter(cont, inComment);
                 }
-                var name = DefineName(line);
+                var name = DefineName(view);
                 if (name is not null) defined(name);
                 var drop = name is not null && inComment == Comment.None && !wanted(name);
                 if (drop) { dropped++; continue; }
