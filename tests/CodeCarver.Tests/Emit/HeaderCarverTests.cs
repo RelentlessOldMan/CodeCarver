@@ -113,8 +113,8 @@ public class HeaderCarverTests
     public void Carve_KeepsTokenPasteTargets_TheParseBlindSpot()
     {
         // If code builds a define name with ## (REG_##n##_BASE), the concrete define (REG_1_BASE) never
-        // appears literally, so a literal-identifier seed would wrongly drop it and break the build. The
-        // paste fragments "REG_"/"_BASE" must keep the whole candidate family (sound over-approximation).
+        // appears literally, so a literal-identifier seed would wrongly drop it and break the build. The use
+        // MAKE_REG(1) builds exactly REG_1_BASE; its siblings no use builds are dropped.
         var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdrp-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         try
@@ -135,8 +135,8 @@ public class HeaderCarverTests
             var carved = File.ReadAllText(Path.Combine(dir, "chip.h"));
 
             Assert.Contains("#define REG_1_BASE", carved); // the actual paste target — must survive
-            Assert.Contains("#define REG_0_BASE", carved); // siblings could also be targets (can't know n)
-            Assert.Contains("#define REG_2_BASE", carved);
+            Assert.DoesNotContain("#define REG_0_BASE", carved); // no use builds a sibling
+            Assert.DoesNotContain("#define REG_2_BASE", carved);
             Assert.DoesNotContain("#define UNRELATED", carved); // no fragment match, unreferenced -> dropped
         }
         finally
@@ -618,7 +618,7 @@ public class HeaderCarverTests
             Assert.Contains("#define LN_17 3", carved);
             Assert.DoesNotContain("REG_Q", carved);
             Assert.DoesNotContain("LN_X", carved);
-            Assert.Equal(0, keys["pastedUnknownEnds"]);
+            Assert.Equal(1, keys["patterns"]);   // LN_ and any digits
 
             File.WriteAllText(Path.Combine(dir, "app.c"), """
                 #include "chip.h"
@@ -630,13 +630,13 @@ public class HeaderCarverTests
             carved = File.ReadAllText(Path.Combine(dir, "chip.h"));
             Assert.Contains("#define SZ_QQ 1", carved);
             Assert.DoesNotContain("OTHER", carved);
-            Assert.Equal(1, keys["pastedUnknownEnds"]);
+            Assert.Equal(1, keys["patterns"]);
         }
         finally { Directory.Delete(dir, recursive: true); }
     }
 
-    /// <summary>One letter passed to a paste macro keeps only the names it starts that a piece also ends: work's tree
-    /// kept 109M of 122M defines for a piece at one end. The summary counts what one end alone would have kept.</summary>
+    /// <summary>One letter passed to a paste macro keeps only the name its call builds: work's tree kept 109M of 122M
+    /// defines for a piece at one end.</summary>
     [Fact]
     public void Carve_OneLetterPiece_KeepsOnlyNamesBothEndsMatch()
     {
@@ -652,7 +652,6 @@ public class HeaderCarverTests
             var res = HeaderCarver.Carve(dir, new[] { "chip.h" }, partDone: (k, v) => keys[k] = v);
             Assert.Equal(1, res.DefinesKept);
             Assert.Equal(1000, res.DefinesDropped);
-            Assert.Equal(1000, keys["droppedOneEndPiece"]);
             Assert.Contains("#define A1 0", File.ReadAllText(Path.Combine(dir, "chip.h")));
         }
         finally { Directory.Delete(dir, recursive: true); }
@@ -702,11 +701,9 @@ public class HeaderCarverTests
             Assert.DoesNotContain($"#define {dropped} ", carved);
     }
 
-    /// <summary>A paste macro's sides are per parameter: <c>SUF2(a, b) a##SFX##b</c> puts its first argument only at
-    /// the start of a name and its second only at the end, so <c>SUF2(K, L)</c> builds KSFX and SFXL but never
-    /// LSFX or SFXK. A forwarder gives each parameter the sides of the argument it passes it as (<c>FWD(p, q)</c>
-    /// swaps them), and one passing a parameter to a macro that calls a paste macro it names (<c>APPLY2(SUF2, a)</c>)
-    /// gives it every side of that paste macro. The sides were one union per macro: L ended and started both.</summary>
+    /// <summary>A use builds the cross product of its own slots: <c>SUF2(K, L)</c> builds KSFXL, never KSFX, SFXL, LSFX
+    /// or SFXK. A forwarder passes each argument to the slot of the parameter it fills (<c>FWD(p, q)</c> swaps them),
+    /// and a higher-order call (<c>APPLY2(SUF2, a)</c>) to the paste macro it names.</summary>
     [Fact]
     public void Carve_PieceSides_PerParameter()
     {
@@ -718,26 +715,26 @@ public class HeaderCarverTests
             #define MYCAT(a) APPLY2(SUF2, a)
             int u(void){ return SUF2(K, L) + FWD(M, N) + MYCAT(W); }
             """, """
-            #define KSFX 1
-            #define SFXL 2
-            #define NSFX 3
-            #define SFXM 4
-            #define WSFX 5
-            #define SFXW 6
-            #define LSFX 10
-            #define SFXK 11
-            #define MSFX 12
-            #define SFXN 13
+            #define KSFXL 1
+            #define NSFXM 2
+            #define WSFXZ 3
+            #define KSFX 10
+            #define SFXL 11
+            #define LSFX 12
+            #define SFXK 13
+            #define MSFXN 14
+            #define ZSFXW 15
+            #define KSFXM 16
             """);
-        foreach (var kept in new[] { "KSFX", "SFXL", "NSFX", "SFXM", "WSFX", "SFXW" })
+        foreach (var kept in new[] { "KSFXL", "NSFXM", "WSFXZ" })
             Assert.Contains($"#define {kept} ", carved);
-        foreach (var dropped in new[] { "LSFX", "SFXK", "MSFX", "SFXN" })
+        foreach (var dropped in new[] { "KSFX", "SFXL", "LSFX", "SFXK", "MSFXN", "ZSFXW", "KSFXM" })
             Assert.DoesNotContain($"#define {dropped} ", carved);
     }
 
-    /// <summary>The summary says why each define was kept: its name is used, or the shorter of the pieces it starts and
-    /// ends with, by length. A define kept for a piece counts as that, not as a name (its own line names it). One a
-    /// piece starts or ends but not both is dropped, and counted.</summary>
+    /// <summary>The summary says why each define was kept: its name is used, or a paste use builds it (exactly, by a
+    /// wildcard pattern, or from a use's pool). A define kept for a use counts as that, not as a name (its own line
+    /// names it).</summary>
     [Fact]
     public void Carve_CountsWhyEachDefineWasKept()
     {
@@ -762,42 +759,106 @@ public class HeaderCarverTests
             var res = HeaderCarver.Carve(dir, new[] { "chip.h" }, partDone: (k, v) => keys[k] = v);
             Assert.Equal(2, res.DefinesDropped);   // VREG, OTHER
             Assert.Equal(2, keys["keptByName"]);   // USED, and BASE_V from V1's body
-            Assert.Equal(1, keys["keptByPiece1"]); // V1, for V and 1
-            Assert.Equal(1, keys["keptByPiece4plus"]); // UARTX_CR2, for UARTX and _CR2
-            Assert.Equal(0, keys["keptByPiece2"] + keys["keptByPiece3"] + keys["keptBySystemHeaders"]);
-            Assert.Equal(1, keys["droppedOneEndPiece"]); // VREG: V starts it, no piece ends it
-            Assert.Equal(2, keys["pieces1"]);      // V, 1
+            Assert.Equal(2, keys["keptByUse"]);    // V1 and UARTX_CR2, each built by its call
+            Assert.Equal(0, keys["keptByPattern"] + keys["keptByPool"] + keys["keptBySystemHeaders"]);
+            Assert.Equal(2, keys["pasteUses"]);
+            Assert.Equal(2, keys["namesBuilt"]);
         }
         finally { Directory.Delete(dir, recursive: true); }
     }
 
-    /// <summary>An argument expands to its body before the paste, but only what can begin or end the body joins it:
-    /// <c>#define PORT ((t)U)</c> builds no name from U, and <c>(LEFT) mid + RIGHT</c> only names ending in RIGHT. Every
-    /// definition counts, however many.</summary>
+    /// <summary>A use through a chain of forwarders in the big headers takes every define of the chain in one read: the
+    /// 40 links took 40 more passes, each reading every big header, when each link asked only for the next (every link
+    /// named, so taken in the first pass) or each taken link named only the next (only the first named).</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Carve_ForwarderChainInBigHeaders_TakesFewPasses(bool everyLinkNamed)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdr-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "app.c"), """
+                #include "chip.h"
+                int u(void){ return FW0(KQ, 7); }
+                """ + "\n// " + (everyLinkNamed ? string.Join(" ", Enumerable.Range(1, 40).Select(i => $"FW{i}")) : "") + "\n");
+            var chip = new System.Text.StringBuilder();
+            for (var i = 0; i < 40; i++) chip.AppendLine($"#define FW{i}(a, b) FW{i + 1}(a, b)");
+            chip.AppendLine("#define FW40(a, b) a##b").AppendLine("#define KQ7 1").AppendLine("#define KQ8 2");
+            File.WriteAllText(Path.Combine(dir, "chip.h"), chip.ToString());
+            var res = HeaderCarver.Carve(dir, new[] { "chip.h" });
+            var carved = File.ReadAllText(Path.Combine(dir, "chip.h"));
+            Assert.Contains("#define KQ7 1", carved);
+            Assert.DoesNotContain("KQ8", carved);
+            Assert.InRange(res.Passes, 1, 4);
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    /// <summary>An argument expanded through a chain of 40 aliases in the big headers, each read a pass after the one
+    /// naming it: until the chain's end was read, each link expanded the next twice (its first and last edges), 2^40
+    /// times.</summary>
+    [Fact]
+    public void Carve_AliasChainInBigHeaders_ExpandsEachLinkOnce()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdr-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            File.WriteAllText(Path.Combine(dir, "app.c"), """
+                #include "chip.h"
+                #define CAT(a, b) a##b
+                #define XCAT(a, b) CAT(a, b)
+                int u(void){ return XCAT(AL0, 1); }
+                """ + "\n// " + string.Join(" ", Enumerable.Range(1, 40).Select(i => $"AL{i}")) + "\n");
+            var chip = new System.Text.StringBuilder();
+            for (var i = 0; i < 40; i++) chip.AppendLine($"#define AL{i} AL{i + 1}");
+            chip.AppendLine("#define AL40 ZQ").AppendLine("#define ZQ1 1").AppendLine("#define ZQ2 2");
+            File.WriteAllText(Path.Combine(dir, "chip.h"), chip.ToString());
+            var carve = Task.Run(() => HeaderCarver.Carve(dir, new[] { "chip.h" }));
+            Assert.True(carve.Wait(TimeSpan.FromSeconds(60)), "the carve did not finish in 60 s");
+            var carved = File.ReadAllText(Path.Combine(dir, "chip.h"));
+            Assert.Contains("#define ZQ1 1", carved);
+            Assert.DoesNotContain("ZQ2", carved);
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
+    /// <summary>An argument a forwarder expands before the paste joins it by the body's edge token only: <c>#define PORT
+    /// ((t)U)</c> ends in ), which builds nothing, and <c>(LEFT) mid + RIGHT</c> only names starting with RIGHT. Every
+    /// definition counts, however many. Pasted directly, an argument is not expanded (CAT(EDGE, 4) is EDGE4).</summary>
     [Fact]
     public void Carve_ArgumentExpansion_OnlyBodyEdgesArePieces()
     {
         var app = new System.Text.StringBuilder("""
             #include "chip.h"
             #define CAT(a, b) a##b
+            #define XCAT(a, b) CAT(a, b)
             #define PORT ((t)U)
             #define EDGE (LEFT) mid + RIGHT
 
             """);
         for (var i = 0; i < 20; i++) app.Append($"#if B == {i}\n#define MANY BODY{i}X\n#endif\n");
-        app.Append("int u(void){ return CAT(PORT, 1) + CAT(EDGE, 2) + CAT(MANY, 3); }\n");
+        app.Append("int u(void){ return XCAT(PORT, 1) + XCAT(EDGE, 2) + XCAT(MANY, 3) + CAT(EDGE, 4); }\n");
         var carved = CarveOne(app.ToString(), """
             #define U1 1
             #define LEFT2 2
             #define RIGHT2 3
             #define mid2 4
-            #define BODY19X_3 5
+            #define BODY19X3 5
+            #define BODY19X_3 8
+            #define EDGE4 6
+            #define RIGHT4 7
             """);
         Assert.DoesNotContain("#define U1", carved);
         Assert.DoesNotContain("LEFT2", carved);
         Assert.Contains("#define RIGHT2 3", carved);
         Assert.DoesNotContain("mid2", carved);
-        Assert.Contains("#define BODY19X_3 5", carved);   // the 20th body (16 were kept before)
+        Assert.Contains("#define BODY19X3 5", carved);   // the 20th body (16 were kept before)
+        Assert.DoesNotContain("BODY19X_3", carved);
+        Assert.Contains("#define EDGE4 6", carved);
+        Assert.DoesNotContain("RIGHT4", carved);
     }
 
     /// <summary>The counts are of names defined in the carved header; whether one is a paste macro is judged from every
@@ -821,16 +882,14 @@ public class HeaderCarverTests
         Assert.Equal(5, res.DefinesKept + res.DefinesDropped);
     }
 
-    /// <summary>Up to 64 paste pieces a define name is tried against each piece; past 64, against its prefixes and
-    /// suffixes of the lengths some piece has. Both ways keep the same defines: names a piece starts and a piece ends,
-    /// the two from different calls included, a piece equal to the name; never one end only, nor a piece in the
-    /// middle.</summary>
+    /// <summary>However many calls, each builds only its own names: HEADP from one call never pairs with 2 from another
+    /// (HEADP2), and nothing a call does not build or code names (EXACTP is named) is kept.</summary>
     [Theory]
     [InlineData(63)]
     [InlineData(64)]
     [InlineData(65)]
     [InlineData(66)]
-    public void Carve_PieceLookup_SameAtTheCrossover(int pieces)
+    public void Carve_ManyCalls_EachPairsOnlyItsOwnPieces(int pieces)
     {
         var app = new System.Text.StringBuilder("#include \"chip.h\"\n#define CAT(a, b) a##b\n");
         app.Append("int u(void){ return CAT(HEADP, 1) + CAT(TAILP, 2) + CAT(EXACTP, 2)");
@@ -849,8 +908,8 @@ public class HeaderCarverTests
 
             """);
         Assert.Contains("#define HEADP1 1", carved);
-        Assert.Contains("#define HEADP2 2", carved);
-        Assert.Contains("#define EXACTP 3", carved);
+        Assert.DoesNotContain("HEADP2", carved);
+        Assert.Contains("#define EXACTP 3", carved);   // named in code: wanted by its name
         Assert.Contains("#define PX50 6", carved);
         Assert.DoesNotContain("MID_HEADP_X", carved);
         Assert.DoesNotContain("NONE_REG", carved);
@@ -889,5 +948,102 @@ public class HeaderCarverTests
             Assert.DoesNotContain("NOT_USED", text);
         }
         finally { Directory.Delete(dir, true); }
+    }
+
+    /// <summary>A function-like macro whose body ends in a paste macro forwards to it: <c>PICK(1)(PK, A)</c> is
+    /// <c>CAT(PK, A)</c>, so it builds PKA and nothing else.</summary>
+    [Fact]
+    public void Carve_FunctionLikeAliasCalled_BuildsItsCallsName()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define CAT(a, b) a##b
+            #define PICK(x) CAT
+            int u(void){ return PICK(1)(PK, A) + CAT(Q, R); }
+            """, """
+            #define PKA 1
+            #define PKB 2
+            #define PK1 3
+            """);
+        Assert.Contains("#define PKA 1", carved);
+        Assert.DoesNotContain("PKB", carved);
+        Assert.DoesNotContain("PK1", carved);
+    }
+
+    /// <summary>A paste macro named but never called anywhere (a pointer to it, say) gets one use whose arguments are any
+    /// text: ZW_Q_OFF is kept, ZW_Q_OFZ not. Called anywhere, dropped text included, it does not: only the names
+    /// its calls build are kept.</summary>
+    [Fact]
+    public void Carve_UncalledPasteMacro_GetsAWildcardUse()
+    {
+        const string chip = """
+            #define ZW_Q_OFF 1
+            #define ZW_R_OFF 2
+            #define ZW_Q_OFZ 3
+            """;
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define KG(a) ZW_##a##_OFF
+            void *p = (void *)KG;
+            """, chip);
+        Assert.Contains("#define ZW_Q_OFF 1", carved);
+        Assert.Contains("#define ZW_R_OFF 2", carved);
+        Assert.DoesNotContain("ZW_Q_OFZ", carved);
+
+        carved = CarveOne("""
+            #include "chip.h"
+            #define KG(a) ZW_##a##_OFF
+            void *p = (void *)KG;
+            #if 0
+            int q = KG(Q);
+            #endif
+            """, chip);
+        Assert.Contains("#define ZW_Q_OFF 1", carved);
+        Assert.DoesNotContain("ZW_R_OFF", carved);
+        Assert.DoesNotContain("ZW_Q_OFZ", carved);
+    }
+
+    /// <summary>A call open across #if/#else falls back to its own pool: any of its start pieces with any of its end
+    /// pieces (PA_2 too), every branch's tokens included, never a name none of its pieces both starts and ends. A call
+    /// opened in a branch and closed after the #endif is pooled with the rest of its arguments any text.</summary>
+    [Fact]
+    public void Carve_CallOpenAcrossABranch_KeepsItsOwnPool()
+    {
+        var carved = CarveOne("""
+            #include "chip.h"
+            #define CAT(a, b) a##b
+            int u(void){ return CAT(
+            #if A
+                PA_, 1
+            #else
+                PB_, 2
+            #endif
+                ); }
+            int v(void){ return CAT(QQ_, 3); }
+            int w(void){ return
+            #if B
+                CAT(RA_,
+            #else
+                CAT(RB_,
+            #endif
+                9); }
+            """, """
+            #define PA_1 1
+            #define PB_2 2
+            #define PA_2 3
+            #define QQ_1 4
+            #define PA_3 5
+            #define RA_9 6
+            #define RB_9 7
+            #define RC_9 8
+            """);
+        Assert.Contains("#define PA_1 1", carved);
+        Assert.Contains("#define PB_2 2", carved);
+        Assert.Contains("#define PA_2 3", carved);
+        Assert.DoesNotContain("QQ_1", carved);
+        Assert.DoesNotContain("PA_3", carved);
+        Assert.Contains("#define RA_9 6", carved);
+        Assert.Contains("#define RB_9 7", carved);
+        Assert.DoesNotContain("RC_9", carved);
     }
 }

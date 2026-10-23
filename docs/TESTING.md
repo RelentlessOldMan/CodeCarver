@@ -117,50 +117,41 @@ bug fixed against the corpus, not a corpus case removed.
    `, ##__VA_ARGS__`), or forwards to a paste macro: by a function-like body that holds a `(` and names one, called or not
    (`#define MYCAT(a) APPLY2(CAT, a)` forwards to CAT), or an object-like
    define whose body's last token is one (`#define F CAT`: `F(a, b)` calls it; `#define F (CAT)` does not). Order does not matter; a later definition only adds.
-2. **Pieces**: every identifier beside a `##` (any length), and every number beside one made only of identifier
-   characters (`1`, `0x1F`, `2u`; not `1.5`); every identifier and such number among the arguments of a
-   paste-macro call in kept text, a call spanning lines included; a paste macro passed as an argument
-   (`APPLY(CAT, A, 2)`) makes the enclosing call's argument identifiers pieces; in a computed call
-   (`CAT(FWD_, 7)(x)`) the trailing arguments count too; and, for each argument identifier, the **edge pieces**
-   of every body of its defines, object-like or function-like (an argument passed on is expanded, and `##` joins
-   only the boundary tokens), each expanded the same way, transitively. A body's edge pieces, walking in from
-   each end: an identifier (other than the define's own parameters) is one, and the walk goes on past it, since it
-   may expand to nothing (`#define X A B E` with `E` empty ends in `B`); a call `G(...)` there gives `G` and every
-   identifier and number among its arguments (`#define H(x) x` makes `H(FOO)` end in `FOO`), and the walk goes on
-   past it; `##` is skipped; the walk stops at a number (a piece when made of identifier characters) or any other
-   token (`((t)U)` gives none). A paste of `__LINE__` or `__COUNTER__` ends a name in any digits; of another name
-   starting `__` that nothing defines (a compiler's own, `__SIZEOF_INT__`), in anything. The defines of headers
-   read outside the root and each build's `-D` values (`-DN=2` is `#define N 2`, `-DN` is `#define N 1`) are
-   definitions for rules 1 and 2 like any other. Digraphs are read as C reads them (`%:` is `#`, `%:%:` is `##`);
-   trigraphs are not (`??/` as a line splice, `??=` as `#`): a known gap.
-   Pieces come only from kept text outside the big headers, the big headers' non-define lines, and the bodies of
-   **wanted** big-header defines (a define never kept is never expanded); rule 1 uses every definition. A
-   define's own parameters are never pieces: its call sites supply them. An argument list runs to its matching
-   `)` across lines and directives (`CAT(A,` / `#if X` / `B)` / `#else` / `C)` / `#endif` gives A, B and C).
-   Calls inside comments or strings are left open: no truth name depends on them.
-   **Sides.** A piece is a **start** piece (it can begin a pasted name), an **end** piece (it can end one), or
-   both. In a `##` chain (`HWB_##blk##_r##n##_VAL`), an operand starts a name when every operand before it is a
-   parameter (one may expand to nothing) and ends one when every operand after it is: so `HWB_` is a start piece,
-   `_VAL` an end piece, and `_r` none. A paste macro's parameter takes the sides of its place in the chain, the
-   union over every chain it appears in; one at neither end (`blk`, `n`) gives its argument no side, but the
-   argument's expansion still joins both neighbours (its last edge piece starts a name, its first ends one). The
-   variadic parameter at neither end counts as both. A forwarding macro or alias gives an argument the sides of the
-   paste-macro parameters it reaches; if it passes a parameter on as anything but a whole argument
-   (`#define MF(x) HWP(x y, 3)`), both. A call's argument that is one identifier or number gets the paste macro's
-   side for that parameter; an argument of several tokens (`CAT(A b, x)`, `CAT(G(a), x)`), every identifier of a
-   call around a paste macro named without a call, of a computed call, of a call whose argument list crossed an
-   `#if` branch or was still open at the end of a file, gets both. A literal `##` operand gets its chain sides; an
-   edge piece of an argument's expansion gets the side it lands on (the expansion's last edge where the argument
-   starts a name, its first where it ends one).
+2. **Uses** (rule 3', since CodeSpawner 1.4.5). Each paste-macro call in kept text is a **use**, and each use
+   builds its own names: pieces of different uses never pair (`CAT(HEADP, 1)` and `CAT(X, 2)` build HEADP1 and X2,
+   never HEADP2). A use is followed through forwarders, aliases and higher-order calls (`APPLY2(CAT, a)`) into every
+   `##` chain it reaches, and each chain builds the cross product of its slots:
+   - a literal operand gives itself; an operand that is not an identifier or identifier-like number (`2`, `2u`,
+     `0x1F`; not `1.5`) means the chain builds nothing;
+   - an argument gives its spelling, plus its expansion where the macro expands it (an argument passed on through a
+     forwarder is expanded; one pasted directly is not, so `CAT(EDGE, 4)` builds EDGE4 whatever EDGE is). A left
+     slot takes the argument's last token, a right slot its first, an interior slot both (an interior argument of
+     several tokens: its first and last). An expansion's edge walks in past identifiers that may expand to
+     nothing (`#define X A B E` with `E` empty ends in `B`) and stops at any other token (`((t)U)` gives none);
+   - an empty argument, or one whose expansion can be empty, gives nothing (the slot is skipped);
+   - `__LINE__` and `__COUNTER__` are a run of digits, and an undefined `__name` (a compiler's own,
+     `__SIZEOF_INT__`) is any text. A chain with more than one such wildcard keeps only its outer text and one
+     wildcard;
+   - a call's missing arguments at end of file are any text.
+
+   A chain with no parameter builds its literal name. A paste macro named in kept text and never called gets one
+   use whose arguments are all any text. A use falls back to its own **pool** (any of its start pieces with any of
+   its end pieces) when its callee is computed (`CAT(FWD_, 7)(x)`), when the call is open across an
+   `#if`/`#elif`/`#else`/`#endif`, or when a chain's product passes 4,096 names. An argument list runs to its
+   matching `)` across lines and directives; at `#elif`/`#else` the call is restored to its state at the `#if`, so
+   each branch closes it on its own, and a call opened inside a branch and closed after the `#endif` is pooled.
+   Calls inside comments or strings are left open: no truth name depends on them. The defines of headers read
+   outside the root and each build's `-D` values (`-DN=2` is `#define N 2`, `-DN` is `#define N 1`) are
+   definitions like any other. Digraphs are read as C reads them (`%:` is `#`, `%:%:` is `##`); trigraphs are not
+   (`??/` as a line splice, `??=` as `#`): a known gap.
 3. **Wanted** starts as every identifier of every line of kept text outside the big headers, every identifier of
    every non-define line of the big headers (comments, strings, `#undef`, `#pragma`, inactive `#if` text
    included), the identifiers of each build's `-D` defines, those of every header outside the root that a build
-   includes, those of big headers kept whole because they are included from outside the root, and the reserved names (`__x`, `_` + uppercase, and NDEBUG, DEBUG,
-   WIN32_LEAN_AND_MEAN, VC_EXTRALEAN, NOMINMAX, STRICT, UNICODE, NOGDI, NOUSER, NOCRYPT, NOSERVICE, NOMCX, NOIME,
-   WINVER, NTDDI_VERSION); it grows to a fixpoint through the bodies of wanted defines; plus every big-header define whose name starts with a **start** piece **and** ends with an **end**
-   piece (one piece equal to the name counts when it is both; a name that only starts or only ends with one is
-   dropped: a one-letter piece at one end matched 109M of 122M defines at work, and the one-letter arguments of
-   interior parameters, `HWP(T, 0)`, matched every name at both ends until pieces had sides). A wanted name keeps all its definitions.
+   includes, those of big headers kept whole because they are included from outside the root, and the reserved
+   names (`__x`, `_` + uppercase, and NDEBUG, DEBUG, WIN32_LEAN_AND_MEAN, VC_EXTRALEAN, NOMINMAX, STRICT, UNICODE,
+   NOGDI, NOUSER, NOCRYPT, NOSERVICE, NOMCX, NOIME, WINVER, NTDDI_VERSION). It grows to a fixpoint through the
+   bodies of wanted defines, and every use in a wanted body is followed. A big-header define is also wanted when a
+   use builds its name: exactly, by a wildcard, or from its pool. A wanted name keeps all its definitions.
 4. A file is **big** (header-carved) when longer than `maxParseBytes`; exactly `maxParseBytes` is parsed. A file
    of 1,000,000 bytes up to `maxParseBytes` is **dense** (carved by the same rules) when, over its first 262,144
    chars (a truncated last line dropped), define lines are at least 0.60 of the substantive lines and there are

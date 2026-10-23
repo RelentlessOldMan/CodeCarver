@@ -43,7 +43,7 @@ public sealed record HeaderCarveResult(long BytesBefore, long BytesAfter, int De
 /// Over-keeping is the safe side of "must build": anything uncertain (any non-#define line, any name we
 /// can't rule out) is kept. Still EXPERIMENTAL — always build-verify the result.
 /// </summary>
-public static class HeaderCarver
+public static partial class HeaderCarver
 {
     /// <summary>
     /// Carve the given big headers (relative paths) in place under <paramref name="outDir"/>, dropping
@@ -173,226 +173,216 @@ public static class HeaderCarver
 
         // 1. Seed: every identifier used by kept code that ISN'T one of the carved headers. That is the set
         //    of names the compiled output could reference; a define outside its closure is unreachable.
-        //    ALSO collect token-paste fragments: if code builds a name with `##` (`REG_##n##_BASE`), the
-        //    concrete define (`REG_0_BASE`) never appears literally, so we'd wrongly drop it. A define whose name
-        //    starts with a fragment that can start a pasted name and ends with one that can end one is kept: a pasted
-        //    name's first token begins it and its last ends it (sound over-approximation — the paste blind spot). Either
-        //    end alone kept everything at work: a one-letter argument started or ended 109M of 122M names; and so did
-        //    both ends while a piece counted at either: one-letter arguments pasted between two others (HWB_##b##_R)
-        //    were pieces at both, though no name a paste builds from them starts or ends with them.
         //    Every TEXT file in the output counts — assembly, linker scripts, .inc tables, scripts — not only C:
         //    a define used only by startup.S or a linker script is still needed (review H1). The caller runs this
         //    after the infrastructure copy so those files are present. Binary files are skipped.
+        //    A name a paste builds (`REG_##n##_BASE` makes REG_0_BASE) never appears literally: rule 3 of
+        //    docs/TESTING.md keeps the names ONE paste use builds (see UseEngine), from the calls in the kept files and
+        //    in the big headers' kept lines, through the paste macros every define in reach makes.
         // Names by key (see NameKey): work held 8M of them as strings. Two names that share a key are both needed.
         var needed = new HashSet<ulong>((extraNames ?? Array.Empty<string>()).Select(n => NameKey.Short(n)));
-        var fragments = new PieceSets();
-        var pastes = new Pastes();
+        var facts = new DefineFacts();
+        var pasterCount = 0;
+        // The kept files' and the build's defines: what a paste use instantiates. The big headers' are read when a use
+        // needs one (UseEngine.Asked).
+        var texts = new Dictionary<ulong, List<string>>();
         // Hidden files count (a .config, a dot-named generated header): only the system ones are skipped.
         var walk = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.System };
         var candidates = Directory.EnumerateFiles(outDir, "*", walk)
             .Where(f => !bigSet.Contains(Path.GetRelativePath(outDir, f).Replace('\\', '/'))).ToList();
-        var seedFiles = new List<string>();
-        string Learned() => $"{pastes.Counts.Pasters:N0} paste macros, {pastes.Counts.Callers:N0} forwarding macros, {needed.Count:N0} names, {fragments.Count:N0} paste pieces";
-        CodeCarver.Core.Util.Activity.Doing("reading the kept files for names and paste macros", Learned);
+        var callFiles = new List<string>();
+        var hashHashFiles = new HashSet<string>(StringComparer.Ordinal);
+        UseEngine? engine = null;
+        UseResults? built = null;   // what the uses built, once the engine is let go
+        string Learned() => engine is null
+            ? $"{pasterCount:N0} paste macros, {needed.Count:N0} names"
+            : $"{facts.Pasters.Count:N0} paste macros, {needed.Count:N0} names, {engine.Uses:N0} paste uses, {engine.Results.Exact.Count:N0} names built";
+        CodeCarver.Core.Util.Activity.Doing("reading the kept files for names and defines", Learned);
         foreach (var (i, seen) in CodeCarver.Core.Util.ReadAhead.Ordered(candidates, SeedScan, CodeCarver.Core.Util.ReadAhead.Window))
         {
             limit.Check();
             if (seen.Names is null) continue;   // binary
-            seedFiles.Add(candidates[i]);
             needed.UnionWith(seen.Names);
-            // Only a line with a '#' can define or paste.
-            foreach (var line in seen.HashLines)
-            {
-                if (Pastes.ParseDef(line) is { } def) pastes.Learn(def, big: false);
-                Pastes.AddLiteralPieces(line, fragments);
-                pastes.LearnObject(line);
-            }
+            facts.Merge(seen.Facts);
+            foreach (var (key, text) in seen.Defines) AddText(texts, key, text);
+            if (!StreamsCalls(candidates[i])) continue;
+            callFiles.Add(candidates[i]);
+            if (seen.HashHash) hashHashFiles.Add(candidates[i]);
         }
         var elsewhere = (elsewhereDefines ?? Array.Empty<string>()).Select(Digraphs).ToList();
+        var def = new PpDefine();
+        var elsewhereFacts = new FileFacts();
         foreach (var line in elsewhere)
         {
-            if (Pastes.ParseDef(line) is { } def) pastes.Learn(def, big: false);
-            Pastes.AddLiteralPieces(line, fragments);
-            pastes.LearnObject(line);
+            if (!def.Parse(line)) continue;
+            elsewhereFacts.Add(def, big: false);
+            AddText(texts, NameKey.Short(def.NameSpan), line);
         }
+        facts.Merge(elsewhereFacts);
         PartDone("seed");
-        // A paste macro's own call sites name the pieces (`CAT(UART, 2)` builds UART2): learned macros first,
-        // in the big headers too, then the calls.
+
+        // Rule 1 over every define in reach: which names are paste macros, which of them something calls, which names can
+        // expand to nothing. The big headers' defines are held as name keys only.
         CodeCarver.Core.Util.Activity.Doing("learning paste macros from the big headers", Learned);
-        foreach (var (_, defines) in CodeCarver.Core.Util.ReadAhead.Ordered(bigFull, PasteDefines, CodeCarver.Core.Util.ReadAhead.Window))
+        foreach (var (_, f) in CodeCarver.Core.Util.ReadAhead.Ordered(bigFull, BigFacts, CodeCarver.Core.Util.ReadAhead.Window))
         {
             limit.Check();
-            foreach (var def in defines) pastes.Learn(def, big: true);   // its literal pieces count once it's wanted
+            facts.Merge(f);
         }
-        pastes.Resolve();
+        facts.Resolve();
         PartDone("bigDefines");
-        CodeCarver.Core.Util.Activity.Doing("reading paste-macro calls in the kept files", Learned);
-        if (pastes.Any)
-            foreach (var (_, found) in CodeCarver.Core.Util.ReadAhead.Ordered(seedFiles, f => ScanCalls(pastes, f), CodeCarver.Core.Util.ReadAhead.Window))
-            {
-                limit.Check();
-                foreach (var (piece, side) in found) pastes.AddPiece(piece, side, fragments);
-            }
-        if (pastes.Any && elsewhere.Count > 0)
-        {
-            var calls = new CallScanner(pastes);
-            foreach (var line in elsewhere) calls.Define(line);
-            calls.Flush();
-            foreach (var (piece, side) in calls.Pieces) pastes.AddPiece(piece, side, fragments);
-        }
 
-        // A define is wanted if the code references its name, OR a paste fragment could build that name. Only the
-        // lengths some fragment has are tried (every prefix and suffix of every define name was a string each).
-        // A prefix or suffix is looked up by its hash first, a string made only when a fragment has that hash.
-        int[] startLengths = Array.Empty<int>(), endLengths = Array.Empty<int>();
-        HashSet<int> startHashes = new(), endHashes = new();
-        var unknownEnds = false;
-        void FreezeFragments()
+        // The kept files' paste uses and chains, and the build's defines' (each a body of its own).
+        CodeCarver.Core.Util.Activity.Doing("reading paste uses in the kept files", Learned);
+        engine = new UseEngine(facts, texts) { Tick = limit.Check };
+        if (bigFull.Count == 0) engine.NothingToAsk();
+        var pasters = facts.Pasters;
+        pasterCount = pasters.Count;
+        var streamed = pasters.Count > 0 ? callFiles : callFiles.Where(hashHashFiles.Contains).ToList();
+        foreach (var (_, ev) in CodeCarver.Core.Util.ReadAhead.Ordered(streamed, f => StreamKept(f, pasters), CodeCarver.Core.Util.ReadAhead.Window))
         {
-            startLengths = fragments.Starts.Select(f => f.Length).Distinct().Order().ToArray();
-            startHashes = fragments.Starts.Select(f => f.GetHashCode()).ToHashSet();
-            endLengths = fragments.Ends.Select(f => f.Length).Distinct().Order().ToArray();
-            endHashes = fragments.Ends.Select(f => f.GetHashCode()).ToHashSet();
-            unknownEnds = pastes.UnknownEnds > 0;
+            limit.Check();
+            if (ev is not null) engine.Fold(ev);
         }
-        bool Wanted(string name) => needed.Contains(NameKey.Short(name)) || ReadBySystemHeaders(name) || PieceLength(name, true) > 0;
-        // The length of the shortest piece that can start a pasted name the name starts with (or end one, ends with),
-        // 0 when none.
-        int PieceAt(string name, bool start)
+        if (elsewhere.Count > 0)
         {
-            // A paste of __LINE__ ends a name in digits; of a compiler macro nothing here defines, in anything.
-            if (!start && unknownEnds) return 1;
-            if (!start && pastes.DigitsEnd && char.IsAsciiDigit(name[^1])) return 1;
-            var set = start ? fragments.Starts : fragments.Ends;
-            if (set.Count <= 64)
-                return set.Where(fr => fr.Length > 0 && (start ? name.StartsWith(fr, StringComparison.Ordinal) : name.EndsWith(fr, StringComparison.Ordinal)))
-                          .Select(fr => fr.Length).DefaultIfEmpty(0).Min();
-            var hashes = start ? startHashes : endHashes;
-            foreach (var k in start ? startLengths : endLengths)
-            {
-                if (k > name.Length) break;
-                var s = start ? name.AsSpan(0, k) : name.AsSpan(name.Length - k);
-                if (k > 0 && hashes.Contains(string.GetHashCode(s)) && set.Contains(s.ToString())) return k;
-            }
-            return 0;
+            var ev = new UseEvents(pasters);
+            var bodies = new UseTracker(ev);
+            foreach (var line in elsewhere) if (def.Parse(line)) StreamBody(bodies, def);
+            engine.Fold(ev);
         }
-        // Both ends: the shorter of the two shortest pieces, 0 unless a piece starts it and one ends it. Either end
-        // (bothEnds false): the shortest piece it starts or ends with.
-        int PieceLength(string name, bool bothEnds)
+        engine.Drain();
+        PartDone("pasteCalls");
+
+        bool Wanted(string name)
         {
-            var s = PieceAt(name, true);
-            if (bothEnds && s == 0) return 0;
-            var e = PieceAt(name, false);
-            if (bothEnds) return e == 0 ? 0 : Math.Min(s, e);
-            return s == 0 ? e : e == 0 ? s : Math.Min(s, e);
+            var key = NameKey.Short(name);
+            if (needed.Contains(key) || ReadBySystemHeaders(name)) return true;
+            var r = built ?? engine!.Results;
+            return r.Exact.Contains(key) || r.PatternMatch(name) || r.PoolMatch(name);
         }
-        // Why the emit kept each define: its name is needed, the compiler's headers read it, or the shorter of the
-        // pieces it starts and ends with (1, 2, 3, 4 or more characters). A carve that drops nothing says which; and
-        // how many it dropped that start or end with a piece (one end only: what keeping either end would keep).
-        long keptByName = 0, keptBySystem = 0, droppedOneEnd = 0;
-        var keptByPiece = new long[5];
+        // Why the emit kept each define: its name is needed, the compiler's headers read it, a paste use builds it, a
+        // pattern of one fits it (an unknown or __LINE__ slot), or a use's own pool does (a computed call, one open
+        // across a conditional, or one past the cap).
+        long keptByName = 0, keptBySystem = 0, keptByUse = 0, keptByPattern = 0, keptByPool = 0;
         bool WantedCounted(string name)
         {
-            if (needed.Contains(NameKey.Short(name))) { Interlocked.Increment(ref keptByName); return true; }
+            var key = NameKey.Short(name);
+            if (needed.Contains(key)) { Interlocked.Increment(ref keptByName); return true; }
             if (ReadBySystemHeaders(name)) { Interlocked.Increment(ref keptBySystem); return true; }
-            var k = PieceLength(name, true);
-            if (k == 0)
-            {
-                if (PieceLength(name, false) > 0) Interlocked.Increment(ref droppedOneEnd);
-                return false;
-            }
-            Interlocked.Increment(ref keptByPiece[Math.Min(k, 4)]);
-            return true;
+            var r = built ?? engine!.Results;
+            if (r.Exact.Contains(key)) { Interlocked.Increment(ref keptByUse); return true; }
+            if (r.PatternMatch(name)) { Interlocked.Increment(ref keptByPattern); return true; }
+            if (r.PoolMatch(name)) { Interlocked.Increment(ref keptByPool); return true; }
+            return false;
         }
 
-        // 2. Fixpoint: grow `needed` with the bodies of wanted defines and all #if-condition identifiers.
-        //    Terminates because `needed` only grows and is finite. Passes ≈ the deepest define-dependency chain
-        //    (small for register maps).
-        //    The header's own non-#define lines (typedefs, enums, inline functions) are kept verbatim, so the
-        //    names they use are needed too; and a kept define that pastes (##) can form further names.
-        //    Headers are read in batches on many threads against what is needed so far, and what they hand back is
+        // 2. Fixpoint: grow `needed` with the bodies of wanted defines and the big headers' own non-define lines (kept
+        //    verbatim: typedefs, enums, inline functions, #if conditions, so branch selection can't change), and grow
+        //    what the paste uses build with the uses those lines and bodies make. Terminates because both only grow
+        //    and are finite. Passes ≈ the deepest define-dependency chain (small for register maps).
+        //    Headers are read in batches on many threads against what is wanted so far, and what they hand back is
         //    folded in in order. The first pass takes every kept line; a later one only the defines wanted, but those
         //    taken two passes back (a name taken in a pass may have been passed over in a batch before it became
-        //    wanted; the pass after takes every line of it). When the paste macros grew, a call or a define taken
-        //    before can build more: the next pass takes every line again.
-        PartDone("pasteCalls");
+        //    wanted). A use that met a name whose big-header defines were not read yet asks for them: each batch hands
+        //    them back, and the use runs again with them.
         var batches = Batches(bigFull, 256L << 20);
         // Defines taken, by key (see NameKey): work took 18.9M in one pass, held as strings.
         var done = new HashSet<UInt128>();
         var takenBefore = new HashSet<UInt128>();
         var passes = 0;
-        for (var all = true; ;)
+        var forwardsNeeded = new HashSet<ulong>();
+        void NeedForwards(ulong name)
+        {
+            if (forwardsNeeded.Add(name)) facts.ForwardsTo(name, k => { needed.Add(k); return forwardsNeeded.Add(k); });
+        }
+        foreach (var name in needed.Where(pasters.Contains).ToList()) NeedForwards(name);
+        while (true)
         {
             passes++;
             inPass(passes);
             CodeCarver.Core.Util.Activity.Doing($"reading the big headers for what they need, pass {passes}", Learned);
+            var first = passes == 1;
             var grew = false;
             var taken = new HashSet<UInt128>();
-            var pastesAt = pastes.Version;
-            // Where this pass's new pieces came from (work's 1.0.330 run went from 0.5M pieces in pass 1 to 4.5M in pass 2,
-            // and stopped at 20 GB in pass 3, with no part's numbers to say which source).
-            long fromLiteral = 0, fromExpansion = 0, fromCalls = 0, expandedDefines = 0;
+            List<ulong>? newPasters = null;
+            var versionAt = engine.Results.Version;
+            var capturedAt = engine.Captured;
+            var runsAt = engine.Runs;
             foreach (var batch in batches)
             {
-                FreezeFragments();
-                var skip = all ? null : done;
-                // Nothing is added to what is needed, the pieces or the paste macros while a batch is read, so each
-                // reader hands back only what its file adds, not its lines: work's first pass held its kept lines' text,
-                // a batch at a time, and stopped at 20 GB.
-                foreach (var take in CodeCarver.Core.Util.ReadAhead.Each(batch, path => Take(path, all, skip, Wanted, needed, pastes, limit)))
+                var serial = engine.BatchBegin();
+                var skip = first ? null : done;
+                var asked = engine.Asked;
+                // Nothing wanted, built or asked for changes while a batch is read: each reader hands back only what its
+                // file adds (work's first pass held its kept lines' text, a batch at a time, and stopped at 20 GB).
+                foreach (var take in CodeCarver.Core.Util.ReadAhead.Each(batch, path => Take(path, first, skip, Wanted, needed, pasters, asked, limit)))
                 {
                     limit.Check();
-                    var n = fragments.Count;
-                    // Kept verbatim (not a define) or kept as wanted: what it names is needed, and what its pastes
-                    // and paste-macro calls can build.
-                    foreach (var name in take.Names) grew |= needed.Add(name);
-                    fragments.UnionWith(take.LiteralPieces);
-                    var m = fragments.Count;
-                    fromLiteral += m - n;
-                    foreach (var (key, name, edges) in take.Defines)
-                    {
-                        if (name is not null) { expandedDefines++; pastes.ExpandDefine(name, edges, fragments); }
-                        taken.Add(key);
-                    }
-                    fromExpansion += fragments.Count - m;
-                    m = fragments.Count;
-                    foreach (var (piece, side) in take.CallPieces) pastes.AddPiece(piece, side, fragments);
-                    fromCalls += fragments.Count - m;
-                    grew |= fragments.Count != n;
+                    foreach (var name in take.Names)
+                        if (needed.Add(name))
+                        {
+                            grew = true;
+                            if (pasters.Contains(name)) (newPasters ??= new()).Add(name);
+                        }
+                    foreach (var key in take.Defines) taken.Add(key);
+                    if (take.Captured is not null)
+                        foreach (var (key, text) in take.Captured) engine.Capture(key, text);
+                    if (take.Events is not null) engine.Fold(take.Events);
                 }
+                engine.BatchEnd(serial, batches.Count);
+            }
+            // A paste macro needed needs every paste macro it forwards to, names in its body or theirs: each link of a
+            // chain of 40 forwarders took a pass of its own.
+            if (newPasters is not null)
+                foreach (var name in newPasters) NeedForwards(name);
+            // Every stream has been read: a paste macro named and never called is used with wildcards.
+            if (first)
+            {
+                engine.PastersRead();
+                engine.CalledFinal();
+                engine.Drain();
             }
             if (partDone is not null)
             {
                 var at = $"pass{passes}";
                 partDone($"{at}.ms", partClock.ElapsedMilliseconds);
                 partDone($"{at}.names", needed.Count);
-                partDone($"{at}.pieces", fragments.Count);
-                partDone($"{at}.piecesFromLiteral", fromLiteral);
-                partDone($"{at}.piecesFromExpansion", fromExpansion);
-                partDone($"{at}.piecesFromCalls", fromCalls);
                 partDone($"{at}.definesTaken", taken.Count);
-                partDone($"{at}.definesExpanded", expandedDefines);
-                partDone($"{at}.expandedNames", pastes.ExpandedCount);
+                partDone($"{at}.namesBuilt", engine.Results.Exact.Count);
+                partDone($"{at}.patterns", engine.Results.Patterns);
+                partDone($"{at}.pools", engine.Results.Pools);
+                partDone($"{at}.uses", engine.Uses);
+                partDone($"{at}.useRuns", engine.Runs - runsAt);
+                partDone($"{at}.definesCaptured", engine.Captured - capturedAt);
+                partDone($"{at}.asked", engine.Asked.Count);
                 using (var p = System.Diagnostics.Process.GetCurrentProcess()) partDone($"{at}.privateMb", p.PrivateMemorySize64 / (1024 * 1024));
             }
-            all = pastes.Version != pastesAt;
-            grew |= all;
             done.UnionWith(takenBefore);
             takenBefore = taken;
-            if (!grew) break;
+            if (!grew && engine.Results.Version == versionAt && !engine.Pending) break;
         }
 
         PartDone("fixpoint");
+        // The rewrite needs only what the uses built. Every closure of this method shares one frame, so the engine (its
+        // uses, captured texts and runs), the kept files' define texts and the big headers' define facts stayed live
+        // through it: 85 MB more after the fixpoint on a 1.2M-define tree.
+        built = engine.Results;
+        var counts = (Uses: engine.Uses, Chains: engine.Chains, Runs: engine.Runs, OverWork: engine.OverWork,
+            Captured: engine.Captured, Defines: facts.Defines, Edges: facts.Edges, Called: facts.CalledPasters.Count,
+            Emptyable: facts.Emptyable.Count, Forwarding: facts.ForwardingMacros);
+        engine = null;
+        texts = null!;
+        facts = null!;
         // 3. Emit: rewrite each header, dropping #defines whose name isn't wanted (and their continuations).
         CodeCarver.Core.Util.Activity.Doing("rewriting the big headers", Learned);
-        FreezeFragments();
         var rewritten = CodeCarver.Core.Util.ReadAhead.Each(bigFull, path =>
         {
             var before = new FileInfo(path).Length;
             var tmp = path + ".carve.tmp";
             int kept = 0, dropped = 0;
             var pasteNames = new HashSet<string>(StringComparer.Ordinal);
-            RewriteDroppingUnneeded(path, tmp, WantedCounted, ref kept, ref dropped, name => { if (pastes.IsPaster(name)) pasteNames.Add(name); });
+            RewriteDroppingUnneeded(path, tmp, WantedCounted, ref kept, ref dropped, name => { if (pasters.Contains(NameKey.Short(name))) pasteNames.Add(name); });
             // A read-only source copy (Perforce) must not make the replace throw.
             var attrs = File.GetAttributes(path);
             if ((attrs & FileAttributes.ReadOnly) != 0) File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
@@ -405,102 +395,146 @@ public static class HeaderCarver
         {
             partDone("keptByName", keptByName);
             partDone("keptBySystemHeaders", keptBySystem);
-            for (var k = 1; k <= 4; k++) partDone(k < 4 ? $"keptByPiece{k}" : "keptByPiece4plus", keptByPiece[k]);
-            partDone("droppedOneEndPiece", droppedOneEnd);
-            partDone("pastedUnknownEnds", pastes.UnknownEnds);
-            var allPieces = fragments.Starts.Union(fragments.Ends).ToList();
-            partDone("pieces", allPieces.Count);
-            partDone("startPieces", fragments.Starts.Count);
-            partDone("endPieces", fragments.Ends.Count);
-            for (var k = 1; k <= 3; k++) partDone($"pieces{k}", allPieces.Count(f => f.Length == k));
+            partDone("keptByUse", keptByUse);
+            partDone("keptByPattern", keptByPattern);
+            partDone("keptByPool", keptByPool);
+            partDone("pasteUses", counts.Uses);
+            partDone("pasteChains", counts.Chains);
+            partDone("useRuns", counts.Runs);
+            partDone("usesOverWork", counts.OverWork);
+            partDone("namesBuilt", built.Exact.Count);
+            partDone("patterns", built.Patterns);
+            partDone("pools", built.Pools);
+            partDone("definesCaptured", counts.Captured);
+            partDone("bigDefines.defines", counts.Defines);
+            partDone("bigDefines.edges", counts.Edges);
+            partDone("bigDefines.pasters", pasterCount);
+            partDone("bigDefines.calledPasters", counts.Called);
+            partDone("bigDefines.emptyable", counts.Emptyable);
         }
         CodeCarver.Core.Util.Activity.Doing(null);
         return new HeaderCarveResult(rewritten.Sum(r => r.Before), rewritten.Sum(r => r.After), rewritten.Sum(r => r.Kept), rewritten.Sum(r => r.Dropped))
         {
             Passes = passes, PartMs = partMs,
             PasteMacros = rewritten.SelectMany(r => r.Pasters).Distinct(StringComparer.Ordinal).Count(),
-            ForwardingMacros = pastes.BigForwarders,
+            ForwardingMacros = counts.Forwarding,
         };
     }
 
-    /// <summary>A seed file's identifiers and its logical lines with a '#' (null names: a binary file).</summary>
-    private static (HashSet<ulong>? Names, List<string> HashLines) SeedScan(string path)
+    private static void AddText(Dictionary<ulong, List<string>> texts, ulong key, string text)
     {
-        if (LooksBinary(path)) return (null, new List<string>());
+        if (!texts.TryGetValue(key, out var l)) texts[key] = l = new List<string>(1);
+        l.Add(text);
+    }
+
+    /// <summary>A seed file's identifiers, what its defines say (rule 1), and their texts (null names: a binary file).</summary>
+    private static (HashSet<ulong>? Names, FileFacts Facts, List<(ulong Key, string Text)> Defines, bool HashHash) SeedScan(string path)
+    {
+        var facts = new FileFacts();
+        var defines = new List<(ulong, string)>();
+        if (LooksBinary(path)) return (null, facts, defines, false);
         var names = new HashSet<ulong>();
-        var hashLines = new List<string>();
+        var def = new PpDefine();
+        var hashHash = false;
         foreach (var line in LogicalLines(path))
         {
             AddIdentifiers(names, line);
-            if (line.Contains('#')) hashLines.Add(line);
+            if (!line.Contains('#')) continue;
+            hashHash |= line.Contains("##", StringComparison.Ordinal);
+            if (!def.Parse(line)) continue;
+            facts.Add(def, big: false);
+            defines.Add((NameKey.Short(def.NameSpan), line));
         }
-        return (names, hashLines);
+        return (names, facts, defines, hashHash);
     }
 
-    /// <summary>What a big header's #defines say for paste macros: the paste macros are learned from them.</summary>
-    private static List<Pastes.Def> PasteDefines(string path)
+    /// <summary>What a big header's #defines say (rule 1, calls, emptiness), as name keys.</summary>
+    private static FileFacts BigFacts(string path)
     {
-        var list = new List<Pastes.Def>();
+        var facts = new FileFacts();
+        var def = new PpDefine();
         foreach (var (_, text, kind) in EnumerateLogicalLines(path))
-            if (kind == LineKind.Define && Pastes.ParseDef(text) is { } def) list.Add(def);
-        return list;
+            if (kind == LineKind.Define && def.Parse(text)) facts.Add(def, big: true);
+        return facts;
     }
 
-    /// <summary>The pieces a kept file's paste-macro calls pass.</summary>
-    private static List<(string Piece, Side Side)> ScanCalls(Pastes pastes, string path)
-    {
-        var calls = new CallScanner(pastes);
-        foreach (var line in LogicalLines(path)) calls.Feed(line);
-        calls.Flush();
-        return calls.Pieces;
-    }
-
-    /// <summary>What a pass takes from one big header's lines (every non-define line when <paramref name="all"/>, and each
-    /// wanted define but those named in <paramref name="skip"/>): the names they use not yet <paramref name="needed"/>,
-    /// their literal paste pieces, the pieces their paste-macro calls pass, and each define's name with the names at the
-    /// edges of its body (an object-like define's expansion can be a piece). Read on many threads at once: nothing it
-    /// reads changes until the batch is read.</summary>
-    private static FileTake Take(string path, bool all, HashSet<UInt128>? skip, Func<string, bool> wanted, HashSet<ulong> needed, Pastes pastes,
-                                 MemoryLimit limit)
+    /// <summary>What a pass takes from one big header's lines (every non-define line when <paramref name="first"/>, and
+    /// each wanted define but those named in <paramref name="skip"/>): the names they use not yet
+    /// <paramref name="needed"/>, the paste uses and chains of its non-define lines (one stream) and of each define body
+    /// it takes that pastes or names a paste macro (a stream each), and the text of every define of a name
+    /// <paramref name="asked"/> for. Read on many threads at once: nothing it reads changes until the batch is read.</summary>
+    private static FileTake Take(string path, bool first, HashSet<UInt128>? skip, Func<string, bool> wanted, HashSet<ulong> needed,
+                                 HashSet<ulong> pasters, Dictionary<ulong, int> asked, MemoryLimit limit)
     {
         var lines = 0;
         var names = new HashSet<ulong>();
-        var literal = new PieceSets();
-        var defines = new List<(UInt128, string?, Pastes.EdgeLists?)>();
-        var calls = pastes.Any ? new CallScanner(pastes) : null;
+        var defines = new List<UInt128>();
+        List<(ulong, string)>? captured = null;
+        var ev = new UseEvents(pasters);
+        var main = first ? new UseTracker(ev) : null;
+        var bodies = new UseTracker(ev);
+        var def = new PpDefine();
+        var toks = new List<PpToken>();
+        var inBlock = false;
+        main?.Begin(null);
         foreach (var (name, text, kind) in EnumerateLogicalLines(path))
         {
             if ((++lines & 0xFFFF) == 0) limit.Check();
             if (kind != LineKind.Define)
             {
-                if (!all) continue;
+                if (!first) continue;
                 AddNewIdentifiers(names, needed, text);
-                Pastes.AddLiteralPieces(text, literal);
-                calls?.Feed(text);
+                StreamLine(main!, text, ref inBlock, toks);
                 continue;
             }
+            inBlock = false;
             if (name is null) continue;
+            // The first pass takes every paste macro's text: the uses each level builds call them.
+            var shortKey = NameKey.Short(name);
+            if ((first && pasters.Contains(shortKey)) || (asked.Count > 0 && asked.ContainsKey(shortKey))) (captured ??= new()).Add((shortKey, text));
             var key = NameKey.Of(name);
             if (skip?.Contains(key) == true || !wanted(name)) continue;
-            // Not its own name: it is wanted already, and stays so (the pieces only grow). Held as needed, it was one more
-            // name per kept define, and a define kept for a piece looked kept by name.
-            AddNewIdentifiers(names, needed, text, except: name);
-            Pastes.AddLiteralPieces(text, literal);
-            // Only a define whose body names a paste macro passes it pieces (the paste macros are all known by now, a
-            // forwarding macro that reaches one among them): the rest skip the scanner's copies of their text.
-            if (calls is not null && pastes.NamesAPaster(text)) calls.Define(text);
-            // The edges of its body only matter when an argument expanded its name (see ExpandDefine); a name expanded
-            // later in the pass grows the paste state, and the pass after reads every define again.
-            var edges = pastes.IsExpanded(name) ? Pastes.Edges(text).Edges : null;
-            // Its name only when its edges count: a key otherwise, not one more string per define.
-            defines.Add(edges is { IsEmpty: false } ? (key, name, edges) : (key, null, null));
+            defines.Add(key);
+            if (!def.Parse(text))
+            {
+                AddNewIdentifiers(names, needed, text, except: name);
+                continue;
+            }
+            // Not its own name (it is wanted already, and stays so) nor its parameters': every other name in its body.
+            AddBodyNames(names, needed, def);
+            if (MayUse(def, pasters)) StreamBody(bodies, def);
         }
-        calls?.Flush();
-        return new FileTake(names, literal, defines, calls?.Pieces ?? new List<(string, Side)>());
+        main?.End();
+        return new FileTake(names, defines, captured, ev.Events.Count > 0 ? ev : null);
     }
 
-    private sealed record FileTake(HashSet<ulong> Names, PieceSets LiteralPieces, List<(UInt128 Key, string? Name, Pastes.EdgeLists? Edges)> Defines,
-                                   List<(string Piece, Side Side)> CallPieces);
+    private sealed record FileTake(HashSet<ulong> Names, List<UInt128> Defines, List<(ulong Key, string Text)>? Captured, UseEvents? Events);
+
+    /// <summary>Every name in a define's body, comments and strings too, but its parameters. A number names nothing.</summary>
+    private static void AddBodyNames(HashSet<ulong> set, HashSet<ulong> known, PpDefine d)
+    {
+        var s = d.Text;
+        var i = d.BodyStart;
+        while (NextIdentifier(s, ref i, out var st))
+        {
+            var id = s.AsSpan(st, i - st);
+            if (d.IsParam(id)) continue;
+            var key = NameKey.Short(id);
+            if (!known.Contains(key)) set.Add(key);
+        }
+    }
+
+    /// <summary>A body with a <c>##</c> or a paste macro's name in it: only such a body can use or name one.</summary>
+    private static bool MayUse(PpDefine d, HashSet<ulong> pasters)
+    {
+        for (var k = 0; k < d.Body.Count; k++)
+        {
+            var t = d.Body[k];
+            if (t.Kind == PpTok.HashHash) return true;
+            if (t.Kind == PpTok.Ident && pasters.Contains(NameKey.Short(d.Tok(k)))) return true;
+        }
+        return false;
+    }
 
     /// <summary>The headers in runs of about <paramref name="bytes"/> each, in order.</summary>
     private static List<List<string>> Batches(List<string> paths, long bytes)
@@ -740,952 +774,6 @@ public static class HeaderCarver
     {
         var t = line.AsSpan().TrimEnd();
         return t.Length > 0 && t[^1] == '\\';
-    }
-
-    /// <summary>
-    /// The pieces next to each <c>##</c> paste (<c>REG_ ## n ## _BASE</c> → "REG_", "n", "_BASE"), spaces around the
-    /// <c>##</c> allowed: identifiers, and numbers of identifier characters (<c>REG_##1</c> builds REG_1, whose end is
-    /// the 1; <c>1.5</c> ends no name). <c>AfterComma</c>: the piece follows
-    /// <c>, ##</c> — GNU's <c>, ##__VA_ARGS__</c>, which deletes the comma for an empty argument list and pastes nothing.
-    /// </summary>
-    private static IEnumerable<(string Piece, bool AfterComma)> PastePieces(string text)
-    {
-        var i = text.IndexOf("##", StringComparison.Ordinal);
-        while (i >= 0)
-        {
-            var e = i;
-            while (e > 0 && text[e - 1] is ' ' or '\t') e--;
-            var b = e;
-            while (b > 0 && IsIdentChar(text[b - 1])) b--;
-            if (e > b) yield return (text[b..e], false);
-            var s = i + 2;
-            while (s < text.Length && text[s] is ' ' or '\t') s++;
-            var j = s;
-            while (j < text.Length && IsIdentChar(text[j])) j++;
-            if (j > s) yield return (text[s..j], e > 0 && text[e - 1] == ',');
-            i = text.IndexOf("##", i + 2, StringComparison.Ordinal);
-        }
-    }
-
-    private enum Tok { End, Ident, Other }
-
-    /// <summary>Where a paste piece can stand in a name a paste builds: at its start, at its end. For a paste macro's
-    /// parameters also <c>Interior</c> (one of them only ever stands between two other operands).</summary>
-    [Flags]
-    private enum Side : byte { None = 0, Start = 1, End = 2, Both = 3, Interior = 4 }
-
-    /// <summary>The paste pieces that can start a pasted name, and those that can end one.</summary>
-    private sealed class PieceSets
-    {
-        public readonly HashSet<string> Starts = new(StringComparer.Ordinal), Ends = new(StringComparer.Ordinal);
-        public int Count => Starts.Count + Ends.Count;
-        public void Add(string piece, Side side)
-        {
-            if ((side & Side.Start) != 0) Starts.Add(piece);
-            if ((side & Side.End) != 0) Ends.Add(piece);
-        }
-        public void UnionWith(PieceSets other) { Starts.UnionWith(other.Starts); Ends.UnionWith(other.Ends); }
-    }
-
-    /// <summary>The preprocessing tokens of <paramref name="text"/> (see <see cref="NextToken"/>).</summary>
-    private static List<(Tok Kind, int S, int E)> Tokens(string text)
-    {
-        var toks = new List<(Tok Kind, int S, int E)>();
-        var i = 0;
-        Tok k;
-        while ((k = NextToken(text, ref i, out var s)) != Tok.End) toks.Add((k, s, i));
-        return toks;
-    }
-
-    /// <summary>
-    /// The operands of each <c>##</c> chain of <paramref name="body"/> (<c>HWB_##blk##_R##n</c>: HWB_, blk, _R, n), each
-    /// with where it can stand in the name the chain builds: at its start when every operand before it is a parameter
-    /// (an argument may be empty), at its end when every one after it is. HWB_ starts the name; _R neither (HWB_ stays
-    /// before it, so a paste macro's argument there is not a piece unless it has several tokens); n ends it. A parameter
-    /// at neither end is <see cref="Side.Interior"/> (the variadic one: at both). Only identifiers and numbers of identifier characters are handed
-    /// on; GNU's <c>, ##__VA_ARGS__</c> pastes nothing.
-    /// </summary>
-    private static void Chains(string body, HashSet<string>? parms, string? variadic, Action<string, Side, bool> each)
-    {
-        if (!body.Contains("##", StringComparison.Ordinal)) return;
-        var toks = Tokens(body);
-        bool Hash(int t) => t >= 0 && t < toks.Count && toks[t].Kind == Tok.Other && toks[t].E - toks[t].S == 1 && body[toks[t].S] == '#';
-        bool PasteAt(int t) => Hash(t) && Hash(t + 1) && toks[t + 1].S == toks[t].E;
-        string Text(int t) => body[toks[t].S..toks[t].E];
-        var ops = new List<int>();
-        var isParam = new List<bool>();
-        for (var j = 0; j < toks.Count; j++)
-        {
-            if (Hash(j) || !PasteAt(j + 1) || j + 3 >= toks.Count) continue;
-            ops.Clear();
-            ops.Add(j);
-            var k = j;
-            while (PasteAt(k + 1) && k + 3 < toks.Count && !Hash(k + 3)) { k += 3; ops.Add(k); }
-            j = k;
-            if (ops.Count == 2 && variadic is not null && toks[ops[0]].Kind == Tok.Other && body[toks[ops[0]].S] == ',' && Text(ops[1]) == variadic)
-                continue;
-            isParam.Clear();
-            foreach (var o in ops) isParam.Add(toks[o].Kind == Tok.Ident && parms is not null && parms.Contains(Text(o)));
-            for (var i = 0; i < ops.Count; i++)
-            {
-                var before = true;
-                for (var b = 0; b < i; b++) before &= isParam[b];
-                var after = true;
-                for (var a = i + 1; a < ops.Count; a++) after &= isParam[a];
-                var side = (before ? Side.Start : Side.None) | (after ? Side.End : Side.None);
-                var (kind, s, e) = toks[ops[i]];
-                // __VA_ARGS__ between two operands is often several arguments: P(B, C) pastes PRE_B, C_SUF.
-                if (isParam[i]) each(body[s..e], side != Side.None ? side : body[s..e] == variadic ? Side.Both : Side.Interior, true);
-                else if (kind == Tok.Ident || IsPieceNumber(body, s, e)) each(body[s..e], side, false);
-            }
-        }
-    }
-
-    /// <summary>The next preprocessing token of <paramref name="text"/> at or after <paramref name="i"/>, past spaces,
-    /// line splices and comments: an identifier, or another token (a pp-number such as <c>0x10UL</c>, a string or
-    /// character literal, a punctuator).</summary>
-    private static Tok NextToken(string text, ref int i, out int start)
-    {
-        while (i < text.Length)
-        {
-            var c = text[i];
-            if (c is ' ' or '\t' or '\r' or '\n' or '\\' or '\f' or '\v') { i++; continue; }
-            if (c == '/' && i + 1 < text.Length && text[i + 1] == '*')
-            {
-                var e = text.IndexOf("*/", i + 2, StringComparison.Ordinal);
-                i = e < 0 ? text.Length : e + 2;
-                continue;
-            }
-            if (c == '/' && i + 1 < text.Length && text[i + 1] == '/') { i = text.Length; break; }
-            start = i;
-            if (IsIdentStart(c)) { while (i < text.Length && IsIdentChar(text[i])) i++; return Tok.Ident; }
-            if (StartsNumber(text, i)) { i = PpNumberEnd(text, i); return Tok.Other; }
-            if (c is '"' or '\'') { i = QuoteEnd(text, i); return Tok.Other; }
-            i++;
-            return Tok.Other;
-        }
-        start = i;
-        return Tok.End;
-    }
-
-    private static bool StartsNumber(string t, int i) =>
-        char.IsAsciiDigit(t[i]) || (t[i] == '.' && i + 1 < t.Length && char.IsAsciiDigit(t[i + 1]));
-
-    /// <summary>Is <paramref name="t"/>[<paramref name="s"/>..<paramref name="e"/>] a number only of identifier
-    /// characters (<c>1</c>, <c>0x10</c>, <c>2u</c>), one that can end a pasted name? <c>1.5</c> or <c>1e+3</c> cannot.</summary>
-    private static bool IsPieceNumber(string t, int s, int e)
-    {
-        for (var k = s; k < e; k++) if (!IsIdentChar(t[k])) return false;
-        return e > s;
-    }
-
-    /// <summary>The end of the pp-number starting at <paramref name="i"/> (<c>0x10UL</c>, <c>1.5e+3f</c>).</summary>
-    private static int PpNumberEnd(string t, int i)
-    {
-        i++;
-        while (i < t.Length)
-        {
-            var c = t[i];
-            if ((c is '+' or '-') && t[i - 1] is 'e' or 'E' or 'p' or 'P') { i++; continue; }
-            if (IsIdentChar(c) || c == '.') { i++; continue; }
-            break;
-        }
-        return i;
-    }
-
-    /// <summary>The end of the string or character literal starting at <paramref name="i"/> (or of its line).</summary>
-    private static int QuoteEnd(string t, int i)
-    {
-        var q = t[i++];
-        while (i < t.Length)
-        {
-            var c = t[i];
-            if (c == '\\') { i += 2; continue; }
-            i++;
-            if (c == q || c == '\n') break;
-        }
-        return Math.Min(i, t.Length);
-    }
-
-    /// <summary>The identifier tokens of <paramref name="text"/> (not those in comments, literals or numbers).</summary>
-    private static IEnumerable<string> Identifiers(string text)
-    {
-        var i = 0;
-        Tok k;
-        while ((k = NextToken(text, ref i, out var s)) != Tok.End)
-            if (k == Tok.Ident) yield return text[s..i];
-    }
-
-    /// <summary>
-    /// The pieces at the edges of a define body: what can begin or end its expansion, and so a name a paste builds
-    /// from it (<c>#define N 2</c>: XCAT(REG_, N) builds REG_2). From each end it takes an identifier other than one
-    /// of <paramref name="parms"/> (a call's arguments, pieces already, supply those) and goes on inward, since the
-    /// identifier may expand to nothing (<c>#define X A B E</c> with E empty ends in B); a call there
-    /// (<c>H(FOO)</c>) gives its name and every identifier among its arguments (<c>#define H(x) x</c> makes it FOO),
-    /// and the walk goes on past it. It stops at a token that can't expand to nothing: a number of identifier
-    /// characters, itself a piece, or anything else (<c>((t)U)</c> gives none). What the walk from the start finds
-    /// goes to <paramref name="starts"/>, from the end to <paramref name="ends"/>; a walk over every token gives both.
-    /// </summary>
-    private static void EdgePieces(string body, HashSet<string>? parms, List<string> starts, List<string> ends)
-    {
-        var toks = Tokens(body);
-        bool Is(int t, char c) => t >= 0 && t < toks.Count && toks[t].Kind == Tok.Other && toks[t].E - toks[t].S == 1 && body[toks[t].S] == c;
-        var into = starts;
-        void Add(int t)
-        {
-            var (kind, s, e) = toks[t];
-            if (kind == Tok.Ident ? parms is not null && parms.Contains(body[s..e]) : !IsPieceNumber(body, s, e)) return;
-            var x = body[s..e];
-            if (!into.Contains(x)) into.Add(x);
-        }
-        void Inside(int open, int close) { for (var t = open + 1; t < close; t++) Add(t); }
-        // The matching parenthesis of the one at t, walking by dir; -1 when none.
-        int Match(int t, int dir)
-        {
-            var depth = 0;
-            for (var m = t; m >= 0 && m < toks.Count; m += dir)
-            {
-                if (Is(m, '(')) depth += dir;
-                else if (Is(m, ')')) depth -= dir;
-                if (depth == 0) return m;
-            }
-            return -1;
-        }
-        // From the start.
-        var j = 0;
-        var stopAt = -1;
-        while (j < toks.Count)
-        {
-            if (toks[j].Kind == Tok.Ident)
-            {
-                Add(j);
-                if (Is(j + 1, '('))
-                {
-                    var close = Match(j + 1, +1);
-                    Inside(j + 1, close < 0 ? toks.Count : close);
-                    j = close < 0 ? toks.Count : close + 1;
-                    continue;
-                }
-                j++;
-                continue;
-            }
-            if (Is(j, '#') && Is(j + 1, '#')) { j += 2; continue; }   // an empty operand leaves the other
-            Add(j);
-            stopAt = j;
-            break;
-        }
-        if (stopAt < 0) { foreach (var x in starts) if (!ends.Contains(x)) ends.Add(x); return; }   // every token walked: both ends seen
-        // From the end, down to where the walk from the start stopped (that token too: a lone 2 ends as it starts).
-        into = ends;
-        j = toks.Count - 1;
-        while (j >= stopAt)
-        {
-            if (Is(j, ')'))
-            {
-                var open = Match(j, -1);
-                if (open > 0 && toks[open - 1].Kind == Tok.Ident) { Inside(open, j); Add(open - 1); j = open - 2; continue; }
-                break;
-            }
-            if (toks[j].Kind == Tok.Ident) { Add(j); j--; continue; }
-            if (Is(j, '#') && Is(j - 1, '#')) { j -= 2; continue; }
-            Add(j);
-            break;
-        }
-    }
-
-    /// <summary>A define body's first and last token, each when it is an identifier (<c>USART</c>: both USART;
-    /// <c>((t)U)</c>: neither).</summary>
-    private static (string? First, string? Last) BoundaryIdents(string body)
-    {
-        string? first = null;
-        var seen = false;
-        int ls = 0, le = 0;
-        var lastIdent = false;
-        var i = 0;
-        Tok k;
-        while ((k = NextToken(body, ref i, out var s)) != Tok.End)
-        {
-            if (!seen) { seen = true; if (k == Tok.Ident) first = body[s..i]; }
-            ls = s; le = i; lastIdent = k == Tok.Ident;
-        }
-        return (first, lastIdent ? body[ls..le] : null);
-    }
-
-    /// <summary>
-    /// What token pasting can build (the rules in TESTING.md, "Header-carve rules"). A define whose name starts with a
-    /// piece that can start a pasted name, and ends with one that can end one, could be a paste result, so it is kept.
-    /// Pieces come from the operands of a <c>##</c> chain (<c>REG_##n##_BASE</c>: "REG_" starts, "_BASE" ends; see
-    /// <see cref="Chains"/>) and from what the calls of a paste macro pass (<c>CAT(UART, 2)</c>: "UART"), with what such
-    /// an argument expands to at the edges of its body. A paste macro pastes a parameter, or forwards to one: a
-    /// function-like body that names one, or an object-like body that ends in one (<c>#define F CAT</c>: <c>F(a, b)</c>
-    /// calls it). Any definition makes it one, in any order. Each has the sides its arguments can stand at in a name it
-    /// builds: where it pastes them, and where the paste macros it forwards to do.
-    /// </summary>
-    private sealed class Pastes
-    {
-        // Name -> the macros whose body names it, and the object-like defines whose body ends in a name (that name, the
-        // define): Resolve hands each paste macro's sides on to them, and lets them go.
-        private Dictionary<string, List<string>> calledBy = new(StringComparer.Ordinal);
-        private List<(string Target, string Name)> aliases = new();
-        // Paste macros and the sides each argument can stand at.
-        private readonly Dictionary<string, Sig> pasters = new(StringComparer.Ordinal);
-        // Hash codes of the pasters: a name read from a line is looked up without a string made for it.
-        private readonly HashSet<int> pasterHashes = new();
-        // Forwarding macros learned (name -> one defined in a big header), counted, not used.
-        private readonly Dictionary<string, bool> forwarders = new(StringComparer.Ordinal);
-        // Function-like definitions: Resolve works out each paste macro's sides per argument from them, and lets them go.
-        private List<Def> functionDefs = new();
-        public bool Any => pasters.Count > 0;
-
-        /// <summary>The sides a paste macro's arguments can stand at, by position: <c>Pos[i]</c> for argument i,
-        /// <c>Rest</c> past them (the variadic parameter's; both when it has none).</summary>
-        internal sealed class Sig
-        {
-            public Side[] Pos = Array.Empty<Side>();
-            public Side Rest;
-
-            /// <summary>Every argument at both sides: a call of what a paste-macro call builds.</summary>
-            public static readonly Sig All = new() { Rest = Side.Both };
-
-            public Side At(int arg) => arg < Pos.Length ? Pos[arg] : Rest;
-
-            /// <summary>The sides of argument <paramref name="k"/> and every one after it (a variadic parameter passed on
-            /// there can be any of them).</summary>
-            public Side From(int k)
-            {
-                var v = Rest;
-                for (var i = k; i < Pos.Length; i++) v |= Pos[i];
-                return v;
-            }
-
-            public bool Union(ReadOnlySpan<Side> pos, Side rest)
-            {
-                if (pos.Length > Pos.Length)
-                {
-                    var np = new Side[pos.Length];
-                    for (var i = 0; i < np.Length; i++) np[i] = i < Pos.Length ? Pos[i] : Rest;
-                    Pos = np;
-                }
-                var changed = false;
-                for (var i = 0; i < Pos.Length; i++)
-                {
-                    var v = Pos[i] | (i < pos.Length ? pos[i] : rest);
-                    if (v != Pos[i]) { Pos[i] = v; changed = true; }
-                }
-                if ((Rest | rest) != Rest) { Rest |= rest; changed = true; }
-                return changed;
-            }
-        }
-
-        /// <summary>Paste macros and forwarding macros learned so far (for the heartbeat).</summary>
-        public (int Pasters, int Callers) Counts => (pasters.Count, forwarders.Count);
-
-        /// <summary>Forwarding macros with a definition in the big headers.</summary>
-        public int BigForwarders => forwarders.Count(f => f.Value);
-
-        /// <summary>Grows when an argument name's expansion is learned: defines read before may then build more.</summary>
-        public int Version => pasters.Count + expandStart.Count + expandEnd.Count;
-
-        /// <summary>Argument names whose expansion counts, at either side (for the summary).</summary>
-        public int ExpandedCount => expandStart.Count + expandEnd.Count;
-
-        public bool IsPaster(string name) => pasters.ContainsKey(name);
-
-        /// <summary>Was <paramref name="name"/> passed to a paste macro, or reached from one (its expansion is a piece)?</summary>
-        public bool IsExpanded(string name) => expandStart.Contains(name) || expandEnd.Contains(name);
-
-        /// <summary>Does any identifier in <paramref name="text"/> name a paste macro?</summary>
-        public bool NamesAPaster(string text)
-        {
-            var i = 0;
-            while (NextIdentifier(text, ref i, out var start))
-                if (SigOf(text.AsSpan(start, i - start)) is not null) return true;
-            return false;
-        }
-
-        /// <summary>The sides a paste macro's arguments can stand at; null when not one.</summary>
-        public Sig? SigOf(ReadOnlySpan<char> name) =>
-            pasterHashes.Contains(string.GetHashCode(name)) && pasters.TryGetValue(name.ToString(), out var sig) ? sig : null;
-
-        internal enum DefKind { Paster, Forwarder, Alias }
-
-        /// <summary>What a definition says for paste macros: it pastes a parameter; it is function-like with a call in
-        /// its body (<c>Names</c>: the names it uses, its own parameters excepted); or object-like ending in a name.
-        /// A function-like one has its parameters' sides from its <c>##</c> chains (<c>Own</c>, by position) and where
-        /// it passes them on (<c>Refs</c>), with the names its body holds without a call (<c>Bare</c>: a paste macro
-        /// among them makes the calls around it higher-order).</summary>
-        internal readonly record struct Def(string Name, DefKind Kind, string[] Names, Side[]? Own = null, bool Variadic = false,
-                                            Ref[]? Refs = null, string[]? Bare = null);
-
-        /// <summary>Parameter <c>Param</c> passed to <c>Callee</c> as argument <c>K</c>: on its own (<c>Whole</c>; the
-        /// variadic one, <c>FromK</c>, as any argument from K on), or with other tokens beside it.</summary>
-        internal readonly record struct Ref(int Param, string Callee, int K, bool FromK, bool Whole);
-
-        internal static Def? ParseDef(string text)
-        {
-            if (!text.Contains("define", StringComparison.Ordinal)) return null;
-            var (name, parms, body, variadic) = FunctionLike(text);
-            if (name is not null)
-            {
-                var order = ParamOrder(text);
-                var own = new Side[order.Count];
-                var pasted = false;
-                Chains(body, parms, variadic, (p, s, isParam) =>
-                {
-                    if (!isParam) return;
-                    pasted = true;
-                    var at = order.IndexOf(p);
-                    if (at >= 0) own[at] |= s;
-                });
-                // A paste macro can forward as well (PRE_##x HWP(x y, 0)): its calls count too.
-                var calls = body.Contains('(');
-                if (!pasted && !calls) return null;
-                var names = calls ? Identifiers(body).Where(id => !parms.Contains(id)).Distinct().ToArray() : Array.Empty<string>();
-                var (refs, bare) = calls ? PassedOn(body, order, variadic, own, names) : (Array.Empty<Ref>(), Array.Empty<string>());
-                return new Def(name, pasted ? DefKind.Paster : DefKind.Forwarder, names, own, variadic is not null, refs, bare);
-            }
-            if (ObjectBody(text, out var oname) is { } obody && oname is not null && BoundaryIdents(obody).Last is { } last)
-                return new Def(oname, DefKind.Alias, new[] { last });
-            return null;
-        }
-
-        /// <summary>The parameters of a function-like define, in order (<c>...</c> as <c>__VA_ARGS__</c>, GNU's
-        /// <c>args...</c> as <c>args</c>).</summary>
-        private static List<string> ParamOrder(string text)
-        {
-            var name = DefineName(text)!;
-            var at = text.IndexOf(name, text.IndexOf("define", StringComparison.Ordinal) + 6, StringComparison.Ordinal) + name.Length;
-            var close = text.IndexOf(')', at);
-            return text[(at + 1)..close].Split(',').Select(p => p.Trim()).Where(p => p.Length > 0)
-                .Select(p => p == "..." ? "__VA_ARGS__" : p.TrimEnd('.').Trim()).ToList();
-        }
-
-        /// <summary>
-        /// Where a function-like body passes its parameters on, for the sides of its arguments (TESTING.md rule 2): each
-        /// call in it (<c>G(</c>) and the parameters among its arguments. One that is a whole argument takes the sides of
-        /// the callee's argument there; one beside other tokens (<c>HWP(x y, 3)</c>, <c>CAT(G(x), 1)</c>), both when the
-        /// callee is a paste macro. A call of a parameter (<c>f(x)</c>) or of what a call builds (<c>CAT(A, B)(x)</c>)
-        /// gives its parameters both here. Which callees are paste macros is known only once every definition is
-        /// learned: <see cref="Resolve"/> reads the refs then. <paramref name="names"/> lends its strings.
-        /// </summary>
-        private static (Ref[] Refs, string[] Bare) PassedOn(string body, List<string> order, string? variadic, Side[] own, string[] names)
-        {
-            var toks = Tokens(body);
-            bool Is(int t, char c) => t >= 0 && t < toks.Count && toks[t].Kind == Tok.Other && toks[t].E - toks[t].S == 1 && body[toks[t].S] == c;
-            int Param(int t) => toks[t].Kind == Tok.Ident ? order.IndexOf(body[toks[t].S..toks[t].E]) : -1;
-            string Name(int t)
-            {
-                var s = body.AsSpan(toks[t].S, toks[t].E - toks[t].S);
-                foreach (var n in names) if (s.SequenceEqual(n)) return n;
-                return s.ToString();
-            }
-            var va = variadic is null ? -1 : order.IndexOf(variadic);
-            var refs = new List<Ref>();
-            var bare = new List<string>();
-            for (var k = 0; k < toks.Count; k++)
-                if (toks[k].Kind == Tok.Ident && !Is(k + 1, '(') && Param(k) < 0)
-                {
-                    var n = Name(k);
-                    if (!bare.Contains(n)) bare.Add(n);
-                }
-            for (var k = 1; k < toks.Count; k++)
-            {
-                if (!Is(k, '(')) continue;
-                string? callee = null;
-                if (!Is(k - 1, ')'))
-                {
-                    if (toks[k - 1].Kind != Tok.Ident) continue;
-                    if (Param(k - 1) < 0) callee = Name(k - 1);
-                }
-                int depth = 0, argStart = k + 1, arg = 0;
-                for (var j = k + 1; ; j++)
-                {
-                    var end = j >= toks.Count;
-                    if (!end && Is(j, '(')) { depth++; continue; }
-                    if (!end && Is(j, ')') && depth > 0) { depth--; continue; }
-                    if (!end && (depth > 0 || !(Is(j, ',') || Is(j, ')')))) continue;
-                    if (callee is null || j - argStart != 1)
-                    {
-                        for (var t = argStart; t < j; t++)
-                            if (Param(t) is var p and >= 0)
-                            {
-                                if (callee is null) own[p] |= Side.Both;
-                                else refs.Add(new Ref(p, callee, arg, false, false));
-                            }
-                    }
-                    else if (Param(argStart) is var p and >= 0) refs.Add(new Ref(p, callee, arg, p == va, true));
-                    if (end || Is(j, ')')) break;
-                    argStart = j + 1;
-                    arg++;
-                }
-            }
-            return (refs.ToArray(), refs.Count > 0 ? bare.ToArray() : Array.Empty<string>());
-        }
-
-        /// <summary>Learn a definition (<paramref name="big"/>: in a big header, where the counts are kept).</summary>
-        public void Learn(Def def, bool big)
-        {
-            if (def.Kind == DefKind.Alias) { aliases.Add((def.Names[0], def.Name)); return; }
-            if (def.Kind == DefKind.Paster) MakePaster(def.Name);
-            else forwarders[def.Name] = big || forwarders.GetValueOrDefault(def.Name);
-            if (def.Own is { } own && (def.Refs!.Length > 0 || Array.Exists(own, s => s != Side.None))) functionDefs.Add(def);
-            foreach (var id in def.Names)
-            {
-                if (!calledBy.TryGetValue(id, out var by)) calledBy[id] = by = new List<string>();
-                by.Add(def.Name);
-            }
-        }
-
-        private bool MakePaster(string name)
-        {
-            if (pasters.ContainsKey(name)) return false;
-            pasters[name] = new Sig();
-            pasterHashes.Add(name.GetHashCode());
-            return true;
-        }
-
-        /// <summary>Every definition is learned: what forwards to a paste macro is one, and so is an alias of one
-        /// (TESTING.md rule 1). Then each paste macro's sides per argument, to a fixpoint (rule 2): its parameters'
-        /// own, and those of the paste-macro arguments it passes them to (an alias, those of what it names).</summary>
-        public void Resolve()
-        {
-            var aliasIndex = aliases.ToArray();
-            aliases = new();
-            Array.Sort(aliasIndex, (a, b) => string.CompareOrdinal(a.Target, b.Target));
-            var work = new Stack<string>(pasters.Keys);
-            while (work.TryPop(out var p))
-            {
-                if (calledBy.TryGetValue(p, out var by))
-                    foreach (var caller in by)
-                        if (MakePaster(caller)) work.Push(caller);
-                var lo = 0;
-                var hi = aliasIndex.Length;
-                while (lo < hi) { var mid = (lo + hi) / 2; if (string.CompareOrdinal(aliasIndex[mid].Target, p) < 0) lo = mid + 1; else hi = mid; }
-                for (; lo < aliasIndex.Length && aliasIndex[lo].Target == p; lo++)
-                    if (MakePaster(aliasIndex[lo].Name)) work.Push(aliasIndex[lo].Name);
-            }
-            calledBy = new(StringComparer.Ordinal);
-            var defs = functionDefs.Where(d => pasters.ContainsKey(d.Name)).ToArray();
-            functionDefs = new();
-            var pasterAliases = aliasIndex.Where(a => pasters.ContainsKey(a.Name) && pasters.ContainsKey(a.Target)).ToArray();
-            var vals = new List<Side>();
-            for (var changed = true; changed;)
-            {
-                changed = false;
-                foreach (var d in defs)
-                {
-                    vals.Clear();
-                    vals.AddRange(d.Own!);
-                    // A paste macro named without a call: a call of another macro may call it with what it is passed
-                    // (APPLY2(CAT, a)), so that call's arguments take the sides of every argument of each one named.
-                    var higher = false;
-                    var higherSides = Side.None;
-                    foreach (var b in d.Bare!)
-                        if (pasters.TryGetValue(b, out var bs)) { higher = true; higherSides |= bs.From(0); }
-                    foreach (var r in d.Refs!)
-                    {
-                        var isPaster = pasters.TryGetValue(r.Callee, out var q);
-                        if (!isPaster && !higher) continue;
-                        vals[r.Param] |= !r.Whole ? Side.Both : !isPaster ? higherSides : r.FromK ? q!.From(r.K) : q!.At(r.K);
-                    }
-                    var n = vals.Count;
-                    var fixedN = d.Variadic ? n - 1 : n;
-                    changed |= pasters[d.Name].Union(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(vals)[..fixedN],
-                                                     d.Variadic ? vals[n - 1] : Side.Both);
-                }
-                foreach (var (target, name) in pasterAliases)
-                {
-                    var q = pasters[target];
-                    changed |= pasters[name].Union(q.Pos, q.Rest);
-                }
-            }
-        }
-
-        /// <summary>The literal operands of each <c>##</c> chain of a line, at the sides they can stand at (a
-        /// function-like define's own parameters excepted: its call sites supply them).</summary>
-        public static void AddLiteralPieces(string text, PieceSets pieces)
-        {
-            if (!text.Contains("##", StringComparison.Ordinal)) return;
-            var (name, parms, body, variadic) = FunctionLike(text);
-            if (name is null) { Chains(text, null, null, (piece, side, _) => pieces.Add(piece, side)); return; }
-            Chains(body, parms, variadic, (piece, side, isParam) => { if (!isParam) pieces.Add(piece, side); });
-        }
-
-        /// <summary>The pieces at the edges of a define body: those that can begin its expansion, and end it.</summary>
-        internal sealed record EdgeLists(List<string> Starts, List<string> Ends)
-        {
-            public bool IsEmpty => Starts.Count == 0 && Ends.Count == 0;
-        }
-
-        // Defines of the kept files (name -> the pieces at the edges of each body: `#if BOARD == 1 / #define P USART /
-        // #else / #define P LPUART` builds either; a function-like one's own parameters excepted), and the argument
-        // names whose expansion counts: where it can start a pasted name (the end of its body does), and end one (the
-        // start of its body does).
-        private readonly Dictionary<string, EdgeLists> objects = new(StringComparer.Ordinal);
-        private readonly HashSet<string> expandStart = new(StringComparer.Ordinal), expandEnd = new(StringComparer.Ordinal);
-
-        /// <summary>Remember a define of a kept file: a paste argument naming it may expand to it.</summary>
-        public void LearnObject(string text)
-        {
-            if (!text.Contains("define", StringComparison.Ordinal)) return;
-            var (name, edges) = Edges(text);
-            if (name is null) return;
-            defined.Add(name);
-            if (edges.IsEmpty) return;
-            if (!objects.TryGetValue(name, out var have)) { objects[name] = edges; return; }
-            foreach (var e in edges.Starts) if (!have.Starts.Contains(e)) have.Starts.Add(e);
-            foreach (var e in edges.Ends) if (!have.Ends.Contains(e)) have.Ends.Add(e);
-        }
-
-        // Names a kept file or the build defines (their expansion is known), and the names starting __ passed to a paste
-        // macro (a compiler's own macro: __LINE__, __COUNTER__, __SIZEOF_INT__).
-        private readonly HashSet<string> defined = new(StringComparer.Ordinal);
-        private readonly HashSet<string> reservedPieces = new(StringComparer.Ordinal);
-
-        /// <summary>Did a paste get __LINE__ or __COUNTER__? Then a name it builds can end in any digits.</summary>
-        public bool DigitsEnd { get; private set; }
-
-        /// <summary>The names starting __ passed to a paste macro that nothing here defines: the compiler's own
-        /// (<c>__SIZEOF_INT__</c>), whose value the text never shows. A name a paste builds from one can end in anything.</summary>
-        public int UnknownEnds => reservedPieces.Count(r => !defined.Contains(r));
-
-        /// <summary>A name passed to a paste macro is a piece at the sides it can stand at, and so is what it expands
-        /// to. Between two operands (<see cref="Side.Interior"/>) it is none, but what it expands to can be at either
-        /// end: <c>#define B T x</c> pasted as <c>HWB_##B##_R</c> builds HWB_T and x_R.</summary>
-        public void AddPiece(string id, Side side, PieceSets fragments)
-        {
-            if ((side & Side.Start) != 0) fragments.Starts.Add(id);
-            if ((side & Side.End) != 0) fragments.Ends.Add(id);
-            if (id is "__LINE__" or "__COUNTER__") DigitsEnd = true;
-            else if (id.StartsWith("__", StringComparison.Ordinal)) reservedPieces.Add(id);   // not _BASE: a literal piece
-            if ((side & (Side.Start | Side.Interior)) != 0) Expand(id, true, fragments);
-            if ((side & (Side.End | Side.Interior)) != 0) Expand(id, false, fragments);
-        }
-
-        /// <summary>
-        /// An argument passed through a forwarding macro is macro-expanded before the paste:
-        /// <c>CAT(UART_PREFIX, UART_NUM)</c> with <c>#define UART_PREFIX USART</c> builds USART2, and <c>XCAT(H(), _1)</c>
-        /// with <c>#define H() FOO</c> builds FOO_1. Only a body's first and last tokens can join a paste (<c>##</c> joins
-        /// the tokens beside it): where the argument starts a name, the end of its body does (<c>#define P A B</c>,
-        /// <c>XCAT(P, _1)</c> builds A B_1), and where it ends one, the start (see <see cref="Edges"/>), expanded the same
-        /// way. Bodies in the kept files and the build's resolve here; one in a carved header when the fixpoint reads it
-        /// (<see cref="ExpandDefine"/>).
-        /// </summary>
-        private void Expand(string id, bool start, PieceSets fragments)
-        {
-            var seen = start ? expandStart : expandEnd;
-            var into = start ? fragments.Starts : fragments.Ends;
-            var work = new Stack<string>();
-            work.Push(id);
-            while (work.TryPop(out var x))
-            {
-                if (!seen.Add(x) || !objects.TryGetValue(x, out var edges)) continue;
-                foreach (var e in start ? edges.Ends : edges.Starts) { into.Add(e); work.Push(e); }
-            }
-        }
-
-        /// <summary>A carved header's define for an argument name passed to a paster (the pieces at the edges of its
-        /// body, see <see cref="Edges"/>): its expansion is a piece.</summary>
-        public void ExpandDefine(string name, EdgeLists? edges, PieceSets fragments)
-        {
-            if (edges is null) return;
-            if (expandStart.Contains(name)) foreach (var e in edges.Ends) AddPiece(e, Side.Start, fragments);
-            if (expandEnd.Contains(name)) foreach (var e in edges.Starts) AddPiece(e, Side.End, fragments);
-        }
-
-        /// <summary>A define's name and the pieces at the edges of its body, object-like or function-like (its own
-        /// parameters excepted: a call's arguments, pieces already, take their place); a null name when not a define.</summary>
-        internal static (string? Name, EdgeLists Edges) Edges(string text)
-        {
-            var edges = new EdgeLists(new List<string>(), new List<string>());
-            var (fname, parms, fbody, _) = FunctionLike(text);
-            if (fname is not null) { EdgePieces(fbody, parms, edges.Starts, edges.Ends); return (fname, edges); }
-            if (ObjectBody(text, out var name) is not { } body || name is null) return (null, edges);
-            EdgePieces(body, null, edges.Starts, edges.Ends);
-            return (name, edges);
-        }
-
-        /// <summary>Name, parameters, body and variadic parameter (<c>__VA_ARGS__</c>, or <c>args</c> for GNU's
-        /// <c>args...</c>; null when not variadic) of a function-like <c>#define NAME(params) body</c>, or a null name.</summary>
-        internal static (string? Name, HashSet<string> Params, string Body, string? Variadic) FunctionLike(string text)
-        {
-            var none = (default(string), new HashSet<string>(), "", default(string));
-            if (!IsDefineDirective(text.TrimStart())) return none;
-            var name = DefineName(text);
-            if (name is null) return none;
-            var at = text.IndexOf(name, text.IndexOf("define", StringComparison.Ordinal) + 6, StringComparison.Ordinal) + name.Length;
-            if (at >= text.Length || text[at] != '(') return none;   // object-like
-            var close = text.IndexOf(')', at);
-            if (close < 0) return none;
-            var list = text[(at + 1)..close].Split(',').Select(p => p.Trim()).Where(p => p.Length > 0).ToList();
-            string? variadic = list.Count > 0 && list[^1].EndsWith("...", StringComparison.Ordinal)
-                ? (list[^1] == "..." ? "__VA_ARGS__" : list[^1].TrimEnd('.').Trim()) : null;
-            var parms = list.Select(p => p == "..." ? "__VA_ARGS__" : p.TrimEnd('.').Trim()).ToHashSet(StringComparer.Ordinal);
-            parms.Add("__VA_ARGS__");
-            return (name, parms, text[(close + 1)..], variadic);
-        }
-
-        /// <summary>The body of an object-like <c>#define NAME body</c>, or null.</summary>
-        public static string? ObjectBody(string text, out string? name)
-        {
-            name = null;
-            if (!IsDefineDirective(text.TrimStart())) return null;
-            var n = DefineName(text);
-            if (n is null) return null;
-            var at = text.IndexOf(n, text.IndexOf("define", StringComparison.Ordinal) + 6, StringComparison.Ordinal) + n.Length;
-            if (at < text.Length && text[at] == '(') return null;   // function-like
-            name = n;
-            return text[at..];
-        }
-    }
-
-    /// <summary>
-    /// The pieces a file's paste-macro calls pass, read a logical line at a time with what is open carried over:
-    /// <list type="bullet">
-    /// <item>every identifier among a paste macro's arguments, nested calls included; an argument list runs to its
-    /// matching <c>)</c> over lines and <c>#if</c> branches (each branch starts from what was open at the <c>#if</c>;
-    /// after the <c>#endif</c> the branch leaving the most open goes on);</item>
-    /// <item>a paste macro named without a call (<c>APPLY(CAT, A, 2)</c>): every identifier of the call around it;</item>
-    /// <item>a call of what a paste-macro call builds (<c>CAT(FWD_, 7)(x)</c>): its arguments too;</item>
-    /// <item>a <c>#define</c> is read on its own, its parameters not pieces (its call sites supply them).</item>
-    /// </list>
-    /// An argument of one token is a piece at the sides the paste macro gives its arguments; one of several tokens
-    /// (<c>CAT(A B, x)</c>, <c>CAT(G(a), x)</c>) at both, as is all of a call named without one, of a call of what a
-    /// call builds, or of one whose arguments ran over an <c>#if</c> branch. Comments and literals name nothing. A list
-    /// still open at the end of the file gives its pieces then, at both sides.
-    /// </summary>
-    private sealed class CallScanner
-    {
-        private readonly Pastes pastes;
-        public readonly List<(string Piece, Side Side)> Pieces = new();
-        // Identifiers inside the open parentheses, in order, each with the depth it was read at and whether it was an
-        // argument of its own there; each frame owns those from its start on.
-        private readonly List<Id> ids = new();
-        private readonly List<Frame> frames = new();
-        private readonly Stack<Branch> branches = new();
-        private bool inBlock, afterPasterCall;
-        // The paste macro just named, by its sides (null: not one).
-        private Pastes.Sig? pending;
-        private HashSet<string>? exclude;
-        private CallScanner? defines;
-
-        private record struct Id(string Name, int Depth, bool Single, int Arg);
-
-        /// <summary>An open parenthesis: where its identifiers start, whether it is a paste-macro call (<c>Sig</c> its
-        /// arguments' sides) or one around a paste macro named without a call (<c>Bare</c>), where its current argument
-        /// starts, which one it is and how many tokens it has so far; <c>Branched</c>: its arguments ran over an <c>#if</c> branch.</summary>
-        private record struct Frame(int Start, bool Paster, bool Bare, Pastes.Sig? Sig, int ArgStart, int ArgTokens, bool Branched, int Arg);
-
-        /// <summary>An <c>#if</c> group: what was open at the <c>#if</c> (the identifiers up to <c>IdsCount</c> are
-        /// never let go while it is open), and the branch so far that left the most open, with its own identifiers.</summary>
-        private sealed class Branch
-        {
-            public required Frame[] Frames;
-            public required int IdsCount;
-            public required Pastes.Sig? Pending;
-            public required bool AfterPasterCall;
-            public Frame[]? DeepFrames;
-            public Id[]? DeepIds;
-            public Pastes.Sig? DeepPending;
-            public bool DeepAfterPasterCall;
-        }
-
-        public CallScanner(Pastes pastes) => this.pastes = pastes;
-
-        /// <summary>Read the next logical line of the file.</summary>
-        public void Feed(string line)
-        {
-            if (!inBlock)
-            {
-                var t = line.TrimStart();
-                if (t.Length > 0 && t[0] == '#') { Directive(line, t); return; }
-            }
-            Scan(line, 0);
-        }
-
-        /// <summary>Read a <c>#define</c> on its own.</summary>
-        public void Define(string text)
-        {
-            defines ??= new CallScanner(pastes);
-            defines.ReadDefine(text);
-            Pieces.AddRange(defines.Pieces);
-            defines.Pieces.Clear();
-        }
-
-        private void ReadDefine(string text)
-        {
-            var (name, parms, body, _) = Pastes.FunctionLike(text);
-            if (name is null)
-            {
-                if (Pastes.ObjectBody(text, out _) is not { } obody) return;
-                body = obody;
-                parms = null!;
-            }
-            exclude = parms;
-            Scan(body, 0);
-            Flush();
-            exclude = null;
-            inBlock = false;
-        }
-
-        private void Directive(string line, string t)
-        {
-            if (IsDefineDirective(t)) Define(line);
-            else if (StartsWithHash(t, "if") || StartsWithHash(t, "ifdef") || StartsWithHash(t, "ifndef"))
-                branches.Push(new Branch { Frames = frames.ToArray(), IdsCount = ids.Count, Pending = pending, AfterPasterCall = afterPasterCall });
-            else if (branches.Count > 0 && (StartsWithHash(t, "elif") || StartsWithHash(t, "else") || StartsWithHash(t, "elifdef") || StartsWithHash(t, "elifndef")))
-            {
-                var b = branches.Peek();
-                KeepIfDeeper(b);
-                Restore(b.Frames);
-                ids.RemoveRange(b.IdsCount, ids.Count - b.IdsCount);
-                pending = b.Pending; afterPasterCall = b.AfterPasterCall;
-            }
-            else if (branches.Count > 0 && StartsWithHash(t, "endif"))
-            {
-                var b = branches.Pop();
-                if (b.DeepFrames is not null && b.DeepFrames.Length > frames.Count)
-                {
-                    Restore(b.DeepFrames);
-                    ids.RemoveRange(b.IdsCount, ids.Count - b.IdsCount);
-                    ids.AddRange(b.DeepIds!);
-                    pending = b.DeepPending; afterPasterCall = b.DeepAfterPasterCall;
-                }
-            }
-            // Other directives (#include, #pragma, #error, #undef) take no part in a call.
-            inBlock = CommentOpenAfter(line, Comment.None) == Comment.Block;
-        }
-
-        // Frames carried over a branch: which tokens an argument has depends on the branch taken.
-        private void Restore(Frame[] from)
-        {
-            frames.Clear();
-            foreach (var f in from) frames.Add(f with { Branched = true });
-        }
-
-        private void KeepIfDeeper(Branch b)
-        {
-            if (b.DeepFrames is not null && b.DeepFrames.Length >= frames.Count) return;
-            b.DeepFrames = frames.ToArray();
-            b.DeepIds = ids.GetRange(b.IdsCount, ids.Count - b.IdsCount).ToArray();
-            b.DeepPending = pending; b.DeepAfterPasterCall = afterPasterCall;
-        }
-
-        /// <summary>One more token in the current argument.</summary>
-        private void Tick()
-        {
-            if (frames.Count > 0) frames[^1] = frames[^1] with { ArgTokens = frames[^1].ArgTokens + 1 };
-        }
-
-        /// <summary>The current argument ends: an identifier that was all of it is an argument of its own.</summary>
-        private void EndArg()
-        {
-            var f = frames[^1];
-            if (f.ArgTokens == 1 && ids.Count == f.ArgStart + 1 && ids[f.ArgStart].Depth == frames.Count)
-                ids[f.ArgStart] = ids[f.ArgStart] with { Single = true };
-        }
-
-        private void Scan(string text, int i)
-        {
-            while (i < text.Length)
-            {
-                if (inBlock)
-                {
-                    var e = text.IndexOf("*/", i, StringComparison.Ordinal);
-                    if (e < 0) return;
-                    inBlock = false;
-                    i = e + 2;
-                    continue;
-                }
-                var c = text[i];
-                if (c is ' ' or '\t' or '\r' or '\n' or '\\' or '\f' or '\v') { i++; continue; }
-                if (c == '/' && i + 1 < text.Length && text[i + 1] == '*') { inBlock = true; i += 2; continue; }
-                if (c == '/' && i + 1 < text.Length && text[i + 1] == '/') return;
-                if (IsIdentStart(c))
-                {
-                    var s = i;
-                    while (i < text.Length && IsIdentChar(text[i])) i++;
-                    Other();
-                    Tick();   // a parameter excluded too: it is a token of the argument
-                    string? id = null;
-                    var excluded = exclude is not null && exclude.Contains(id = text[s..i]);
-                    if (frames.Count > 0 && !excluded) ids.Add(new Id(id ?? text[s..i], frames.Count, false, frames[^1].Arg));
-                    pending = excluded ? null : pastes.SigOf(text.AsSpan(s, i - s));
-                    continue;
-                }
-                if (StartsNumber(text, i))
-                {
-                    // CAT(REG_, 1) builds REG_1: a number of identifier characters can end a pasted name.
-                    var s = i;
-                    i = PpNumberEnd(text, i);
-                    Other();
-                    Tick();
-                    if (frames.Count > 0 && IsPieceNumber(text, s, i)) ids.Add(new Id(text[s..i], frames.Count, false, frames[^1].Arg));
-                    continue;
-                }
-                if (c is '"' or '\'') { i = QuoteEnd(text, i); Other(); Tick(); continue; }
-                i++;
-                if (c == '(')
-                {
-                    Tick();
-                    var sig = afterPasterCall ? Pastes.Sig.All : pending;
-                    frames.Add(new Frame(ids.Count, sig is not null, false, sig, ids.Count, 0, false, 0));
-                    pending = null;
-                    afterPasterCall = false;
-                    continue;
-                }
-                Other();
-                if (c == ',' && frames.Count > 0)
-                {
-                    EndArg();
-                    frames[^1] = frames[^1] with { ArgStart = ids.Count, ArgTokens = 0, Arg = frames[^1].Arg + 1 };
-                    continue;
-                }
-                if (c != ')' || frames.Count == 0) { Tick(); continue; }
-                EndArg();
-                var f = frames[^1];
-                frames.RemoveAt(frames.Count - 1);
-                if (f.Paster || f.Bare) Emit(f, frames.Count + 1);
-                if (frames.Count == 0)
-                {
-                    var keep = branches.Count > 0 ? branches.Peek().IdsCount : 0;
-                    ids.RemoveRange(keep, ids.Count - keep);
-                }
-                Tick();
-                afterPasterCall = f.Paster;
-            }
-        }
-
-        /// <summary>A token other than '(' follows: a paste macro just named was not called, so the call around it
-        /// passes it on.</summary>
-        private void Other()
-        {
-            if (pending is not null && frames.Count > 0) frames[^1] = frames[^1] with { Bare = true };
-            pending = null;
-            afterPasterCall = false;
-        }
-
-        /// <summary>The pieces of a call that closed at <paramref name="depth"/>: an argument of one token at the sides
-        /// the paste macro gives that argument, the rest at both.</summary>
-        private void Emit(Frame f, int depth)
-        {
-            var exact = f.Paster && !f.Bare && !f.Branched;
-            for (var k = f.Start; k < ids.Count; k++)
-                Pieces.Add((ids[k].Name, exact && ids[k].Single && ids[k].Depth == depth ? f.Sig!.At(ids[k].Arg) : Side.Both));
-        }
-
-        /// <summary>The end of the file (or of a define): what is still open gives its pieces.</summary>
-        public void Flush()
-        {
-            Other();
-            for (var k = 0; k < frames.Count; k++)
-                if (frames[k].Paster || frames[k].Bare) { Emit(frames[k] with { Bare = true }, k + 1); break; }   // the outermost such holds them all
-            frames.Clear();
-            ids.Clear();
-            branches.Clear();
-            pending = null;
-            afterPasterCall = false;
-        }
     }
 
     /// <summary>Add each C identifier in <paramref name="text"/> not in <paramref name="known"/> to <paramref name="set"/>.</summary>

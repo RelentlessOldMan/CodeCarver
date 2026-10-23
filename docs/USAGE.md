@@ -658,21 +658,23 @@ many paste macros, forwarding macros, names and paste pieces it has learned; the
 process's private memory as it ended) and `.liveMb` (what is still live after it, from a full collection). A memory
 stop's `stopped-summary.txt` carries those of the parts that finished.
 Why the header carve kept each define, counted: `stageN.headerCarve.keptByName` (code or a kept define names it),
-`.keptBySystemHeaders` (a reserved or well-known config name), and `.keptByPiece1`, `.keptByPiece2`, `.keptByPiece3`,
-`.keptByPiece4plus` (its name starts with a paste piece that can begin a pasted name and ends with one that can end
-it, by the shorter of the two pieces' lengths: a paste could build it). A piece's side comes from where the paste
-puts it: in `HWB_##blk##_r##n##_VAL`, `HWB_` only begins a name, `_VAL` only ends one, and `_r`, or an argument
-passed for `blk` or `n`, does neither. `.startPieces` and `.endPieces` count the pieces of each side, `.pieces`
-those of either, and `.pieces1` to `.pieces3` how many of those have 1 to 3 characters. `.droppedOneEndPiece`
-counts the defines dropped although a piece starts or ends their name (only one end matched: nothing could paste
-the rest on). `.pastedUnknownEnds` counts the names starting `__` that
-nothing defines (a compiler's own macro, `__SIZEOF_INT__`) passed to a paste macro: its value is not in the text,
-so while it is above 0 any name with a piece at its start counts as matched at its end. A paste of `__LINE__` or
-`__COUNTER__` likewise lets any name ending in a digit match at its end.
-Each pass over the big headers also writes `.passN.ms`, `.names`, `.pieces`, where that pass's new pieces came from
-(`.piecesFromLiteral`: `##` operands of the defines it took; `.piecesFromExpansion`: the edges of the defines a paste
-argument names; `.piecesFromCalls`: paste-macro calls in those defines), `.definesTaken`, `.definesExpanded`,
-`.expandedNames` and `.privateMb`, each as the pass ends.
+`.keptBySystemHeaders` (a reserved or well-known config name), `.keptByUse` (a paste-macro use builds exactly its
+name), `.keptByPattern` (a use builds it with a wildcard: a paste of `__LINE__` or `__COUNTER__` is any digits, of
+an undefined `__name` any text) and `.keptByPool` (a use too wide to build name by name builds it from its pool: a
+start piece of that use joined to an end piece of the same use). Each paste-macro call is a use and builds only its
+own names: `CAT(HWA_, 3)` and `CAT(KSC_, 7)` build HWA_3 and KSC_7, never HWA_7. A use is followed through
+forwarders and higher-order calls into each `##` chain it reaches, and builds the cross product of that chain's
+slots. A use gets its own pool when its callee is computed (`CAT(FWD_, 7)(x)`), when its call is open across an
+`#if` branch, or when one chain would build more than 4,096 names. `.pasteUses` counts the uses, `.pasteChains` the
+`##` chains they reached, `.useRuns` how many times a use was built (again when a define it reads is taken),
+`.usesOverWork` the uses too wide to build name by name (pooled), `.namesBuilt` the exact names built, `.patterns`
+the wildcard patterns and `.pools` the pools. `.definesCaptured` counts the define texts a use read from the big
+headers. `.bigDefines.defines`, `.edges`, `.pasters`, `.calledPasters` and `.emptyable` describe the big headers'
+defines as first read: how many, the name links between them, the paste macros, those some code calls, and the
+names that can expand to nothing.
+Each pass over the big headers also writes `.passN.ms`, `.names` (names wanted), `.definesTaken`, `.uses`,
+`.useRuns`, `.namesBuilt`, `.patterns`, `.pools`, `.definesCaptured`, `.asked` (define texts a use asked for, read
+in the next pass) and `.privateMb`, each as the pass ends.
 The header carve has a memory limit of its own: nine tenths of `memoryStopMb` (of the machine's memory when that is
 not set). Past it, after one full collection, it gives up before it rewrites any header: the big headers stay whole,
 the stage goes on, a `warn    :` line says so, and the summary carries `.abandoned = 1`, `.abandonedIn` (the part it
