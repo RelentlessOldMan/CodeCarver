@@ -1909,6 +1909,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
         // Alternative parameter sets (#if/#else inside a parameter list) parsed as the first one.
         parseText = ParamListConditionals.Blank(parseText, initializers: !_cGrammar, out var branches);
+        parseText = NumberRuns.Blank(parseText);
         blanked = cut.Length == 0 ? branches : branches.Length == 0 ? cut : cut + "\n" + branches;
         return parseText;
     }
