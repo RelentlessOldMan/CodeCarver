@@ -76,12 +76,33 @@ jobs:
           }
           exit $failed
 
+  # T2 firmware truth (docs/TESTING.md): the vendored CodeSpawner writes a firmware corpus with the defines a header
+  # carve must keep and drop; carve it twice and compile every unit of its compile db against the carved tree.
+  firmware-truth:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build
+        run: dotnet build src/CodeCarver.Cli -c Release
+
+      - name: T2
+        shell: pwsh
+        run: |
+          ./tools/firmware-truth/firmware-truth.ps1 -Work "$env:RUNNER_TEMP/t2" -Exe src/CodeCarver.Cli/bin/Release/net8.0/codecarver.exe -RequireCompilers
+          exit $LASTEXITCODE
+
   # Every green push to main publishes its zip as GitHub Release v1.0.<commit-count>, the same number the
   # build stamps into `codecarver version`. Packaging is release.ps1, exactly as run locally; the tests already
   # passed in the jobs above, so it skips its own test gate.
   release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, lint, horror]
+    needs: [test, lint, horror, firmware-truth]
     runs-on: windows-latest
     timeout-minutes: 20
     permissions:

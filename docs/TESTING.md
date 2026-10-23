@@ -205,6 +205,8 @@ is the T2 check:
    against the carved tree. Each compiler is run with the db's flags plus `-Wall -Werror -fsyntax-only`
    (`-RequireCompilers` fails when gcc or clang is missing).
 
+CI's `firmware-truth` job runs it on every push with both compilers required, and a release waits for it.
+
 For T3, pass `-Scale 0.1`. Sizes and generation times at 0.01, 0.1 and 1, the per-step
 case details and the hostile-file list are in CodeSpawner's `manifest-schema.md` under `firmware`.
 
