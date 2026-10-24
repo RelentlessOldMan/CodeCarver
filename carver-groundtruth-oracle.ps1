@@ -14,7 +14,7 @@
 #   ./carver-groundtruth-oracle.ps1 -Corpus C:\path\to\corpora\carve_r75
 #   ./carver-groundtruth-oracle.ps1 -Corpus <tree> -Root func_0,func_7 -ExpectedReachableFrac 0.5
 # NOTE: these graded corpora need CodeSpawner >= 1.0.9 to (re)generate (the --oracle-* knobs, indirectEdges,
-# reachable-frac dial, indirectTruthSha). The exe vendored in this repo (tools\codespawner) is 1.4.4; the
+# reachable-frac dial, indirectTruthSha). The exe vendored in this repo (tools\codespawner) is 1.4.8; the
 # indirectTruthSha read-side verify self-tests against the shipped golden vector before trusting a recompute.
 [CmdletBinding()]
 param(

@@ -125,8 +125,10 @@ bug fixed against the corpus, not a corpus case removed.
      `0x1F`; not `1.5`) means the chain builds nothing;
    - an argument gives its spelling, plus its expansion where the macro expands it (an argument passed on through a
      forwarder is expanded; one pasted directly is not, so `CAT(EDGE, 4)` builds EDGE4 whatever EDGE is). A left
-     slot takes the argument's last token, a right slot its first, an interior slot both (an interior argument of
-     several tokens: its first and last). An expansion's edge walks in past identifiers that may expand to
+     slot takes the argument's last token, a right slot its first, an interior slot both. An interior argument of
+     several tokens splits the chain: its first token ends the name on its left and its last starts the one on its
+     right, and no name runs across it (`P_##b##_Q` with `b` = `KA KB` builds P_KA and KB_Q, never P_KA_Q;
+     since 1.4.8). One whose tokens may expand to nothing may be one token, so it both splits and does not. An expansion's edge walks in past identifiers that may expand to
      nothing (`#define X A B E` with `E` empty ends in `B`) and stops at any other token (`((t)U)` gives none);
    - an empty argument, or one whose expansion can be empty, gives nothing (the slot is skipped);
    - `__LINE__` and `__COUNTER__` are a run of digits, and an undefined `__name` (a compiler's own,
@@ -139,7 +141,10 @@ bug fixed against the corpus, not a corpus case removed.
    its end pieces) when its callee is computed (`CAT(FWD_, 7)(x)`), when the call is open across an
    `#if`/`#elif`/`#else`/`#endif`, or when a chain's product passes 4,096 names. An argument list runs to its
    matching `)` across lines and directives; at `#elif`/`#else` the call is restored to its state at the `#if`, so
-   each branch closes it on its own, and a call opened inside a branch and closed after the `#endif` is pooled.
+   each branch closes it on its own, and a call opened inside a branch and closed after the `#endif` is pooled. A
+   paste macro left last in a branch that ends at `#elif`/`#else` is called by a `(` right after the `#endif`,
+   with the arguments that follow (since 1.4.8; inside a call's arguments it is must-keep, at the top level open,
+   since a compiler there does not call a name with a directive before its `(`).
    Calls inside comments or strings are left open: no truth name depends on them. The defines of headers read
    outside the root and each build's `-D` values (`-DN=2` is `#define N 2`, `-DN` is `#define N 1`) are
    definitions like any other. Digraphs are read as C reads them (`%:` is `#`, `%:%:` is `##`); trigraphs are not

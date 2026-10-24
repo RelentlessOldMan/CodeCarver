@@ -108,10 +108,13 @@ if ($after -lt [long]$c.bytesAfterMin -or $after -gt [long]$c.bytesAfterMax) { F
 # Names: every define in the carved tree against the union lists (Carver keeps the union of its builds).
 $carved = Join-Path $Work 'carve1/hdr/carved'
 $defined = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
-$rx = [regex]'(?m)^[ \t]*(?:#|%:)[ \t]*define[ \t]+([A-Za-z_]\w*)'
+# As the preprocessor reads lines: a lone CR ends one, a splice (with spaces before its newline) joins two, and a
+# closed comment around the # is a space (/* c */ #define X, # /* c */ define X).
+$rx = [regex]'(?m)^[ \t]*(?:/\*.*?\*/[ \t]*)*(?:#|%:)[ \t]*(?:/\*.*?\*/[ \t]*)*define[ \t]+([A-Za-z_]\w*)'
 $latin1 = [Text.Encoding]::GetEncoding(28591)
 foreach ($f in Get-ChildItem -Recurse -File -Force $carved) {
-    foreach ($m in $rx.Matches([IO.File]::ReadAllText($f.FullName, $latin1))) { [void]$defined.Add($m.Groups[1].Value) }
+    $text = [IO.File]::ReadAllText($f.FullName, $latin1) -replace '\r\n?', "`n" -replace '\\[ \t]*\n', ''
+    foreach ($m in $rx.Matches($text)) { [void]$defined.Add($m.Groups[1].Value) }
 }
 function Read-List($entry) {
     $p = Join-Path $Corpus $entry.path

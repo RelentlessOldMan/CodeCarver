@@ -398,11 +398,18 @@ root.
   `ext/include/` that a build includes), the size boundaries, and big headers
   with no guard or with CRLF.
 - **`cases`** points to a TSV (`name\tcase\tsite`): each case's target name, its case kind, and where it is
-  exercised (relative to `root`).
+  exercised (relative to `root`; `../` for a site outside it, such as `../fw-build/compile_commands.json` for the
+  `-D` case, since 1.4.7).
 
-`verify` recomputes all of it from the tree and FAILs on any difference. `verify --reference-carve <dir>` writes the
+`verify` recomputes all of it from the tree, with the same engine gen used, and FAILs on any difference. It also
+checks the names' spelling against their class, the lists element by element, each cases row's site, each hostile
+path, and `work` (required when `_meta.gen.fwWork` is true or `fw/work/` exists). An unreadable compile db is a
+`FAIL firmware compileDb`. `treeSha256` doesn't cover `ext/` or the compile db. `verify --reference-carve <dir>` writes the
 carve the truth describes, so that it can be compiled. Sizes and generation times at each scale, the per-kind cases
 and the hostile-file list are in [firmware-design.md](firmware-design.md).
+
+With `--fw-work`, `firmware` also holds **`work`**, the work carve's construction counts (verify recounts them from the
+lists). Its fields are in [firmware-design.md](firmware-design.md#work-shape---fw-work---preset-firmware-work).
 
 ## Stable invariants consumers may rely on
 

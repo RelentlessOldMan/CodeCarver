@@ -91,6 +91,24 @@ public class HeaderCarverShapeTests
     }
 
     [Fact]
+    public void A_paste_macro_left_last_in_an_earlier_branch_takes_the_arguments_after_the_endif()
+    {
+        // CAT ends the #ifdef branch and the ( comes after the #endif: called with what follows, not with any name (a
+        // wildcard use matched every define in the tree). Inside an argument gcc calls it; at the top level it doesn't,
+        // and either is fine there.
+        var carved = Carve("#include \"chip.h\"\n#define CAT(a, b) a##b\n#define ID(x) x\n" +
+            "int u(void){ return ID(\n#ifdef X\n  CAT\n#else\n  PLAIN\n#endif\n  (HW_, 7)) + CAT(Z, Z); }\n" +
+            "int v = CAT\n#ifdef X\n#else\n#endif\n  ;\n" +
+            "int w = CAT\n#ifdef X\n#elif 1\n  ;\n#else\n  (HW_, 9);\n#endif\n" +
+            "#ifdef X\nint y = CAT\n#else\nint y = PLAIN\n#endif\n  (HW_, 8);\n",
+            "#define HW_7 1\n#define HW_8 2\n#define ZZ 3\n#define QQ 4\n#define HW_6 5\n");
+        Assert.Contains("#define HW_7 1", carved);
+        Assert.Contains("#define ZZ 3", carved);
+        Assert.DoesNotContain("QQ", carved);
+        Assert.DoesNotContain("HW_6", carved);
+    }
+
+    [Fact]
     public void A_paste_use_in_an_if_condition_builds_its_name()
     {
         var carved = Carve("#include \"chip.h\"\n#define CAT(a, b) a##b\n#define XCAT(a, b) CAT(a, b)\n" +
@@ -147,6 +165,21 @@ public class HeaderCarverShapeTests
             "#define Q R(P)\nint u(void){ return XCAT(Q, 1); }\n",
             "#define P_a 1\n#define Q1 2\n");
         Assert.Contains("#define Q1 2", carved);
+    }
+
+    [Fact]
+    public void A_several_token_argument_inside_a_chain_splits_it()
+    {
+        // HM_##b##_r with b = KSC_A KSC_B gives HM_KSC_A KSC_B_r: HM_KSC_A_r is built by no call. With b = E KSC_C, E
+        // may expand to nothing, so HM_KSC_C_r can be built.
+        var carved = Carve("#include \"chip.h\"\n#define F(b) HM_##b##_r\n#define G(b) F(b)\n#define E\n" +
+            "int u(void){ return F(KSC_A KSC_B) + G(E KSC_C); }\n",
+            "#define HM_KSC_A 1\n#define KSC_B_r 2\n#define HM_KSC_A_r 3\n#define HM_KSC_B_r 4\n#define HM_KSC_C_r 5\n");
+        Assert.Contains("#define HM_KSC_A 1", carved);
+        Assert.Contains("#define KSC_B_r 2", carved);
+        Assert.Contains("#define HM_KSC_C_r 5", carved);
+        Assert.DoesNotContain("HM_KSC_A_r", carved);
+        Assert.DoesNotContain("HM_KSC_B_r", carved);
     }
 
     [Fact]

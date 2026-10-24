@@ -499,11 +499,11 @@ public static partial class HeaderCarver
         }
     }
 
-    private const byte EvUse = 0, EvChain = 1, EvCalled = 2, EvNamed = 3, EvLeft = 4;
+    private const byte EvUse = 0, EvChain = 1, EvCalled = 2, EvNamed = 3;
 
     /// <summary>One event of a stream. A computed call (<c>CAT(F, 7)(x)</c>) has its <paramref name="Head"/>: the call whose
     /// result it calls. A call open across a directive is <paramref name="Crossed"/>: its arguments hold every branch's
-    /// tokens. <see cref="EvLeft"/>: a paste macro left last in a branch, which a <c>(</c> after the <c>#endif</c> calls.</summary>
+    /// tokens.</summary>
     private readonly record struct UseEvent(byte Kind, int Id, List<XTok>[]? Args, bool Pool, bool Eof, int[]? Ops, UseHead? Head = null, bool Crossed = false);
 
     /// <summary>The call a computed call calls the result of: its callee (-1 if computed too, with its own head), its
@@ -557,12 +557,14 @@ public static partial class HeaderCarver
             public bool Marked, Computed, Crossed, Template;
             public int Depth;                         // parentheses open inside the current argument
             public UseHead? Head;                    // a computed call: the use whose result it calls
+            public List<int>? Also;                   // paste macros left last in an earlier branch: called with these arguments too
             public Frame Clone() => (Frame)MemberwiseClone();
         }
 
         private sealed class State
         {
             public readonly List<Frame> Frames = new();
+            public List<int>? Left;                   // paste macros left last in a branch that ended at an #elif or #else
             public int BufLen;
             public bool LastClosedUse;
             public UseHead? LastUse;
@@ -576,6 +578,7 @@ public static partial class HeaderCarver
         private readonly List<XTok> buf = new();       // the tokens since the outermost open call
         private int pending = OpOther;                 // a name not yet known to be called (a name id or OpParam)
         private bool hasPending, lastClosedUse;
+        private List<int>? left;                      // just after an #endif: paste macros earlier branches left last
         private UseHead? lastUse;                     // the use that just closed, when lastClosedUse
         private readonly List<int> chain = new();      // the ## chain being read: its operands
         private bool afterHash;
@@ -591,6 +594,7 @@ public static partial class HeaderCarver
             buf.Clear();
             hasPending = lastClosedUse = afterHash = hasLast = false;
             lastUse = null;
+            left = null;
             chain.Clear();
         }
 
@@ -621,6 +625,8 @@ public static partial class HeaderCarver
 
         public void Token(PpTok kind, ReadOnlySpan<char> text)
         {
+            var leftHere = left;   // only a ( right after the #endif calls them
+            left = null;
             if (kind == PpTok.HashHash)
             {
                 if (!afterHash)
@@ -656,8 +662,15 @@ public static partial class HeaderCarver
                         var callee = pending;
                         hasPending = false;
                         if (callee >= 0) ev.Mark(EvCalled, callee);
+                        if (leftHere is not null) foreach (var a in leftHere) ev.Mark(EvCalled, a);
                         buf.Add(new XTok(XTok.LParen));
-                        frames.Add(new Frame { Callee = callee >= 0 ? callee : -1, Open = buf.Count - 1, Template = callee == OpParam });
+                        frames.Add(new Frame { Callee = callee >= 0 ? callee : -1, Open = buf.Count - 1, Template = callee == OpParam, Also = leftHere });
+                    }
+                    else if (leftHere is not null)
+                    {
+                        foreach (var a in leftHere) ev.Mark(EvCalled, a);
+                        buf.Add(new XTok(XTok.LParen));
+                        frames.Add(new Frame { Open = buf.Count - 1, Also = leftHere });
                     }
                     else if (lastClosedUse)
                     {
@@ -718,7 +731,7 @@ public static partial class HeaderCarver
             frames.RemoveAt(frames.Count - 1);
             var use = f.Computed || (f.Callee >= 0 && (f.Marked || ev.IsPaster(f.Callee)));
             lastUse = null;
-            if (use && !f.Template)
+            if ((use || f.Also is not null) && !f.Template)
             {
                 var inner = buf.GetRange(f.Open + 1, close - f.Open - 1);
                 var template = false;
@@ -726,13 +739,24 @@ public static partial class HeaderCarver
                 if (!template)
                 {
                     var args = Split(inner);
-                    var head = f.Computed ? f.Head : null;
-                    ev.Events.Add(new UseEvent(EvUse, f.Callee, args, f.Computed || f.Crossed, eof, null, head, f.Crossed));
-                    lastUse = new UseHead(f.Callee, args, head, f.Crossed);
+                    if (use)
+                    {
+                        var head = f.Computed ? f.Head : null;
+                        ev.Events.Add(new UseEvent(EvUse, f.Callee, args, f.Computed || f.Crossed, eof, null, head, f.Crossed));
+                        lastUse = new UseHead(f.Callee, args, head, f.Crossed);
+                    }
+                    AlsoUses(f, args, eof);
                 }
             }
             if (frames.Count == 0) buf.RemoveRange(Floor, buf.Count - Floor);
             return use;
+        }
+
+        // The paste macros earlier branches left last, called by this ( too (CAT, #else, PLAIN, #endif, (HW_, 7)).
+        private void AlsoUses(Frame f, List<XTok>[] args, bool eof)
+        {
+            if (f.Also is null) return;
+            foreach (var a in f.Also) ev.Events.Add(new UseEvent(EvUse, a, args, f.Crossed, eof, null, null, f.Crossed));
         }
 
         private int Floor => conds.Count > 0 ? Math.Min(conds[^1].BufLen, buf.Count) : 0;
@@ -746,6 +770,8 @@ public static partial class HeaderCarver
             FlushChain();
             afterHash = hasLast = false;
             foreach (var f in frames) f.Crossed = true;
+            var leftHere = left;   // an inner #endif's, so left last in this branch too
+            left = null;
             switch (kind)
             {
                 case PpLine.Cond:
@@ -754,10 +780,13 @@ public static partial class HeaderCarver
                 case PpLine.Else:
                     if (conds.Count > 0)
                     {
-                        // A paste macro last in the branch ending: a ( after the #endif calls it, with what we can't see.
-                        if (hasPending && frames.Count == 0 && ev.IsPaster(pending)) ev.Events.Add(new UseEvent(EvLeft, pending, null, false, false, null));
+                        // A paste macro last in the branch ending: a ( right after the #endif calls it, with the
+                        // arguments that follow.
+                        var s = conds[^1];
+                        if (hasPending && pending >= 0 && ev.IsPaster(pending)) (s.Left ??= new List<int>()).Add(pending);
+                        if (leftHere is not null) (s.Left ??= new List<int>()).AddRange(leftHere);
                         FinalizePending();
-                        Restore(conds[^1]);
+                        Restore(s);
                     }
                     break;
                 case PpLine.EndIf:
@@ -768,6 +797,9 @@ public static partial class HeaderCarver
                         for (var k = 0; k < Math.Min(frames.Count, s.Frames.Count); k++)
                             if (frames[k].Open == s.Frames[k].Open) frames[k].Marked |= s.Frames[k].Marked;
                         conds.RemoveAt(conds.Count - 1);
+                        // (the last branch's own name is still pending)
+                        if (s.Left is not null) { left = s.Left; if (leftHere is not null) left.AddRange(leftHere); }
+                        else left = leftHere;
                     }
                     break;
             }
@@ -788,10 +820,13 @@ public static partial class HeaderCarver
             for (var k = frames.Count - 1; k >= 0 && frames[k].Open >= s.BufLen; k--)
             {
                 var f = frames[k];
-                if (f.Template || !(f.Computed || (f.Callee >= 0 && (f.Marked || ev.IsPaster(f.Callee))))) continue;
+                var use = f.Computed || (f.Callee >= 0 && (f.Marked || ev.IsPaster(f.Callee)));
+                if (f.Template || !(use || f.Also is not null)) continue;
                 var inner = buf.GetRange(f.Open + 1, buf.Count - f.Open - 1);
                 if (inner.Exists(t => t.K == XTok.Param)) continue;
-                ev.Events.Add(new UseEvent(EvUse, f.Callee, Split(inner), true, true, null));
+                var args = Split(inner);
+                if (use) ev.Events.Add(new UseEvent(EvUse, f.Callee, args, true, true, null));
+                if (f.Also is not null) foreach (var a in f.Also) ev.Events.Add(new UseEvent(EvUse, a, args, true, true, null));
             }
             // A call open at the #if passed a paste macro in this branch: it was passed one whatever branch is compiled.
             for (var k = 0; k < Math.Min(frames.Count, s.Frames.Count); k++)
@@ -1358,9 +1393,6 @@ public static partial class HeaderCarver
                         var ops = x.Ops!.Select(G).ToArray();
                         if (chainSeen.Add(string.Join(',', ops))) LiteralChain(ops);
                         break;
-                    case EvLeft:
-                        LeftUse(G(x.Id));
-                        break;
                     case EvUse:
                         var callee = x.Id >= 0 ? G(x.Id) : -1;
                         var args = MapArgs(x.Args!);
@@ -1417,15 +1449,7 @@ public static partial class HeaderCarver
 
         private void WildUse(int id)
         {
-            if (!IsPaster(id) || Has(id, BitCalled)) return;
-            LeftUse(id);
-        }
-
-        /// <summary>A paste macro called with arguments we can't see (left last in an <c>#if</c> branch, a <c>(</c> after the
-        /// <c>#endif</c>): one use with every argument a wildcard, called elsewhere or not.</summary>
-        private void LeftUse(int id)
-        {
-            if (!IsPaster(id) || !wildDone.Add(id)) return;
+            if (!IsPaster(id) || Has(id, BitCalled) || !wildDone.Add(id)) return;
             var rec = new UseRec { Wild = true, Callee = id };
             uses.Add(rec);
             dirty.Add(rec);
@@ -2029,7 +2053,8 @@ public static partial class HeaderCarver
             var n = ops.Count;
             var slots = new List<El>[n];
             var unbound = false;
-            List<(int At, List<El> Ends, List<El> Starts)>? breaks = null;
+            List<(int At, List<El> Ends, List<El> Starts, bool Sure)>? breaks = null;
+            var sure = false;   // a split that is always there: no name runs across it
             for (var i = 0; i < n; i++)
             {
                 var tk = b[ops[i]];
@@ -2045,7 +2070,11 @@ public static partial class HeaderCarver
                     // An interior argument of several tokens splits the chain: its first token ends the name on its
                     // left, its last starts the one on its right (HWB_##blk##_r with blk = T x: HWB_T and x_r).
                     if (lastSide is not null && firstSide is not null && MaybeTokens(a[tk.Id]))
-                        (breaks ??= new()).Add((i, firstSide.ToList(), lastSide.ToList()));
+                    {
+                        var always = SeveralTokens(a[tk.Id]);
+                        sure |= always;
+                        (breaks ??= new()).Add((i, firstSide.ToList(), lastSide.ToList(), always));
+                    }
                     // At the chain's start or end, its far token is the body's edge there (x##_r with x = A B: A B_r).
                     else if (i == 0 && n > 1 && MaybeTokens(a[tk.Id])) outFirst = EdgeSet(a[tk.Id], last: false, forceExp: false);
                     else if (i == n - 1 && n > 1 && MaybeTokens(a[tk.Id])) outLast = EdgeSet(a[tk.Id], last: true, forceExp: false);
@@ -2058,7 +2087,8 @@ public static partial class HeaderCarver
                 foreach (var s in slots) UnionAll(lit, s);
                 return lit;
             }
-            var made = Product(slots);
+            // (ZSX_##b##_QZ with b = KA KB: ZSX_KA and KB_QZ, never ZSX_KA_QZ)
+            var made = sure ? new HashSet<El>() : Product(slots);
             if (made is null)
             {
                 made = new HashSet<El>(slots[0]);
@@ -2071,7 +2101,7 @@ public static partial class HeaderCarver
 
         /// <summary>The names a chain builds between its splits: from its start or a split's last token, over the slots
         /// between, to its end or a later split's first token.</summary>
-        private void Segments(List<El>[] slots, List<(int At, List<El> Ends, List<El> Starts)> breaks, HashSet<El> made)
+        private void Segments(List<El>[] slots, List<(int At, List<El> Ends, List<El> Starts, bool Sure)> breaks, HashSet<El> made)
         {
             var n = slots.Length;
             var starts = new List<(int At, List<El> Set)> { (0, slots[0]) };
@@ -2085,6 +2115,7 @@ public static partial class HeaderCarver
                 foreach (var en in ends)
                 {
                     if (en.At <= st.At || (st.At == 0 && en.At == n - 1)) continue;
+                    if (breaks.Exists(br => br.Sure && br.At > st.At && br.At < en.At)) continue;
                     var seg = new List<El>[en.At - st.At + 1];
                     seg[0] = st.Set;
                     for (var k = st.At + 1; k < en.At; k++) seg[k - st.At] = slots[k];
@@ -2093,6 +2124,15 @@ public static partial class HeaderCarver
                     if (part is null) { UnionAll(made, seg[0]); UnionAll(made, seg[^1]); }
                     else UnionAll(made, part);
                 }
+        }
+
+        /// <summary>Whether an argument is always more than one token: two of its tokens stand for themselves alone
+        /// (one that stands for its expansion too can expand to nothing).</summary>
+        private static bool SeveralTokens(List<XTok> arg)
+        {
+            var n = 0;
+            foreach (var t in arg) if (!t.Exp && t.K != XTok.Wild && ++n == 2) return true;
+            return false;
         }
 
         /// <summary>Whether an argument can be more than one token: it is, or it is a name whose expansion can be.</summary>
