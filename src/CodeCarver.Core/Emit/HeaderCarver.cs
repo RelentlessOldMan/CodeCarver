@@ -194,9 +194,15 @@ public static partial class HeaderCarver
         var hashHashFiles = new HashSet<string>(StringComparer.Ordinal);
         UseEngine? engine = null;
         UseResults? built = null;   // what the uses built, once the engine is let go
+        // The big headers read so far this pass, of how many: a pass held up reading them shows how far it got (work's
+        // sat 18 minutes at "pass 1" with nothing on the line moving).
+        var headersRead = 0;
+        var headersAll = 0;
         string Learned() => engine is null
             ? $"{pasterCount:N0} paste macros, {needed.Count:N0} names"
-            : $"{facts.Pasters.Count:N0} paste macros, {needed.Count:N0} names, {engine.Uses:N0} paste uses, {engine.Results.Exact.Count:N0} names built";
+            : $"{facts.Pasters.Count:N0} paste macros, {needed.Count:N0} names, {engine.Uses:N0} paste uses, " +
+              $"{engine.Results.Exact.Count:N0} names built, {engine.Results.Patterns:N0} patterns, {engine.Results.Pools:N0} pools" +
+              (headersAll > 0 ? $", {Volatile.Read(ref headersRead):N0} of {headersAll:N0} big headers read" : "");
         CodeCarver.Core.Util.Activity.Doing("reading the kept files for names and defines", Learned);
         foreach (var (i, seen) in CodeCarver.Core.Util.ReadAhead.Ordered(candidates, SeedScan, CodeCarver.Core.Util.ReadAhead.Window))
         {
@@ -309,6 +315,8 @@ public static partial class HeaderCarver
             var versionAt = engine.Results.Version;
             var capturedAt = engine.Captured;
             var runsAt = engine.Runs;
+            headersRead = 0;
+            headersAll = bigFull.Count;
             foreach (var batch in batches)
             {
                 var serial = engine.BatchBegin();
@@ -319,6 +327,7 @@ public static partial class HeaderCarver
                 foreach (var take in CodeCarver.Core.Util.ReadAhead.Each(batch, path => Take(path, first, skip, Wanted, needed, pasters, asked, limit)))
                 {
                     limit.Check();
+                    headersRead++;
                     foreach (var name in take.Names)
                         if (needed.Add(name))
                         {
@@ -364,6 +373,7 @@ public static partial class HeaderCarver
         }
 
         PartDone("fixpoint");
+        headersAll = 0;
         // The rewrite needs only what the uses built. Every closure of this method shares one frame, so the engine (its
         // uses, captured texts and runs), the kept files' define texts and the big headers' define facts stayed live
         // through it: 85 MB more after the fixpoint on a 1.2M-define tree.

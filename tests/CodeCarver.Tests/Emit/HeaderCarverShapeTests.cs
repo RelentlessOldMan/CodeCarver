@@ -192,4 +192,48 @@ public class HeaderCarverShapeTests
         Assert.Contains("#define QHM_ 1", carved);
         Assert.Contains("#define KSC_A_r 2", carved);
     }
+    [Fact]
+    public void Many_patterns_or_pools_under_one_piece_keep_what_each_builds()
+    {
+        // Past 8 under one start piece they are looked up by the name's end: each still keeps only its own names.
+        var app = new System.Text.StringBuilder("#include \"chip.h\"\n#define CAT(a, b) a##b\n#define XCAT(a, b) CAT(a, b)\n");
+        var chip = new System.Text.StringBuilder();
+        for (var i = 0; i < 12; i++)
+        {
+            // named, never called: KW_ * _R{i}, and * _S{i}
+            app.Append($"#define M{i}(a) KW_##a##_R{i}\n#define N{i}(a) a##_S{i}\nint m{i} = M{i} + N{i};\n");
+            // each a call open across #if: a pool with KP_ and KQ{i}_ to start, R{i} and S{i} to end
+            app.Append($"int p{i}(void){{ return CAT(\n#if A\n  KP_, R{i}\n#else\n  KQ{i}_, S{i}\n#endif\n  ); }}\n");
+        }
+        app.Append("int u(void){ return CAT(Z, Z); }\n");
+        chip.Append("#define ZZ 0\n#define KW_7_R3 1\n#define KW_7_Q3 2\n#define KW_7_R99 3\n#define ANY_S5 4\n#define ANY_T5 5\n" +
+                    "#define KP_R3 6\n#define KP_S10 7\n#define KQ3_R3 8\n#define KP_T1 9\n#define KQ3_R4 10\n#define KQ3_S30 11\n");
+        var carved = Carve(app.ToString(), chip.ToString());
+        foreach (var kept in new[] { "KW_7_R3", "ANY_S5", "KP_R3", "KP_S10", "KQ3_R3" })
+            Assert.Contains($"#define {kept} ", carved);
+        foreach (var dropped in new[] { "KW_7_Q3", "KW_7_R99", "ANY_T5", "KP_T1", "KQ3_R4", "KQ3_S30" })
+            Assert.DoesNotContain($"#define {dropped} ", carved);
+    }
+
+    [Fact]
+    public void Many_paste_macros_named_and_never_called_read_the_big_headers_in_time()
+    {
+        // Each gives a wildcard pattern, and every big-header define was matched against each one in turn: 16,000 of
+        // them against 160,000 defines took 87 s with no prefix and 64 s with one (2 s and 3 s looked up by the end).
+        // Work's pass 1 sat 18 minutes at 2.6M paste macros and 18.9M defines with nothing on the progress line moving.
+        const int n = 16000;
+        var app = new System.Text.StringBuilder("#include \"chip.h\"\n");
+        var chip = new System.Text.StringBuilder();
+        for (var i = 0; i < n; i++)
+        {
+            app.Append($"#define M{i}(a) a##_R{i}\n#define N{i}(a) KW_##a##_S{i}\nint t{i} = M{i} + N{i};\n");
+        }
+        for (var i = 0; i < n * 10; i++) chip.Append($"#define KW_{i}_Q{i} {i}\n");
+        chip.Append("#define KX_R77 1\n#define KW_x_S77 2\n");
+        var run = Task.Run(() => Carve(app.ToString(), chip.ToString()));
+        Assert.True(run.Wait(TimeSpan.FromSeconds(40)), "the carve took over 40 s");
+        Assert.Contains("#define KX_R77 1", run.Result);
+        Assert.Contains("#define KW_x_S77 2", run.Result);
+        Assert.DoesNotContain("KW_5_Q5 ", run.Result);
+    }
 }

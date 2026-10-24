@@ -951,11 +951,66 @@ public static partial class HeaderCarver
     {
         public readonly HashSet<ulong> Exact = new();
         private readonly HashSet<(string, byte, string)> patternSeen = new();
-        private readonly Dictionary<string, List<(string Suf, byte Wild)>> byPre = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, SufSet> byPre = new(StringComparer.Ordinal);
         private readonly List<int> preLens = new();
         private readonly HashSet<int> preHashes = new();
-        private readonly List<(string Suf, byte Wild)> noPre = new();
+        private readonly SufSet noPre = new();
         private bool anyAll;
+
+        /// <summary>The end pieces of the patterns under one start piece, each with the wildcards before it. A few are
+        /// scanned; past that they are looked up by the name's last characters, length by length: every big-header
+        /// define was matched against every pattern in a list, and 16,000 patterns against 160,000 defines took 87 s.</summary>
+        private sealed class SufSet
+        {
+            private const int Few = 8;
+            private List<(string Suf, byte Wild)>? few = new();
+            private Dictionary<string, byte>? wilds;   // end piece -> bit (1 << wild) for each wildcard before it
+            private HashSet<int>? hashes;
+            private List<int>? lens;
+
+            public void Add(string suf, byte wild)
+            {
+                if (few is not null)
+                {
+                    few.Add((suf, wild));
+                    if (few.Count <= Few) return;
+                    wilds = new(StringComparer.Ordinal);
+                    hashes = new();
+                    lens = new();
+                    foreach (var (q, w) in few) Index(q, w);
+                    few = null;
+                    return;
+                }
+                Index(suf, wild);
+            }
+
+            private void Index(string suf, byte wild)
+            {
+                wilds!.TryGetValue(suf, out var bits);
+                wilds[suf] = (byte)(bits | (1 << wild));
+                hashes!.Add(string.GetHashCode(suf.AsSpan()));
+                InsertSorted(lens!, suf.Length);
+            }
+
+            /// <summary>One fits <paramref name="name"/> after its first <paramref name="p"/> characters.</summary>
+            public bool Match(string name, int p)
+            {
+                if (few is not null)
+                {
+                    foreach (var (suf, wild) in few) if (Fits(name, p, suf, wild)) return true;
+                    return false;
+                }
+                foreach (var l in lens!)
+                {
+                    if (p + l > name.Length) break;
+                    var span = name.AsSpan(name.Length - l);
+                    if (!hashes!.Contains(string.GetHashCode(span)) || !wilds!.TryGetValue(span.ToString(), out var bits)) continue;
+                    if ((bits & ~(1 << UseEngine.WildDigits)) != 0) return true;
+                    if (Fits(name, p, span.ToString(), UseEngine.WildDigits)) return true;
+                }
+                return false;
+            }
+        }
 
         private sealed class EndSet
         {
@@ -974,7 +1029,24 @@ public static partial class HeaderCarver
 
         private readonly List<EndSet> pools = new();
         private readonly HashSet<string> poolSeen = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, List<int>> poolsByStart = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, StartPools> poolsByStart = new(StringComparer.Ordinal);
+
+        /// <summary>The pools one start piece begins: a few are tried one by one; past that, their end pieces are one set
+        /// (a name fits a pool with this start if its rest is an end of any of them).</summary>
+        private sealed class StartPools
+        {
+            public readonly List<int> Ids = new();
+            public EndSet? Merged;
+        }
+
+        private const int FewPools = 8;
+
+        private static void MergeInto(EndSet to, EndSet from)
+        {
+            foreach (var e in from.Ends) to.Add(e);
+            to.AnyE |= from.AnyE;
+            to.DigitsE |= from.DigitsE;
+        }
         private readonly List<int> startLens = new();
         private readonly HashSet<int> startHashes = new();
         private EndSet? anyStart;
@@ -994,14 +1066,14 @@ public static partial class HeaderCarver
             if (!patternSeen.Add((pre, wild, suf))) return;
             Version++;
             if (pre.Length == 0 && suf.Length == 0 && wild == UseEngine.WildAny) { anyAll = true; return; }
-            if (pre.Length == 0) { noPre.Add((suf, wild)); return; }
+            if (pre.Length == 0) { noPre.Add(suf, wild); return; }
             if (!byPre.TryGetValue(pre, out var l))
             {
                 byPre[pre] = l = new();
                 preHashes.Add(string.GetHashCode(pre.AsSpan()));
                 InsertSorted(preLens, pre.Length);
             }
-            l.Add((suf, wild));
+            l.Add(suf, wild);
         }
 
         public void AddPool(HashSet<string> starts, bool anyS, HashSet<string> ends, bool anyE, bool digitsE)
@@ -1032,7 +1104,13 @@ public static partial class HeaderCarver
                     startHashes.Add(string.GetHashCode(s.AsSpan()));
                     InsertSorted(startLens, s.Length);
                 }
-                l.Add(id);
+                l.Ids.Add(id);
+                if (l.Merged is not null) MergeInto(l.Merged, set);
+                else if (l.Ids.Count > FewPools)
+                {
+                    l.Merged = new EndSet();
+                    foreach (var q in l.Ids) MergeInto(l.Merged, pools[q]);
+                }
             }
         }
 
@@ -1049,10 +1127,9 @@ public static partial class HeaderCarver
             {
                 if (p > name.Length) break;
                 if (!preHashes.Contains(string.GetHashCode(name.AsSpan(0, p))) || !byPre.TryGetValue(name[..p], out var l)) continue;
-                foreach (var (suf, wild) in l) if (Fits(name, p, suf, wild)) return true;
+                if (l.Match(name, p)) return true;
             }
-            foreach (var (suf, wild) in noPre) if (Fits(name, 0, suf, wild)) return true;
-            return false;
+            return noPre.Match(name, 0);
         }
 
         private static bool Fits(string name, int p, string q, byte wild)
@@ -1070,7 +1147,8 @@ public static partial class HeaderCarver
             {
                 if (l > name.Length) break;
                 if (!startHashes.Contains(string.GetHashCode(name.AsSpan(0, l))) || !poolsByStart.TryGetValue(name[..l], out var ps)) continue;
-                foreach (var p in ps) if (Ends(pools[p], name, l)) return true;
+                if (ps.Merged is not null) { if (Ends(ps.Merged, name, l)) return true; continue; }
+                foreach (var p in ps.Ids) if (Ends(pools[p], name, l)) return true;
             }
             return false;
         }
