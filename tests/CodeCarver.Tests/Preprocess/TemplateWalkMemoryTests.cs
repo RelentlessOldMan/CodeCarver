@@ -84,6 +84,10 @@ public class TemplateWalkMemoryTests
         var root = Path.Combine(Path.GetTempPath(), "cc-wmem-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(Path.Combine(root, "regs"));
         var was = (Environment.GetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB"), Environment.GetEnvironmentVariable("CODECARVER_CHECK_WALK_MB"));
+        // The held budget is a share of the run's memory limit, which a carve test leaves set (MemoryWatchTests' 1 MB
+        // left nothing held and failed this on CI).
+        var limitWas = CodeCarver.Core.Util.MemoryGate.RunLimitBytes;
+        CodeCarver.Core.Util.MemoryGate.RunLimitBytes = 0;
         try
         {
             (string, string) W(string rel, string text)
@@ -124,6 +128,7 @@ public class TemplateWalkMemoryTests
         {
             Environment.SetEnvironmentVariable("CODECARVER_CHECK_HEADER_MB", was.Item1);
             Environment.SetEnvironmentVariable("CODECARVER_CHECK_WALK_MB", was.Item2);
+            CodeCarver.Core.Util.MemoryGate.RunLimitBytes = limitWas;
             try { Directory.Delete(root, true); } catch { }
         }
     }

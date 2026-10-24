@@ -342,7 +342,11 @@ public class HeaderCarverTests
             Assert.Contains("#define KQ0_R0 0", h0);
             Assert.Contains($"#define KQ{aliases - 1}_R{aliases - 1} ", File.ReadAllText(Path.Combine(dir, $"h{(aliases - 1) % headers}.h")));
         }
-        finally { Directory.Delete(dir, recursive: true); }
+        finally
+        {
+            HeaderCarver.BatchBytes.Value = null;
+            Directory.Delete(dir, recursive: true);
+        }
     }
 
     /// <summary>A dropped #define must not take half a comment with it, and a #define inside a comment is text.</summary>
