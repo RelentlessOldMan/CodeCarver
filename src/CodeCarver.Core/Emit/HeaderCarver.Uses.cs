@@ -1019,36 +1019,32 @@ public static partial class HeaderCarver
             public readonly List<int> Lens = new();
             public bool AnyE, DigitsE;
 
-            public void Add(string e)
+            public bool Add(string e)
             {
-                if (!Ends.Add(e)) return;
+                if (!Ends.Add(e)) return false;
                 Hashes.Add(string.GetHashCode(e.AsSpan()));
                 InsertSorted(Lens, e.Length);
+                return true;
             }
         }
 
+        // The pools, one per set of start pieces (two with the same starts are one with both's ends: the same names), each
+        // start and end piece with the pools it is in. A name fits a pool when a start piece of it and an end piece in
+        // the room left share one. Each start piece held every end piece of its pools: a call open across an #if passing
+        // an alias of 1,000 names started and ended a pool with each, and every pool copied a million pieces.
+        private sealed class Piece
+        {
+            public readonly HashSet<int> Pools = new();
+            public bool AnyE, DigitsE;   // a pool it starts ends with anything, or with digits
+        }
+
+        private readonly Dictionary<string, int> poolByStarts = new(StringComparer.Ordinal);
         private readonly List<EndSet> pools = new();
-        private readonly HashSet<string> poolSeen = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, StartPools> poolsByStart = new(StringComparer.Ordinal);
-
-        /// <summary>The pools one start piece begins: a few are tried one by one; past that, their end pieces are one set
-        /// (a name fits a pool with this start if its rest is an end of any of them).</summary>
-        private sealed class StartPools
-        {
-            public readonly List<int> Ids = new();
-            public EndSet? Merged;
-        }
-
-        private const int FewPools = 8;
-
-        private static void MergeInto(EndSet to, EndSet from)
-        {
-            foreach (var e in from.Ends) to.Add(e);
-            to.AnyE |= from.AnyE;
-            to.DigitsE |= from.DigitsE;
-        }
-        private readonly List<int> startLens = new();
-        private readonly HashSet<int> startHashes = new();
+        private readonly List<string[]> poolStarts = new();
+        private readonly Dictionary<string, Piece> startPieces = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, Piece> endPieces = new(StringComparer.Ordinal);
+        private readonly List<int> startLens = new(), endLens = new();
+        private readonly HashSet<int> startHashes = new(), endHashes = new();
         private EndSet? anyStart;
 
         public int Patterns => patternSeen.Count;
@@ -1089,29 +1085,42 @@ public static partial class HeaderCarver
                 if (anyStart.Ends.Count != before || flags != (anyStart.AnyE, anyStart.DigitsE)) Version++;
                 return;
             }
-            var sig = string.Join('\n', starts.Order(StringComparer.Ordinal)) + "\n\n" + string.Join('\n', ends.Order(StringComparer.Ordinal)) + $"\n{anyE}{digitsE}";
-            if (!poolSeen.Add(sig)) return;
-            Version++;
-            var set = new EndSet { AnyE = anyE, DigitsE = digitsE };
-            foreach (var e in ends) set.Add(e);
-            var id = pools.Count;
-            pools.Add(set);
-            foreach (var s in starts)
+            var sorted = starts.Order(StringComparer.Ordinal).ToArray();
+            var sig = string.Join('\n', sorted);
+            var grew = false;
+            if (!poolByStarts.TryGetValue(sig, out var id))
             {
-                if (!poolsByStart.TryGetValue(s, out var l))
-                {
-                    poolsByStart[s] = l = new();
-                    startHashes.Add(string.GetHashCode(s.AsSpan()));
-                    InsertSorted(startLens, s.Length);
-                }
-                l.Ids.Add(id);
-                if (l.Merged is not null) MergeInto(l.Merged, set);
-                else if (l.Ids.Count > FewPools)
-                {
-                    l.Merged = new EndSet();
-                    foreach (var q in l.Ids) MergeInto(l.Merged, pools[q]);
-                }
+                poolByStarts[sig] = id = pools.Count;
+                pools.Add(new EndSet());
+                poolStarts.Add(sorted);
+                foreach (var s in sorted) Of(startPieces, s, startHashes, startLens).Pools.Add(id);
+                grew = true;
             }
+            var set = pools[id];
+            foreach (var e in ends)
+                if (set.Add(e)) { Of(endPieces, e, endHashes, endLens).Pools.Add(id); grew = true; }
+            if ((anyE && !set.AnyE) || (digitsE && !set.DigitsE))
+            {
+                set.AnyE |= anyE;
+                set.DigitsE |= digitsE;
+                foreach (var s in poolStarts[id])
+                {
+                    var p = startPieces[s];
+                    p.AnyE |= anyE;
+                    p.DigitsE |= digitsE;
+                }
+                grew = true;
+            }
+            if (grew) Version++;
+        }
+
+        private static Piece Of(Dictionary<string, Piece> pieces, string s, HashSet<int> hashes, List<int> lens)
+        {
+            if (pieces.TryGetValue(s, out var p)) return p;
+            pieces[s] = p = new Piece();
+            hashes.Add(string.GetHashCode(s.AsSpan()));
+            InsertSorted(lens, s.Length);
+            return p;
         }
 
         private static void InsertSorted(List<int> l, int v)
@@ -1146,14 +1155,23 @@ public static partial class HeaderCarver
             foreach (var l in startLens)
             {
                 if (l > name.Length) break;
-                if (!startHashes.Contains(string.GetHashCode(name.AsSpan(0, l))) || !poolsByStart.TryGetValue(name[..l], out var ps)) continue;
-                if (ps.Merged is not null) { if (Ends(ps.Merged, name, l)) return true; continue; }
-                foreach (var p in ps.Ids) if (Ends(pools[p], name, l)) return true;
+                if (!startHashes.Contains(string.GetHashCode(name.AsSpan(0, l))) || !startPieces.TryGetValue(name[..l], out var sp)) continue;
+                var room = name.Length - l;
+                if (sp.AnyE || (sp.DigitsE && room >= 1 && char.IsAsciiDigit(name[^1]))) return true;
+                // the end pieces in the room the start piece leaves (they never overlap)
+                foreach (var el in endLens)
+                {
+                    if (el > room) break;
+                    var span = name.AsSpan(name.Length - el);
+                    if (!endHashes.Contains(string.GetHashCode(span)) || !endPieces.TryGetValue(span.ToString(), out var ep)) continue;
+                    var (small, big) = sp.Pools.Count <= ep.Pools.Count ? (sp.Pools, ep.Pools) : (ep.Pools, sp.Pools);
+                    foreach (var p in small) if (big.Contains(p)) return true;
+                }
             }
             return false;
         }
 
-        // Ends with one of the set's end pieces in the room the start piece leaves (they never overlap).
+        // Ends with one of the set's end pieces in the room the start piece leaves.
         private static bool Ends(EndSet e, string s, int startLen)
         {
             var room = s.Length - startLen;
@@ -1302,7 +1320,11 @@ public static partial class HeaderCarver
         public Dictionary<ulong, int> Asked => asked;
 
         /// <summary>There are no big headers to ask: every template is known.</summary>
-        public void NothingToAsk() => asking = false;
+        public void NothingToAsk()
+        {
+            asking = false;
+            ClearPartial();
+        }
 
         private List<Tpl> Templates(int id)
         {
@@ -1313,6 +1335,7 @@ public static partial class HeaderCarver
                     facts.ForwardsTo(key, k => !tried.Contains(k) && asked.TryAdd(k, nextBatch));
                 misses?.Add(id);
                 missCount++;
+                missTop?.Own.Add(id);
             }
             if (tpls.TryGetValue(id, out var l)) return l;
             l = new();
@@ -1374,6 +1397,7 @@ public static partial class HeaderCarver
             asked.Remove(key);
             tried.Add(key);
             if (idByKey.TryGetValue(key, out var id)) waiting.Remove(id);
+            if (expPartial.Count > 0) ClearPartial();
         }
 
         /// <summary>A batch of the big headers is about to be read: its number.</summary>
@@ -1390,7 +1414,7 @@ public static partial class HeaderCarver
             Captured++;
             if (!idByKey.TryGetValue(key, out var id)) return;
             tpls.Remove(id);
-            expPartial.Clear();
+            ClearPartial();
             if (waiting.Remove(id, out var recs)) dirty.UnionWith(recs);
         }
 
@@ -1419,6 +1443,8 @@ public static partial class HeaderCarver
         public long Chains => chainSeen.Count;
         public long Runs { get; private set; }
         public long OverWork { get; private set; }
+        /// <summary>The uses left to run in this drain (the progress line's: a pass sat 12 minutes with nothing moving).</summary>
+        public long Left { get; private set; }
 
         /// <summary>Uses waiting to run again, or names asked of the big headers: another pass has work.</summary>
         public bool Pending => asked.Count > 0 || dirty.Count > 0;
@@ -1429,8 +1455,13 @@ public static partial class HeaderCarver
             {
                 var now = dirty.ToList();
                 dirty.Clear();
-                foreach (var r in now) Run(r);
+                for (var i = 0; i < now.Count; i++)
+                {
+                    Left = now.Count - i + dirty.Count;
+                    Run(now[i]);
+                }
             }
+            Left = 0;
         }
 
         /// <summary>Called now and then while uses run: the memory limit.</summary>
@@ -1443,6 +1474,7 @@ public static partial class HeaderCarver
             misses = new HashSet<int>();
             if (r.Wild) WildUseCore(r.Callee);
             else UseCore(r.Callee, r.Args, r.Pool, r.Eof, r.Crossed, r.Head);
+            PartialMisses();
             foreach (var id in misses)
             {
                 if (!waiting.TryGetValue(id, out var l)) waiting[id] = l = new();
@@ -1882,10 +1914,11 @@ public static partial class HeaderCarver
                     finally { eofArgs = savedEof; }
                 }
 
-            // the body's edges, walking in from each end
+            // the body's edges, walking in from each end up to the first token that can't be empty (the walk went on past
+            // it: a use pasting onto an alias of 1,000 names built 1,000 names, each waiting for its header)
             var all = true;
             var x = 0;
-            while (x < n)
+            while (x < n && all)
             {
                 if (chainEnd[x] >= 0)
                 {
@@ -1917,7 +1950,7 @@ public static partial class HeaderCarver
             }
             all = true;
             x = n - 1;
-            while (x >= 0)
+            while (x >= 0 && all)
             {
                 if (chainStart[x] >= 0)
                 {
@@ -2300,7 +2333,7 @@ public static partial class HeaderCarver
             {
                 var all = true;
                 var k = last ? n - 1 : 0;
-                while (last ? k >= 0 : k < n)
+                while ((last ? k >= 0 : k < n) && all)
                 {
                     var x = toks[k];
                     int callee = -1, o = -1, c = -1;
@@ -2440,10 +2473,50 @@ public static partial class HeaderCarver
         private readonly Dictionary<int, Val> expMemo = new();
         private readonly Dictionary<int, int> expAt = new();   // names being expanded: their depth
         private int expLow = int.MaxValue;
-        // Expansions that met a define not read yet, until one arrives or another use runs: a chain of 40 forwarders whose
-        // end was unread expanded each link twice (its first and last edges), 2^40 times.
+        // Expansions that met a define not read yet, until a big-header define arrives: a chain of 40 forwarders whose end
+        // was unread expanded each link twice (its first and last edges), 2^40 times. They were dropped after each use,
+        // and every use expanded its names' whole alias tree again: work's pass 1 sat 12 minutes at 241K uses. Each keeps
+        // the names it met unread, directly and through the partial expansions inside it: a use that takes one waits on
+        // them too.
         private readonly Dictionary<int, Val> expPartial = new();
-        private HashSet<int>? partialFor;
+        private readonly Dictionary<int, MissRec> partialMiss = new();
+        private MissRec? missTop;                                   // the expansion running: the names it meets unread
+        private readonly List<int> partialsTaken = new();           // the partial expansions the running use took
+
+        private sealed class MissRec
+        {
+            public readonly HashSet<int> Own = new(), Kids = new();
+        }
+
+        private void ClearPartial()
+        {
+            if (misses is not null) PartialMisses();
+            expPartial.Clear();
+            partialMiss.Clear();
+        }
+
+        /// <summary>A partial expansion is taken: what the use and the expansion around it wait on.</summary>
+        private void TakePartial(int id)
+        {
+            missTop?.Kids.Add(id);
+            if (misses is not null) partialsTaken.Add(id);
+        }
+
+        /// <summary>The running use waits on every name the partial expansions it took met unread.</summary>
+        private void PartialMisses()
+        {
+            if (partialsTaken.Count == 0) return;
+            var seen = new HashSet<int>();
+            var todo = new Stack<int>(partialsTaken);
+            partialsTaken.Clear();
+            while (todo.Count > 0)
+            {
+                var k0 = todo.Pop();
+                if (!seen.Add(k0) || !partialMiss.TryGetValue(k0, out var rec)) continue;
+                misses!.UnionWith(rec.Own);
+                foreach (var k in rec.Kids) if (!seen.Contains(k)) todo.Push(k);
+            }
+        }
         // The names of a define cycle (A = B x in one #if branch, B = A y in the other) while its first name is expanded:
         // each one's value so far, the stack depth its cycle reaches, and whether this round has computed it. Without
         // them no name in a cycle was kept, and 16 names in one cycle took a minute: each was expanded once per path.
@@ -2458,8 +2531,7 @@ public static partial class HeaderCarver
         private Val Expand(int id)
         {
             if (expMemo.TryGetValue(id, out var m)) return m;
-            if (!ReferenceEquals(partialFor, misses)) { expPartial.Clear(); partialFor = misses; }
-            if (expPartial.TryGetValue(id, out m)) { missCount++; return m; }
+            if (expPartial.TryGetValue(id, out m)) { missCount++; TakePartial(id); return m; }
             var inCyc = expCyc.TryGetValue(id, out var cyc);
             if (expAt.TryGetValue(id, out var at)) { expLow = Math.Min(expLow, at); return inCyc ? cyc.V : new Val(); }
             if (inCyc && cyc.Done) { expLow = Math.Min(expLow, cyc.Low); return cyc.V; }
@@ -2470,6 +2542,8 @@ public static partial class HeaderCarver
             var savedGrew = expGrew;
             var missesAt = missCount;
             var mark = expCycOrder.Count;
+            var up = missTop;
+            var rec = missTop = new MissRec();
             noPool++;
             try
             {
@@ -2487,11 +2561,15 @@ public static partial class HeaderCarver
                         var grew = CycNote(id, v, expLow);
                         expGrew = savedGrew || grew;
                         expLow = Math.Min(savedLow, expLow);
+                        missTop = up;
+                        if (up is not null) { up.Own.UnionWith(rec.Own); up.Kids.UnionWith(rec.Kids); }
                         return v;
                     }
                     if (expLow > depth && expCycOrder.Count == mark)
                     {
-                        (missCount == missesAt ? expMemo : expPartial)[id] = v;
+                        missTop = up;
+                        if (missCount == missesAt) expMemo[id] = v;
+                        else { expPartial[id] = v; partialMiss[id] = rec; TakePartial(id); }
                         expGrew = savedGrew;
                         expLow = savedLow;
                         return v;
@@ -2507,21 +2585,26 @@ public static partial class HeaderCarver
                         }
                         continue;
                     }
-                    var to = missCount == missesAt ? expMemo : expPartial;
+                    missTop = up;
+                    var part = missCount != missesAt;
+                    var to = part ? expPartial : expMemo;
                     for (var i = mark; i < expCycOrder.Count; i++)
                     {
                         var x = expCycOrder[i];
                         to[x] = expCyc[x].V;
+                        if (part) partialMiss[x] = rec;
                         expCyc.Remove(x);
                     }
                     expCycOrder.RemoveRange(mark, expCycOrder.Count - mark);
                     expGrew = savedGrew;
                     expLow = savedLow;
+                    if (part) TakePartial(id);
                     return to[id];
                 }
             }
             catch
             {
+                missTop = up;
                 for (var i = mark; i < expCycOrder.Count; i++) expCyc.Remove(expCycOrder[i]);
                 expCycOrder.RemoveRange(mark, expCycOrder.Count - mark);
                 throw;

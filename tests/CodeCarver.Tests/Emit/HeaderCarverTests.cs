@@ -305,6 +305,46 @@ public class HeaderCarverTests
         finally { TempDir.Delete(dir); }
     }
 
+    /// <summary>A paste onto an alias of many names pastes only its last: <c>CAT(KW_ALL, _R5)</c> with KW_ALL naming
+    /// 2,000 aliases builds one name, not one per alias. The edge walk went on past names that can't be empty, so each
+    /// use built 2,000 names, each waiting in every batch for its big header: 1,000 such uses took 1.3 GB and the
+    /// carve never finished.</summary>
+    [Fact]
+    public void Carve_PasteOntoAWideAlias_BuildsOnlyItsLastName()
+    {
+        const int uses = 2000, aliases = 2000, headers = 8;
+        var dir = Path.Combine(Path.GetTempPath(), "codecarver-hdrw-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var app = new System.Text.StringBuilder("#define CAT(a, b) a##b\n#define XCAT(a, b) CAT(a, b)\n#define KW_ALL");
+            for (var j = 0; j < aliases; j++) app.Append($" KW_S{j}");
+            app.Append('\n');
+            for (var i = 0; i < uses; i++) app.Append($"int x{i} = XCAT(\n#if A\nKW_ALL\n#else\nKW_S{i % aliases}\n#endif\n, _R{i});\n");
+            File.WriteAllText(Path.Combine(dir, "app.c"), app.ToString());
+            var rels = new List<string>();
+            for (var k = 0; k < headers; k++)
+            {
+                var h = new System.Text.StringBuilder(k == 0 ? "#define KQ0_R1 0\n" : "");
+                for (var j = k; j < aliases; j += headers) h.Append($"#define KW_S{j} KQ{j}\n#define KQ{j}_R{j} {j}\n");
+                File.WriteAllText(Path.Combine(dir, $"h{k}.h"), h.ToString());
+                rels.Add($"h{k}.h");
+            }
+            HeaderCarver.BatchBytes.Value = 1;   // a batch per header, as work's 590 big headers came in many
+            var keys = new Dictionary<string, long>();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            HeaderCarver.Carve(dir, rels, partDone: (k, v) => keys[k] = v);
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(60), $"took {sw.Elapsed.TotalSeconds:N0} s");
+            Assert.True(keys["namesBuilt"] < 8 * uses, $"{keys["namesBuilt"]:N0} names built");
+            Assert.True(keys["fixpoint.liveMb"] < 400, $"{keys["fixpoint.liveMb"]:N0} MB live");
+            var h0 = File.ReadAllText(Path.Combine(dir, "h0.h"));
+            Assert.DoesNotContain("KQ0_R1", h0);                // KQ0 is never last: KW_S1 gives KQ1_R1
+            Assert.Contains("#define KQ0_R0 0", h0);
+            Assert.Contains($"#define KQ{aliases - 1}_R{aliases - 1} ", File.ReadAllText(Path.Combine(dir, $"h{(aliases - 1) % headers}.h")));
+        }
+        finally { Directory.Delete(dir, recursive: true); }
+    }
+
     /// <summary>A dropped #define must not take half a comment with it, and a #define inside a comment is text.</summary>
     [Fact]
     public void Carve_RespectsBlockComments()

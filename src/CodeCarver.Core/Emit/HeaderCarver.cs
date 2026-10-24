@@ -201,7 +201,9 @@ public static partial class HeaderCarver
         string Learned() => engine is null
             ? $"{pasterCount:N0} paste macros, {needed.Count:N0} names"
             : $"{facts.Pasters.Count:N0} paste macros, {needed.Count:N0} names, {engine.Uses:N0} paste uses, " +
-              $"{engine.Results.Exact.Count:N0} names built, {engine.Results.Patterns:N0} patterns, {engine.Results.Pools:N0} pools" +
+              $"{engine.Results.Exact.Count:N0} names built, {engine.Results.Patterns:N0} patterns, {engine.Results.Pools:N0} pools, " +
+              $"{engine.Runs:N0} use runs" + (engine.Left > 0 ? $" ({engine.Left:N0} to go)" : "") +
+              (engine.OverWork > 0 ? $", {engine.OverWork:N0} over the work limit" : "") +
               (headersAll > 0 ? $", {Volatile.Read(ref headersRead):N0} of {headersAll:N0} big headers read" : "");
         CodeCarver.Core.Util.Activity.Doing("reading the kept files for names and defines", Learned);
         foreach (var (i, seen) in CodeCarver.Core.Util.ReadAhead.Ordered(candidates, SeedScan, CodeCarver.Core.Util.ReadAhead.Window))
@@ -292,7 +294,7 @@ public static partial class HeaderCarver
         //    taken two passes back (a name taken in a pass may have been passed over in a batch before it became
         //    wanted). A use that met a name whose big-header defines were not read yet asks for them: each batch hands
         //    them back, and the use runs again with them.
-        var batches = Batches(bigFull, 256L << 20);
+        var batches = Batches(bigFull, BatchBytes.Value ?? 256L << 20);
         // Defines taken, by key (see NameKey): work took 18.9M in one pass, held as strings.
         var done = new HashSet<UInt128>();
         var takenBefore = new HashSet<UInt128>();
@@ -547,6 +549,9 @@ public static partial class HeaderCarver
         }
         return false;
     }
+
+    /// <summary>A test's batch size: work's first batch held 8 headers, a small test's hold all of them.</summary>
+    internal static readonly AsyncLocal<long?> BatchBytes = new();
 
     /// <summary>The headers in runs of about <paramref name="bytes"/> each, in order.</summary>
     private static List<List<string>> Batches(List<string> paths, long bytes)
