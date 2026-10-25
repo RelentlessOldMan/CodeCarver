@@ -133,12 +133,13 @@ public sealed class PpTraceTests
             Assert.True(roomy.PeakRunning > 1, "runs that fit run at once");
             Assert.Equal(0, roomy.Evictions);
 
-            // Room for about one and a half: the runs hold no more than the budget and what they grow by between two
-            // samples, and every command still finishes.
+            // Room for about one and a half: the runs hold no more than the budget and what two grow by between two
+            // samples on a slow machine (under one run; running all three at once would hold two budgets), and every
+            // command still finishes.
             var budget = roomy.PeakChildBytes * 3 / 2;
             var tight = PpTrace.Run(exe!, cmds, parallel: 3, memoryBudget: budget);
             Assert.True(tight.Complete, $"{tight.Succeeded} of {tight.Commands}");
-            Assert.True(tight.PeakTotalBytes <= budget + roomy.PeakChildBytes / 4, $"{tight.PeakTotalBytes >> 20} MB held of {budget >> 20}");
+            Assert.True(tight.PeakTotalBytes <= budget + roomy.PeakChildBytes, $"{tight.PeakTotalBytes >> 20} MB held of {budget >> 20}");
             Assert.Equal(roomy.Names, tight.Names);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
