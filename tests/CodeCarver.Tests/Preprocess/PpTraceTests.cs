@@ -67,6 +67,16 @@ public sealed class PpTraceTests
     public void PlainAssembly_IsNotPreprocessed(string file, bool preprocessed) =>
         Assert.Equal(preprocessed, PpTrace.Preprocessed(file));
 
+    [Theory]
+    [InlineData("PLEASE submit a bug report to the LLVM project|Stack dump:", PpTrace.Failure.Crash, null)]
+    [InlineData("a.c:1:10: fatal error: 'kq/gen.h' file not found", PpTrace.Failure.HeaderNotFound, "kq/gen.h")]
+    [InlineData("error: unknown argument: '-mkq-fast'|a.c:3:1: error: unknown type name 'kq_t'", PpTrace.Failure.Option, null)]
+    [InlineData("error: unsupported option '-mkq' for target 'aarch64-none-elf'", PpTrace.Failure.Option, null)]
+    [InlineData("a.c:3:1: error: unknown type name 'kq_t'", PpTrace.Failure.Error, null)]
+    [InlineData("", PpTrace.Failure.NoMessage, null)]
+    public void Classify_SaysWhyARunFailed(string lines, PpTrace.Failure why, string? header) =>
+        Assert.Equal((why, header), PpTrace.Classify(lines.Split('|', StringSplitOptions.RemoveEmptyEntries)));
+
     [SkippableFact]
     public void Run_GivesTheNamesTheLiveCodeUsed_AndCountsWhatDidNotRun()
     {
@@ -122,6 +132,12 @@ public sealed class PpTraceTests
             Assert.Equal(3, paths.MissingPaths);
             Assert.Equal((1, 1, 1), (paths.MissingForcedInclude, paths.MissingWorkDir, paths.MissingSource));
             Assert.Equal(6, paths.Commands);   // g.c ran and failed: gen.h was only in out/gen
+            Assert.Equal((1, 0, 1), (paths.FailedHeaderNotFound, paths.FailedHeaderNotFoundCLibrary, paths.HeadersNotFound));
+
+            // A bare-metal target with no C library here: the build's came from its toolchain's folders.
+            File.WriteAllText(Path.Combine(dir, "lib.c"), "#include <string.h>\nint l;\n");
+            var lib = PpTrace.Run(exe!, new[] { Cmd(dir, "lib.c", "aarch64-none-elf-clang", "-c"), Cmd(dir, "g.c", "clang", "-c") }, parallel: 2, root: dir);
+            Assert.Equal((2, 1, 2), (lib.FailedHeaderNotFound, lib.FailedHeaderNotFoundCLibrary, lib.HeadersNotFound));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

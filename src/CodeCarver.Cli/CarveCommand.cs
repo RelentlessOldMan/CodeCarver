@@ -1338,6 +1338,14 @@ public static class CarveCommand
             summary["world.ppTrace.refused"] = trace.Refused;
             summary["world.ppTrace.incomplete"] = trace.Incomplete;
             summary["world.ppTrace.timedOut"] = trace.TimedOut;
+            summary["world.ppTrace.failedBy.crash"] = trace.FailedCrash;
+            summary["world.ppTrace.failedBy.headerNotFound"] = trace.FailedHeaderNotFound;
+            summary["world.ppTrace.failedBy.headerNotFound.cLibrary"] = trace.FailedHeaderNotFoundCLibrary;
+            summary["world.ppTrace.failedBy.option"] = trace.FailedOption;
+            summary["world.ppTrace.failedBy.error"] = trace.FailedError;
+            summary["world.ppTrace.failedBy.noMessage"] = trace.FailedNoMessage;
+            summary["world.ppTrace.failedBy.notStarted"] = trace.FailedNotStarted;
+            summary["world.ppTrace.headersNotFound"] = trace.HeadersNotFound;
             summary["world.ppTrace.names"] = trace.Names.Count;
             summary["world.ppTrace.unitsWithoutCommand"] = unitsWithout;
             summary["world.ppTrace.trusted"] = trusted ? 1 : 0;
@@ -1354,7 +1362,15 @@ public static class CarveCommand
                 + (trusted ? UsedFor(unitsWithout)
                    : $"; NOT trusted ({string.Join(", ", new[] {
                          trace.Commands == 0 ? "no command to run" : null,
-                         ran > 0 ? $"{ran:N0} failed{(trace.TimedOut > 0 ? $" ({trace.TimedOut:N0} over the time limit)" : "")}" : null,
+                         ran > 0 ? $"{ran:N0} failed: " + string.Join(", ", new[] {
+                             trace.TimedOut > 0 ? $"{trace.TimedOut:N0} over the time limit" : null,
+                             trace.FailedHeaderNotFound > 0 ? $"{trace.FailedHeaderNotFound:N0} an include not found ({trace.HeadersNotFound:N0} header(s); {trace.FailedHeaderNotFoundCLibrary:N0} the C library's: its toolchain folders, pathMap?)" : null,
+                             trace.FailedOption > 0 ? $"{trace.FailedOption:N0} an option the driver rejected" : null,
+                             trace.FailedError > 0 ? $"{trace.FailedError:N0} another error" : null,
+                             trace.FailedCrash > 0 ? $"{trace.FailedCrash:N0} pp-trace crashed" : null,
+                             trace.FailedNoMessage > 0 ? $"{trace.FailedNoMessage:N0} no error printed" : null,
+                             trace.FailedNotStarted > 0 ? $"{trace.FailedNotStarted:N0} didn't start" : null,
+                         }.Where(x => x is not null)) : null,
                          trace.MissingPaths > 0 ? $"{trace.MissingPaths:N0} name a path missing here: " + string.Join(", ", new[] {
                              trace.MissingWorkDir > 0 ? $"{trace.MissingWorkDir:N0} the directory it ran in" : null,
                              trace.MissingSource > 0 ? $"{trace.MissingSource:N0} its source" : null,

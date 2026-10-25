@@ -104,6 +104,9 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
   those `missingDirsInRootFromBuild`: at, above or under a folder some `-o` writes to). If a header only such a
   directory held is needed, the compile fails and says so. Generate those headers in the tree before the carve, or
   the commands that include them fail.
+- The `failedBy.*` keys say why commands failed. Many `headerNotFound.cLibrary` means the build's C library isn't
+  where the log says: it is in the build machine's toolchain folders. Install the same toolchain on the carve machine
+  and map the log's toolchain path to it with `[advanced] pathMap`.
 - A driver named for its target (`aarch64-none-elf-clang`) gets that target passed as `--target`. `clang++` and the
   file's extension pick C++.
 - `.S` and `.sx` files run too: pp-trace parses them as C after preprocessing, so their parse errors are expected;
@@ -143,6 +146,8 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `world.ppTrace.commands` / `.succeeded` / `.failed` | commands pp-trace was to run, ran clean, and didn't |
 | `world.ppTrace.missingPaths` / `.refused` / `.incomplete` / `.timedOut` | of the failed: a path missing here, a flag that loads other code, not all of it in the log (an unreadable response file), over the time limit |
 | `world.ppTrace.missing.workDir` / `.source` / `.forcedInclude` | of `missingPaths`: what was missing |
+| `world.ppTrace.failedBy.crash` / `.headerNotFound` / `.option` / `.error` / `.noMessage` / `.notStarted` | of the commands that ran and failed within the time limit, why, by the first that applies: pp-trace crashed, an include wasn't found, the driver rejected an option, another error, no error printed, pp-trace didn't start |
+| `world.ppTrace.failedBy.headerNotFound.cLibrary` / `world.ppTrace.headersNotFound` | of `headerNotFound`, those whose header is the C standard library's (`stdio.h`, `string.h`, ...); and the distinct headers not found |
 | `world.ppTrace.ranWithoutOutsideDirs` / `.ranWithoutDirsInRoot` | commands that ran with an include directory missing here, outside the carve root / inside it |
 | `world.ppTrace.missingDirsInRoot` / `.missingDirsInRootFromBuild` | distinct include directories inside the carve root missing here, and of those, the ones at, above or under a folder some `-o` writes to |
 | `world.ppTrace.notPreprocessed` | `.s` and `.asm` commands, not run |

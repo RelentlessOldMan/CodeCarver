@@ -54,6 +54,20 @@ public sealed class PpTrace
     public int Incomplete { get; private set; }
     /// <summary>Commands pp-trace didn't finish within the time limit.</summary>
     public int TimedOut { get; private set; }
+    /// <summary>Of the commands that ran and failed, within the time limit, why, by what pp-trace printed: a crash, an
+    /// include it couldn't find (a fatal error), an option the driver rejected, another error, no error printed, or
+    /// pp-trace didn't start. The first that applies counts.</summary>
+    public int FailedCrash { get; private set; }
+    public int FailedHeaderNotFound { get; private set; }
+    public int FailedOption { get; private set; }
+    public int FailedError { get; private set; }
+    public int FailedNoMessage { get; private set; }
+    public int FailedNotStarted { get; private set; }
+    /// <summary>Of <see cref="FailedHeaderNotFound"/>, those whose header is one of the C standard library's
+    /// (<c>stdio.h</c>, <c>string.h</c>, ...): the build's C library, usually in its toolchain's folders, isn't
+    /// where the command says. And the distinct headers not found, by name.</summary>
+    public int FailedHeaderNotFoundCLibrary { get; private set; }
+    public int HeadersNotFound { get; private set; }
     /// <summary>pp-trace's version line (<c>LLVM version 17.0.6</c>), or null when it printed none.</summary>
     public string? Version { get; private set; }
 
@@ -86,6 +100,9 @@ public sealed class PpTrace
         int succeeded = 0, missing = 0, refused = 0, incomplete = 0, timedOut = 0, outside = 0, inRoot = 0;
         var missingBy = new int[4];
         var missingInRoot = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(PathComparer.Default);
+        var failedBy = new int[Enum.GetValues<Failure>().Length];
+        int cLibrary = 0;
+        var notFound = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
         var namesLock = new object();
         Parallel.ForEach(traced, new ParallelOptions { MaxDegreeOfParallelism = most }, cmd =>
         {
@@ -104,14 +121,25 @@ public sealed class PpTrace
             foreach (var d in dirs) if (d.Inside) missingInRoot.TryAdd(d.Dir, 0);
             var names = new HashSet<ulong>();
             bool ok, late;
+            Failure failure;
+            string? header;
             while (true)
             {
                 using var lease = gate.Admit();
-                (ok, late) = TraceOne(exe, cmd, names, timeoutMs, lease);
+                (ok, late, failure, header) = TraceOne(exe, cmd, names, timeoutMs, lease);
                 if (!lease.Evicted) break;
                 names.Clear();   // stopped for memory: run again when there is room
             }
             if (late) Interlocked.Increment(ref timedOut);
+            if (!ok && !late)
+            {
+                Interlocked.Increment(ref failedBy[(int)failure]);
+                if (header is not null)
+                {
+                    notFound.TryAdd(header, 0);
+                    if (CLibraryHeaders.Contains(header)) Interlocked.Increment(ref cLibrary);
+                }
+            }
             if (!ok) return;
             Interlocked.Increment(ref succeeded);
             lock (namesLock) r.Names.UnionWith(names);
@@ -129,6 +157,14 @@ public sealed class PpTrace
         r.Refused = refused;
         r.Incomplete = incomplete;
         r.TimedOut = timedOut;
+        r.FailedCrash = failedBy[(int)Failure.Crash];
+        r.FailedHeaderNotFound = failedBy[(int)Failure.HeaderNotFound];
+        r.FailedOption = failedBy[(int)Failure.Option];
+        r.FailedError = failedBy[(int)Failure.Error];
+        r.FailedNoMessage = failedBy[(int)Failure.NoMessage];
+        r.FailedNotStarted = failedBy[(int)Failure.NotStarted];
+        r.FailedHeaderNotFoundCLibrary = cLibrary;
+        r.HeadersNotFound = notFound.Count;
         r.BudgetBytes = gate.Budget;
         r.PeakChildBytes = gate.PeakChildBytes;
         r.PeakTotalBytes = gate.PeakTotalBytes;
@@ -261,7 +297,39 @@ public sealed class PpTrace
         return dirs;
     }
 
-    private static (bool Ok, bool TimedOut) TraceOne(string exe, CompileCommand cmd, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease)
+    public enum Failure { NotStarted, Crash, HeaderNotFound, Option, Error, NoMessage }
+
+    /// <summary>The C standard library's headers, C89 to C23.</summary>
+    internal static readonly HashSet<string> CLibraryHeaders = new(StringComparer.Ordinal)
+    {
+        "assert.h", "complex.h", "ctype.h", "errno.h", "fenv.h", "float.h", "inttypes.h", "iso646.h", "limits.h",
+        "locale.h", "math.h", "setjmp.h", "signal.h", "stdalign.h", "stdarg.h", "stdatomic.h", "stdbit.h", "stdbool.h",
+        "stdckdint.h", "stddef.h", "stdint.h", "stdio.h", "stdlib.h", "stdnoreturn.h", "string.h", "tgmath.h",
+        "threads.h", "time.h", "uchar.h", "wchar.h", "wctype.h",
+    };
+
+    static readonly Regex NotFoundLine = new(@"fatal error: '([^']+)' file not found", RegexOptions.CultureInvariant);
+    static readonly string[] OptionErrors = { "unknown argument", "unsupported option", "unsupported argument", "unknown target", "invalid value", "invalid argument", "unsupported target" };
+
+    /// <summary>Why a run failed, from the lines it printed to stderr (see <see cref="FailedCrash"/>); the header it
+    /// couldn't find, for a fatal one.</summary>
+    internal static (Failure Why, string? Header) Classify(IEnumerable<string> stderr)
+    {
+        bool crash = false, option = false, error = false;
+        string? header = null;
+        foreach (var line in stderr)
+        {
+            if (line.Contains("PLEASE submit a bug report", StringComparison.Ordinal) || line.StartsWith("Stack dump:", StringComparison.Ordinal)) crash = true;
+            if (header is null && NotFoundLine.Match(line) is { Success: true } m) header = m.Groups[1].Value;
+            if (!line.Contains("error:", StringComparison.Ordinal)) continue;
+            error = true;
+            if (OptionErrors.Any(o => line.Contains(o, StringComparison.Ordinal))) option = true;
+        }
+        var why = crash ? Failure.Crash : header is not null ? Failure.HeaderNotFound : option ? Failure.Option : error ? Failure.Error : Failure.NoMessage;
+        return (why, header);
+    }
+
+    private static (bool Ok, bool TimedOut, Failure Why, string? Header) TraceOne(string exe, CompileCommand cmd, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease)
     {
         // The command goes in a compile database of its own: no command-line quoting or length limit to meet.
         var db = Path.Combine(Path.GetTempPath(), "codecarver-ppt-" + Guid.NewGuid().ToString("N"));
@@ -285,11 +353,18 @@ public sealed class PpTrace
 
             using var launch = IoMeter.Start(IoMeter.Kind.Launch);   // until pp-trace exits
             using var p = Process.Start(psi);
-            if (p is null) return (false, false);
+            if (p is null) return (false, false, Failure.NotStarted, null);
             lease.Track(p);
             p.StandardInput.Close();
             var fatal = false;   // drained so a full stderr pipe can't block it
-            p.ErrorDataReceived += (_, e) => { if (e.Data?.Contains("fatal error:", StringComparison.Ordinal) == true) fatal = true; };
+            var said = new List<string>();   // what's needed to say why it failed: error lines and a crash's
+            p.ErrorDataReceived += (_, e) =>
+            {
+                if (e.Data is not { } line) return;
+                if (line.Contains("fatal error:", StringComparison.Ordinal)) fatal = true;
+                if (said.Count < 64 && (line.Contains("error:", StringComparison.Ordinal) || line.Contains("PLEASE submit", StringComparison.Ordinal) || line.StartsWith("Stack dump:", StringComparison.Ordinal)))
+                    said.Add(line);
+            };
             p.BeginErrorReadLine();
             var timedOut = false;
             using var timer = new Timer(_ =>
@@ -300,9 +375,11 @@ public sealed class PpTrace
             ReadNames(p.StandardOutput, names);
             p.WaitForExit();   // also waits for stderr's last line
             var clean = p.ExitCode == 0 || (AssemblyWithCpp(cmd.File) && p.ExitCode == 1 && !fatal);
-            return (!timedOut && !lease.Evicted && clean, timedOut);
+            var ok = !timedOut && !lease.Evicted && clean;
+            var (why, header) = ok ? (Failure.NoMessage, null) : Classify(said);
+            return (ok, timedOut, why, header);
         }
-        catch (Exception ex) when (ex is not OutOfMemoryException) { return (false, false); }
+        catch (Exception ex) when (ex is not OutOfMemoryException) { return (false, false, Failure.NotStarted, null); }
         finally
         {
             try { Directory.Delete(db, true); } catch { /* best effort */ }
