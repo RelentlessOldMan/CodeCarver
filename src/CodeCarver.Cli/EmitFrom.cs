@@ -43,7 +43,10 @@ public static class EmitFrom
         L("pathMap", cv.PathMap.Select(p => p.From + "->" + p.To));
         L("flags", new[] { cv.ClosedWorld, cv.DropUnobservedCmm, cv.AllowUnmatchedTraces, cv.PruneGarbage }.Select(b => b ? "1" : "0"));
         L("advanced", new[] { cv.MaxParseBytes?.ToString() ?? "", cv.ParseTimeout?.ToString() ?? "", cv.MaxSymbolsPerFile?.ToString() ?? "" });
-        foreach (var f in cv.BuildLogs.Concat(cv.BuildTraceFiles).Concat(cv.RunTraceFiles).Concat(cv.RunTraceLogs))
+        // usedMacros may name folders: each file in them counts.
+        var usedFiles = cv.UsedMacros.SelectMany<string, string>(p => Directory.Exists(p)
+            ? Directory.EnumerateFiles(p, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal) : new[] { p });
+        foreach (var f in cv.BuildLogs.Concat(cv.BuildTraceFiles).Concat(cv.RunTraceFiles).Concat(cv.RunTraceLogs).Concat(usedFiles))
         {
             var info = new FileInfo(f);
             L("input", new[] { Path.GetFullPath(f), info.Exists ? info.Length.ToString() : "-", info.Exists ? info.LastWriteTimeUtc.Ticks.ToString() : "-" });

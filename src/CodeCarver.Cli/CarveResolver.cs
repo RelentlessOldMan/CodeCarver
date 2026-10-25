@@ -23,6 +23,7 @@ public sealed class ResolvedCarve
     /// <summary>Names the selected builds define differently or not at all (review W3): unknown, not defined.</summary>
     public List<string> VaryingDefines = new();
     public List<string> BuildTraceFiles = new();
+    public List<string> UsedMacros = new();        // files or folders of what the compiles printed with -E -dU
     public bool EveryBuildTraced;                  // every selected build has a build trace: its opens cover the whole build
     public string? CacheDirectory;                 // [advanced] cacheEnabled: where the big headers' names are kept between runs; null: no cache
     public string? MirrorOf;                       // [advanced] the carve root must match this tree (a local copy of a share)
@@ -43,6 +44,7 @@ public sealed class ResolvedCarve
     public int? ParseTimeout;                      // seconds
     public long? MemoryStopMb;                     // see CarveTomlConfig.MemoryStopMb
     public int? MaxSymbolsPerFile;
+    public long? HeaderCarveMinutes;               // see CarveTomlConfig.HeaderCarveMinutes
 }
 
 public static class CarveResolver
@@ -110,6 +112,7 @@ public static class CarveResolver
         r.ParseTimeout = cfg.ParseTimeout;
         r.MemoryStopMb = cfg.MemoryStopMb;
         r.MaxSymbolsPerFile = cfg.MaxSymbolsPerFile;
+        r.HeaderCarveMinutes = cfg.HeaderCarveMinutes;
 
         // Selected builds/runs (UNION). Null selection = all defined.
         var buildNames = cfg.UseBuilds ?? cfg.Builds.Keys.ToList();
@@ -120,6 +123,7 @@ public static class CarveResolver
             r.BuildLogs.AddRange(bs.BuildLogs);
             r.Defines.AddRange(bs.Defines);
             r.BuildTraceFiles.AddRange(bs.BuildTraceFiles);
+            r.UsedMacros.AddRange(bs.UsedMacros);
             if (!string.IsNullOrWhiteSpace(bs.Compiler)) r.Compilers.Add(bs.Compiler!);
             r.CompilerNames.AddRange(bs.CompilerNames);
         }
@@ -153,6 +157,7 @@ public static class CarveResolver
             r.Defines = r.Defines.Where(s => !r.VaryingDefines.Contains(Name(s))).ToList();
         }
         r.BuildTraceFiles = r.BuildTraceFiles.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        r.UsedMacros = r.UsedMacros.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.RunTraceFiles = r.RunTraceFiles.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.RunTraceLogs = r.RunTraceLogs.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.Compilers = r.Compilers.Distinct(StringComparer.OrdinalIgnoreCase).ToList();

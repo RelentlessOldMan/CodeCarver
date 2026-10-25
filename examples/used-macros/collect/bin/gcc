@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stands in for gcc on PATH: the build runs gcc, this runs the real one and records what it used.
+# ADAPT: name a copy after each compiler driver your build runs (arm-none-eabi-gcc, ...).
+exec sh "$(dirname "$0")/../du-wrap.sh" "$(basename "$0")" "$@"

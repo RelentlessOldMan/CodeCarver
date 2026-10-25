@@ -19,6 +19,10 @@ namespace CodeCarver.Cli;
 /// </summary>
 public static class CarveCommand
 {
+    /// <summary>The static header carve's time limit when <c>[advanced] headerCarveMinutes</c> is unset. Past it the big
+    /// headers stay whole: work's 1.0.345 max stage read them for 2 hours and dropped none.</summary>
+    const long DefaultHeaderCarveMinutes = 30;
+
     /// <summary>
     /// Run a carve. <paramref name="args"/> is the full argv (<c>args[0]=="carve"</c>, <c>args[1]</c> = source
     /// dir). Output goes to the injected writers (Console in production, a capture buffer under test). Wraps the
@@ -185,7 +189,8 @@ public static class CarveCommand
         {
             var inputFiles = buildLogs.Concat(traceList).Concat(buildFileTraces).Concat(runFileTraces)
                                       .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            var missing = inputFiles.Where(f => !File.Exists(f)).ToList();
+            var missing = inputFiles.Where(f => !File.Exists(f))
+                                    .Concat(cv.UsedMacros.Where(f => !File.Exists(f) && !Directory.Exists(f))).ToList();
             if (missing.Count > 0)
             {
                 err.WriteLine($"missing {missing.Count} input file(s) referenced in the config — fix the path(s):");
@@ -1228,6 +1233,42 @@ public static class CarveCommand
                                          + $"{exactPre.Refused:N0} refused), so headers keep the scanner's answer" : ""));
         }
         Mark("preprocess");
+        // What the build's compiles used, from -E -dU (docs/USED-MACROS.md): trusted only when every compile command has
+        // its file and every translation unit the build compiles has a command.
+        IReadOnlySet<ulong>? usedMacros = null;
+        if (cv.UsedMacros.Count > 0)
+        {
+            if (buildCmds.Count == 0)
+            {
+                err.WriteLine("usedMacros needs the build log the files came from: set buildLogs in the same [builds.X].");
+                return 2;
+            }
+            var um = CodeCarver.Core.Preprocess.UsedMacros.Read(cv.UsedMacros);
+            var tuExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
+            var logged = buildCmds.Select(CmdRel).Where(r => r is not null).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var unitsWithout = parseRels.Count(r => !notBuilt.Contains(r) && tuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !logged.Contains(r));
+            var cov = um.Check(buildCmds, dir, MapPath, unitsWithout);
+            summary["world.usedMacros.files"] = um.Files;
+            summary["world.usedMacros.incomplete"] = um.Incomplete;
+            summary["world.usedMacros.noSource"] = um.NoSource;
+            summary["world.usedMacros.noMacros"] = um.NoMacros;
+            summary["world.usedMacros.duplicates"] = um.Duplicates;
+            summary["world.usedMacros.names"] = um.Names.Count;
+            summary["world.usedMacros.commands"] = cov.Commands;
+            summary["world.usedMacros.commandsCovered"] = cov.Covered;
+            summary["world.usedMacros.unitsWithoutCommand"] = cov.UnitsWithoutCommand;
+            summary["world.usedMacros.trusted"] = cov.Complete ? 1 : 0;
+            if (cov.Complete) usedMacros = um.Names;
+            err.WriteLine($"  config  : used macros: {um.Files:N0} file(s), {um.Names.Count:N0} name(s), {cov.Covered:N0} of {cov.Commands:N0} compile command(s) covered"
+                + (cov.Complete ? " -> the big headers keep only the defines the compiles used"
+                   : $"; NOT trusted ({string.Join(", ", new[] {
+                         cov.Commands - cov.Covered > 0 ? $"{cov.Commands - cov.Covered:N0} command(s) without a file" : null,
+                         cov.UnitsWithoutCommand > 0 ? $"{cov.UnitsWithoutCommand:N0} source file(s) in no command" : null,
+                         um.Incomplete > 0 ? $"{um.Incomplete:N0} file(s) not ending in {CodeCarver.Core.Preprocess.UsedMacros.OkLine}" : null,
+                         um.NoSource > 0 ? $"{um.NoSource:N0} naming no source" : null,
+                         um.NoMacros > 0 ? $"{um.NoMacros:N0} with no #define (not -dU output?)" : null,
+                     }.Where(x => x is not null))}), so the header carve models the paste macros itself"));
+        }
         if (perFileSpecs.Count > 0)
         {
             // D-B: translation units no compile command covers are resolved open-world; say how many.
@@ -3654,6 +3695,7 @@ public static class CarveCommand
             sb.AppendLine($"compilerNames = {L(cv.CompilerNames)}");
             sb.AppendLine($"defines = {L(manualDefines)}");
             sb.AppendLine($"buildTraceFiles = {L(buildFileTraces)}");
+            sb.AppendLine($"usedMacros = {L(cv.UsedMacros)}");
             sb.AppendLine("[runs.resolved]");
             sb.AppendLine($"runTraceFiles = {L(runFileTraces)}");
             sb.AppendLine($"runTraceLogs = {L(traceList)}");
@@ -3876,7 +3918,13 @@ public static class CarveCommand
                     var elsewhereDefines = new List<string>(outsideDefineTexts);
                     foreach (var spec in buildCmds.SelectMany(c => c.Defines).Concat(defineSpecs).Distinct(StringComparer.Ordinal))
                         elsewhereDefines.Add(spec.IndexOf('=') is var eq and > 0 ? $"#define {spec[..eq]} {spec[(eq + 1)..]}" : $"#define {spec} 1");
-                    var hc = HeaderCarver.Carve(stageDir, keptBig, elsewhere, (key, value) => summary[$"{summaryStage}.headerCarve.{key}"] = value, elsewhereDefines);
+                    void HcKey(string key, long value) => summary[$"{summaryStage}.headerCarve.{key}"] = value;
+                    // The compiles said what they used: no model of the paste macros needed (docs/USED-MACROS.md).
+                    var hc = usedMacros is not null
+                        ? HeaderCarver.CarveFromUsed(stageDir, keptBig, usedMacros, HcKey)
+                        : HeaderCarver.Carve(stageDir, keptBig, elsewhere, HcKey, elsewhereDefines,
+                                             TimeSpan.FromMinutes(cv.HeaderCarveMinutes ?? DefaultHeaderCarveMinutes));
+                    summary[$"{summaryStage}.headerCarve.fromUsedMacros"] = usedMacros is not null ? 1 : 0;
                     summary[$"{summaryStage}.headerCarve.bytesBefore"] = hc.BytesBefore;
                     summary[$"{summaryStage}.headerCarve.bytesAfter"] = hc.BytesAfter;
                     summary[$"{summaryStage}.headerCarve.definesKept"] = hc.DefinesKept;
@@ -3890,7 +3938,9 @@ public static class CarveCommand
                     if (hc.AbandonedIn is { } abandonedIn)
                     {
                         summary[$"{summaryStage}.headerCarve.abandonedIn"] = abandonedIn;
-                        err.WriteLine($"  warn    : the header carve passed its memory limit in its {abandonedIn} ({hc.AbandonedPrivateMb:N0} MB private) "
+                        err.WriteLine((hc.AbandonedOverTime
+                                ? $"  warn    : the header carve passed its time limit (headerCarveMinutes {cv.HeaderCarveMinutes ?? DefaultHeaderCarveMinutes}) in its {abandonedIn} "
+                                : $"  warn    : the header carve passed its memory limit in its {abandonedIn} ({hc.AbandonedPrivateMb:N0} MB private) ")
                             + $"and left the {keptBig.Count} big header(s) whole; the rest of the stage goes on");
                     }
                     var hpct = hc.BytesBefore > 0 ? (double)(hc.BytesBefore - hc.BytesAfter) / hc.BytesBefore : 0;

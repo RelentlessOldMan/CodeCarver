@@ -1,0 +1,27 @@
+# The used-macros example (README.md): carved from the build log and what each compile printed with -E -dU.
+#   sh run.sh <codecarver>           # build with the collector, carve, build + run every carved stage
+#   carve src --config carve.toml    # just the carve, from the capture in inputs/
+
+outputDirectory = "out"
+
+[common]
+entryPoints = ["main"]
+languages   = ["c"]
+
+[builds.main]
+buildLogs  = ["inputs/build.log"]
+usedMacros = ["inputs/du"]
+
+[advanced]
+# The inputs were captured on a Linux build machine under /build/used-macros: map its paths onto this checkout.
+pathMap = [{ from = "/build/used-macros/src", to = "." }]
+# Small, so this sample's 20 KB register header counts as big. Leave it unset in a real tree.
+maxParseBytes = 4000
+
+[stages.safe]
+carveSourceFileContents = false
+carveHeaderFileContents = false
+
+[stages.max]
+carveSourceFileContents = true
+carveHeaderFileContents = true

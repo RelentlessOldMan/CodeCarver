@@ -1,0 +1,30 @@
+#codecarver-cwd /build/used-macros/src
+# 0 "uart.c"
+# 0 "<built-in>"
+# 0 "<command-line>"
+# 1 "/usr/include/stdc-predef.h" 1 3 4
+#undef _STDC_PREDEF_H
+#define __GCC_IEC_559 2
+#define __GCC_IEC_559_COMPLEX 2
+# 0 "<command-line>" 2
+# 1 "uart.c"
+# 1 "inc/kq_config.h" 1
+#undef KQ_CONFIG_H
+# 2 "uart.c" 2
+# 1 "inc/kq_regs.h" 1
+#undef KQ_REGS_H
+# 3 "uart.c" 2
+#define KQ_UART_CTRL_EN_BMSK (0x7u << 0)
+#define KQ_UART_CTRL_EN_SHFT 0
+#define KQ_UART_CTRL_MODE_BMSK (0x7u << 3)
+#define KQ_MASK(blk,reg,fld) KQ_ ##blk ##_ ##reg ##_ ##fld ##_BMSK
+#define KQ_UART_CTRL_MODE_SHFT 3
+#define KQ_SHIFT(blk,reg,fld) KQ_ ##blk ##_ ##reg ##_ ##fld ##_SHFT
+#define KQ_FIELD(blk,reg,fld,v) (((v) << KQ_SHIFT(blk, reg, fld)) & KQ_MASK(blk, reg, fld))
+#define KQ_UART_MODE 2
+#define KQ_UART_CTRL_OFF 0x0u
+#define KQ_BLK_UART 0x4000u
+#define KQ_CAT(a,b) a ##b
+#define KQ_REG(blk,reg) (KQ_CAT(KQ_BLK_, blk) + KQ_ ##blk ##_ ##reg ##_OFF)
+# 7 "uart.c"
+#codecarver-ok

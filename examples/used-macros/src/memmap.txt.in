@@ -1,0 +1,2 @@
+uart_base = KQ_BLK_UART
+spi_base = KQ_BLK_SPI

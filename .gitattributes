@@ -5,6 +5,8 @@
 # Shell scripts must stay LF - CRLF breaks the `#!/usr/bin/env bash` shebang under WSL/Linux
 # (`bad interpreter: .../bash^M`). These are run inside WSL by the linker-map / C++ link oracles.
 *.sh text eol=lf
+# The used-macros example runs on a Linux build machine: its gcc stand-in and Makefile too.
+examples/used-macros/** text eol=lf
 
 # PowerShell scripts check out as CRLF on every platform (Windows PowerShell 5.1 is the target; pwsh reads
 # either). They must also stay ASCII-only: 5.1 reads a BOM-less file as ANSI and misparses e.g. an em dash.

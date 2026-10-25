@@ -76,6 +76,11 @@ jobs:
           }
           exit $failed
 
+      # The used-macros example (docs/USED-MACROS.md): build it with the -dU collector in front of real gcc, carve it
+      # from what the compiles printed, then build and run every carved stage.
+      - name: Used macros
+        run: sh examples/used-macros/run.sh src/CodeCarver.Cli/bin/Release/net8.0/codecarver.dll
+
   # T2 firmware truth (docs/TESTING.md): the vendored CodeSpawner writes a firmware corpus with the defines a header
   # carve must keep and drop; carve it twice and compile every unit of its compile db against the carved tree.
   firmware-truth:

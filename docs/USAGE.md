@@ -160,6 +160,7 @@ use only letters, digits, `_` and `-`.
 | `compilerNames = ["armcc","iccarm"]` | extra compiler driver names to recognise in a **text** build log (gcc/clang/cl and cross drivers are known) |
 | `defines = ["CHIP=F4"]` | manual defines, applied to every file. They do **not** by themselves make the world closed (see below). |
 | `buildTraceFiles = ["build.trace"]` | files opened while **building** (capture with [`tools/capture`](../tools/capture/README.md)) |
+| `usedMacros = ["du/"]` | GCC: what each compile of the same build printed with `-E -dU`, one file per compile (files or folders). When every compile command in `buildLogs` has its file, the max stage's big headers keep only the defines some compile used or a kept non-C file names, instead of modelling the paste macros. Needs `buildLogs` in the same build. See [USED-MACROS.md](USED-MACROS.md) and [`examples/used-macros`](../examples/used-macros) |
 
 **`[runs.NAME]`** — what a real execution touched (optional; tightens + audits):
 
@@ -180,6 +181,7 @@ A stage may also set `stubUnexecuted = true` (with `carveSourceFileContents = tr
 | `maxParseBytes` | `20000000` (bytes) | files larger than this are not parsed; they are kept whole via `#include` closure |
 | `parseTimeout` | `20` (seconds) | per-file parse budget; a file that exceeds it is kept whole. `0` disables the budget |
 | `maxSymbolsPerFile` | `50000` | a file with more symbols than this is kept whole instead of exploding the graph |
+| `headerCarveMinutes` | `30` | the static header carve's time limit for each stage: past it, the carve gives up and leaves the big headers whole (`stageN.headerCarve.abandonedOverTime = 1`) and the stage goes on. `0`: no limit. Not used when the header carve works from `usedMacros` |
 | `pathMap = [{ from = "/build/agent/repo", to = "." }]` | none | rewrites a path prefix captured elsewhere (CI agent, other drive, WSL vs Windows) onto the carve root. `to` is relative to the carve root. Applies to trace paths and to compile commands (directory, file, `-I`, response files) |
 | `allowUnmatchedTraces = true` | `false` | a file trace with no path under the carve root becomes a warning instead of exit 2 |
 | `memoryStopMb = 20000` | none | stop the run when its private memory passes this many MB: it writes `<outputDirectory>/codecarver/stopped-summary.txt` (the summary so far, plus `stop.*` keys) and exits 4. `0` or unset: never stop |
@@ -678,7 +680,10 @@ in the next pass) and `.privateMb`, each as the pass ends.
 The header carve has a memory limit of its own: nine tenths of `memoryStopMb` (of the machine's memory when that is
 not set). Past it, after one full collection, it gives up before it rewrites any header: the big headers stay whole,
 the stage goes on, a `warn    :` line says so, and the summary carries `.abandoned = 1`, `.abandonedIn` (the part it
-was in), `.abandonedPrivateMb` and `.limitMb`. The run is not stopped for it. `CODECARVER_HEADER_CARVE_MB=N` sets
+was in), `.abandonedPrivateMb` and `.limitMb`. The run is not stopped for it. It also has a time limit,
+`[advanced] headerCarveMinutes` (30 by default): past it, it gives up the same way, with `.abandonedOverTime = 1` and
+`.limitMinutes`. With trusted `usedMacros` files ([USED-MACROS.md](USED-MACROS.md)), the header carve models no paste
+macros and needs neither limit. `CODECARVER_HEADER_CARVE_MB=N` sets
 the limit (`0`: none).
 
 What the stage's output is made of: `stageN.bytesAfter.code.<ext>.bytes` and `.files` (code files the build needs,

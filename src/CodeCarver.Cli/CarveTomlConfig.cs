@@ -21,6 +21,7 @@ public sealed class CarveTomlConfig
     public int? ParseTimeout;         // seconds (0 disables)
     public long? MemoryStopMb;        // stop the run when its private memory passes this (0 or unset: never)
     public int? MaxSymbolsPerFile;
+    public long? HeaderCarveMinutes;
     public List<(string From, string To)> PathMap = new();   // trace / compile-command path prefixes -> carve root
     public bool AllowUnmatchedTraces;
     public bool PlaceholderFiles = true;                      // a dropped file the build compiled is emitted as a stand-in
@@ -49,6 +50,7 @@ public sealed class BuildSection
     public List<string> CompilerNames = new();
     public List<string> Defines = new();
     public List<string> BuildTraceFiles = new();
+    public List<string> UsedMacros = new();                   // what each compile printed with -E -dU (docs/USED-MACROS.md)
 }
 
 public sealed class RunSection
@@ -73,11 +75,11 @@ public static class ConfigLoader
     public sealed record Result(CarveTomlConfig? Config, IReadOnlyList<string> Errors, IReadOnlyList<string> Warnings);
 
     private static readonly string[] TopKeys = { "outputDirectory", "analysisOnly", "common", "builds", "runs", "stages", "use", "advanced" };
-    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "memoryStopMb", "maxSymbolsPerFile", "pathMap", "allowUnmatchedTraces", "pruneGarbage", "skipFilesNotBuilt", "placeholderFiles", "cacheEnabled", "cacheDirectory", "unparsedHeaderCache", "mirrorOf" };
+    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "memoryStopMb", "maxSymbolsPerFile", "headerCarveMinutes", "pathMap", "allowUnmatchedTraces", "pruneGarbage", "skipFilesNotBuilt", "placeholderFiles", "cacheEnabled", "cacheDirectory", "unparsedHeaderCache", "mirrorOf" };
     private static readonly string[] CommonKeys =
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
-    private static readonly string[] BuildKeys = { "buildLogs", "compiler", "compilerNames", "defines", "buildTraceFiles" };
+    private static readonly string[] BuildKeys = { "buildLogs", "compiler", "compilerNames", "defines", "buildTraceFiles", "usedMacros" };
     private static readonly string[] RunKeys = { "runTraceFiles", "runTraceLogs", "dropUnobservedCmm" };
     private static readonly string[] StageKeys = { "carveSourceFileContents", "carveHeaderFileContents", "stubUnexecuted" };
     private static readonly string[] UseKeys = { "builds", "runs" };
@@ -107,6 +109,7 @@ public static class ConfigLoader
         {
             b.BuildLogs = b.BuildLogs.Select(R).ToList();
             b.BuildTraceFiles = b.BuildTraceFiles.Select(R).ToList();
+            b.UsedMacros = b.UsedMacros.Select(R).ToList();
             if (b.Compiler is { } c && (c.Contains('/') || c.Contains('\\'))) b.Compiler = R(c);
         }
         foreach (var run in cfg.Runs.Values)
@@ -167,6 +170,7 @@ public static class ConfigLoader
                 CompilerNames = GetStringList(t, "compilerNames", $"[builds.{name}]", ctx),
                 Defines = GetStringList(t, "defines", $"[builds.{name}]", ctx),
                 BuildTraceFiles = GetStringList(t, "buildTraceFiles", $"[builds.{name}]", ctx),
+                UsedMacros = GetStringList(t, "usedMacros", $"[builds.{name}]", ctx),
             };
         }
 
@@ -244,6 +248,7 @@ public static class ConfigLoader
             cfg.ParseTimeout = (int?)GetLong(adv, "parseTimeout", "[advanced]", ctx, min: 0, max: int.MaxValue / 1000);
             cfg.MemoryStopMb = GetLong(adv, "memoryStopMb", "[advanced]", ctx, min: 0, max: long.MaxValue / (1024 * 1024));
             cfg.MaxSymbolsPerFile = (int?)GetLong(adv, "maxSymbolsPerFile", "[advanced]", ctx, min: 1, max: int.MaxValue);
+            cfg.HeaderCarveMinutes = GetLong(adv, "headerCarveMinutes", "[advanced]", ctx, min: 0, max: 100000);
         }
 
         // Cross-checks: a [use] selection must name a defined section.
@@ -265,7 +270,7 @@ public static class ConfigLoader
         # Inputs and options live here, so the command line stays short. Relative paths are relative to THIS
         # file's directory; globs (excludeDirectories, forceKeepFiles) are relative to the source dir.
         # Rarely needed: analysisOnly = true (top level: plan + reports, no carved tree) and an [advanced]
-        # section (maxParseBytes, parseTimeout, memoryStopMb, maxSymbolsPerFile, pathMap, allowUnmatchedTraces, pruneGarbage, skipFilesNotBuilt, placeholderFiles, cacheEnabled, cacheDirectory, mirrorOf) — see USAGE.md.
+        # section (maxParseBytes, parseTimeout, memoryStopMb, maxSymbolsPerFile, headerCarveMinutes, pathMap, allowUnmatchedTraces, pruneGarbage, skipFilesNotBuilt, placeholderFiles, cacheEnabled, cacheDirectory, mirrorOf) — see USAGE.md.
 
         # Where the carved project + reports go — must be OUTSIDE the source tree. CodeCarver manages a
         # carved/ + codecarver/ layout under it, and never replaces an existing directory it did not create.
@@ -297,6 +302,7 @@ public static class ConfigLoader
         compilerNames = []               # optional: vendor compiler names in a TEXT log, e.g. ["armcc","iccarm"] (gcc/clang/cl are known)
         defines = []                     # RARE manual override, only if you have no build log: ["CHIP=F4","FEATURE_X=1"]
         buildTraceFiles = []             # optional: files opened while BUILDING (ProcMon/strace capture)
+        usedMacros = []                  # optional, GCC: what each compile printed with -E -dU (docs/USED-MACROS.md, examples/used-macros)
 
         # ===== runs (what a real execution actually touched) — all OPTIONAL =====
         # One [runs.NAME] per captured scenario. Tightens + audits: observed files are kept and never auto-excluded.

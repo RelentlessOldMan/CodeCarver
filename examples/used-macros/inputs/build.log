@@ -1,0 +1,7 @@
+make: Entering directory '/build/used-macros/src'
+gcc -O0 -Wall -Iinc -MMD -c main.c -o /build/used-macros/obj/main.o
+gcc -O0 -Wall -Iinc -MMD -c uart.c -o /build/used-macros/obj/uart.o
+gcc -O0 -Wall -Iinc -MMD -c dma.c -o /build/used-macros/obj/dma.o
+gcc -o /build/used-macros/obj/app /build/used-macros/obj/main.o /build/used-macros/obj/uart.o /build/used-macros/obj/dma.o
+gcc -E -P -x c -Iinc -include kq_regs.h memmap.txt.in -o /build/used-macros/obj/memmap.txt
+make: Leaving directory '/build/used-macros/src'

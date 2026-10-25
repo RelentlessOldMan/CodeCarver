@@ -17,11 +17,14 @@ public sealed record HeaderCarveResult(long BytesBefore, long BytesAfter, int De
     /// <summary>Milliseconds per part: seed, bigDefines, pasteCalls, fixpoint, emit.</summary>
     public IReadOnlyList<(string Part, long Ms)> PartMs { get; init; } = Array.Empty<(string, long)>();
 
-    /// <summary>The part the carve gave up in, past its memory limit (the headers are left whole); null when it finished.</summary>
+    /// <summary>The part the carve gave up in, past its memory or time limit (the headers are left whole); null when it finished.</summary>
     public string? AbandonedIn { get; init; }
 
     /// <summary>Private memory (MB) when it gave up.</summary>
     public long AbandonedPrivateMb { get; init; }
+
+    /// <summary>It gave up past its time limit, not its memory limit.</summary>
+    public bool AbandonedOverTime { get; init; }
 }
 
 /// <summary>
@@ -57,25 +60,35 @@ public static partial class HeaderCarver
     /// (<c>#define N 2</c>) and the defines of headers read outside it. A paste macro among them is one, and what one
     /// expands to can be a paste's piece (<c>XCAT(REG_, N)</c> builds REG_2).</param>
     public static HeaderCarveResult Carve(string outDir, IReadOnlyCollection<string> bigHeaderRels, IEnumerable<string>? extraNames = null,
-                                          Action<string, long>? partDone = null, IEnumerable<string>? elsewhereDefines = null)
+                                          Action<string, long>? partDone = null, IEnumerable<string>? elsewhereDefines = null,
+                                          TimeSpan? timeLimit = null)
     {
         // Past its memory limit the carve gives up before it rewrites a header, so they stay whole (as a carve that drops
         // nothing leaves them) and the run goes on: work's 1.0.330 max stage stopped the whole run at 20 GB in the
         // fixpoint, when its paste pieces grew from 0.5M to 4.5M between two passes.
-        var limit = new MemoryLimit(LimitBytes());
+        // Past its time limit it gives up the same way: work's 1.0.345 max stage read its big headers for 2 hours and
+        // kept every one of 122M defines.
+        var limit = new MemoryLimit(LimitBytes(), timeLimit is { } t && t > TimeSpan.Zero
+            ? System.Diagnostics.Stopwatch.GetTimestamp() + (long)(t.TotalSeconds * System.Diagnostics.Stopwatch.Frequency) : 0);
         var part = "seed";
         var passes = 0;   // those begun: a carve given up in its fixpoint says how far it got
         try { return CarveWithin(outDir, bigHeaderRels, extraNames, partDone, elsewhereDefines, limit, p => part = p, n => passes = n); }
         catch (Exception ex) when (OverLimit(ex) is { } over)
         {
+            var overTime = over is OverTimeLimit;
             CodeCarver.Core.Util.Activity.Doing(null);
             GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);   // what the carve held, back
             long bytes = 0;
             foreach (var rel in bigHeaderRels) bytes += new FileInfo(Path.Combine(outDir, rel)).Length;
             partDone?.Invoke("abandoned", 1);
             partDone?.Invoke("abandonedPrivateMb", over.PrivateBytes / (1024 * 1024));
+            partDone?.Invoke("abandonedOverTime", overTime ? 1 : 0);
             partDone?.Invoke("limitMb", limit.Bytes / (1024 * 1024));
-            return new HeaderCarveResult(bytes, bytes, 0, 0) { Passes = passes, AbandonedIn = part, AbandonedPrivateMb = over.PrivateBytes / (1024 * 1024) };
+            if (timeLimit is { } tl) partDone?.Invoke("limitMinutes", (long)tl.TotalMinutes);
+            return new HeaderCarveResult(bytes, bytes, 0, 0)
+            {
+                Passes = passes, AbandonedIn = part, AbandonedPrivateMb = over.PrivateBytes / (1024 * 1024), AbandonedOverTime = overTime,
+            };
         }
     }
 
@@ -85,24 +98,30 @@ public static partial class HeaderCarver
         long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_HEADER_CARVE_MB"), out var mb) && mb >= 0
             ? mb * 1024 * 1024 : CodeCarver.Core.Util.MemoryGate.BudgetBytes() / 10 * 9;
 
-    static OverMemoryLimit? OverLimit(Exception ex) => ex switch
+    static OverLimitBase? OverLimit(Exception ex) => ex switch
     {
         OverMemoryLimit o => o,
+        OverTimeLimit o => o,
         AggregateException a => a.InnerExceptions.Select(OverLimit).FirstOrDefault(o => o is not null),
         _ => null,
     };
 
-    private sealed class OverMemoryLimit(long privateBytes) : Exception("the header carve passed its memory limit")
+    private abstract class OverLimitBase(string message, long privateBytes) : Exception(message)
     {
         public long PrivateBytes { get; } = privateBytes;
     }
 
+    private sealed class OverMemoryLimit(long privateBytes) : OverLimitBase("the header carve passed its memory limit", privateBytes);
+
+    private sealed class OverTimeLimit(long privateBytes) : OverLimitBase("the header carve passed its time limit", privateBytes);
+
     /// <summary>
     /// Private memory against the carve's limit, looked at a few times a second from any thread. Past it, one full
     /// compacting collection (much of a pass's memory is garbage the GC has not handed back yet); still past, the carve
-    /// ends (<see cref="OverMemoryLimit"/>).
+    /// ends (<see cref="OverMemoryLimit"/>). Past <paramref name="deadline"/> (a Stopwatch timestamp; 0 for none) it ends too
+    /// (<see cref="OverTimeLimit"/>).
     /// </summary>
-    private sealed class MemoryLimit(long bytes)
+    private sealed class MemoryLimit(long bytes, long deadline = 0)
     {
         public long Bytes { get; } = bytes;
         private readonly object gate = new();
@@ -110,12 +129,14 @@ public static partial class HeaderCarver
 
         public void Check()
         {
-            if (Bytes <= 0 || System.Diagnostics.Stopwatch.GetTimestamp() < Volatile.Read(ref nextAt)) return;
+            if ((Bytes <= 0 && deadline == 0) || System.Diagnostics.Stopwatch.GetTimestamp() < Volatile.Read(ref nextAt)) return;
             lock (gate)
             {
                 var now = System.Diagnostics.Stopwatch.GetTimestamp();
                 if (now < nextAt) return;
                 Volatile.Write(ref nextAt, now + System.Diagnostics.Stopwatch.Frequency / 5);
+                if (deadline != 0 && now > deadline) throw new OverTimeLimit(Private());
+                if (Bytes <= 0) return;
                 if (Private() <= Bytes) return;
                 GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
                 var after = Private();
