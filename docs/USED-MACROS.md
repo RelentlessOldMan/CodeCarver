@@ -104,8 +104,15 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
 - `ppTrace` and `usedMacros` say the same thing; set one of them. One carve runs one pp-trace.
 
 The carve trusts the names when every command ran clean (exit 0, within 30 minutes each) and every translation unit the
-carve keeps has a compile command in the logs. Otherwise it says why and the static carve runs. Commands run in
-parallel, one per core but one.
+carve keeps has a compile command in the logs. Otherwise it says why and the static carve runs.
+
+**Memory.** Each pp-trace holds about 0.5 KB for every define in the headers its compile includes: 2 GB for a compile
+that includes 3.8 million. That memory is pp-trace's, not the carve's, so the runs share what `memoryStopMb` leaves
+the carve (or the machine's memory without it). They run at most one per core but one: one at first, one more at
+once for each that finishes, and a new one starts only when the running ones, each counted at no less than the
+most one has needed so far, plus that again, fit. If the running ones grow past it, the newest are stopped and run
+again later (`mem.rerunForMemory`). One run that alone needs more than the whole
+budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the build needed.
 
 ## Summary keys
 
@@ -125,6 +132,9 @@ parallel, one per core but one.
 | `world.ppTrace.missingPaths` / `.refused` / `.incomplete` / `.timedOut` | of the failed: a path missing here, a flag that loads other code, not all of it in the log (an unreadable response file), over the time limit |
 | `world.ppTrace.notPreprocessed` | `.s` and `.asm` commands, not run |
 | `world.ppTrace.names` / `.unitsWithoutCommand` / `.trusted` | as for `usedMacros` |
+| `world.ppTrace.mem.budgetMb` | the memory the runs shared |
+| `world.ppTrace.mem.peakOneMb` / `.peakAllMb` / `.peakRunning` | the most one run held, the most all held at once, and the most at once |
+| `world.ppTrace.mem.rerunForMemory` / `.overBudgetAlone` | runs stopped and run again to stay in the budget; runs that alone needed more |
 | `stageN.headerCarve.fromUsedMacros` | `1` when this stage's header carve used them (from either key) |
 | `stageN.headerCarve.keptByUsed` / `.keptByOther` | defines kept because a compile used them, or a non-C file names them |
 | `stageN.headerCarve.used.otherFiles` / `.otherNames` | non-C files read, and the names they gave |

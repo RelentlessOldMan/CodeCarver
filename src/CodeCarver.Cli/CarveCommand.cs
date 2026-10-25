@@ -1322,6 +1322,13 @@ public static class CarveCommand
             summary["world.ppTrace.names"] = trace.Names.Count;
             summary["world.ppTrace.unitsWithoutCommand"] = unitsWithout;
             summary["world.ppTrace.trusted"] = trusted ? 1 : 0;
+            const long Mb = 1024 * 1024;
+            summary["world.ppTrace.mem.budgetMb"] = trace.BudgetBytes / Mb;
+            summary["world.ppTrace.mem.peakOneMb"] = trace.PeakChildBytes / Mb;
+            summary["world.ppTrace.mem.peakAllMb"] = trace.PeakTotalBytes / Mb;
+            summary["world.ppTrace.mem.peakRunning"] = trace.PeakRunning;
+            summary["world.ppTrace.mem.rerunForMemory"] = trace.Evictions;
+            summary["world.ppTrace.mem.overBudgetAlone"] = trace.OverBudgetAlone;
             if (trusted) usedMacros = trace.Names;
             var ran = trace.Failed - trace.MissingPaths - trace.Refused - trace.Incomplete;
             err.WriteLine($"  config  : pp-trace ({trace.Version ?? "version unknown"}): {trace.Succeeded:N0} of {trace.Commands:N0} compile command(s) ran clean, {trace.Names.Count:N0} name(s)"
@@ -1334,6 +1341,10 @@ public static class CarveCommand
                          trace.Incomplete > 0 ? $"{trace.Incomplete:N0} not fully in the log" : null,
                          unitsWithout > 0 ? $"{unitsWithout:N0} source file(s) in no command" : null,
                      }.Where(x => x is not null))}), so the header carve models the paste macros itself"));
+            err.WriteLine($"  config  : pp-trace memory: at most {trace.PeakTotalBytes / Mb:N0} MB in {trace.PeakRunning:N0} run(s) at once, {trace.PeakChildBytes / Mb:N0} MB in one, "
+                + $"of a {trace.BudgetBytes / Mb:N0} MB budget (memoryStopMb less the carve's own)"
+                + (trace.Evictions > 0 ? $"; {trace.Evictions:N0} stopped and run again to stay in it" : "")
+                + (trace.OverBudgetAlone > 0 ? $"; {trace.OverBudgetAlone:N0} needed more than the budget alone and ran alone" : ""));
         }
         if (perFileSpecs.Count > 0)
         {

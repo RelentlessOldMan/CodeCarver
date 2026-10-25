@@ -43,36 +43,63 @@ public sealed class PpTrace
     /// <summary>pp-trace's version line (<c>LLVM version 17.0.6</c>), or null when it printed none.</summary>
     public string? Version { get; private set; }
 
+    /// <summary>The memory the pp-trace runs had (<see cref="ChildMemoryGate"/>), and what they held: the most one
+    /// held, the most all held at once, how many ran at once, and how many were stopped to stay in it and ran again.</summary>
+    public long BudgetBytes { get; private set; }
+    public long PeakChildBytes { get; private set; }
+    public long PeakTotalBytes { get; private set; }
+    public int PeakRunning { get; private set; }
+    public int Evictions { get; private set; }
+    /// <summary>Runs that alone held more than the budget (each ran alone).</summary>
+    public int OverBudgetAlone { get; private set; }
+
     /// <summary>Every command ran and printed its names.</summary>
     public bool Complete => Commands > 0 && Succeeded == Commands;
 
     /// <summary>
     /// Run pp-trace (<paramref name="exe"/>) on every command. Each command's <see cref="CompileCommand.Directory"/>
-    /// must be absolute and its paths already mapped onto this machine.
+    /// must be absolute and its paths already mapped onto this machine. The runs share <paramref name="memoryBudget"/>
+    /// (default: <see cref="ChildMemoryGate.BudgetForRun"/>, what memoryStopMb leaves the carve) and run at most
+    /// <paramref name="parallel"/> at once (default: one per core but one).
     /// </summary>
-    public static PpTrace Run(string exe, IReadOnlyList<CompileCommand> commands, int timeoutMs = 1_800_000, int? parallel = null)
+    public static PpTrace Run(string exe, IReadOnlyList<CompileCommand> commands, int timeoutMs = 1_800_000, int? parallel = null, long? memoryBudget = null)
     {
+        var most = parallel ?? Math.Max(1, Environment.ProcessorCount - 1);
+        using var gate = new ChildMemoryGate(memoryBudget ?? ChildMemoryGate.BudgetForRun(), most);
         var traced = commands.Where(c => Preprocessed(c.File)).ToList();
         var r = new PpTrace { Commands = traced.Count, NotPreprocessed = commands.Count - traced.Count, Version = ReadVersion(exe) };
         int succeeded = 0, missing = 0, refused = 0, incomplete = 0, timedOut = 0;
-        var gate = new object();
-        Parallel.ForEach(traced, new ParallelOptions { MaxDegreeOfParallelism = parallel ?? Math.Max(1, Environment.ProcessorCount - 1) }, cmd =>
+        var namesLock = new object();
+        Parallel.ForEach(traced, new ParallelOptions { MaxDegreeOfParallelism = most }, cmd =>
         {
             if (cmd.Incomplete || cmd.AlternativeDirectories.Count > 0) { Interlocked.Increment(ref incomplete); return; }
             if (CompilerPreprocess.Refuse(cmd.Arguments)) { Interlocked.Increment(ref refused); return; }
             if (!Directory.Exists(cmd.Directory) || CompilerPreprocess.MissingPath(cmd)) { Interlocked.Increment(ref missing); return; }
             var names = new HashSet<ulong>();
-            var (ok, late) = TraceOne(exe, cmd, names, timeoutMs);
+            bool ok, late;
+            while (true)
+            {
+                using var lease = gate.Admit();
+                (ok, late) = TraceOne(exe, cmd, names, timeoutMs, lease);
+                if (!lease.Evicted) break;
+                names.Clear();   // stopped for memory: run again when there is room
+            }
             if (late) Interlocked.Increment(ref timedOut);
             if (!ok) return;
             Interlocked.Increment(ref succeeded);
-            lock (gate) r.Names.UnionWith(names);
+            lock (namesLock) r.Names.UnionWith(names);
         });
         r.Succeeded = succeeded;
         r.MissingPaths = missing;
         r.Refused = refused;
         r.Incomplete = incomplete;
         r.TimedOut = timedOut;
+        r.BudgetBytes = gate.Budget;
+        r.PeakChildBytes = gate.PeakChildBytes;
+        r.PeakTotalBytes = gate.PeakTotalBytes;
+        r.PeakRunning = gate.PeakRunning;
+        r.Evictions = gate.Evictions;
+        r.OverBudgetAlone = gate.OverBudgetAlone;
         return r;
     }
 
@@ -133,7 +160,7 @@ public sealed class PpTrace
     }
 
     /// <summary>Run pp-trace on one command and add the names it prints. Ok: it exited 0 within the time limit.</summary>
-    private static (bool Ok, bool TimedOut) TraceOne(string exe, CompileCommand cmd, HashSet<ulong> names, int timeoutMs)
+    private static (bool Ok, bool TimedOut) TraceOne(string exe, CompileCommand cmd, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease)
     {
         // The command goes in a compile database of its own: no command-line quoting or length limit to meet.
         var db = Path.Combine(Path.GetTempPath(), "codecarver-ppt-" + Guid.NewGuid().ToString("N"));
@@ -158,6 +185,7 @@ public sealed class PpTrace
             using var launch = IoMeter.Start(IoMeter.Kind.Launch);   // until pp-trace exits
             using var p = Process.Start(psi);
             if (p is null) return (false, false);
+            lease.Track(p);
             p.StandardInput.Close();
             var fatal = false;   // drained so a full stderr pipe can't block it
             p.ErrorDataReceived += (_, e) => { if (e.Data?.Contains("fatal error:", StringComparison.Ordinal) == true) fatal = true; };
@@ -171,7 +199,7 @@ public sealed class PpTrace
             ReadNames(p.StandardOutput, names);
             p.WaitForExit();   // also waits for stderr's last line
             var clean = p.ExitCode == 0 || (AssemblyWithCpp(cmd.File) && p.ExitCode == 1 && !fatal);
-            return (!timedOut && clean, timedOut);
+            return (!timedOut && !lease.Evicted && clean, timedOut);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException) { return (false, false); }
         finally

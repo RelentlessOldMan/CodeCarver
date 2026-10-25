@@ -103,4 +103,44 @@ public sealed class PpTraceTests
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
+
+    /// <summary>Each pp-trace holds about 0.5 KB per define its compile includes, outside the carve's memoryStopMb. The runs
+    /// share a budget: several run at once when they fit, and when they don't, all still finish within it.</summary>
+    [SkippableFact]
+    public void Runs_StayWithinTheirMemoryBudget_AndStillAllFinish()
+    {
+        var exe = Find();
+        Skip.If(exe is null, "pp-trace (LLVM) not installed");
+        var dir = Path.Combine(Path.GetTempPath(), "cc-ppt-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var sb = new System.Text.StringBuilder();
+            for (var i = 0; i < 150_000; i++) sb.Append("#define KQ_R").Append(i).Append("_ADDR(n) (0x40000000 + ((n) * 0x").Append(i.ToString("x")).Append("))\n");
+            File.WriteAllText(Path.Combine(dir, "big.h"), sb.ToString());
+            var cmds = Enumerable.Range(0, 6).Select(i =>
+            {
+                File.WriteAllText(Path.Combine(dir, $"u{i}.c"), $"#include \"big.h\"\nint x = KQ_R{i}_ADDR(1);\n");
+                return Cmd(dir, $"u{i}.c", "clang", "-c");
+            }).ToList();
+            // A small compile first finishes before its memory is ever sampled: it must not make the big ones look small.
+            File.WriteAllText(Path.Combine(dir, "main.c"), "int main(void) { return 0; }\n");
+            cmds.Insert(0, Cmd(dir, "main.c", "clang", "-c"));
+
+            var roomy = PpTrace.Run(exe!, cmds, parallel: 3, memoryBudget: 4L << 30);
+            Assert.True(roomy.Complete, $"{roomy.Succeeded} of {roomy.Commands}");
+            Assert.True(roomy.PeakChildBytes > 20L << 20, $"one run held {roomy.PeakChildBytes >> 20} MB");
+            Assert.True(roomy.PeakRunning > 1, "runs that fit run at once");
+            Assert.Equal(0, roomy.Evictions);
+
+            // Room for about one and a half: the runs hold no more than the budget and what they grow by between two
+            // samples, and every command still finishes.
+            var budget = roomy.PeakChildBytes * 3 / 2;
+            var tight = PpTrace.Run(exe!, cmds, parallel: 3, memoryBudget: budget);
+            Assert.True(tight.Complete, $"{tight.Succeeded} of {tight.Commands}");
+            Assert.True(tight.PeakTotalBytes <= budget + roomy.PeakChildBytes / 4, $"{tight.PeakTotalBytes >> 20} MB held of {budget >> 20}");
+            Assert.Equal(roomy.Names, tight.Names);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
 }
