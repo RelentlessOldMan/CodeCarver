@@ -175,7 +175,7 @@ public sealed class CompilerPreprocess
 
     /// <summary>Does an include directory, forced include or the source the command names not exist here? gcc skips a
     /// missing -I silently, and the same name then resolves somewhere else: a different configuration.</summary>
-    private static bool MissingPath(CompileCommand cmd)
+    internal static bool MissingPath(CompileCommand cmd)
     {
         string Full(string p) => Path.IsPathFullyQualified(p) ? p : Path.Combine(cmd.Directory, p);
         try
@@ -231,6 +231,16 @@ public sealed class CompilerPreprocess
     /// <summary>The command's arguments for <c>-E -dD</c>.</summary>
     public static List<string> PreprocessArguments(IReadOnlyList<string> args)
     {
+        var r = WithoutOutputs(args);
+        r.Add("-E");
+        r.Add("-dD");
+        return r;
+    }
+
+    /// <summary>The command's arguments without the flags that write files or pick what the compile produces
+    /// (<c>-c</c>, <c>-o</c>, dependency output, <c>-Werror</c>): what a tool that only preprocesses passes.</summary>
+    public static List<string> WithoutOutputs(IReadOnlyList<string> args)
+    {
         var r = new List<string>();
         for (var i = 0; i < args.Count; i++)
         {
@@ -239,8 +249,6 @@ public sealed class CompilerPreprocess
             if (DropFlag(a, out var values)) { i += values; continue; }
             r.Add(a);
         }
-        r.Add("-E");
-        r.Add("-dD");
         return r;
     }
 

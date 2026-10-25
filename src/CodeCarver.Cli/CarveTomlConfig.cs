@@ -51,6 +51,7 @@ public sealed class BuildSection
     public List<string> Defines = new();
     public List<string> BuildTraceFiles = new();
     public List<string> UsedMacros = new();                   // what each compile printed with -E -dU (docs/USED-MACROS.md)
+    public string? PpTrace;                                   // Clang: LLVM's pp-trace, run on the build log's commands (docs/USED-MACROS.md)
 }
 
 public sealed class RunSection
@@ -79,7 +80,7 @@ public static class ConfigLoader
     private static readonly string[] CommonKeys =
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
-    private static readonly string[] BuildKeys = { "buildLogs", "compiler", "compilerNames", "defines", "buildTraceFiles", "usedMacros" };
+    private static readonly string[] BuildKeys = { "buildLogs", "compiler", "compilerNames", "defines", "buildTraceFiles", "usedMacros", "ppTrace" };
     private static readonly string[] RunKeys = { "runTraceFiles", "runTraceLogs", "dropUnobservedCmm" };
     private static readonly string[] StageKeys = { "carveSourceFileContents", "carveHeaderFileContents", "stubUnexecuted" };
     private static readonly string[] UseKeys = { "builds", "runs" };
@@ -110,6 +111,7 @@ public static class ConfigLoader
             b.BuildLogs = b.BuildLogs.Select(R).ToList();
             b.BuildTraceFiles = b.BuildTraceFiles.Select(R).ToList();
             b.UsedMacros = b.UsedMacros.Select(R).ToList();
+            if (b.PpTrace is { } pt && (pt.Contains('/') || pt.Contains('\\'))) b.PpTrace = R(pt);
             if (b.Compiler is { } c && (c.Contains('/') || c.Contains('\\'))) b.Compiler = R(c);
         }
         foreach (var run in cfg.Runs.Values)
@@ -171,6 +173,7 @@ public static class ConfigLoader
                 Defines = GetStringList(t, "defines", $"[builds.{name}]", ctx),
                 BuildTraceFiles = GetStringList(t, "buildTraceFiles", $"[builds.{name}]", ctx),
                 UsedMacros = GetStringList(t, "usedMacros", $"[builds.{name}]", ctx),
+                PpTrace = GetString(t, "ppTrace", $"[builds.{name}]", ctx),
             };
         }
 
@@ -303,6 +306,7 @@ public static class ConfigLoader
         defines = []                     # RARE manual override, only if you have no build log: ["CHIP=F4","FEATURE_X=1"]
         buildTraceFiles = []             # optional: files opened while BUILDING (ProcMon/strace capture)
         usedMacros = []                  # optional, GCC: what each compile printed with -E -dU (docs/USED-MACROS.md, examples/used-macros)
+        ppTrace = ""                     # optional, Clang: LLVM's pp-trace exe (same LLVM version as the build), run on the buildLogs' commands
 
         # ===== runs (what a real execution actually touched) — all OPTIONAL =====
         # One [runs.NAME] per captured scenario. Tightens + audits: observed files are kept and never auto-excluded.

@@ -46,7 +46,9 @@ public static class EmitFrom
         // usedMacros may name folders: each file in them counts.
         var usedFiles = cv.UsedMacros.SelectMany<string, string>(p => Directory.Exists(p)
             ? Directory.EnumerateFiles(p, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal) : new[] { p });
-        foreach (var f in cv.BuildLogs.Concat(cv.BuildTraceFiles).Concat(cv.RunTraceFiles).Concat(cv.RunTraceLogs).Concat(usedFiles))
+        // A new pp-trace (another LLVM) can answer differently: its size and time count like an input's.
+        var ppTraces = cv.PpTraces.Select(p => CarveCommand.FindExe(p) ?? p);
+        foreach (var f in cv.BuildLogs.Concat(cv.BuildTraceFiles).Concat(cv.RunTraceFiles).Concat(cv.RunTraceLogs).Concat(usedFiles).Concat(ppTraces))
         {
             var info = new FileInfo(f);
             L("input", new[] { Path.GetFullPath(f), info.Exists ? info.Length.ToString() : "-", info.Exists ? info.LastWriteTimeUtc.Ticks.ToString() : "-" });

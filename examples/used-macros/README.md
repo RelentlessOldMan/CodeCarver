@@ -38,6 +38,14 @@ between the two is far wider.
 Without a build machine, `codecarver carve src --config carve.toml` carves from the capture in `inputs/`. The paths
 in the capture are under `/build/used-macros`, which `pathMap` maps onto this checkout.
 
+## The same tree with pp-trace
+
+This sample is built with GCC, but its commands are plain enough for Clang too. With LLVM installed, replace
+`usedMacros` in `carve.toml` with `ppTrace = "C:/Program Files/LLVM/bin/pp-trace.exe"` (or the path on your
+machine) and carve again: pp-trace runs the log's 3 compile commands and the max stage keeps the same 13 defines.
+For a Clang build that is the whole job: nothing to collect, no wrapper. See
+[USED-MACROS.md](../../docs/USED-MACROS.md#clang-builds-pp-trace).
+
 ## Adapting it to a real build
 
 The wrapper is an example of what to collect, not a drop-in. Read its `ADAPT:` comments against your build:

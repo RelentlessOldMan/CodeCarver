@@ -23,6 +23,19 @@ public static class CarveCommand
     /// headers stay whole: work's 1.0.345 max stage read them for 2 hours and dropped none.</summary>
     const long DefaultHeaderCarveMinutes = 30;
 
+    /// <summary>An exe given as a path, or a bare name found on PATH (with <c>.exe</c> on Windows); null if neither.</summary>
+    internal static string? FindExe(string exe)
+    {
+        if (File.Exists(exe)) return Path.GetFullPath(exe);
+        if (Path.GetDirectoryName(exe) is not ("" or null)) return null;
+        foreach (var d in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+            foreach (var ext in OperatingSystem.IsWindows() ? new[] { ".exe", "" } : new[] { "" })
+            {
+                try { var p = Path.Combine(d, exe + ext); if (File.Exists(p)) return p; } catch (ArgumentException) { }
+            }
+        return null;
+    }
+
     /// <summary>
     /// Run a carve. <paramref name="args"/> is the full argv (<c>args[0]=="carve"</c>, <c>args[1]</c> = source
     /// dir). Output goes to the injected writers (Console in production, a capture buffer under test). Wraps the
@@ -191,6 +204,11 @@ public static class CarveCommand
                                       .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             var missing = inputFiles.Where(f => !File.Exists(f))
                                     .Concat(cv.UsedMacros.Where(f => !File.Exists(f) && !Directory.Exists(f))).ToList();
+            if (cv.PpTraces.FirstOrDefault(p => FindExe(p) is null) is { } noPpTrace)
+            {
+                err.WriteLine($"ppTrace: {noPpTrace} not found. Install the LLVM release your build's Clang comes from; pp-trace is in its bin folder.");
+                return 2;
+            }
             if (missing.Count > 0)
             {
                 err.WriteLine($"missing {missing.Count} input file(s) referenced in the config — fix the path(s):");
@@ -1267,6 +1285,54 @@ public static class CarveCommand
                          um.Incomplete > 0 ? $"{um.Incomplete:N0} file(s) not ending in {CodeCarver.Core.Preprocess.UsedMacros.OkLine}" : null,
                          um.NoSource > 0 ? $"{um.NoSource:N0} naming no source" : null,
                          um.NoMacros > 0 ? $"{um.NoMacros:N0} with no #define (not -dU output?)" : null,
+                     }.Where(x => x is not null))}), so the header carve models the paste macros itself"));
+        }
+        // The same names for a Clang build, from LLVM's pp-trace run here on the build log's commands (docs/USED-MACROS.md).
+        if (cv.PpTraces.Count > 0)
+        {
+            if (cv.PpTraces.Count > 1 || cv.UsedMacros.Count > 0)
+            {
+                err.WriteLine(cv.PpTraces.Count > 1
+                    ? $"the selected builds name {cv.PpTraces.Count} different ppTrace exes; one carve runs one: {string.Join(", ", cv.PpTraces)}"
+                    : "ppTrace and usedMacros both say what the compiles used: set one of them.");
+                return 2;
+            }
+            if (buildCmds.Count == 0)
+            {
+                err.WriteLine("ppTrace runs the build log's compile commands: set buildLogs in the same [builds.X].");
+                return 2;
+            }
+            var exe = FindExe(cv.PpTraces[0])!;   // checked with the other inputs
+            var absCmds = buildCmds.Select(c => c with { Directory = Path.IsPathFullyQualified(c.Directory) ? c.Directory : Path.GetFullPath(Path.Combine(dir, c.Directory)) }).ToList();
+            var tuExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
+            var logged = buildCmds.Select(CmdRel).Where(r => r is not null).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var unitsWithout = parseRels.Count(r => !notBuilt.Contains(r) && tuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !logged.Contains(r));
+            err.WriteLine($"  config  : running pp-trace on {absCmds.Count:N0} compile command(s) ...");
+            var trace = CodeCarver.Core.Preprocess.PpTrace.Run(exe, absCmds);
+            var trusted = trace.Complete && unitsWithout == 0;
+            summary["world.ppTrace.version"] = trace.Version ?? "unknown";
+            summary["world.ppTrace.commands"] = trace.Commands;
+            summary["world.ppTrace.notPreprocessed"] = trace.NotPreprocessed;
+            summary["world.ppTrace.succeeded"] = trace.Succeeded;
+            summary["world.ppTrace.failed"] = trace.Failed;
+            summary["world.ppTrace.missingPaths"] = trace.MissingPaths;
+            summary["world.ppTrace.refused"] = trace.Refused;
+            summary["world.ppTrace.incomplete"] = trace.Incomplete;
+            summary["world.ppTrace.timedOut"] = trace.TimedOut;
+            summary["world.ppTrace.names"] = trace.Names.Count;
+            summary["world.ppTrace.unitsWithoutCommand"] = unitsWithout;
+            summary["world.ppTrace.trusted"] = trusted ? 1 : 0;
+            if (trusted) usedMacros = trace.Names;
+            var ran = trace.Failed - trace.MissingPaths - trace.Refused - trace.Incomplete;
+            err.WriteLine($"  config  : pp-trace ({trace.Version ?? "version unknown"}): {trace.Succeeded:N0} of {trace.Commands:N0} compile command(s) ran clean, {trace.Names.Count:N0} name(s)"
+                + (trusted ? " -> the big headers keep only the defines the compiles used"
+                   : $"; NOT trusted ({string.Join(", ", new[] {
+                         trace.Commands == 0 ? "no command to run" : null,
+                         ran > 0 ? $"{ran:N0} failed{(trace.TimedOut > 0 ? $" ({trace.TimedOut:N0} over the time limit)" : "")}" : null,
+                         trace.MissingPaths > 0 ? $"{trace.MissingPaths:N0} name a path missing here" : null,
+                         trace.Refused > 0 ? $"{trace.Refused:N0} refused" : null,
+                         trace.Incomplete > 0 ? $"{trace.Incomplete:N0} not fully in the log" : null,
+                         unitsWithout > 0 ? $"{unitsWithout:N0} source file(s) in no command" : null,
                      }.Where(x => x is not null))}), so the header carve models the paste macros itself"));
         }
         if (perFileSpecs.Count > 0)
@@ -3696,6 +3762,7 @@ public static class CarveCommand
             sb.AppendLine($"defines = {L(manualDefines)}");
             sb.AppendLine($"buildTraceFiles = {L(buildFileTraces)}");
             sb.AppendLine($"usedMacros = {L(cv.UsedMacros)}");
+        sb.AppendLine($"ppTrace = {L(cv.PpTraces)}");
             sb.AppendLine("[runs.resolved]");
             sb.AppendLine($"runTraceFiles = {L(runFileTraces)}");
             sb.AppendLine($"runTraceLogs = {L(traceList)}");

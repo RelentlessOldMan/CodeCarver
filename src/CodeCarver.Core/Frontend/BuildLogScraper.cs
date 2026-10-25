@@ -499,7 +499,7 @@ public static class BuildLogScraper
             || name.StartsWith("clang", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool IsSourceFile(string token)
+    internal static bool IsSourceFile(string token)
     {
         if (token.StartsWith('-')) return false; // MSVC flags like /c won't match a source extension anyway
         foreach (var ext in SourceExtensions)

@@ -35,6 +35,20 @@ public sealed class UsedMacrosExampleTests
         Assert.Equal(File.ReadAllText(Path.Combine(r.Dir, "src", "inc", "kq_regs.h")), File.ReadAllText(r.Carved("safe", "inc/kq_regs.h")));
     }
 
+    /// <summary>A Clang build's route: pp-trace, run here on the log's commands, says the same names as -dU said.</summary>
+    [SkippableFact]
+    public void PpTraceOnTheLog_KeepsWhatTheCompilesUsed()
+    {
+        var exe = CodeCarver.Tests.Preprocess.PpTraceTests.Find();
+        Skip.If(exe is null, "pp-trace (LLVM) not installed");
+        using var r = new Run($"[builds.main]\nbuildLogs = [\"inputs/build.log\"]\nppTrace = \"{exe!.Replace('\\', '/')}\"\n");
+        Assert.True(r.Code == 0, r.Output);
+        Assert.Contains("3 of 3 compile command(s) ran clean", r.Output);
+        Assert.Contains("world.ppTrace.trusted = 1", r.Summary("max"));
+        Assert.Equal(Used.Append("KQ_REGS_H").Order(StringComparer.Ordinal),
+                     Defines(r.Carved("max", "inc/kq_regs.h")).Order(StringComparer.Ordinal));
+    }
+
     /// <summary>Without the files the static carve models the paste macros itself: sound, and on this sample it also
     /// keeps the DMA fields behind dma.c's #if KQ_HAS_DMA, which this configuration turns off.</summary>
     [Fact]

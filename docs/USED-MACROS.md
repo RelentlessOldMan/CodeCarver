@@ -10,7 +10,8 @@ and an `#undef` for every name it tested and found undefined. If each compile of
 the carve keeps a big header's define only if some compile used it. The carve doesn't need its own model of `#if`
 or `##`.
 
-This is GCC only: Clang accepts `-dU` and prints nothing for it. It costs one more preprocess per compile.
+This is GCC only: Clang accepts `-dU` and prints nothing for it. It costs one more preprocess per compile. For a
+Clang build, the carve can ask Clang itself instead (see [Clang builds: pp-trace](#clang-builds-pp-trace)).
 
 ## What to collect
 
@@ -74,6 +75,38 @@ When it trusts the files, a big header keeps:
 
 All non-define lines stay as they are: typedefs, enums, inline functions and `#if` lines.
 
+## Clang builds: pp-trace
+
+For a Clang build, nothing needs collecting during the build. LLVM's `pp-trace` (from clang-tools-extra, in the
+`bin` folder of an LLVM release) runs Clang's preprocessor on a compile command and prints every macro it expanded and
+every name an `#ifdef`, `#ifndef`, `#elifdef`, `#elifndef` or `defined` tested: the same names `-dU` gives. The
+carve runs it on each compile command of the build log, on the machine that runs the carve:
+
+```toml
+[builds.main]
+buildLogs = ["build.log"]                                  # required: the commands pp-trace runs
+ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
+```
+
+- **Install the LLVM release your build's Clang comes from**, on the carve machine. Any host works: Clang
+  preprocesses for any target, so a Linux build's log can be traced on Windows. A different version can answer
+  `__has_builtin`, `__has_include` and its predefined macros differently, so the carve prints the version it ran
+  (`world.ppTrace.version`). Nothing is bundled or downloaded.
+- The tree must be readable at the paths the log names, after `[advanced] pathMap`, like for the build's own
+  preprocessor run. A command naming a source or include folder missing here doesn't run (`missingPaths`).
+- A driver named for its target (`aarch64-none-elf-clang`) gets that target passed as `--target`. `clang++` and the
+  file's extension pick C++.
+- `.S` and `.sx` files run too: pp-trace parses them as C after preprocessing, so their parse errors are expected;
+  only a fatal error (a missing include) fails one. `.s` and `.asm` files have no preprocessor and are skipped
+  (`notPreprocessed`).
+- Text files the build runs through the preprocessor (a linker script, `clang -E` on a template) aren't compile
+  commands in the log. Their names come in as for any kept non-C file (`keptByOther`).
+- `ppTrace` and `usedMacros` say the same thing; set one of them. One carve runs one pp-trace.
+
+The carve trusts the names when every command ran clean (exit 0, within 30 minutes each) and every translation unit the
+carve keeps has a compile command in the logs. Otherwise it says why and the static carve runs. Commands run in
+parallel, one per core but one.
+
 ## Summary keys
 
 | Key | Meaning |
@@ -87,7 +120,12 @@ All non-define lines stay as they are: typedefs, enums, inline functions and `#i
 | `world.usedMacros.commands` / `.commandsCovered` | compile commands in the logs, and how many a file matched |
 | `world.usedMacros.unitsWithoutCommand` | kept translation units the logs have no compile for |
 | `world.usedMacros.trusted` | `1` when the header carve used the files |
-| `stageN.headerCarve.fromUsedMacros` | `1` when this stage's header carve used them |
+| `world.ppTrace.version` | the `LLVM version` line pp-trace printed, or `unknown` |
+| `world.ppTrace.commands` / `.succeeded` / `.failed` | commands pp-trace was to run, ran clean, and didn't |
+| `world.ppTrace.missingPaths` / `.refused` / `.incomplete` / `.timedOut` | of the failed: a path missing here, a flag that loads other code, not all of it in the log (an unreadable response file), over the time limit |
+| `world.ppTrace.notPreprocessed` | `.s` and `.asm` commands, not run |
+| `world.ppTrace.names` / `.unitsWithoutCommand` / `.trusted` | as for `usedMacros` |
+| `stageN.headerCarve.fromUsedMacros` | `1` when this stage's header carve used them (from either key) |
 | `stageN.headerCarve.keptByUsed` / `.keptByOther` | defines kept because a compile used them, or a non-C file names them |
 | `stageN.headerCarve.used.otherFiles` / `.otherNames` | non-C files read, and the names they gave |
 
