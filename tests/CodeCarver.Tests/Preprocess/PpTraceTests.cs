@@ -101,21 +101,27 @@ public sealed class PpTraceTests
             Assert.Equal(0, bad.Succeeded);
             Assert.Equal(1, bad.MissingPaths);
 
-            // The build machine's toolchain directories aren't here: Clang skips a missing include directory, so a
-            // command still runs. One inside the carve root is a pathMap the log needs.
+            // Clang skips a missing include directory, as the build did: the build machine's toolchain outside the
+            // carve root, and inside it one the tree never had or one the build made for its output (out/gen, next to
+            // the out/obj its -o writes to). A command still runs; a header only such a directory held fails it.
             var outside = Path.Combine(Path.GetTempPath(), "cc-ppt-gone-" + Guid.NewGuid().ToString("N"), "sysroot", "include");
+            File.WriteAllText(Path.Combine(dir, "g.c"), "#include \"gen.h\"\nint g;\n");
             var paths = PpTrace.Run(exe!, new[]
             {
                 Cmd(dir, "a.c", "clang", "-Iinc", "-isystem", outside, "-c"),
-                Cmd(dir, "a.c", "clang", "-Iinc", "-Ignone", "-c"),
+                Cmd(dir, "a.c", "clang", "-Iinc", "-Ignone", "-Iout/gen", "-c", "-o", "out/a.o"),
+                Cmd(dir, "g.c", "clang", "-Iout/gen", "-c", "-o", "out/g.o"),
                 Cmd(dir, "a.c", "clang", "-include", "gone.h", "-c"),
                 Cmd(Path.Combine(dir, "obj"), "../a.c", "clang", "-c"),
                 Cmd(dir, "nosuch.c", "clang", "-c"),
             }, parallel: 2, root: dir);
-            Assert.Equal(1, paths.Succeeded);
+            Assert.Equal(2, paths.Succeeded);
             Assert.Equal(1, paths.RanWithoutOutsideDirs);
-            Assert.Equal(4, paths.MissingPaths);
-            Assert.Equal((1, 1, 1, 1), (paths.MissingIncludeDirInRoot, paths.MissingForcedInclude, paths.MissingWorkDir, paths.MissingSource));
+            Assert.Equal(2, paths.RanWithoutDirsInRoot);
+            Assert.Equal((2, 1), (paths.MissingDirsInRoot, paths.MissingDirsInRootFromBuild));
+            Assert.Equal(3, paths.MissingPaths);
+            Assert.Equal((1, 1, 1), (paths.MissingForcedInclude, paths.MissingWorkDir, paths.MissingSource));
+            Assert.Equal(6, paths.Commands);   // g.c ran and failed: gen.h was only in out/gen
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

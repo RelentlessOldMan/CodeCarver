@@ -96,11 +96,14 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
   `__has_builtin`, `__has_include` and its predefined macros differently, so the carve prints the version it ran
   (`world.ppTrace.version`). Nothing is bundled or downloaded.
 - The tree must be readable at the paths the log names, after `[advanced] pathMap`, like for the build's own
-  preprocessor run. A command doesn't run (`missingPaths`) when the directory it ran in, its source, an `-include` or
-  `-imacros` file, or an include directory inside the carve root is missing here; the `missing.*` keys say which. An
-  include directory outside the carve root that is missing here, such as the build machine's toolchain folders, is
-  skipped as Clang skips it, and the command runs (`ranWithoutOutsideDirs`). If a header only it held is needed, the
-  compile fails and says so.
+  preprocessor run. A command doesn't run (`missingPaths`) when the directory it ran in, its source, or an `-include`
+  or `-imacros` file is missing here; the `missing.*` keys say which. A missing include directory is skipped as Clang
+  skips it, and the command runs. Outside the carve root it is the build machine's toolchain folders
+  (`ranWithoutOutsideDirs`). Inside, the tree the build compiled didn't have it either: a directory the build never
+  had, or one it made for its output, such as generated headers (`ranWithoutDirsInRoot`, `missingDirsInRoot`, and of
+  those `missingDirsInRootFromBuild`: at, above or under a folder some `-o` writes to). If a header only such a
+  directory held is needed, the compile fails and says so. Generate those headers in the tree before the carve, or
+  the commands that include them fail.
 - A driver named for its target (`aarch64-none-elf-clang`) gets that target passed as `--target`. `clang++` and the
   file's extension pick C++.
 - `.S` and `.sx` files run too: pp-trace parses them as C after preprocessing, so their parse errors are expected;
@@ -139,8 +142,9 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `world.ppTrace.version` | the `LLVM version` line pp-trace printed, or `unknown` |
 | `world.ppTrace.commands` / `.succeeded` / `.failed` | commands pp-trace was to run, ran clean, and didn't |
 | `world.ppTrace.missingPaths` / `.refused` / `.incomplete` / `.timedOut` | of the failed: a path missing here, a flag that loads other code, not all of it in the log (an unreadable response file), over the time limit |
-| `world.ppTrace.missing.workDir` / `.source` / `.forcedInclude` / `.includeDirInRoot` | of `missingPaths`: what was missing |
-| `world.ppTrace.ranWithoutOutsideDirs` | commands that ran with an include directory outside the carve root missing here |
+| `world.ppTrace.missing.workDir` / `.source` / `.forcedInclude` | of `missingPaths`: what was missing |
+| `world.ppTrace.ranWithoutOutsideDirs` / `.ranWithoutDirsInRoot` | commands that ran with an include directory missing here, outside the carve root / inside it |
+| `world.ppTrace.missingDirsInRoot` / `.missingDirsInRootFromBuild` | distinct include directories inside the carve root missing here, and of those, the ones at, above or under a folder some `-o` writes to |
 | `world.ppTrace.notPreprocessed` | `.s` and `.asm` commands, not run |
 | `world.ppTrace.names` / `.unitsWithoutCommand` / `.trusted` | as for `usedMacros` |
 | `world.ppTrace.mem.budgetMb` | the memory the runs shared |

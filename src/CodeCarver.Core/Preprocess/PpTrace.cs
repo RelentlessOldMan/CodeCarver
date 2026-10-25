@@ -32,19 +32,22 @@ public sealed class PpTrace
     public int NotPreprocessed { get; private set; }
     public int Succeeded { get; private set; }
     public int Failed => Commands - Succeeded;
-    /// <summary>Commands not run because a path they name does not exist here: where it ran, its source, a file
-    /// <c>-include</c> or <c>-imacros</c> names, or an include directory inside the carve root (a pathMap the log
-    /// needs; another directory's header of the same name could stand in for one there). The four counts after it
-    /// say which, by the first missing.</summary>
+    /// <summary>Commands not run because a path they name does not exist here: where it ran, its source, or a file
+    /// <c>-include</c> or <c>-imacros</c> names. The three counts after it say which, by the first missing.</summary>
     public int MissingPaths { get; private set; }
     public int MissingWorkDir { get; private set; }
     public int MissingSource { get; private set; }
     public int MissingForcedInclude { get; private set; }
-    public int MissingIncludeDirInRoot { get; private set; }
-    /// <summary>Commands run although an include directory outside the carve root is missing here: the build
-    /// machine's toolchain or sysroot. Clang skips a missing directory, and a header only it held stops the run with
-    /// a fatal error, a failed command.</summary>
+    /// <summary>Commands run although an include directory is missing here. Clang skips a missing directory, as in the
+    /// build, and a header only it held stops the run with a fatal error, a failed command. Outside the carve root it
+    /// is the build machine's toolchain or sysroot. Inside, the tree the build compiled didn't have it either: a
+    /// directory the build never had, or one it made (<see cref="MissingDirsInRootFromBuild"/>).</summary>
     public int RanWithoutOutsideDirs { get; private set; }
+    public int RanWithoutDirsInRoot { get; private set; }
+    /// <summary>Distinct include directories inside the carve root missing here, and of those, the ones the build
+    /// wrote to: at or above, or under, the directory of a file some command's <c>-o</c> names.</summary>
+    public int MissingDirsInRoot { get; private set; }
+    public int MissingDirsInRootFromBuild { get; private set; }
     /// <summary>Commands not run because a flag would load or run other code.</summary>
     public int Refused { get; private set; }
     /// <summary>Commands not run because the log doesn't say all of them (an unreadable response file) or where they ran.</summary>
@@ -80,21 +83,25 @@ public sealed class PpTrace
         using var gate = new ChildMemoryGate(memoryBudget ?? ChildMemoryGate.BudgetForRun(), most);
         var traced = commands.Where(c => Preprocessed(c.File)).ToList();
         var r = new PpTrace { Commands = traced.Count, NotPreprocessed = commands.Count - traced.Count, Version = ReadVersion(exe) };
-        int succeeded = 0, missing = 0, refused = 0, incomplete = 0, timedOut = 0, outside = 0;
-        var missingBy = new int[5];
+        int succeeded = 0, missing = 0, refused = 0, incomplete = 0, timedOut = 0, outside = 0, inRoot = 0;
+        var missingBy = new int[4];
+        var missingInRoot = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(PathComparer.Default);
         var namesLock = new object();
         Parallel.ForEach(traced, new ParallelOptions { MaxDegreeOfParallelism = most }, cmd =>
         {
             if (cmd.Incomplete || cmd.AlternativeDirectories.Count > 0) { Interlocked.Increment(ref incomplete); return; }
             if (CompilerPreprocess.Refuse(cmd.Arguments)) { Interlocked.Increment(ref refused); return; }
-            var why = Missing(cmd, root, out var skipsOutside);
+            var dirs = new List<(string Dir, bool Inside)>();
+            var why = Missing(cmd, root, dirs);
             if (why != MissingKind.None)
             {
                 Interlocked.Increment(ref missing);
                 Interlocked.Increment(ref missingBy[(int)why]);
                 return;
             }
-            if (skipsOutside) Interlocked.Increment(ref outside);
+            if (dirs.Any(d => !d.Inside)) Interlocked.Increment(ref outside);
+            if (dirs.Any(d => d.Inside)) Interlocked.Increment(ref inRoot);
+            foreach (var d in dirs) if (d.Inside) missingInRoot.TryAdd(d.Dir, 0);
             var names = new HashSet<ulong>();
             bool ok, late;
             while (true)
@@ -114,8 +121,11 @@ public sealed class PpTrace
         r.MissingWorkDir = missingBy[(int)MissingKind.WorkDir];
         r.MissingSource = missingBy[(int)MissingKind.Source];
         r.MissingForcedInclude = missingBy[(int)MissingKind.ForcedInclude];
-        r.MissingIncludeDirInRoot = missingBy[(int)MissingKind.IncludeDirInRoot];
         r.RanWithoutOutsideDirs = outside;
+        r.RanWithoutDirsInRoot = inRoot;
+        r.MissingDirsInRoot = missingInRoot.Count;
+        var outDirs = OutputDirs(commands);
+        r.MissingDirsInRootFromBuild = missingInRoot.Keys.Count(d => outDirs.Any(o => Within(o, d) || Within(d, o)));
         r.Refused = refused;
         r.Incomplete = incomplete;
         r.TimedOut = timedOut;
@@ -185,17 +195,16 @@ public sealed class PpTrace
     }
 
     /// <summary>Run pp-trace on one command and add the names it prints. Ok: it exited 0 within the time limit.</summary>
-    internal enum MissingKind { None, WorkDir, Source, ForcedInclude, IncludeDirInRoot }
+    internal enum MissingKind { None, WorkDir, Source, ForcedInclude }
 
     static readonly string[] DirFlags = { "-isystem", "-iquote", "-idirafter", "-I" };
     static readonly string[] FileFlags = { "-include", "-imacros" };
 
     /// <summary>The first path of <paramref name="cmd"/> missing here that keeps it from running (see
-    /// <see cref="MissingPaths"/>). A missing include directory outside <paramref name="root"/> doesn't (null root:
-    /// every directory is inside); <paramref name="skipsOutside"/> says one was missing.</summary>
-    internal static MissingKind Missing(CompileCommand cmd, string? root, out bool skipsOutside)
+    /// <see cref="MissingPaths"/>). A missing include directory doesn't: it goes in <paramref name="missingDirs"/>,
+    /// with whether it is inside <paramref name="root"/> (null root: every directory is inside).</summary>
+    internal static MissingKind Missing(CompileCommand cmd, string? root, List<(string Dir, bool Inside)> missingDirs)
     {
-        skipsOutside = false;
         string Full(string p) => Path.GetFullPath(Path.IsPathFullyQualified(p) ? p : Path.Combine(cmd.Directory, p));
         try
         {
@@ -214,15 +223,42 @@ public sealed class PpTrace
                 var full = Full(value);
                 if (file is not null) { if (!File.Exists(full)) return MissingKind.ForcedInclude; continue; }
                 if (Directory.Exists(full)) continue;
-                var inside = rootFull is null
-                             || full.StartsWith(rootFull + Path.DirectorySeparatorChar, PathComparer.Comparison)
-                             || string.Equals(full, rootFull, PathComparer.Comparison);
-                if (inside) return MissingKind.IncludeDirInRoot;
-                skipsOutside = true;
+                missingDirs.Add((full, rootFull is null || Within(full, rootFull)));
             }
             return MissingKind.None;
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return MissingKind.Source; }
+    }
+
+    // Is full path a at or under directory b?
+    static bool Within(string a, string b)
+    {
+        a = Path.TrimEndingDirectorySeparator(a);
+        b = Path.TrimEndingDirectorySeparator(b);
+        return string.Equals(a, b, PathComparer.Comparison) || a.StartsWith(b + Path.DirectorySeparatorChar, PathComparer.Comparison);
+    }
+
+    /// <summary>The directories the commands' <c>-o</c> files go to, full paths.</summary>
+    internal static HashSet<string> OutputDirs(IEnumerable<CompileCommand> commands)
+    {
+        var dirs = new HashSet<string>(PathComparer.Default);
+        foreach (var cmd in commands)
+        {
+            var args = cmd.Arguments;
+            for (var i = 0; i < args.Count; i++)
+            {
+                var o = args[i] == "-o" ? (i + 1 < args.Count ? args[i + 1] : null)
+                      : args[i].StartsWith("-o", StringComparison.Ordinal) && args[i].Length > 2 ? args[i][2..] : null;
+                if (o is null) continue;
+                try
+                {
+                    var full = Path.GetFullPath(Path.IsPathFullyQualified(o) ? o : Path.Combine(cmd.Directory, o));
+                    if (Path.GetDirectoryName(full) is { } d) dirs.Add(d);
+                }
+                catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { }
+            }
+        }
+        return dirs;
     }
 
     private static (bool Ok, bool TimedOut) TraceOne(string exe, CompileCommand cmd, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease)

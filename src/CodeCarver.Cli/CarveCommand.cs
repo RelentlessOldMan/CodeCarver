@@ -1331,8 +1331,10 @@ public static class CarveCommand
             summary["world.ppTrace.missing.workDir"] = trace.MissingWorkDir;
             summary["world.ppTrace.missing.source"] = trace.MissingSource;
             summary["world.ppTrace.missing.forcedInclude"] = trace.MissingForcedInclude;
-            summary["world.ppTrace.missing.includeDirInRoot"] = trace.MissingIncludeDirInRoot;
             summary["world.ppTrace.ranWithoutOutsideDirs"] = trace.RanWithoutOutsideDirs;
+            summary["world.ppTrace.ranWithoutDirsInRoot"] = trace.RanWithoutDirsInRoot;
+            summary["world.ppTrace.missingDirsInRoot"] = trace.MissingDirsInRoot;
+            summary["world.ppTrace.missingDirsInRootFromBuild"] = trace.MissingDirsInRootFromBuild;
             summary["world.ppTrace.refused"] = trace.Refused;
             summary["world.ppTrace.incomplete"] = trace.Incomplete;
             summary["world.ppTrace.timedOut"] = trace.TimedOut;
@@ -1357,11 +1359,13 @@ public static class CarveCommand
                              trace.MissingWorkDir > 0 ? $"{trace.MissingWorkDir:N0} the directory it ran in" : null,
                              trace.MissingSource > 0 ? $"{trace.MissingSource:N0} its source" : null,
                              trace.MissingForcedInclude > 0 ? $"{trace.MissingForcedInclude:N0} an -include/-imacros file" : null,
-                             trace.MissingIncludeDirInRoot > 0 ? $"{trace.MissingIncludeDirInRoot:N0} an include directory inside the carve root (pathMap?)" : null,
                          }.Where(x => x is not null)) : null,
                          trace.Refused > 0 ? $"{trace.Refused:N0} refused" : null,
                          trace.Incomplete > 0 ? $"{trace.Incomplete:N0} not fully in the log" : null,
                      }.Where(x => x is not null))}), so the header carve models the paste macros itself"));
+            if (trace.MissingDirsInRoot > 0)
+                err.WriteLine($"  config  : pp-trace: {trace.RanWithoutDirsInRoot:N0} command(s) ran without {trace.MissingDirsInRoot:N0} include director(ies) missing from the tree"
+                    + $" ({trace.MissingDirsInRootFromBuild:N0} where the build writes its output), as Clang skips them; a header only they held fails its command");
             err.WriteLine($"  config  : pp-trace memory: at most {trace.PeakTotalBytes / Mb:N0} MB in {trace.PeakRunning:N0} run(s) at once, {trace.PeakChildBytes / Mb:N0} MB in one, "
                 + $"of a {trace.BudgetBytes / Mb:N0} MB budget (memoryStopMb less the carve's own)"
                 + (trace.Evictions > 0 ? $"; {trace.Evictions:N0} stopped and run again to stay in it" : "")
