@@ -32,8 +32,19 @@ public sealed class PpTrace
     public int NotPreprocessed { get; private set; }
     public int Succeeded { get; private set; }
     public int Failed => Commands - Succeeded;
-    /// <summary>Commands not run because an include path or the source they name does not exist here.</summary>
+    /// <summary>Commands not run because a path they name does not exist here: where it ran, its source, a file
+    /// <c>-include</c> or <c>-imacros</c> names, or an include directory inside the carve root (a pathMap the log
+    /// needs; another directory's header of the same name could stand in for one there). The four counts after it
+    /// say which, by the first missing.</summary>
     public int MissingPaths { get; private set; }
+    public int MissingWorkDir { get; private set; }
+    public int MissingSource { get; private set; }
+    public int MissingForcedInclude { get; private set; }
+    public int MissingIncludeDirInRoot { get; private set; }
+    /// <summary>Commands run although an include directory outside the carve root is missing here: the build
+    /// machine's toolchain or sysroot. Clang skips a missing directory, and a header only it held stops the run with
+    /// a fatal error, a failed command.</summary>
+    public int RanWithoutOutsideDirs { get; private set; }
     /// <summary>Commands not run because a flag would load or run other code.</summary>
     public int Refused { get; private set; }
     /// <summary>Commands not run because the log doesn't say all of them (an unreadable response file) or where they ran.</summary>
@@ -62,19 +73,28 @@ public sealed class PpTrace
     /// (default: <see cref="ChildMemoryGate.BudgetForRun"/>, what memoryStopMb leaves the carve) and run at most
     /// <paramref name="parallel"/> at once (default: one per core but one).
     /// </summary>
-    public static PpTrace Run(string exe, IReadOnlyList<CompileCommand> commands, int timeoutMs = 1_800_000, int? parallel = null, long? memoryBudget = null)
+    public static PpTrace Run(string exe, IReadOnlyList<CompileCommand> commands, int timeoutMs = 1_800_000, int? parallel = null, long? memoryBudget = null,
+                              string? root = null)
     {
         var most = parallel ?? Math.Max(1, Environment.ProcessorCount - 1);
         using var gate = new ChildMemoryGate(memoryBudget ?? ChildMemoryGate.BudgetForRun(), most);
         var traced = commands.Where(c => Preprocessed(c.File)).ToList();
         var r = new PpTrace { Commands = traced.Count, NotPreprocessed = commands.Count - traced.Count, Version = ReadVersion(exe) };
-        int succeeded = 0, missing = 0, refused = 0, incomplete = 0, timedOut = 0;
+        int succeeded = 0, missing = 0, refused = 0, incomplete = 0, timedOut = 0, outside = 0;
+        var missingBy = new int[5];
         var namesLock = new object();
         Parallel.ForEach(traced, new ParallelOptions { MaxDegreeOfParallelism = most }, cmd =>
         {
             if (cmd.Incomplete || cmd.AlternativeDirectories.Count > 0) { Interlocked.Increment(ref incomplete); return; }
             if (CompilerPreprocess.Refuse(cmd.Arguments)) { Interlocked.Increment(ref refused); return; }
-            if (!Directory.Exists(cmd.Directory) || CompilerPreprocess.MissingPath(cmd)) { Interlocked.Increment(ref missing); return; }
+            var why = Missing(cmd, root, out var skipsOutside);
+            if (why != MissingKind.None)
+            {
+                Interlocked.Increment(ref missing);
+                Interlocked.Increment(ref missingBy[(int)why]);
+                return;
+            }
+            if (skipsOutside) Interlocked.Increment(ref outside);
             var names = new HashSet<ulong>();
             bool ok, late;
             while (true)
@@ -91,6 +111,11 @@ public sealed class PpTrace
         });
         r.Succeeded = succeeded;
         r.MissingPaths = missing;
+        r.MissingWorkDir = missingBy[(int)MissingKind.WorkDir];
+        r.MissingSource = missingBy[(int)MissingKind.Source];
+        r.MissingForcedInclude = missingBy[(int)MissingKind.ForcedInclude];
+        r.MissingIncludeDirInRoot = missingBy[(int)MissingKind.IncludeDirInRoot];
+        r.RanWithoutOutsideDirs = outside;
         r.Refused = refused;
         r.Incomplete = incomplete;
         r.TimedOut = timedOut;
@@ -160,6 +185,46 @@ public sealed class PpTrace
     }
 
     /// <summary>Run pp-trace on one command and add the names it prints. Ok: it exited 0 within the time limit.</summary>
+    internal enum MissingKind { None, WorkDir, Source, ForcedInclude, IncludeDirInRoot }
+
+    static readonly string[] DirFlags = { "-isystem", "-iquote", "-idirafter", "-I" };
+    static readonly string[] FileFlags = { "-include", "-imacros" };
+
+    /// <summary>The first path of <paramref name="cmd"/> missing here that keeps it from running (see
+    /// <see cref="MissingPaths"/>). A missing include directory outside <paramref name="root"/> doesn't (null root:
+    /// every directory is inside); <paramref name="skipsOutside"/> says one was missing.</summary>
+    internal static MissingKind Missing(CompileCommand cmd, string? root, out bool skipsOutside)
+    {
+        skipsOutside = false;
+        string Full(string p) => Path.GetFullPath(Path.IsPathFullyQualified(p) ? p : Path.Combine(cmd.Directory, p));
+        try
+        {
+            if (!Directory.Exists(cmd.Directory)) return MissingKind.WorkDir;
+            if (!File.Exists(Full(cmd.File))) return MissingKind.Source;
+            var rootFull = root is null ? null : Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
+            var args = cmd.Arguments;
+            for (var i = 0; i < args.Count; i++)
+            {
+                var a = args[i];
+                var file = FileFlags.FirstOrDefault(f => a.StartsWith(f, StringComparison.Ordinal));
+                var flag = file ?? DirFlags.FirstOrDefault(f => a.StartsWith(f, StringComparison.Ordinal));
+                if (flag is null) continue;
+                var value = a.Length > flag.Length ? a[flag.Length..] : i + 1 < args.Count ? args[++i] : null;
+                if (value is null || value.StartsWith('=')) continue;   // sysroot-relative: the compiler's own
+                var full = Full(value);
+                if (file is not null) { if (!File.Exists(full)) return MissingKind.ForcedInclude; continue; }
+                if (Directory.Exists(full)) continue;
+                var inside = rootFull is null
+                             || full.StartsWith(rootFull + Path.DirectorySeparatorChar, PathComparer.Comparison)
+                             || string.Equals(full, rootFull, PathComparer.Comparison);
+                if (inside) return MissingKind.IncludeDirInRoot;
+                skipsOutside = true;
+            }
+            return MissingKind.None;
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return MissingKind.Source; }
+    }
+
     private static (bool Ok, bool TimedOut) TraceOne(string exe, CompileCommand cmd, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease)
     {
         // The command goes in a compile database of its own: no command-line quoting or length limit to meet.

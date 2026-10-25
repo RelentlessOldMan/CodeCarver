@@ -100,6 +100,22 @@ public sealed class PpTraceTests
             Assert.False(bad.Complete);
             Assert.Equal(0, bad.Succeeded);
             Assert.Equal(1, bad.MissingPaths);
+
+            // The build machine's toolchain directories aren't here: Clang skips a missing include directory, so a
+            // command still runs. One inside the carve root is a pathMap the log needs.
+            var outside = Path.Combine(Path.GetTempPath(), "cc-ppt-gone-" + Guid.NewGuid().ToString("N"), "sysroot", "include");
+            var paths = PpTrace.Run(exe!, new[]
+            {
+                Cmd(dir, "a.c", "clang", "-Iinc", "-isystem", outside, "-c"),
+                Cmd(dir, "a.c", "clang", "-Iinc", "-Ignone", "-c"),
+                Cmd(dir, "a.c", "clang", "-include", "gone.h", "-c"),
+                Cmd(Path.Combine(dir, "obj"), "../a.c", "clang", "-c"),
+                Cmd(dir, "nosuch.c", "clang", "-c"),
+            }, parallel: 2, root: dir);
+            Assert.Equal(1, paths.Succeeded);
+            Assert.Equal(1, paths.RanWithoutOutsideDirs);
+            Assert.Equal(4, paths.MissingPaths);
+            Assert.Equal((1, 1, 1, 1), (paths.MissingIncludeDirInRoot, paths.MissingForcedInclude, paths.MissingWorkDir, paths.MissingSource));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

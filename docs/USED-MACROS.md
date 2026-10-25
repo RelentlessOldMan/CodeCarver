@@ -57,10 +57,13 @@ The carve trusts the names only when:
 
 1. every compile command in the build logs is matched, by its source file, by a complete file (a source compiled
    twice, say in two configurations, needs two files), and
-2. every translation unit the carve keeps has a compile command in the logs.
+2. in each stage, every source file the stage keeps has a compile command in the logs.
 
-A compile the carve hasn't heard from could use a define the others didn't. If either check fails, the run says why
-(`NOT trusted (...)`) and the header carve models the paste macros itself, as it does without the key. Names from every
+A compile the carve hasn't heard from could use a define the others didn't. If the first check fails, the run says why
+(`NOT trusted (...)`) and the header carve models the paste macros itself, as it does without the key. The second is
+checked per stage, on the files that stage keeps: a tree holds many source files no build compiles, and while the
+carve drops them they need no command. A stage that keeps one says so (`headerCarve.keptUnitsWithoutCommand`) and
+models the paste macros itself; the other stages still use the names. Names from every
 file are still read. Names count even from files that aren't complete or don't match a command, so an extra file
 can keep more, never less.
 
@@ -93,7 +96,11 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
   `__has_builtin`, `__has_include` and its predefined macros differently, so the carve prints the version it ran
   (`world.ppTrace.version`). Nothing is bundled or downloaded.
 - The tree must be readable at the paths the log names, after `[advanced] pathMap`, like for the build's own
-  preprocessor run. A command naming a source or include folder missing here doesn't run (`missingPaths`).
+  preprocessor run. A command doesn't run (`missingPaths`) when the directory it ran in, its source, an `-include` or
+  `-imacros` file, or an include directory inside the carve root is missing here; the `missing.*` keys say which. An
+  include directory outside the carve root that is missing here, such as the build machine's toolchain folders, is
+  skipped as Clang skips it, and the command runs (`ranWithoutOutsideDirs`). If a header only it held is needed, the
+  compile fails and says so.
 - A driver named for its target (`aarch64-none-elf-clang`) gets that target passed as `--target`. `clang++` and the
   file's extension pick C++.
 - `.S` and `.sx` files run too: pp-trace parses them as C after preprocessing, so their parse errors are expected;
@@ -103,8 +110,9 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
   commands in the log. Their names come in as for any kept non-C file (`keptByOther`).
 - `ppTrace` and `usedMacros` say the same thing; set one of them. One carve runs one pp-trace.
 
-The carve trusts the names when every command ran clean (exit 0, within 30 minutes each) and every translation unit the
-carve keeps has a compile command in the logs. Otherwise it says why and the static carve runs.
+The carve trusts the names when every command ran clean (exit 0, within 30 minutes each). Otherwise it says why and the
+static carve runs. As for `usedMacros`, a stage that keeps a source file with no compile command models the paste
+macros itself.
 
 **Memory.** Each pp-trace holds about 0.5 KB for every define in the headers its compile includes: 2 GB for a compile
 that includes 3.8 million. That memory is pp-trace's, not the carve's, so the runs share what `memoryStopMb` leaves
@@ -125,17 +133,20 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `world.usedMacros.duplicates` | files the same as an earlier one, byte for byte (counted once) |
 | `world.usedMacros.names` | distinct names used or tested |
 | `world.usedMacros.commands` / `.commandsCovered` | compile commands in the logs, and how many a file matched |
-| `world.usedMacros.unitsWithoutCommand` | kept translation units the logs have no compile for |
+| `world.usedMacros.unitsWithoutCommand` | source files in the tree the logs have no compile for (those a build trace shows unbuilt aside); only kept ones count, per stage |
 | `world.usedMacros.trusted` | `1` when the header carve used the files |
 | `world.ppTrace.version` | the `LLVM version` line pp-trace printed, or `unknown` |
 | `world.ppTrace.commands` / `.succeeded` / `.failed` | commands pp-trace was to run, ran clean, and didn't |
 | `world.ppTrace.missingPaths` / `.refused` / `.incomplete` / `.timedOut` | of the failed: a path missing here, a flag that loads other code, not all of it in the log (an unreadable response file), over the time limit |
+| `world.ppTrace.missing.workDir` / `.source` / `.forcedInclude` / `.includeDirInRoot` | of `missingPaths`: what was missing |
+| `world.ppTrace.ranWithoutOutsideDirs` | commands that ran with an include directory outside the carve root missing here |
 | `world.ppTrace.notPreprocessed` | `.s` and `.asm` commands, not run |
 | `world.ppTrace.names` / `.unitsWithoutCommand` / `.trusted` | as for `usedMacros` |
 | `world.ppTrace.mem.budgetMb` | the memory the runs shared |
 | `world.ppTrace.mem.peakOneMb` / `.peakAllMb` / `.peakRunning` | the most one run held, the most all held at once, and the most at once |
 | `world.ppTrace.mem.rerunForMemory` / `.overBudgetAlone` | runs stopped and run again to stay in the budget; runs that alone needed more |
 | `stageN.headerCarve.fromUsedMacros` | `1` when this stage's header carve used them (from either key) |
+| `stageN.headerCarve.keptUnitsWithoutCommand` | source files this stage keeps that no compile command compiles; above `0`, the stage models the paste macros itself |
 | `stageN.headerCarve.keptByUsed` / `.keptByOther` | defines kept because a compile used them, or a non-C file names them |
 | `stageN.headerCarve.used.otherFiles` / `.otherNames` | non-C files read, and the names they gave |
 

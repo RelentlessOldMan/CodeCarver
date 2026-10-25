@@ -3,14 +3,14 @@ using CodeCarver.Cli;
 namespace CodeCarver.Tests.Examples;
 
 /// <summary>Carves a copy of examples/&lt;name&gt; with its carve.toml, optionally with a different [builds.main]
-/// section (another input set), and answers what each stage kept, dropped and stubbed.</summary>
+/// section (another input set) and changes of its own to the copy before the carve, and answers what each stage kept, dropped and stubbed.</summary>
 internal class ExampleRun : IDisposable
 {
     readonly TempDir _work;
     public string Dir { get; }
     public int Code { get; }
     public string Output { get; }
-    public ExampleRun(string example, string? buildSection = null)
+    public ExampleRun(string example, string? buildSection = null, Action<string>? before = null)
     {
         _work = new TempDir($"cc-{example}-");
         Dir = _work.Sub(example);
@@ -24,6 +24,7 @@ internal class ExampleRun : IDisposable
             var end = text.IndexOf("[advanced]", StringComparison.Ordinal);
             File.WriteAllText(cfg, text[..start] + buildSection + "\n" + text[end..]);
         }
+        before?.Invoke(Dir);
         var w = new StringWriter();
         Code = CarveCommand.Run(new[] { "carve", Path.Combine(Dir, "src"), "--config", cfg }, w, w);
         Output = w.ToString();

@@ -1251,9 +1251,13 @@ public static class CarveCommand
                                          + $"{exactPre.Refused:N0} refused), so headers keep the scanner's answer" : ""));
         }
         Mark("preprocess");
+        static string UsedFor(int unitsWithout) => " -> the big headers keep only the defines the compiles used"
+            + (unitsWithout > 0 ? $", in each stage whose kept source files all have a command ({unitsWithout:N0} in the tree have none)" : "");
         // What the build's compiles used, from -E -dU (docs/USED-MACROS.md): trusted only when every compile command has
-        // its file and every translation unit the build compiles has a command.
+        // its file, and then, in each stage, only when every source file the stage keeps has a command.
         IReadOnlySet<ulong>? usedMacros = null;
+        HashSet<string>? usedLogged = null;   // the source files the log's commands compile
+        var usedTuExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
         if (cv.UsedMacros.Count > 0)
         {
             if (buildCmds.Count == 0)
@@ -1262,10 +1266,9 @@ public static class CarveCommand
                 return 2;
             }
             var um = CodeCarver.Core.Preprocess.UsedMacros.Read(cv.UsedMacros);
-            var tuExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
-            var logged = buildCmds.Select(CmdRel).Where(r => r is not null).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var unitsWithout = parseRels.Count(r => !notBuilt.Contains(r) && tuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !logged.Contains(r));
-            var cov = um.Check(buildCmds, dir, MapPath, unitsWithout);
+            var logged = buildCmds.Select(CmdRel).Where(r => r is not null).Select(r => r!).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var unitsWithout = parseRels.Count(r => !notBuilt.Contains(r) && usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !logged.Contains(r));
+            var cov = um.Check(buildCmds, dir, MapPath, 0);   // source files without a command: checked per stage, kept ones only
             summary["world.usedMacros.files"] = um.Files;
             summary["world.usedMacros.incomplete"] = um.Incomplete;
             summary["world.usedMacros.noSource"] = um.NoSource;
@@ -1274,14 +1277,13 @@ public static class CarveCommand
             summary["world.usedMacros.names"] = um.Names.Count;
             summary["world.usedMacros.commands"] = cov.Commands;
             summary["world.usedMacros.commandsCovered"] = cov.Covered;
-            summary["world.usedMacros.unitsWithoutCommand"] = cov.UnitsWithoutCommand;
+            summary["world.usedMacros.unitsWithoutCommand"] = unitsWithout;
             summary["world.usedMacros.trusted"] = cov.Complete ? 1 : 0;
-            if (cov.Complete) usedMacros = um.Names;
+            if (cov.Complete) { usedMacros = um.Names; usedLogged = logged; }
             err.WriteLine($"  config  : used macros: {um.Files:N0} file(s), {um.Names.Count:N0} name(s), {cov.Covered:N0} of {cov.Commands:N0} compile command(s) covered"
-                + (cov.Complete ? " -> the big headers keep only the defines the compiles used"
+                + (cov.Complete ? UsedFor(unitsWithout)
                    : $"; NOT trusted ({string.Join(", ", new[] {
                          cov.Commands - cov.Covered > 0 ? $"{cov.Commands - cov.Covered:N0} command(s) without a file" : null,
-                         cov.UnitsWithoutCommand > 0 ? $"{cov.UnitsWithoutCommand:N0} source file(s) in no command" : null,
                          um.Incomplete > 0 ? $"{um.Incomplete:N0} file(s) not ending in {CodeCarver.Core.Preprocess.UsedMacros.OkLine}" : null,
                          um.NoSource > 0 ? $"{um.NoSource:N0} naming no source" : null,
                          um.NoMacros > 0 ? $"{um.NoMacros:N0} with no #define (not -dU output?)" : null,
@@ -1304,18 +1306,22 @@ public static class CarveCommand
             }
             var exe = FindExe(cv.PpTraces[0])!;   // checked with the other inputs
             var absCmds = buildCmds.Select(c => c with { Directory = Path.IsPathFullyQualified(c.Directory) ? c.Directory : Path.GetFullPath(Path.Combine(dir, c.Directory)) }).ToList();
-            var tuExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
-            var logged = buildCmds.Select(CmdRel).Where(r => r is not null).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var unitsWithout = parseRels.Count(r => !notBuilt.Contains(r) && tuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !logged.Contains(r));
+            var logged = buildCmds.Select(CmdRel).Where(r => r is not null).Select(r => r!).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var unitsWithout = parseRels.Count(r => !notBuilt.Contains(r) && usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !logged.Contains(r));
             err.WriteLine($"  config  : running pp-trace on {absCmds.Count:N0} compile command(s) ...");
-            var trace = CodeCarver.Core.Preprocess.PpTrace.Run(exe, absCmds);
-            var trusted = trace.Complete && unitsWithout == 0;
+            var trace = CodeCarver.Core.Preprocess.PpTrace.Run(exe, absCmds, root: dir);
+            var trusted = trace.Complete;   // source files without a command: checked per stage, kept ones only
             summary["world.ppTrace.version"] = trace.Version ?? "unknown";
             summary["world.ppTrace.commands"] = trace.Commands;
             summary["world.ppTrace.notPreprocessed"] = trace.NotPreprocessed;
             summary["world.ppTrace.succeeded"] = trace.Succeeded;
             summary["world.ppTrace.failed"] = trace.Failed;
             summary["world.ppTrace.missingPaths"] = trace.MissingPaths;
+            summary["world.ppTrace.missing.workDir"] = trace.MissingWorkDir;
+            summary["world.ppTrace.missing.source"] = trace.MissingSource;
+            summary["world.ppTrace.missing.forcedInclude"] = trace.MissingForcedInclude;
+            summary["world.ppTrace.missing.includeDirInRoot"] = trace.MissingIncludeDirInRoot;
+            summary["world.ppTrace.ranWithoutOutsideDirs"] = trace.RanWithoutOutsideDirs;
             summary["world.ppTrace.refused"] = trace.Refused;
             summary["world.ppTrace.incomplete"] = trace.Incomplete;
             summary["world.ppTrace.timedOut"] = trace.TimedOut;
@@ -1329,17 +1335,21 @@ public static class CarveCommand
             summary["world.ppTrace.mem.peakRunning"] = trace.PeakRunning;
             summary["world.ppTrace.mem.rerunForMemory"] = trace.Evictions;
             summary["world.ppTrace.mem.overBudgetAlone"] = trace.OverBudgetAlone;
-            if (trusted) usedMacros = trace.Names;
+            if (trusted) { usedMacros = trace.Names; usedLogged = logged; }
             var ran = trace.Failed - trace.MissingPaths - trace.Refused - trace.Incomplete;
             err.WriteLine($"  config  : pp-trace ({trace.Version ?? "version unknown"}): {trace.Succeeded:N0} of {trace.Commands:N0} compile command(s) ran clean, {trace.Names.Count:N0} name(s)"
-                + (trusted ? " -> the big headers keep only the defines the compiles used"
+                + (trusted ? UsedFor(unitsWithout)
                    : $"; NOT trusted ({string.Join(", ", new[] {
                          trace.Commands == 0 ? "no command to run" : null,
                          ran > 0 ? $"{ran:N0} failed{(trace.TimedOut > 0 ? $" ({trace.TimedOut:N0} over the time limit)" : "")}" : null,
-                         trace.MissingPaths > 0 ? $"{trace.MissingPaths:N0} name a path missing here" : null,
+                         trace.MissingPaths > 0 ? $"{trace.MissingPaths:N0} name a path missing here: " + string.Join(", ", new[] {
+                             trace.MissingWorkDir > 0 ? $"{trace.MissingWorkDir:N0} the directory it ran in" : null,
+                             trace.MissingSource > 0 ? $"{trace.MissingSource:N0} its source" : null,
+                             trace.MissingForcedInclude > 0 ? $"{trace.MissingForcedInclude:N0} an -include/-imacros file" : null,
+                             trace.MissingIncludeDirInRoot > 0 ? $"{trace.MissingIncludeDirInRoot:N0} an include directory inside the carve root (pathMap?)" : null,
+                         }.Where(x => x is not null)) : null,
                          trace.Refused > 0 ? $"{trace.Refused:N0} refused" : null,
                          trace.Incomplete > 0 ? $"{trace.Incomplete:N0} not fully in the log" : null,
-                         unitsWithout > 0 ? $"{unitsWithout:N0} source file(s) in no command" : null,
                      }.Where(x => x is not null))}), so the header carve models the paste macros itself"));
             err.WriteLine($"  config  : pp-trace memory: at most {trace.PeakTotalBytes / Mb:N0} MB in {trace.PeakRunning:N0} run(s) at once, {trace.PeakChildBytes / Mb:N0} MB in one, "
                 + $"of a {trace.BudgetBytes / Mb:N0} MB budget (memoryStopMb less the carve's own)"
@@ -3997,12 +4007,19 @@ public static class CarveCommand
                     foreach (var spec in buildCmds.SelectMany(c => c.Defines).Concat(defineSpecs).Distinct(StringComparer.Ordinal))
                         elsewhereDefines.Add(spec.IndexOf('=') is var eq and > 0 ? $"#define {spec[..eq]} {spec[(eq + 1)..]}" : $"#define {spec} 1");
                     void HcKey(string key, long value) => summary[$"{summaryStage}.headerCarve.{key}"] = value;
-                    // The compiles said what they used: no model of the paste macros needed (docs/USED-MACROS.md).
-                    var hc = usedMacros is not null
-                        ? HeaderCarver.CarveFromUsed(stageDir, keptBig, usedMacros, HcKey)
+                    // The compiles said what they used: no model of the paste macros needed (docs/USED-MACROS.md). A kept
+                    // source file no command compiles used macros nobody saw: then the stage models them itself.
+                    var keptWithout = usedLogged is null ? 0
+                        : splan.KeptFiles.Count(r => usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !usedLogged.Contains(r));
+                    if (usedMacros is not null) HcKey("keptUnitsWithoutCommand", keptWithout);
+                    if (keptWithout > 0)
+                        err.WriteLine($"  headers : {keptWithout:N0} kept source file(s) in no compile command: the used macros don't cover them, so the header carve models the paste macros itself");
+                    var stageUsed = keptWithout > 0 ? null : usedMacros;
+                    var hc = stageUsed is not null
+                        ? HeaderCarver.CarveFromUsed(stageDir, keptBig, stageUsed, HcKey)
                         : HeaderCarver.Carve(stageDir, keptBig, elsewhere, HcKey, elsewhereDefines,
                                              TimeSpan.FromMinutes(cv.HeaderCarveMinutes ?? DefaultHeaderCarveMinutes));
-                    summary[$"{summaryStage}.headerCarve.fromUsedMacros"] = usedMacros is not null ? 1 : 0;
+                    summary[$"{summaryStage}.headerCarve.fromUsedMacros"] = stageUsed is not null ? 1 : 0;
                     summary[$"{summaryStage}.headerCarve.bytesBefore"] = hc.BytesBefore;
                     summary[$"{summaryStage}.headerCarve.bytesAfter"] = hc.BytesAfter;
                     summary[$"{summaryStage}.headerCarve.definesKept"] = hc.DefinesKept;

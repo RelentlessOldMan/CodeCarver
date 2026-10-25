@@ -9,7 +9,7 @@ namespace CodeCarver.Tests.Examples;
 /// </summary>
 public sealed class UsedMacrosExampleTests
 {
-    sealed class Run : ExampleRun { public Run(string? buildSection = null) : base("used-macros", buildSection) { } }
+    sealed class Run : ExampleRun { public Run(string? buildSection = null, Action<string>? before = null) : base("used-macros", buildSection, before) { } }
 
     // What the build's compiles used: the paste macros, the UART fields uart.c pastes, and the two block bases the
     // preprocessed memmap.txt.in names.
@@ -47,6 +47,32 @@ public sealed class UsedMacrosExampleTests
         Assert.Contains("world.ppTrace.trusted = 1", r.Summary("max"));
         Assert.Equal(Used.Append("KQ_REGS_H").Order(StringComparer.Ordinal),
                      Defines(r.Carved("max", "inc/kq_regs.h")).Order(StringComparer.Ordinal));
+    }
+
+    /// <summary>The names cover what the carve keeps: a source file no command compiles doesn't stop them while the carve
+    /// drops it (a tree holds many a build never compiles), and makes the header carve model the macros once it is kept.</summary>
+    [Fact]
+    public void ASourceFileInNoCommand_MattersOnlyWhenKept()
+    {
+        const string Spare = "#include \"kq_regs.h\"\nunsigned kq_spare(void) { return KQ_SPI_CTRL_OFF; }\n";
+        using (var dropped = new Run(before: d => File.WriteAllText(Path.Combine(d, "src", "spare.c"), Spare)))
+        {
+            Assert.True(dropped.Code == 0, dropped.Output);
+            Assert.Contains("world.usedMacros.unitsWithoutCommand = 1", dropped.Summary("max"));
+            Assert.Contains("headerCarve.keptUnitsWithoutCommand = 0", dropped.Summary("max"));
+            Assert.Contains("headerCarve.fromUsedMacros = 1", dropped.Summary("max"));
+            Assert.DoesNotContain("KQ_SPI_CTRL_OFF", Defines(dropped.Carved("max", "inc/kq_regs.h")));
+        }
+        using var kept = new Run(before: d =>
+        {
+            File.WriteAllText(Path.Combine(d, "src", "spare.c"), Spare);
+            var cfg = Path.Combine(d, "carve.toml");
+            File.WriteAllText(cfg, File.ReadAllText(cfg).Replace("entryPoints = [\"main\"]", "entryPoints = [\"main\", \"kq_spare\"]"));
+        });
+        Assert.True(kept.Code == 0, kept.Output);
+        Assert.Contains("headerCarve.keptUnitsWithoutCommand = 1", kept.Summary("max"));
+        Assert.Contains("headerCarve.fromUsedMacros = 0", kept.Summary("max"));
+        Assert.Contains("KQ_SPI_CTRL_OFF", Defines(kept.Carved("max", "inc/kq_regs.h")));
     }
 
     /// <summary>Without the files the static carve models the paste macros itself: sound, and on this sample it also
