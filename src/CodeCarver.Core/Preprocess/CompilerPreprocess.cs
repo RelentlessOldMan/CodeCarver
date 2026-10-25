@@ -40,6 +40,15 @@ public sealed class CompilerPreprocess
     /// <summary>Files whose conditional blocks the compiler decided.</summary>
     public int FilesDecided => _decided.Count;
 
+    /// <summary>The memory the compiler runs had (<see cref="ChildMemoryGate"/>), and what they held: the most one
+    /// held, the most all held at once, the most at once, runs stopped and run again, and runs that alone needed more.</summary>
+    public long BudgetBytes { get; private set; }
+    public long PeakChildBytes { get; private set; }
+    public long PeakTotalBytes { get; private set; }
+    public int PeakRunning { get; private set; }
+    public int Evictions { get; private set; }
+    public int OverBudgetAlone { get; private set; }
+
     private CompilerPreprocess(Dictionary<string, HashSet<int>> live, HashSet<string> decided, int commands, int succeeded,
                                int missingPaths, int refused)
     {
@@ -55,19 +64,24 @@ public sealed class CompilerPreprocess
     /// Preprocess every command. <paramref name="driverFor"/> names the executable to run a command with (null: it
     /// can't or mustn't be run here, a failure). <paramref name="sourceOf"/> maps a command to its source file's path
     /// relative to <paramref name="root"/> (null when outside it). <paramref name="units"/> are the translation units
-    /// the carve has: headers are decided only when each is compiled by a command that ran.
+    /// the carve has: headers are decided only when each is compiled by a command that ran. The runs share
+    /// <paramref name="memoryBudget"/> (default: what memoryStopMb leaves the carve) and run at most
+    /// <paramref name="parallel"/> at once (default: one per core but one).
     /// </summary>
     public static CompilerPreprocess Run(IReadOnlyList<CompileCommand> commands, string root,
                                          Func<CompileCommand, string?> driverFor, Func<CompileCommand, string?> sourceOf,
-                                         IEnumerable<string>? units = null, int timeoutMs = 300_000)
+                                         IEnumerable<string>? units = null, int timeoutMs = 300_000,
+                                         int? parallel = null, long? memoryBudget = null)
     {
+        var most = parallel ?? Math.Max(1, Environment.ProcessorCount - 1);
+        using var gate = new ChildMemoryGate(memoryBudget ?? ChildMemoryGate.BudgetForRun(), most);
         var rootFull = Path.GetFullPath(root);
         var paths = new PathResolver(rootFull);
         var live = new ConcurrentDictionary<string, HashSet<int>>(PathComparer.Default);
         var okBySource = new ConcurrentDictionary<string, bool>(PathComparer.Default);   // false once any of its commands failed
         var included = new ConcurrentDictionary<string, byte>(PathComparer.Default);     // reached by a compile of another file
         int succeeded = 0, missing = 0, refused = 0;
-        Parallel.ForEach(commands, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1) }, cmd =>
+        Parallel.ForEach(commands, new ParallelOptions { MaxDegreeOfParallelism = most }, cmd =>
         {
             var src = sourceOf(cmd);
             var local = new Dictionary<string, HashSet<int>>(PathComparer.Default);
@@ -76,7 +90,14 @@ public sealed class CompilerPreprocess
             else if (Refuse(cmd.Arguments)) Interlocked.Increment(ref refused);
             else if (MissingPath(cmd)) Interlocked.Increment(ref missing);
             else if (driverFor(cmd) is not { } exe) Interlocked.Increment(ref refused);
-            else ok = Preprocess(exe, cmd, paths, local, timeoutMs) && (src is null || local.ContainsKey(src));
+            else
+                while (true)
+                {
+                    using var lease = gate.Admit();
+                    ok = Preprocess(exe, cmd, paths, local, timeoutMs, lease) && (src is null || local.ContainsKey(src));
+                    if (!lease.Evicted) break;
+                    local.Clear();   // stopped for memory: run again when there is room
+                }
             if (src is not null) okBySource.AddOrUpdate(src, ok, (_, was) => was && ok);
             if (!ok) return;
             Interlocked.Increment(ref succeeded);
@@ -104,7 +125,12 @@ public sealed class CompilerPreprocess
             }
         }
         return new CompilerPreprocess(new Dictionary<string, HashSet<int>>(live, PathComparer.Default), decided,
-                                      commands.Count, succeeded, missing, refused) { _ownOnly = ownOnly };
+                                      commands.Count, succeeded, missing, refused)
+        {
+            _ownOnly = ownOnly,
+            BudgetBytes = gate.Budget, PeakChildBytes = gate.PeakChildBytes, PeakTotalBytes = gate.PeakTotalBytes,
+            PeakRunning = gate.PeakRunning, Evictions = gate.Evictions, OverBudgetAlone = gate.OverBudgetAlone,
+        };
     }
 
     private HashSet<string> _ownOnly = new();
@@ -260,7 +286,8 @@ public sealed class CompilerPreprocess
 
     /// <summary>Run one command with -E -dD and record, per in-root file, the lines that came through. False when the
     /// compiler failed, timed out, or printed no line marker (not a GCC/Clang-style preprocessor).</summary>
-    private static bool Preprocess(string exe, CompileCommand cmd, PathResolver paths, Dictionary<string, HashSet<int>> live, int timeoutMs)
+    private static bool Preprocess(string exe, CompileCommand cmd, PathResolver paths, Dictionary<string, HashSet<int>> live, int timeoutMs,
+                                   ChildMemoryGate.Lease lease)
     {
         string? rsp = null;
         try
@@ -289,6 +316,7 @@ public sealed class CompilerPreprocess
             using var launch = IoMeter.Start(IoMeter.Kind.Launch);   // until the compiler exits
             using var p = Process.Start(psi);
             if (p is null) return false;
+            lease.Track(p);
             p.StandardInput.Close();
             p.ErrorDataReceived += (_, _) => { };   // drained so a full stderr pipe can't block the compiler
             p.BeginErrorReadLine();
@@ -301,7 +329,7 @@ public sealed class CompilerPreprocess
             }, null, timeoutMs, Timeout.Infinite);
             var markers = Read(p.StandardOutput, dir, paths, live);
             p.WaitForExit();
-            return !timedOut && p.ExitCode == 0 && markers;
+            return !timedOut && !lease.Evicted && p.ExitCode == 0 && markers;
         }
         catch (Exception ex) when (ex is not OutOfMemoryException) { return false; }
         finally

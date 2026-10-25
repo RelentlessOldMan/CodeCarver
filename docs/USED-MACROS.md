@@ -116,7 +116,8 @@ macros itself.
 
 **Memory.** Each pp-trace holds about 0.5 KB for every define in the headers its compile includes: 2 GB for a compile
 that includes 3.8 million. That memory is pp-trace's, not the carve's, so the runs share what `memoryStopMb` leaves
-the carve (or the machine's memory without it). They run at most one per core but one: one at first, one more at
+the carve (or the machine's memory without it), each counted with any process it starts. The `compiler` key's runs
+share it the same way. They run at most one per core but one: one at first, one more at
 once for each that finishes, and a new one starts only when the running ones, each counted at no less than the
 most one has needed so far, plus that again, fit. If the running ones grow past it, the newest are stopped and run
 again later (`mem.rerunForMemory`). One run that alone needs more than the whole

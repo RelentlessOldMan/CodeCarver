@@ -1245,10 +1245,21 @@ public static class CarveCommand
             summary["world.preprocessed.failedMissingPaths"] = exactPre.MissingPaths;
             summary["world.preprocessed.refused"] = exactPre.Refused;
             summary["world.preprocessed.filesDecided"] = exactPre.FilesDecided;
+            const long Mb = 1024 * 1024;
+            summary["world.preprocessed.mem.budgetMb"] = exactPre.BudgetBytes / Mb;
+            summary["world.preprocessed.mem.peakOneMb"] = exactPre.PeakChildBytes / Mb;
+            summary["world.preprocessed.mem.peakAllMb"] = exactPre.PeakTotalBytes / Mb;
+            summary["world.preprocessed.mem.peakRunning"] = exactPre.PeakRunning;
+            summary["world.preprocessed.mem.rerunForMemory"] = exactPre.Evictions;
+            summary["world.preprocessed.mem.overBudgetAlone"] = exactPre.OverBudgetAlone;
             err.WriteLine($"  config  : preprocessed {exactPre.Succeeded:N0} of {exactPre.Commands:N0} compile command(s) with the build's compiler -> "
                 + $"#if branches of {exactPre.FilesDecided:N0} file(s) decided exactly"
                 + (exactPre.Failed > 0 ? $"; {exactPre.Failed:N0} not run ({exactPre.MissingPaths:N0} name a path missing here, "
                                          + $"{exactPre.Refused:N0} refused), so headers keep the scanner's answer" : ""));
+            err.WriteLine($"  config  : compiler memory: at most {exactPre.PeakTotalBytes / Mb:N0} MB in {exactPre.PeakRunning:N0} run(s) at once, {exactPre.PeakChildBytes / Mb:N0} MB in one, "
+                + $"of a {exactPre.BudgetBytes / Mb:N0} MB budget (memoryStopMb less the carve's own)"
+                + (exactPre.Evictions > 0 ? $"; {exactPre.Evictions:N0} stopped and run again to stay in it" : "")
+                + (exactPre.OverBudgetAlone > 0 ? $"; {exactPre.OverBudgetAlone:N0} needed more than the budget alone and ran alone" : ""));
         }
         Mark("preprocess");
         static string UsedFor(int unitsWithout) => " -> the big headers keep only the defines the compiles used"

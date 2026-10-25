@@ -3,9 +3,10 @@ using System.Diagnostics;
 namespace CodeCarver.Core.Util;
 
 /// <summary>
-/// Holds the child processes running at once (pp-trace, one per compile) to a budget of memory, by what they hold:
-/// their memory isn't the carve's, so memoryStopMb never sees it. One pp-trace holds about 0.5 KB per define of the
-/// headers its compile includes (2 GB for 3.8M defines), and a carve ran one per core.
+/// Holds the child processes running at once (pp-trace or the build's compiler, one per compile) to a budget of
+/// memory, by what they hold: their memory isn't the carve's, so memoryStopMb never sees it. One pp-trace holds about
+/// 0.5 KB per define of the headers its compile includes (2 GB for 3.8M defines), and a carve ran one per core. A
+/// child counts with every process it started (<see cref="ProcessTree"/>): `gcc -E` holds little, its `cc1` the rest.
 ///
 /// What a child will need isn't known before it runs, so the gate measures. Children run one at a time at first, and
 /// one more may run at once for each that finishes: a small compile that finished before it was ever measured says
@@ -90,12 +91,11 @@ public sealed class ChildMemoryGate : IDisposable
         return sum;
     }
 
-    static void Measure(Lease l)
+    static void Measure(Lease l, ProcessTree tree)
     {
         try
         {
-            l.Process!.Refresh();
-            l.Held = Math.Max(l.Held, l.Process.PrivateMemorySize64);
+            l.Held = Math.Max(l.Held, tree.PrivateBytes(l.Process!));
         }
         catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException) { /* exited */ }
         l.Peak = Math.Max(l.Peak, l.Held);
@@ -104,13 +104,14 @@ public sealed class ChildMemoryGate : IDisposable
     void Sample()
     {
         var stop = new List<Lease>();
+        lock (_gate) { if (_running.Count + _stopping.Count == 0) return; }
+        var tree = ProcessTree.Snapshot();   // outside the lock: listing every process takes a few ms
         lock (_gate)
         {
-            if (_running.Count + _stopping.Count == 0) return;
             long sum = 0;
             foreach (var l in _running.Concat(_stopping))
             {
-                Measure(l);
+                Measure(l, tree);
                 sum += l.Held;
                 PeakChildBytes = Math.Max(PeakChildBytes, l.Held);
             }

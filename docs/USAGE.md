@@ -475,6 +475,12 @@ CodeCarver **derives this automatically**; the `world:` line says which and why.
     content carving removed lines.
   - **Cost.** One preprocess per command, on all cores but one, up to 5 minutes each. The `config :` line and
     `world.preprocessed.commands` / `.failed` / `.failedMissingPaths` / `.refused` / `.filesDecided` say how it went.
+  - **Memory.** A compiler holds every define its compile includes (840 MB for 1.4 million, nearly all of it in
+    `cc1`, the process `gcc` starts), outside the carve's own limit. So the runs share what `memoryStopMb` leaves the
+    carve, counting each with the processes it starts, as pp-trace's runs do
+    ([USED-MACROS.md](USED-MACROS.md#clang-builds-pp-trace)): one at first, one more at once for each that finishes,
+    and when they grow past it the newest are stopped and run again. `world.preprocessed.mem.budgetMb` / `.peakOneMb` /
+    `.peakAllMb` / `.peakRunning` / `.rerunForMemory` / `.overBudgetAlone` say what they held.
 
 **Resolution affects reachability only.** It decides which calls count; the emitted text still contains both
 branches of every `#if`. So feed a build log (or set a build's `compiler`) to carve tighter; give neither to

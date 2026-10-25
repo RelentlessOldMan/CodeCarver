@@ -263,6 +263,47 @@ public sealed class CompilerPreprocessTests
         Assert.Contains("world.preprocessed.refused = 1", t.Summary);
     }
 
+    /// <summary>The compiles share a memory budget as pp-trace's do, counted with the processes they start: gcc's own
+    /// process holds little, its cc1 holds the defines.</summary>
+    [SkippableFact]
+    public void Runs_StayWithinTheirMemoryBudget_CountingTheCompilersChildren()
+    {
+        var gcc = FindGcc();
+        Skip.If(gcc is null, "gcc not found");
+        var dir = Path.Combine(Path.GetTempPath(), "cc-cpp-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var sb = new System.Text.StringBuilder();
+            for (var i = 0; i < 150_000; i++) sb.Append("#define KQ_R").Append(i).Append("_ADDR(n) (0x40000000 + ((n) * 0x").Append(i.ToString("x")).Append("))\n");
+            File.WriteAllText(Path.Combine(dir, "big.h"), sb.ToString());
+            CodeCarver.Core.Frontend.CompileCommand Cmd(string file) =>
+                new() { Directory = dir, File = file, Driver = "gcc", Arguments = new List<string> { "-c", file } };
+            var cmds = Enumerable.Range(0, 6).Select(i =>
+            {
+                File.WriteAllText(Path.Combine(dir, $"u{i}.c"), $"#include \"big.h\"\nint x = KQ_R{i}_ADDR(1);\n");
+                return Cmd($"u{i}.c");
+            }).ToList();
+            // A small compile first finishes before its memory is ever sampled: it must not make the big ones look small.
+            File.WriteAllText(Path.Combine(dir, "main.c"), "int main(void) { return 0; }\n");
+            cmds.Insert(0, Cmd("main.c"));
+
+            var roomy = CompilerPreprocess.Run(cmds, dir, _ => gcc, c => c.File, parallel: 3, memoryBudget: 4L << 30);
+            Assert.Equal(cmds.Count, roomy.Succeeded);
+            Assert.True(roomy.PeakChildBytes > 20L << 20, $"one run held {roomy.PeakChildBytes >> 20} MB");
+            Assert.True(roomy.PeakRunning > 1, "runs that fit run at once");
+            Assert.Equal(0, roomy.Evictions);
+
+            // Room for about one and a half: no more than the budget and what two grow by between two samples.
+            var budget = roomy.PeakChildBytes * 3 / 2;
+            var tight = CompilerPreprocess.Run(cmds, dir, _ => gcc, c => c.File, parallel: 3, memoryBudget: budget);
+            Assert.Equal(cmds.Count, tight.Succeeded);
+            Assert.True(tight.PeakTotalBytes <= budget + roomy.PeakChildBytes, $"{tight.PeakTotalBytes >> 20} MB held of {budget >> 20}");
+            Assert.Equal(roomy.FilesDecided, tight.FilesDecided);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
     static string? FindGcc()
     {
         for (var d = new DirectoryInfo(AppContext.BaseDirectory); d is not null; d = d.Parent)
