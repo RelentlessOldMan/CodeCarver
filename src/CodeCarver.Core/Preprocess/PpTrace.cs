@@ -55,12 +55,20 @@ public sealed class PpTrace
     /// <summary>Commands pp-trace didn't finish within the time limit.</summary>
     public int TimedOut { get; private set; }
     /// <summary>Of the commands that ran and failed, within the time limit, why, by what pp-trace printed: a crash, an
-    /// include it couldn't find (a fatal error), an option the driver rejected, another error, no error printed, or
-    /// pp-trace didn't start. The first that applies counts.</summary>
+    /// include it couldn't find (a fatal error), another error, an option the driver rejected and no other error, no
+    /// error printed, or pp-trace didn't start. The first that applies counts. A rejected option alone doesn't fail a
+    /// run (see <see cref="OptionErrors"/>), so it counts only when nothing else did.</summary>
     public int FailedCrash { get; private set; }
     public int FailedHeaderNotFound { get; private set; }
     public int FailedOption { get; private set; }
-    public int FailedError { get; private set; }
+    /// <summary>Failed by an error other than a missing include or a rejected option, and of those: past Clang's
+    /// error limit (it stopped there, the preprocessor too), an <c>#error</c> that fired (this Clang's macros differ
+    /// from the build compiler's), or another, such as a builtin or attribute only the build's compiler knows, which
+    /// the parse after preprocessing reports.</summary>
+    public int FailedError => FailedErrorLimit + FailedHashError + FailedOtherError;
+    public int FailedErrorLimit { get; private set; }
+    public int FailedHashError { get; private set; }
+    public int FailedOtherError { get; private set; }
     public int FailedNoMessage { get; private set; }
     public int FailedNotStarted { get; private set; }
     /// <summary>Of <see cref="FailedHeaderNotFound"/>, those whose header is one of the C standard library's
@@ -179,7 +187,9 @@ public sealed class PpTrace
         r.FailedCrash = failedBy[(int)Failure.Crash];
         r.FailedHeaderNotFound = failedBy[(int)Failure.HeaderNotFound];
         r.FailedOption = failedBy[(int)Failure.Option];
-        r.FailedError = failedBy[(int)Failure.Error];
+        r.FailedErrorLimit = failedBy[(int)Failure.ErrorLimit];
+        r.FailedHashError = failedBy[(int)Failure.HashError];
+        r.FailedOtherError = failedBy[(int)Failure.Error];
         r.FailedNoMessage = failedBy[(int)Failure.NoMessage];
         r.FailedNotStarted = failedBy[(int)Failure.NotStarted];
         r.FailedHeaderNotFoundCLibrary = cLibrary;
@@ -360,7 +370,8 @@ public sealed class PpTrace
         return dirs;
     }
 
-    public enum Failure { NotStarted, Crash, HeaderNotFound, Option, Error, NoMessage }
+    /// <summary>Why a run failed. <see cref="Error"/> is an error none of the others names.</summary>
+    public enum Failure { NotStarted, Crash, HeaderNotFound, Option, Error, NoMessage, ErrorLimit, HashError }
 
     /// <summary>The C standard library's headers, C89 to C23.</summary>
     internal static readonly HashSet<string> CLibraryHeaders = new(StringComparer.Ordinal)
@@ -372,6 +383,9 @@ public sealed class PpTrace
     };
 
     static readonly Regex NotFoundLine = new(@"fatal error: '([^']+)' file not found", RegexOptions.CultureInvariant);
+    // The source line Clang shows under an error, with or without its "  12 | " margin.
+    static readonly Regex HashErrorSnippet = new(@"^\s*(?:\d+\s*\|)?\s*#\s*error\b", RegexOptions.CultureInvariant);
+    const string ErrorLimitText = "too many errors emitted";
     static readonly string[] OptionErrorTexts = { "unknown argument", "unsupported option", "unsupported argument", "unknown target", "invalid value", "invalid argument", "unsupported target" };
 
     /// <summary>Why a run failed, from the lines it printed to stderr (see <see cref="FailedCrash"/>); the header it
@@ -379,19 +393,25 @@ public sealed class PpTrace
     internal static bool IsOptionError(string line) =>
         line.Contains("error:", StringComparison.Ordinal) && OptionErrorTexts.Any(o => line.Contains(o, StringComparison.Ordinal));
 
+    /// The lines are the error lines and the line after each, where Clang shows the source.
     internal static (Failure Why, string? Header) Classify(IEnumerable<string> stderr)
     {
-        bool crash = false, option = false, error = false;
+        bool crash = false, option = false, other = false, hash = false, limit = false, afterError = false;
         string? header = null;
         foreach (var line in stderr)
         {
             if (line.Contains("PLEASE submit a bug report", StringComparison.Ordinal) || line.StartsWith("Stack dump:", StringComparison.Ordinal)) crash = true;
             if (header is null && NotFoundLine.Match(line) is { Success: true } m) header = m.Groups[1].Value;
+            if (afterError && HashErrorSnippet.IsMatch(line)) hash = true;
+            afterError = false;
+            if (line.Contains(ErrorLimitText, StringComparison.Ordinal)) { limit = true; continue; }
             if (!line.Contains("error:", StringComparison.Ordinal)) continue;
-            error = true;
+            afterError = true;
             if (IsOptionError(line)) option = true;
+            else if (!NotFoundLine.IsMatch(line)) other = true;
         }
-        var why = crash ? Failure.Crash : header is not null ? Failure.HeaderNotFound : option ? Failure.Option : error ? Failure.Error : Failure.NoMessage;
+        var why = crash ? Failure.Crash : header is not null ? Failure.HeaderNotFound : limit ? Failure.ErrorLimit : hash ? Failure.HashError
+                : other ? Failure.Error : option ? Failure.Option : Failure.NoMessage;
         return (why, header);
     }
 
@@ -423,14 +443,17 @@ public sealed class PpTrace
             lease.Track(p);
             p.StandardInput.Close();
             bool fatal = false, optionError = false;   // drained so a full stderr pipe can't block it
-            var said = new List<string>();   // what's needed to say why it failed: error lines and a crash's
+            var said = new List<string>();   // what's needed to say why it failed: error lines, the source line under each, and a crash's
+            var afterError = false;
             p.ErrorDataReceived += (_, e) =>
             {
                 if (e.Data is not { } line) return;
                 if (line.Contains("fatal error:", StringComparison.Ordinal)) fatal = true;
                 if (IsOptionError(line)) optionError = true;
-                if (said.Count < 64 && (line.Contains("error:", StringComparison.Ordinal) || line.Contains("PLEASE submit", StringComparison.Ordinal) || line.StartsWith("Stack dump:", StringComparison.Ordinal)))
+                var isError = line.Contains("error:", StringComparison.Ordinal);
+                if (said.Count < 128 && (isError || afterError || line.Contains("PLEASE submit", StringComparison.Ordinal) || line.StartsWith("Stack dump:", StringComparison.Ordinal)))
                     said.Add(line);
+                afterError = isError;
             };
             p.BeginErrorReadLine();
             var timedOut = false;

@@ -1343,6 +1343,9 @@ public static class CarveCommand
             summary["world.ppTrace.failedBy.headerNotFound.cLibrary"] = trace.FailedHeaderNotFoundCLibrary;
             summary["world.ppTrace.failedBy.option"] = trace.FailedOption;
             summary["world.ppTrace.failedBy.error"] = trace.FailedError;
+            summary["world.ppTrace.failedBy.error.errorLimit"] = trace.FailedErrorLimit;
+            summary["world.ppTrace.failedBy.error.hashError"] = trace.FailedHashError;
+            summary["world.ppTrace.failedBy.error.other"] = trace.FailedOtherError;
             summary["world.ppTrace.failedBy.noMessage"] = trace.FailedNoMessage;
             summary["world.ppTrace.failedBy.notStarted"] = trace.FailedNotStarted;
             summary["world.ppTrace.headersNotFound"] = trace.HeadersNotFound;
@@ -1370,8 +1373,10 @@ public static class CarveCommand
                          ran > 0 ? $"{ran:N0} failed: " + string.Join(", ", new[] {
                              trace.TimedOut > 0 ? $"{trace.TimedOut:N0} over the time limit" : null,
                              trace.FailedHeaderNotFound > 0 ? $"{trace.FailedHeaderNotFound:N0} an include not found ({trace.HeadersNotFound:N0} header(s); {trace.FailedHeaderNotFoundCLibrary:N0} the C library's: its toolchain folders, pathMap or ppTraceArgs?)" : null,
-                             trace.FailedOption > 0 ? $"{trace.FailedOption:N0} an option the driver rejected" : null,
-                             trace.FailedError > 0 ? $"{trace.FailedError:N0} another error" : null,
+                             trace.FailedErrorLimit > 0 ? $"{trace.FailedErrorLimit:N0} past Clang's error limit" : null,
+                             trace.FailedHashError > 0 ? $"{trace.FailedHashError:N0} an #error fired (this Clang's macros differ from the build compiler's?)" : null,
+                             trace.FailedOtherError > 0 ? $"{trace.FailedOtherError:N0} another error" : null,
+                             trace.FailedOption > 0 ? $"{trace.FailedOption:N0} only an option the driver rejected" : null,
                              trace.FailedCrash > 0 ? $"{trace.FailedCrash:N0} pp-trace crashed" : null,
                              trace.FailedNoMessage > 0 ? $"{trace.FailedNoMessage:N0} no error printed" : null,
                              trace.FailedNotStarted > 0 ? $"{trace.FailedNotStarted:N0} didn't start" : null,

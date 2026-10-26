@@ -83,14 +83,19 @@ public sealed class PpTraceTests
         Assert.Equal(preprocessed, PpTrace.Preprocessed(file));
 
     [Theory]
-    [InlineData("PLEASE submit a bug report to the LLVM project|Stack dump:", PpTrace.Failure.Crash, null)]
+    [InlineData("PLEASE submit a bug report to the LLVM project\nStack dump:", PpTrace.Failure.Crash, null)]
     [InlineData("a.c:1:10: fatal error: 'kq/gen.h' file not found", PpTrace.Failure.HeaderNotFound, "kq/gen.h")]
-    [InlineData("error: unknown argument: '-mkq-fast'|a.c:3:1: error: unknown type name 'kq_t'", PpTrace.Failure.Option, null)]
+    // A rejected option alone doesn't fail a run: it counts only when no other error came with it.
+    [InlineData("error: unknown argument: '-mkq-fast'\na.c:3:1: error: unknown type name 'kq_t'\n    3 | kq_t v;", PpTrace.Failure.Error, null)]
     [InlineData("error: unsupported option '-mkq' for target 'aarch64-none-elf'", PpTrace.Failure.Option, null)]
     [InlineData("a.c:3:1: error: unknown type name 'kq_t'", PpTrace.Failure.Error, null)]
+    [InlineData("error: unknown argument: '-fkq-x'\nh.c:2:2: error: \"kq needs the vendor compiler\"\n    2 | #error \"kq needs the vendor compiler\"", PpTrace.Failure.HashError, null)]
+    [InlineData("h.c:2:2: error: \"old style\"\n#  error \"old style\"", PpTrace.Failure.HashError, null)]
+    [InlineData("a.c:9:1: error: \"x\"\n    9 | int kq_error_count;", PpTrace.Failure.Error, null)]
+    [InlineData("a.c:19:1: error: unknown type name 'kq_t'\nfatal error: too many errors emitted, stopping now [-ferror-limit=]", PpTrace.Failure.ErrorLimit, null)]
     [InlineData("", PpTrace.Failure.NoMessage, null)]
     public void Classify_SaysWhyARunFailed(string lines, PpTrace.Failure why, string? header) =>
-        Assert.Equal((why, header), PpTrace.Classify(lines.Split('|', StringSplitOptions.RemoveEmptyEntries)));
+        Assert.Equal((why, header), PpTrace.Classify(lines.Split('\n', StringSplitOptions.RemoveEmptyEntries)));
 
     [SkippableFact]
     public void Run_GivesTheNamesTheLiveCodeUsed_AndCountsWhatDidNotRun()
@@ -166,6 +171,15 @@ public sealed class PpTraceTests
                                       dropOptions: new[] { "-fkq-*", "-Xnever *" });
             Assert.True(dropped.Complete, $"{dropped.Succeeded} of {dropped.Commands}");
             Assert.Equal((0, 2, 2, 1), (dropped.OptionErrors, dropped.CommandsWithDropped, dropped.OptionsDropped, dropped.DropPatternsUnused));
+
+            // With the rejected option on every command, what failed them is still told apart: an #error that fired,
+            // Clang's error limit, an error the parse after preprocessing reports.
+            File.WriteAllText(Path.Combine(dir, "h.c"), "#ifndef KQ_VENDOR\n#error \"kq needs the vendor compiler\"\n#endif\nint h;\n");
+            File.WriteAllText(Path.Combine(dir, "lim.c"), string.Concat(Enumerable.Range(0, 25).Select(i => $"kq_t v{i};\n")));
+            File.WriteAllText(Path.Combine(dir, "sem.c"), "int f(void) { return __builtin_kq_magic(1); }\n");
+            var errs = PpTrace.Run(exe!, new[] { "h.c", "lim.c", "sem.c" }.Select(f => Cmd(dir, f, "clang", "-fkq-vendor", "-c")).ToList(), parallel: 2, root: dir);
+            Assert.Equal((3, 0), (errs.FailedError, errs.FailedOption));
+            Assert.Equal((1, 1, 1), (errs.FailedHashError, errs.FailedErrorLimit, errs.FailedOtherError));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
