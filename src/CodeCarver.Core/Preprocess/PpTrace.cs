@@ -63,12 +63,19 @@ public sealed class PpTrace
     public int FailedOption { get; private set; }
     /// <summary>Failed by an error other than a missing include or a rejected option, and of those: past Clang's
     /// error limit (it stopped there, the preprocessor too), an <c>#error</c> that fired (this Clang's macros differ
-    /// from the build compiler's), or another, such as a builtin or attribute only the build's compiler knows, which
-    /// the parse after preprocessing reports.</summary>
-    public int FailedError => FailedErrorLimit + FailedHashError + FailedOtherError;
+    /// from the build compiler's), another the preprocessor reported (Clang's "Lexical or Preprocessor Issue", such
+    /// as an <c>#if</c> it couldn't evaluate), or another still. An error only the parse after preprocessing reports
+    /// doesn't fail a run (see <see cref="SucceededPastParseErrors"/>).</summary>
+    public int FailedError => FailedErrorLimit + FailedHashError + FailedPreprocessorError + FailedOtherError;
     public int FailedErrorLimit { get; private set; }
     public int FailedHashError { get; private set; }
+    public int FailedPreprocessorError { get; private set; }
     public int FailedOtherError { get; private set; }
+    /// <summary>Of <see cref="Succeeded"/>, runs that exited 1 although every error they printed came from the parse
+    /// after preprocessing (Clang's "Semantic Issue", "Parse Issue", ...), such as a builtin, attribute or asm only
+    /// the build's compiler knows, or from an option the driver rejected. The preprocessor ran to the end of the
+    /// source, as Clang's error limit is off, so the names are all there.</summary>
+    public int SucceededPastParseErrors { get; private set; }
     public int FailedNoMessage { get; private set; }
     public int FailedNotStarted { get; private set; }
     /// <summary>Of <see cref="FailedHeaderNotFound"/>, those whose header is one of the C standard library's
@@ -76,6 +83,14 @@ public sealed class PpTrace
     /// where the command says. And the distinct headers not found, by name.</summary>
     public int FailedHeaderNotFoundCLibrary { get; private set; }
     public int HeadersNotFound { get; private set; }
+    /// <summary>Of <see cref="HeadersNotFound"/>: those a file of the tree ends in (the tree has it, in a directory the
+    /// command doesn't search), those some file outside the carve root includes (a toolchain's header), and those a
+    /// command failed on that ran without an include directory inside the root where the build writes its output (a
+    /// header the build makes, see <see cref="MissingDirsInRootFromBuild"/>), or without one outside the root.</summary>
+    public int HeadersNotFoundInTree { get; private set; }
+    public int HeadersNotFoundIncludedOutside { get; private set; }
+    public int HeadersNotFoundWithoutBuildDir { get; private set; }
+    public int HeadersNotFoundWithoutOutsideDir { get; private set; }
     /// <summary>Runs, clean or not, that printed an option the driver rejected. Under pp-trace that is an error but
     /// not a fatal one: the run goes on, and exits 0 when nothing else went wrong.</summary>
     public int OptionErrors { get; private set; }
@@ -108,8 +123,11 @@ public sealed class PpTrace
     /// </summary>
     /// <paramref name="dropOptions"/> (<c>ppTraceDropOptions</c>) are taken out of every command first, and
     /// <paramref name="extraArgs"/> (<c>ppTraceArgs</c>) are added after its flags (see <see cref="Drop"/>).
+    /// <paramref name="treeFiles"/>, the tree's files relative to <paramref name="root"/>, say which headers not found
+    /// it has (<see cref="HeadersNotFoundInTree"/>).
     public static PpTrace Run(string exe, IReadOnlyList<CompileCommand> commands, int timeoutMs = 1_800_000, int? parallel = null, long? memoryBudget = null,
-                              string? root = null, IReadOnlyList<string>? dropOptions = null, IReadOnlyList<string>? extraArgs = null)
+                              string? root = null, IReadOnlyList<string>? dropOptions = null, IReadOnlyList<string>? extraArgs = null,
+                              IEnumerable<string>? treeFiles = null)
     {
         var drop = (dropOptions ?? Array.Empty<string>()).Select(DropPattern.Parse).ToList();
         var dropUsed = new int[drop.Count];
@@ -122,8 +140,10 @@ public sealed class PpTrace
         var missingBy = new int[4];
         var missingInRoot = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(PathComparer.Default);
         var failedBy = new int[Enum.GetValues<Failure>().Length];
-        int cLibrary = 0, optionErrors = 0, withDropped = 0, dropped = 0;
-        var notFound = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+        int cLibrary = 0, optionErrors = 0, withDropped = 0, dropped = 0, pastParse = 0;
+        var notFound = new System.Collections.Concurrent.ConcurrentDictionary<string, HeaderSeen>(StringComparer.Ordinal);
+        var outDirs = OutputDirs(commands);
+        var rootFull = root is null ? null : Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
         var namesLock = new object();
         Parallel.ForEach(traced, new ParallelOptions { MaxDegreeOfParallelism = most }, cmd =>
         {
@@ -146,13 +166,13 @@ public sealed class PpTrace
             if (dirs.Any(d => d.Inside)) Interlocked.Increment(ref inRoot);
             foreach (var d in dirs) if (d.Inside) missingInRoot.TryAdd(d.Dir, 0);
             var names = new HashSet<ulong>();
-            bool ok, late, optionError;
+            bool ok, late, optionError, pastErrors;
             Failure failure;
-            string? header;
+            string? header, includer;
             while (true)
             {
                 using var lease = gate.Admit();
-                (ok, late, failure, header, optionError) = TraceOne(exe, cmd, extra, names, timeoutMs, lease);
+                (ok, late, failure, header, includer, optionError, pastErrors) = TraceOne(exe, cmd, extra, names, timeoutMs, lease);
                 if (!lease.Evicted) break;
                 names.Clear();   // stopped for memory: run again when there is room
             }
@@ -163,12 +183,17 @@ public sealed class PpTrace
                 Interlocked.Increment(ref failedBy[(int)failure]);
                 if (header is not null)
                 {
-                    notFound.TryAdd(header, 0);
+                    var seen = HeaderSeen.Any;
+                    if (includer is not null && rootFull is not null && !Within(FullIn(cmd.Directory, includer) ?? rootFull, rootFull)) seen |= HeaderSeen.IncludedOutside;
+                    if (dirs.Any(d => d.Inside && outDirs.Any(o => Within(o, d.Dir) || Within(d.Dir, o)))) seen |= HeaderSeen.WithoutBuildDir;
+                    if (dirs.Any(d => !d.Inside)) seen |= HeaderSeen.WithoutOutsideDir;
+                    notFound.AddOrUpdate(header, seen, (_, was) => was | seen);
                     if (CLibraryHeaders.Contains(header)) Interlocked.Increment(ref cLibrary);
                 }
             }
             if (!ok) return;
             Interlocked.Increment(ref succeeded);
+            if (pastErrors) Interlocked.Increment(ref pastParse);
             lock (namesLock) r.Names.UnionWith(names);
         });
         r.Succeeded = succeeded;
@@ -179,7 +204,6 @@ public sealed class PpTrace
         r.RanWithoutOutsideDirs = outside;
         r.RanWithoutDirsInRoot = inRoot;
         r.MissingDirsInRoot = missingInRoot.Count;
-        var outDirs = OutputDirs(commands);
         r.MissingDirsInRootFromBuild = missingInRoot.Keys.Count(d => outDirs.Any(o => Within(o, d) || Within(d, o)));
         r.Refused = refused;
         r.Incomplete = incomplete;
@@ -189,11 +213,26 @@ public sealed class PpTrace
         r.FailedOption = failedBy[(int)Failure.Option];
         r.FailedErrorLimit = failedBy[(int)Failure.ErrorLimit];
         r.FailedHashError = failedBy[(int)Failure.HashError];
+        r.FailedPreprocessorError = failedBy[(int)Failure.PreprocessorError];
         r.FailedOtherError = failedBy[(int)Failure.Error];
+        r.SucceededPastParseErrors = pastParse;
         r.FailedNoMessage = failedBy[(int)Failure.NoMessage];
         r.FailedNotStarted = failedBy[(int)Failure.NotStarted];
         r.FailedHeaderNotFoundCLibrary = cLibrary;
         r.HeadersNotFound = notFound.Count;
+        r.HeadersNotFoundIncludedOutside = notFound.Values.Count(v => v.HasFlag(HeaderSeen.IncludedOutside));
+        r.HeadersNotFoundWithoutBuildDir = notFound.Values.Count(v => v.HasFlag(HeaderSeen.WithoutBuildDir));
+        r.HeadersNotFoundWithoutOutsideDir = notFound.Values.Count(v => v.HasFlag(HeaderSeen.WithoutOutsideDir));
+        if (!notFound.IsEmpty && treeFiles is not null)
+        {
+            var spelled = notFound.Keys.Select(h => h.Replace('\\', '/')).ToList();
+            var inTree = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rel in treeFiles)
+                foreach (var h in spelled)
+                    if (rel.EndsWith(h, StringComparison.OrdinalIgnoreCase) && (rel.Length == h.Length || rel[rel.Length - h.Length - 1] is '/' or '\\'))
+                        inTree.Add(h);
+            r.HeadersNotFoundInTree = inTree.Count;
+        }
         r.OptionErrors = optionErrors;
         r.CommandsWithDropped = withDropped;
         r.OptionsDropped = dropped;
@@ -250,7 +289,9 @@ public sealed class PpTrace
     /// <summary>The command line pp-trace is given for <paramref name="cmd"/>: the driver's name (which says C or C++),
     /// its target when only the name says it, the command's flags without outputs or other sources,
     /// <paramref name="extra"/> (<c>ppTraceArgs</c>), then the source. After the command's own flags, an added
-    /// <c>-isystem</c> is searched after the build's own directories.</summary>
+    /// <c>-isystem</c> is searched after the build's own directories. Between the two: no error limit (past it Clang
+    /// stops, preprocessing too) and each error's category, which says whether the preprocessor or the parse after
+    /// it reported it (see <see cref="ErrorStage"/>); after the command's own flags, these win.</summary>
     internal static List<string> CompileArguments(CompileCommand cmd, IReadOnlyList<string>? extra = null)
     {
         var driver = cmd.Driver is { } d ? d.Replace('\\', '/').Split('/')[^1] : "clang";
@@ -259,8 +300,9 @@ public sealed class PpTrace
         var flags = CompilerPreprocess.WithoutOutputs(cmd.Arguments);
         if (TargetOf(driver) is { } t && !flags.Any(a => a is "-target" || a.StartsWith("--target=", StringComparison.Ordinal)))
             args.Add("--target=" + t);
-        if (AssemblyWithCpp(cmd.File)) args.Add("-ferror-limit=0");   // past 20 errors Clang stops, preprocessing too
         args.AddRange(flags.Where(a => !BuildLogScraper.IsSourceFile(a)));
+        args.Add("-ferror-limit=0");
+        args.Add("-fdiagnostics-show-category=name");
         if (extra is not null) args.AddRange(extra);
         args.Add(cmd.File);
         return args;
@@ -339,6 +381,15 @@ public sealed class PpTrace
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return MissingKind.Source; }
     }
 
+    [Flags]
+    enum HeaderSeen { Any = 0, IncludedOutside = 1, WithoutBuildDir = 2, WithoutOutsideDir = 4 }
+
+    static string? FullIn(string dir, string path)
+    {
+        try { return Path.GetFullPath(Path.IsPathFullyQualified(path) ? path : Path.Combine(dir, path)); }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return null; }
+    }
+
     // Is full path a at or under directory b?
     static bool Within(string a, string b)
     {
@@ -371,7 +422,35 @@ public sealed class PpTrace
     }
 
     /// <summary>Why a run failed. <see cref="Error"/> is an error none of the others names.</summary>
-    public enum Failure { NotStarted, Crash, HeaderNotFound, Option, Error, NoMessage, ErrorLimit, HashError }
+    public enum Failure { NotStarted, Crash, HeaderNotFound, Option, Error, NoMessage, ErrorLimit, HashError, PreprocessorError }
+
+    /// <summary>What a line of stderr is: not an error, an option the driver rejected, an error the parse after
+    /// preprocessing reported, one the preprocessor did, a fatal one, or another.</summary>
+    public enum Stage { None, Option, Parse, Preprocessor, Fatal, Other }
+
+    /// <summary>Clang's categories (<c>-fdiagnostics-show-category=name</c>) of errors the parse reports after the
+    /// preprocessor gave it the tokens. Not "Lexical or Preprocessor Issue" (an <c>#if</c>, a paste, an include),
+    /// "User-Defined Issue" (<c>#error</c>) or "Modules Issue": those change what was preprocessed.</summary>
+    static readonly HashSet<string> ParseCategories = new(StringComparer.Ordinal)
+    {
+        "Semantic Issue", "Parse Issue", "Inline Assembly Issue", "Value Conversion Issue", "Format String Issue",
+        "Nullability Issue", "Unused Entity Issue", "Deprecations", "Documentation Issue", "Lambda Issue",
+        "Coroutines Issue", "Concepts Issue", "Generics Issue",
+    };
+
+    // The category ends an error line: "[Semantic Issue]", or after its flags: "[-Werror,-Wkq,Semantic Issue]".
+    static readonly Regex CategoryTail = new(@"\[(?:-[^,\]]*,)*(?<cat>[^,\]\-][^,\]]*)\]\s*$", RegexOptions.CultureInvariant);
+
+    internal static Stage ErrorStage(string line)
+    {
+        if (!line.Contains("error:", StringComparison.Ordinal)) return Stage.None;
+        if (line.Contains("fatal error:", StringComparison.Ordinal)) return Stage.Fatal;
+        if (IsOptionError(line)) return Stage.Option;
+        if (CategoryTail.Match(line) is not { Success: true } m) return Stage.Other;
+        var cat = m.Groups["cat"].Value;
+        return ParseCategories.Contains(cat) ? Stage.Parse
+             : cat is "Lexical or Preprocessor Issue" or "User-Defined Issue" ? Stage.Preprocessor : Stage.Other;
+    }
 
     /// <summary>The C standard library's headers, C89 to C23.</summary>
     internal static readonly HashSet<string> CLibraryHeaders = new(StringComparer.Ordinal)
@@ -382,7 +461,8 @@ public sealed class PpTrace
         "threads.h", "time.h", "uchar.h", "wchar.h", "wctype.h",
     };
 
-    static readonly Regex NotFoundLine = new(@"fatal error: '([^']+)' file not found", RegexOptions.CultureInvariant);
+    // The includer is the path before ":line:col: ", where Clang gives one.
+    static readonly Regex NotFoundLine = new(@"^(?:(?<file>.+?):\d+:\d+: )?.*?fatal error: '(?<h>[^']+)' file not found", RegexOptions.CultureInvariant);
     // The source line Clang shows under an error, with or without its "  12 | " margin.
     static readonly Regex HashErrorSnippet = new(@"^\s*(?:\d+\s*\|)?\s*#\s*error\b", RegexOptions.CultureInvariant);
     const string ErrorLimitText = "too many errors emitted";
@@ -394,28 +474,34 @@ public sealed class PpTrace
         line.Contains("error:", StringComparison.Ordinal) && OptionErrorTexts.Any(o => line.Contains(o, StringComparison.Ordinal));
 
     /// The lines are the error lines and the line after each, where Clang shows the source.
-    internal static (Failure Why, string? Header) Classify(IEnumerable<string> stderr)
+    internal static (Failure Why, string? Header, string? Includer) Classify(IEnumerable<string> stderr)
     {
-        bool crash = false, option = false, other = false, hash = false, limit = false, afterError = false;
-        string? header = null;
+        bool crash = false, option = false, other = false, hash = false, limit = false, pp = false, afterError = false;
+        string? header = null, includer = null;
         foreach (var line in stderr)
         {
             if (line.Contains("PLEASE submit a bug report", StringComparison.Ordinal) || line.StartsWith("Stack dump:", StringComparison.Ordinal)) crash = true;
-            if (header is null && NotFoundLine.Match(line) is { Success: true } m) header = m.Groups[1].Value;
+            if (header is null && NotFoundLine.Match(line) is { Success: true } m)
+            {
+                header = m.Groups["h"].Value;
+                includer = m.Groups["file"].Success ? m.Groups["file"].Value : null;
+            }
             if (afterError && HashErrorSnippet.IsMatch(line)) hash = true;
             afterError = false;
             if (line.Contains(ErrorLimitText, StringComparison.Ordinal)) { limit = true; continue; }
-            if (!line.Contains("error:", StringComparison.Ordinal)) continue;
+            var stage = ErrorStage(line);
+            if (stage == Stage.None) continue;
             afterError = true;
-            if (IsOptionError(line)) option = true;
+            if (stage == Stage.Option) option = true;
+            else if (stage == Stage.Preprocessor) pp = true;
             else if (!NotFoundLine.IsMatch(line)) other = true;
         }
         var why = crash ? Failure.Crash : header is not null ? Failure.HeaderNotFound : limit ? Failure.ErrorLimit : hash ? Failure.HashError
-                : other ? Failure.Error : option ? Failure.Option : Failure.NoMessage;
-        return (why, header);
+                : pp ? Failure.PreprocessorError : other ? Failure.Error : option ? Failure.Option : Failure.NoMessage;
+        return (why, header, includer);
     }
 
-    private static (bool Ok, bool TimedOut, Failure Why, string? Header, bool OptionError) TraceOne(string exe, CompileCommand cmd, IReadOnlyList<string> extra, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease)
+    private static (bool Ok, bool TimedOut, Failure Why, string? Header, string? Includer, bool OptionError, bool PastParseErrors) TraceOne(string exe, CompileCommand cmd, IReadOnlyList<string> extra, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease)
     {
         // The command goes in a compile database of its own: no command-line quoting or length limit to meet.
         var db = Path.Combine(Path.GetTempPath(), "codecarver-ppt-" + Guid.NewGuid().ToString("N"));
@@ -439,21 +525,28 @@ public sealed class PpTrace
 
             using var launch = IoMeter.Start(IoMeter.Kind.Launch);   // until pp-trace exits
             using var p = Process.Start(psi);
-            if (p is null) return (false, false, Failure.NotStarted, null, false);
+            if (p is null) return (false, false, Failure.NotStarted, null, null, false, false);
             lease.Track(p);
             p.StandardInput.Close();
-            bool fatal = false, optionError = false;   // drained so a full stderr pipe can't block it
+            // Drained so a full stderr pipe can't block it. Unsafe: a crash, or an error neither the parse after
+            // preprocessing nor a rejected option gave.
+            bool fatal = false, optionError = false, parseError = false, unsafeError = false;
             var said = new List<string>();   // what's needed to say why it failed: error lines, the source line under each, and a crash's
             var afterError = false;
             p.ErrorDataReceived += (_, e) =>
             {
                 if (e.Data is not { } line) return;
-                if (line.Contains("fatal error:", StringComparison.Ordinal)) fatal = true;
-                if (IsOptionError(line)) optionError = true;
-                var isError = line.Contains("error:", StringComparison.Ordinal);
-                if (said.Count < 128 && (isError || afterError || line.Contains("PLEASE submit", StringComparison.Ordinal) || line.StartsWith("Stack dump:", StringComparison.Ordinal)))
-                    said.Add(line);
-                afterError = isError;
+                var stage = ErrorStage(line);
+                var crash = line.Contains("PLEASE submit", StringComparison.Ordinal) || line.StartsWith("Stack dump:", StringComparison.Ordinal);
+                if (stage == Stage.Fatal) fatal = true;
+                if (stage == Stage.Option) optionError = true;
+                if (stage == Stage.Parse) parseError = true;
+                var isUnsafe = crash || stage is Stage.Fatal or Stage.Preprocessor or Stage.Other;
+                if (isUnsafe) unsafeError = true;
+                // Past the first 128 lines only those that say why it failed: the parse's errors can be thousands.
+                var keep = (stage != Stage.None || afterError || crash) && (said.Count < 128 || (said.Count < 512 && (isUnsafe || afterError)));
+                if (keep) said.Add(line);
+                afterError = keep && stage != Stage.None;
             };
             p.BeginErrorReadLine();
             var timedOut = false;
@@ -464,12 +557,14 @@ public sealed class PpTrace
             }, null, timeoutMs, Timeout.Infinite);
             ReadNames(p.StandardOutput, names);
             p.WaitForExit();   // also waits for stderr's last line
-            var clean = p.ExitCode == 0 || (AssemblyWithCpp(cmd.File) && p.ExitCode == 1 && !fatal);
+            // Exit 1 and only the parse's errors: nothing stopped the preprocessor before the end of the source.
+            var pastParse = p.ExitCode == 1 && !fatal && !unsafeError && parseError;
+            var clean = p.ExitCode == 0 || pastParse || (AssemblyWithCpp(cmd.File) && p.ExitCode == 1 && !fatal);
             var ok = !timedOut && !lease.Evicted && clean;
-            var (why, header) = ok ? (Failure.NoMessage, null) : Classify(said);
-            return (ok, timedOut, why, header, optionError);
+            var (why, header, includer) = ok ? (Failure.NoMessage, null, null) : Classify(said);
+            return (ok, timedOut, why, header, includer, optionError, ok && pastParse);
         }
-        catch (Exception ex) when (ex is not OutOfMemoryException) { return (false, false, Failure.NotStarted, null, false); }
+        catch (Exception ex) when (ex is not OutOfMemoryException) { return (false, false, Failure.NotStarted, null, null, false, false); }
         finally
         {
             try { Directory.Delete(db, true); } catch { /* best effort */ }

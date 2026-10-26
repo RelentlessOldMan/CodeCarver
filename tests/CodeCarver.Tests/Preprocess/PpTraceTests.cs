@@ -52,12 +52,14 @@ public sealed class PpTraceTests
     public void CompileArguments_DropOutputsAndAddTheNamedTarget()
     {
         var c = Cmd("/w", "src/a.c", "/opt/bin/aarch64-none-elf-clang", "-O2", "-Iinc", "-MMD", "-MF", "a.d", "-c", "-o", "a.o");
-        Assert.Equal(new[] { "aarch64-none-elf-clang", "--target=aarch64-none-elf", "-O2", "-Iinc", "src/a.c" }, PpTrace.CompileArguments(c));
+        Assert.Equal(new[] { "aarch64-none-elf-clang", "--target=aarch64-none-elf", "-O2", "-Iinc", "-ferror-limit=0", "-fdiagnostics-show-category=name", "src/a.c" }, PpTrace.CompileArguments(c));
         var given = Cmd("/w", "a.c", "aarch64-none-elf-clang", "--target=aarch64-none-elf", "-c");
-        Assert.Equal(new[] { "aarch64-none-elf-clang", "--target=aarch64-none-elf", "a.c" }, PpTrace.CompileArguments(given));
-        Assert.Contains("-ferror-limit=0", PpTrace.CompileArguments(Cmd("/w", "start.S", "clang", "-c")));
+        Assert.Equal(new[] { "aarch64-none-elf-clang", "--target=aarch64-none-elf", "-ferror-limit=0", "-fdiagnostics-show-category=name", "a.c" }, PpTrace.CompileArguments(given));
+        // After the command's own flags, so a -ferror-limit=20 of its own doesn't stop the preprocessor.
+        var limited = PpTrace.CompileArguments(Cmd("/w", "a.c", "clang", "-ferror-limit=20", "-c"));
+        Assert.True(limited.IndexOf("-ferror-limit=0") > limited.IndexOf("-ferror-limit=20"));
         // ppTraceArgs go after the command's own flags, so an added -isystem is searched after the build's directories.
-        Assert.Equal(new[] { "clang", "-Iinc", "-isystem", "/kq/libc", "a.c" },
+        Assert.Equal(new[] { "clang", "-Iinc", "-ferror-limit=0", "-fdiagnostics-show-category=name", "-isystem", "/kq/libc", "a.c" },
                      PpTrace.CompileArguments(Cmd("/w", "a.c", "clang", "-Iinc", "-c"), new[] { "-isystem", "/kq/libc" }));
     }
 
@@ -94,8 +96,32 @@ public sealed class PpTraceTests
     [InlineData("a.c:9:1: error: \"x\"\n    9 | int kq_error_count;", PpTrace.Failure.Error, null)]
     [InlineData("a.c:19:1: error: unknown type name 'kq_t'\nfatal error: too many errors emitted, stopping now [-ferror-limit=]", PpTrace.Failure.ErrorLimit, null)]
     [InlineData("", PpTrace.Failure.NoMessage, null)]
-    public void Classify_SaysWhyARunFailed(string lines, PpTrace.Failure why, string? header) =>
-        Assert.Equal((why, header), PpTrace.Classify(lines.Split('\n', StringSplitOptions.RemoveEmptyEntries)));
+    [InlineData("a.c:1:8: error: expected value in expression [Lexical or Preprocessor Issue]\na.c:3:1: error: unknown type name 'kq_t' [Semantic Issue]", PpTrace.Failure.PreprocessorError, null)]
+    public void Classify_SaysWhyARunFailed(string lines, PpTrace.Failure why, string? header)
+    {
+        var (w, h, _) = PpTrace.Classify(lines.Split('\n', StringSplitOptions.RemoveEmptyEntries));
+        Assert.Equal((why, header), (w, h));
+    }
+
+    [Theory]
+    [InlineData("/kq/tc/include/kq.h:4:10: fatal error: 'kq_os.h' file not found [Lexical or Preprocessor Issue]", "kq_os.h", "/kq/tc/include/kq.h")]
+    [InlineData(@"C:\kq\a.c:1:10: fatal error: 'z.h' file not found", "z.h", @"C:\kq\a.c")]
+    [InlineData("fatal error: 'z.h' file not found", "z.h", null)]
+    public void Classify_GivesTheFileThatIncludedAHeaderNotFound(string line, string header, string? includer) =>
+        Assert.Equal((PpTrace.Failure.HeaderNotFound, header, includer), PpTrace.Classify(new[] { line }));
+
+    [Theory]
+    [InlineData("a.c:3:1: error: unknown type name 'kq_t' [Semantic Issue]", PpTrace.Stage.Parse)]
+    [InlineData("a.c:3:1: error: call to undeclared function 'kq' [-Wimplicit-function-declaration,Semantic Issue]", PpTrace.Stage.Parse)]
+    [InlineData("a.c:2:10: error: expected expression [Parse Issue]", PpTrace.Stage.Parse)]
+    [InlineData("a.c:4:9: error: pasting formed 'x+', an invalid preprocessing token [-Winvalid-token-paste,Lexical or Preprocessor Issue]", PpTrace.Stage.Preprocessor)]
+    [InlineData("a.c:1:2: error: \"kq\" [User-Defined Issue]", PpTrace.Stage.Preprocessor)]
+    [InlineData("a.c:1:2: error: \"kq\"", PpTrace.Stage.Other)]
+    [InlineData("a.c:1:10: fatal error: 'k.h' file not found [Lexical or Preprocessor Issue]", PpTrace.Stage.Fatal)]
+    [InlineData("error: unknown argument: '-mkq-vendor'", PpTrace.Stage.Option)]
+    [InlineData("a.c:5:16: warning: unknown attribute 'kq' ignored [-Wunknown-attributes]", PpTrace.Stage.None)]
+    public void ErrorStage_ReadsClangsCategory(string line, PpTrace.Stage stage) =>
+        Assert.Equal(stage, PpTrace.ErrorStage(line));
 
     [SkippableFact]
     public void Run_GivesTheNamesTheLiveCodeUsed_AndCountsWhatDidNotRun()
@@ -144,7 +170,7 @@ public sealed class PpTraceTests
                 Cmd(dir, "a.c", "clang", "-include", "gone.h", "-c"),
                 Cmd(Path.Combine(dir, "obj"), "../a.c", "clang", "-c"),
                 Cmd(dir, "nosuch.c", "clang", "-c"),
-            }, parallel: 2, root: dir);
+            }, parallel: 2, root: dir, treeFiles: new[] { "a.c", "inc/k.h", "old/gen.h" });
             Assert.Equal(2, paths.Succeeded);
             Assert.Equal(1, paths.RanWithoutOutsideDirs);
             Assert.Equal(2, paths.RanWithoutDirsInRoot);
@@ -153,6 +179,8 @@ public sealed class PpTraceTests
             Assert.Equal((1, 1, 1), (paths.MissingForcedInclude, paths.MissingWorkDir, paths.MissingSource));
             Assert.Equal(6, paths.Commands);   // g.c ran and failed: gen.h was only in out/gen
             Assert.Equal((1, 0, 1), (paths.FailedHeaderNotFound, paths.FailedHeaderNotFoundCLibrary, paths.HeadersNotFound));
+            // gen.h: the tree has one elsewhere, g.c in the root includes it, and its command ran without out/gen.
+            Assert.Equal((1, 0, 1, 0), (paths.HeadersNotFoundInTree, paths.HeadersNotFoundIncludedOutside, paths.HeadersNotFoundWithoutBuildDir, paths.HeadersNotFoundWithoutOutsideDir));
 
             // A bare-metal target with no C library here: the build's came from its toolchain's folders.
             File.WriteAllText(Path.Combine(dir, "lib.c"), "#include <string.h>\nint l;\n");
@@ -172,14 +200,17 @@ public sealed class PpTraceTests
             Assert.True(dropped.Complete, $"{dropped.Succeeded} of {dropped.Commands}");
             Assert.Equal((0, 2, 2, 1), (dropped.OptionErrors, dropped.CommandsWithDropped, dropped.OptionsDropped, dropped.DropPatternsUnused));
 
-            // With the rejected option on every command, what failed them is still told apart: an #error that fired,
-            // Clang's error limit, an error the parse after preprocessing reports.
+            // With the rejected option on every command, what failed them is still told apart: an #error that fired, an
+            // #if the preprocessor couldn't evaluate. Errors only the parse after preprocessing reports, however many,
+            // don't fail a run: the error limit is off, so the preprocessor ran to the end and the names are all there.
             File.WriteAllText(Path.Combine(dir, "h.c"), "#ifndef KQ_VENDOR\n#error \"kq needs the vendor compiler\"\n#endif\nint h;\n");
             File.WriteAllText(Path.Combine(dir, "lim.c"), string.Concat(Enumerable.Range(0, 25).Select(i => $"kq_t v{i};\n")));
-            File.WriteAllText(Path.Combine(dir, "sem.c"), "int f(void) { return __builtin_kq_magic(1); }\n");
-            var errs = PpTrace.Run(exe!, new[] { "h.c", "lim.c", "sem.c" }.Select(f => Cmd(dir, f, "clang", "-fkq-vendor", "-c")).ToList(), parallel: 2, root: dir);
-            Assert.Equal((3, 0), (errs.FailedError, errs.FailedOption));
-            Assert.Equal((1, 1, 1), (errs.FailedHashError, errs.FailedErrorLimit, errs.FailedOtherError));
+            File.WriteAllText(Path.Combine(dir, "sem.c"), "int f(void) { return __builtin_kq_magic(1); }\nint g = KQ_LATE;\n#define KQ_LATE 2\nint h = KQ_LATE;\n");
+            File.WriteAllText(Path.Combine(dir, "pp.c"), "#if 1 +\n#endif\nint p;\n");
+            var errs = PpTrace.Run(exe!, new[] { "h.c", "lim.c", "sem.c", "pp.c" }.Select(f => Cmd(dir, f, "clang", "-fkq-vendor", "-ferror-limit=5", "-c")).ToList(), parallel: 2, root: dir);
+            Assert.Equal((2, 2, 0), (errs.Succeeded, errs.SucceededPastParseErrors, errs.FailedOption));
+            Assert.Equal((1, 1, 0, 0), (errs.FailedHashError, errs.FailedPreprocessorError, errs.FailedErrorLimit, errs.FailedOtherError));
+            Assert.Contains(NameKey.Short("KQ_LATE"), errs.Names);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

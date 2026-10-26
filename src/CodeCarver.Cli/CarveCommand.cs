@@ -1320,12 +1320,13 @@ public static class CarveCommand
             var logged = buildCmds.Select(CmdRel).Where(r => r is not null).Select(r => r!).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var unitsWithout = parseRels.Count(r => !notBuilt.Contains(r) && usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !logged.Contains(r));
             err.WriteLine($"  config  : running pp-trace on {absCmds.Count:N0} compile command(s) ...");
-            var trace = CodeCarver.Core.Preprocess.PpTrace.Run(exe, absCmds, root: dir, dropOptions: cv.PpTraceDropOptions, extraArgs: cv.PpTraceArgs);
+            var trace = CodeCarver.Core.Preprocess.PpTrace.Run(exe, absCmds, root: dir, dropOptions: cv.PpTraceDropOptions, extraArgs: cv.PpTraceArgs, treeFiles: parseRels);
             var trusted = trace.Complete;   // source files without a command: checked per stage, kept ones only
             summary["world.ppTrace.version"] = trace.Version ?? "unknown";
             summary["world.ppTrace.commands"] = trace.Commands;
             summary["world.ppTrace.notPreprocessed"] = trace.NotPreprocessed;
             summary["world.ppTrace.succeeded"] = trace.Succeeded;
+            summary["world.ppTrace.succeeded.pastParseErrors"] = trace.SucceededPastParseErrors;
             summary["world.ppTrace.failed"] = trace.Failed;
             summary["world.ppTrace.missingPaths"] = trace.MissingPaths;
             summary["world.ppTrace.missing.workDir"] = trace.MissingWorkDir;
@@ -1345,10 +1346,15 @@ public static class CarveCommand
             summary["world.ppTrace.failedBy.error"] = trace.FailedError;
             summary["world.ppTrace.failedBy.error.errorLimit"] = trace.FailedErrorLimit;
             summary["world.ppTrace.failedBy.error.hashError"] = trace.FailedHashError;
+            summary["world.ppTrace.failedBy.error.preprocessor"] = trace.FailedPreprocessorError;
             summary["world.ppTrace.failedBy.error.other"] = trace.FailedOtherError;
             summary["world.ppTrace.failedBy.noMessage"] = trace.FailedNoMessage;
             summary["world.ppTrace.failedBy.notStarted"] = trace.FailedNotStarted;
             summary["world.ppTrace.headersNotFound"] = trace.HeadersNotFound;
+            summary["world.ppTrace.headersNotFound.inTree"] = trace.HeadersNotFoundInTree;
+            summary["world.ppTrace.headersNotFound.includedOutside"] = trace.HeadersNotFoundIncludedOutside;
+            summary["world.ppTrace.headersNotFound.withoutBuildDir"] = trace.HeadersNotFoundWithoutBuildDir;
+            summary["world.ppTrace.headersNotFound.withoutOutsideDir"] = trace.HeadersNotFoundWithoutOutsideDir;
             summary["world.ppTrace.optionErrors"] = trace.OptionErrors;
             summary["world.ppTrace.args"] = cv.PpTraceArgs.Count;
             summary["world.ppTrace.dropped.commands"] = trace.CommandsWithDropped;
@@ -1372,9 +1378,10 @@ public static class CarveCommand
                          trace.Commands == 0 ? "no command to run" : null,
                          ran > 0 ? $"{ran:N0} failed: " + string.Join(", ", new[] {
                              trace.TimedOut > 0 ? $"{trace.TimedOut:N0} over the time limit" : null,
-                             trace.FailedHeaderNotFound > 0 ? $"{trace.FailedHeaderNotFound:N0} an include not found ({trace.HeadersNotFound:N0} header(s); {trace.FailedHeaderNotFoundCLibrary:N0} the C library's: its toolchain folders, pathMap or ppTraceArgs?)" : null,
+                             trace.FailedHeaderNotFound > 0 ? $"{trace.FailedHeaderNotFound:N0} an include not found ({trace.HeadersNotFound:N0} header(s); {trace.FailedHeaderNotFoundCLibrary:N0} the C library's: its toolchain folders, pathMap or ppTraceArgs?; of the headers, {trace.HeadersNotFoundInTree:N0} in the tree elsewhere, {trace.HeadersNotFoundIncludedOutside:N0} included from outside the root, {trace.HeadersNotFoundWithoutBuildDir:N0} on a command without a directory the build writes)" : null,
                              trace.FailedErrorLimit > 0 ? $"{trace.FailedErrorLimit:N0} past Clang's error limit" : null,
                              trace.FailedHashError > 0 ? $"{trace.FailedHashError:N0} an #error fired (this Clang's macros differ from the build compiler's?)" : null,
+                             trace.FailedPreprocessorError > 0 ? $"{trace.FailedPreprocessorError:N0} an error the preprocessor reported" : null,
                              trace.FailedOtherError > 0 ? $"{trace.FailedOtherError:N0} another error" : null,
                              trace.FailedOption > 0 ? $"{trace.FailedOption:N0} only an option the driver rejected" : null,
                              trace.FailedCrash > 0 ? $"{trace.FailedCrash:N0} pp-trace crashed" : null,
@@ -1389,6 +1396,8 @@ public static class CarveCommand
                          trace.Refused > 0 ? $"{trace.Refused:N0} refused" : null,
                          trace.Incomplete > 0 ? $"{trace.Incomplete:N0} not fully in the log" : null,
                      }.Where(x => x is not null))}), so the header carve models the paste macros itself"));
+            if (trace.SucceededPastParseErrors > 0)
+                err.WriteLine($"  config  : pp-trace: {trace.SucceededPastParseErrors:N0} run(s) counted clean although the parse after preprocessing reported errors (a builtin, attribute or asm only the build's compiler knows): the preprocessor ran to the end");
             if (trace.OptionErrors > 0)
                 err.WriteLine($"  config  : pp-trace: {trace.OptionErrors:N0} run(s) printed an option the driver rejected; that alone doesn't fail a run (ppTraceDropOptions takes one out)");
             if (cv.PpTraceDropOptions.Count > 0)

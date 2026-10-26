@@ -121,6 +121,14 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
   does stop a command (`failedBy.option`), `ppTraceDropOptions` takes it out of every command: a pattern per
   argument, `*` for any text, or an option and its value as two words (`"-Xkq *"`). Take out only options that
   don't change what the preprocessor sees: one that defines a macro or adds an include directory changes the names.
+- pp-trace parses the code after preprocessing it, and that parse reports errors a build's compiler wouldn't: a
+  builtin, attribute or inline asm only the vendor compiler knows. Those don't fail a command. Clang's error limit is
+  off (`-ferror-limit=0`, after the command's own flags), so the preprocessor runs to the end of the source whatever
+  the parse reports, and each error's category (`-fdiagnostics-show-category=name`) says which stage reported it. A
+  run that exits 1 with only the parse's errors ("Semantic Issue", "Parse Issue", "Inline Assembly Issue", ...) and
+  rejected options counts as clean (`succeeded.pastParseErrors`). An error the preprocessor reports ("Lexical or
+  Preprocessor Issue", such as an `#if` it couldn't evaluate, or an `#error`) still fails it: what it preprocessed
+  isn't what the build did.
 - A driver named for its target (`aarch64-none-elf-clang`) gets that target passed as `--target`. `clang++` and the
   file's extension pick C++.
 - `.S` and `.sx` files run too: pp-trace parses them as C after preprocessing, so their parse errors are expected;
@@ -130,7 +138,7 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
   commands in the log. Their names come in as for any kept non-C file (`keptByOther`).
 - `ppTrace` and `usedMacros` say the same thing; set one of them. One carve runs one pp-trace.
 
-The carve trusts the names when every command ran clean (exit 0, within 30 minutes each). Otherwise it says why and the
+The carve trusts the names when every command ran clean (exit 0, or only the parse's errors, within 30 minutes each). Otherwise it says why and the
 static carve runs. As for `usedMacros`, a stage that keeps a source file with no compile command models the paste
 macros itself.
 
@@ -158,11 +166,13 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `world.usedMacros.trusted` | `1` when the header carve used the files |
 | `world.ppTrace.version` | the `LLVM version` line pp-trace printed, or `unknown` |
 | `world.ppTrace.commands` / `.succeeded` / `.failed` | commands pp-trace was to run, ran clean, and didn't |
+| `world.ppTrace.succeeded.pastParseErrors` | of `succeeded`, runs whose only errors came from the parse after preprocessing (or a rejected option) |
 | `world.ppTrace.missingPaths` / `.refused` / `.incomplete` / `.timedOut` | of the failed: a path missing here, a flag that loads other code, not all of it in the log (an unreadable response file), over the time limit |
 | `world.ppTrace.missing.workDir` / `.source` / `.forcedInclude` | of `missingPaths`: what was missing |
 | `world.ppTrace.failedBy.crash` / `.headerNotFound` / `.error` / `.option` / `.noMessage` / `.notStarted` | of the commands that ran and failed within the time limit, why, by the first that applies: pp-trace crashed, an include wasn't found, another error, only an option the driver rejected (which alone doesn't fail a run), no error printed, pp-trace didn't start |
-| `world.ppTrace.failedBy.error.errorLimit` / `.hashError` / `.other` | of `failedBy.error`: Clang stopped at its error limit (the preprocessor too), an `#error` fired (this Clang's predefined macros or target differ from the build compiler's), another error (such as a builtin or attribute only the build's compiler knows, which the parse after preprocessing reports) |
+| `world.ppTrace.failedBy.error.errorLimit` / `.hashError` / `.preprocessor` / `.other` | of `failedBy.error`: Clang stopped at its error limit (the preprocessor too; only when `ppTraceArgs` sets one), an `#error` fired (this Clang's predefined macros or target differ from the build compiler's), another error the preprocessor reported, another error still (no category, or one neither the parse's nor the preprocessor's) |
 | `world.ppTrace.failedBy.headerNotFound.cLibrary` / `world.ppTrace.headersNotFound` | of `headerNotFound`, those whose header is the C standard library's (`stdio.h`, `string.h`, ...); and the distinct headers not found |
+| `world.ppTrace.headersNotFound.inTree` / `.includedOutside` / `.withoutBuildDir` / `.withoutOutsideDir` | of `headersNotFound`: those a file of the tree ends in (the tree has it, in a directory the command doesn't search); those a file outside the carve root includes (a toolchain's header); those a command failed on that ran without an include directory inside the root where the build writes its output (a header the build makes), or without one outside the root |
 | `world.ppTrace.optionErrors` | runs, clean or not, that printed an option the driver rejected |
 | `world.ppTrace.args` | arguments `ppTraceArgs` added to each command |
 | `world.ppTrace.dropped.commands` / `.options` / `.patternsUnused` | of `ppTraceDropOptions`: commands that had one, arguments taken out, patterns that matched nothing |
