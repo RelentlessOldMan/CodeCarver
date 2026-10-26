@@ -25,6 +25,8 @@ public sealed class ResolvedCarve
     public List<string> BuildTraceFiles = new();
     public List<string> UsedMacros = new();        // files or folders of what the compiles printed with -E -dU
     public List<string> PpTraces = new();          // pp-trace exes the selected builds name (one is allowed)
+    public List<string> PpTraceArgs = new();       // the selected builds' ppTraceArgs, each build's list once, in order
+    public List<string> PpTraceDropOptions = new();
     public bool EveryBuildTraced;                  // every selected build has a build trace: its opens cover the whole build
     public string? CacheDirectory;                 // [advanced] cacheEnabled: where the big headers' names are kept between runs; null: no cache
     public string? MirrorOf;                       // [advanced] the carve root must match this tree (a local copy of a share)
@@ -118,6 +120,7 @@ public static class CarveResolver
         // Selected builds/runs (UNION). Null selection = all defined.
         var buildNames = cfg.UseBuilds ?? cfg.Builds.Keys.ToList();
         var runNames = cfg.UseRuns ?? cfg.Runs.Keys.ToList();
+        var ppArgLists = new HashSet<string>(StringComparer.Ordinal);
         foreach (var b in buildNames)
         {
             if (!cfg.Builds.TryGetValue(b, out var bs)) continue; // loader already errored on a bad [use]
@@ -126,6 +129,9 @@ public static class CarveResolver
             r.BuildTraceFiles.AddRange(bs.BuildTraceFiles);
             r.UsedMacros.AddRange(bs.UsedMacros);
             if (!string.IsNullOrWhiteSpace(bs.PpTrace)) r.PpTraces.Add(bs.PpTrace!);
+            // Arguments come in pairs (-isystem DIR): a build's list is added whole, or not at all when another gave the same.
+            if (bs.PpTraceArgs.Count > 0 && !ppArgLists.Contains(string.Join("\0", bs.PpTraceArgs))) { ppArgLists.Add(string.Join("\0", bs.PpTraceArgs)); r.PpTraceArgs.AddRange(bs.PpTraceArgs); }
+            r.PpTraceDropOptions.AddRange(bs.PpTraceDropOptions);
             if (!string.IsNullOrWhiteSpace(bs.Compiler)) r.Compilers.Add(bs.Compiler!);
             r.CompilerNames.AddRange(bs.CompilerNames);
         }
@@ -161,6 +167,7 @@ public static class CarveResolver
         r.BuildTraceFiles = r.BuildTraceFiles.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.UsedMacros = r.UsedMacros.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.PpTraces = r.PpTraces.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        r.PpTraceDropOptions = r.PpTraceDropOptions.Distinct(StringComparer.Ordinal).ToList();
         r.RunTraceFiles = r.RunTraceFiles.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.RunTraceLogs = r.RunTraceLogs.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.Compilers = r.Compilers.Distinct(StringComparer.OrdinalIgnoreCase).ToList();

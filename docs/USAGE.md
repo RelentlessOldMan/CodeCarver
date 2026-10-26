@@ -162,6 +162,8 @@ use only letters, digits, `_` and `-`.
 | `buildTraceFiles = ["build.trace"]` | files opened while **building** (capture with [`tools/capture`](../tools/capture/README.md)) |
 | `usedMacros = ["du/"]` | GCC: what each compile of the same build printed with `-E -dU`, one file per compile (files or folders). When every compile command in `buildLogs` has its file, the max stage's big headers keep only the defines some compile used or a kept non-C file names, instead of modelling the paste macros. Needs `buildLogs` in the same build. See [USED-MACROS.md](USED-MACROS.md) and [`examples/used-macros`](../examples/used-macros) |
 | `ppTrace = "pp-trace"` | Clang: LLVM's `pp-trace` exe (a path, or a name on PATH), from the same LLVM release as the build's Clang. The carve runs it on each compile command in `buildLogs` and uses the names as `usedMacros`, trusted when every command ran clean. Nothing to collect during the build. Set this or `usedMacros`, not both. See [USED-MACROS.md](USED-MACROS.md#clang-builds-pp-trace) |
+| `ppTraceArgs = ["--sysroot=D:/libc"]` | arguments added to every command pp-trace runs, after its own flags, with paths on the carve machine: where the build's C library is here, when its driver found it by itself (`failedBy.headerNotFound.cLibrary`). See [USED-MACROS.md](USED-MACROS.md#clang-builds-pp-trace) |
+| `ppTraceDropOptions = ["-fkq-*"]` | options taken out of every command pp-trace runs: `*` for any text, `"-Xkq *"` for an option and its value. Only for an option that stops a run (`failedBy.option`) and doesn't change what the preprocessor sees |
 
 **`[runs.NAME]`** — what a real execution touched (optional; tightens + audits):
 

@@ -52,6 +52,8 @@ public sealed class BuildSection
     public List<string> BuildTraceFiles = new();
     public List<string> UsedMacros = new();                   // what each compile printed with -E -dU (docs/USED-MACROS.md)
     public string? PpTrace;                                   // Clang: LLVM's pp-trace, run on the build log's commands (docs/USED-MACROS.md)
+    public List<string> PpTraceArgs = new();                  // added to every command pp-trace runs (--sysroot, -isystem: the C library here)
+    public List<string> PpTraceDropOptions = new();           // options taken out of every command pp-trace runs ("*" globs; "-X *" takes its value too)
 }
 
 public sealed class RunSection
@@ -80,7 +82,7 @@ public static class ConfigLoader
     private static readonly string[] CommonKeys =
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
-    private static readonly string[] BuildKeys = { "buildLogs", "compiler", "compilerNames", "defines", "buildTraceFiles", "usedMacros", "ppTrace" };
+    private static readonly string[] BuildKeys = { "buildLogs", "compiler", "compilerNames", "defines", "buildTraceFiles", "usedMacros", "ppTrace", "ppTraceArgs", "ppTraceDropOptions" };
     private static readonly string[] RunKeys = { "runTraceFiles", "runTraceLogs", "dropUnobservedCmm" };
     private static readonly string[] StageKeys = { "carveSourceFileContents", "carveHeaderFileContents", "stubUnexecuted" };
     private static readonly string[] UseKeys = { "builds", "runs" };
@@ -174,6 +176,8 @@ public static class ConfigLoader
                 BuildTraceFiles = GetStringList(t, "buildTraceFiles", $"[builds.{name}]", ctx),
                 UsedMacros = GetStringList(t, "usedMacros", $"[builds.{name}]", ctx),
                 PpTrace = GetString(t, "ppTrace", $"[builds.{name}]", ctx),
+                PpTraceArgs = GetStringList(t, "ppTraceArgs", $"[builds.{name}]", ctx),
+                PpTraceDropOptions = GetStringList(t, "ppTraceDropOptions", $"[builds.{name}]", ctx),
             };
         }
 
@@ -307,6 +311,8 @@ public static class ConfigLoader
         buildTraceFiles = []             # optional: files opened while BUILDING (ProcMon/strace capture)
         usedMacros = []                  # optional, GCC: what each compile printed with -E -dU (docs/USED-MACROS.md, examples/used-macros)
         ppTrace = ""                     # optional, Clang: LLVM's pp-trace exe (same LLVM version as the build), run on the buildLogs' commands
+        ppTraceArgs = []                 # optional: added to each command pp-trace runs, paths on THIS machine, e.g. ["--sysroot=D:/llvm/lib/clang-runtimes/aarch64-none-elf"]
+        ppTraceDropOptions = []          # optional: options taken out of each command pp-trace runs, e.g. ["-fkq-*", "-Xkq *"] (only if one fails a run)
 
         # ===== runs (what a real execution actually touched) — all OPTIONAL =====
         # One [runs.NAME] per captured scenario. Tightens + audits: observed files are kept and never auto-excluded.

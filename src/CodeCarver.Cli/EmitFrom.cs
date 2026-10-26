@@ -41,6 +41,8 @@ public static class EmitFrom
         L("exclude", cv.ExcludeDirectories);
         L("forceKeep", cv.ForceKeepFiles);
         L("pathMap", cv.PathMap.Select(p => p.From + "->" + p.To));
+        L("ppTraceArgs", cv.PpTraceArgs);
+        L("ppTraceDropOptions", cv.PpTraceDropOptions);
         L("flags", new[] { cv.ClosedWorld, cv.DropUnobservedCmm, cv.AllowUnmatchedTraces, cv.PruneGarbage }.Select(b => b ? "1" : "0"));
         L("advanced", new[] { cv.MaxParseBytes?.ToString() ?? "", cv.ParseTimeout?.ToString() ?? "", cv.MaxSymbolsPerFile?.ToString() ?? "" });
         // usedMacros may name folders: each file in them counts.

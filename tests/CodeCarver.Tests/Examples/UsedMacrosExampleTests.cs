@@ -41,10 +41,13 @@ public sealed class UsedMacrosExampleTests
     {
         var exe = CodeCarver.Tests.Preprocess.PpTraceTests.Find();
         Skip.If(exe is null, "pp-trace (LLVM) not installed");
-        using var r = new Run($"[builds.main]\nbuildLogs = [\"inputs/build.log\"]\nppTrace = \"{exe!.Replace('\\', '/')}\"\n");
+        using var r = new Run($"[builds.main]\nbuildLogs = [\"inputs/build.log\"]\nppTrace = \"{exe!.Replace('\\', '/')}\"\n"
+                              + "ppTraceArgs = [\"-w\"]\nppTraceDropOptions = [\"-fkq-never-*\"]\n");
         Assert.True(r.Code == 0, r.Output);
         Assert.Contains("3 of 3 compile command(s) ran clean", r.Output);
         Assert.Contains("world.ppTrace.trusted = 1", r.Summary("max"));
+        Assert.Contains("world.ppTrace.args = 1", r.Summary("max"));
+        Assert.Contains("world.ppTrace.dropped.patternsUnused = 1", r.Summary("max"));
         Assert.Equal(Used.Append("KQ_REGS_H").Order(StringComparer.Ordinal),
                      Defines(r.Carved("max", "inc/kq_regs.h")).Order(StringComparer.Ordinal));
     }

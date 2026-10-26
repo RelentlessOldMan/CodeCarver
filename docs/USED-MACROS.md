@@ -105,8 +105,22 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
   directory held is needed, the compile fails and says so. Generate those headers in the tree before the carve, or
   the commands that include them fail.
 - The `failedBy.*` keys say why commands failed. Many `headerNotFound.cLibrary` means the build's C library isn't
-  where the log says: it is in the build machine's toolchain folders. Install the same toolchain on the carve machine
-  and map the log's toolchain path to it with `[advanced] pathMap`.
+  found here. When the log names its folders (`-isystem`), map them to a copy on the carve machine with
+  `[advanced] pathMap`. When it doesn't, the build's driver found it by itself, beside the compiler, and pp-trace's
+  Clang looks beside pp-trace instead. Then say where it is with `ppTraceArgs`:
+
+  ```toml
+  [builds.main]
+  ppTraceArgs = ["--sysroot=D:/llvm-embedded/lib/clang-runtimes/aarch64-none-elf"]   # or ["-isystem", "D:/libc/include"]
+  ```
+
+  `ppTraceArgs` are added to every command, after its own flags, with paths on the carve machine. Only the C
+  library's headers are needed, and the same C library is enough; the folder layout needn't match the build machine's.
+- An option pp-trace's Clang doesn't know (a vendor compiler's own flag) is an error it prints and goes on from: by
+  itself it doesn't fail a command, which still exits 0 (`optionErrors` counts the runs that printed one). If one
+  does stop a command (`failedBy.option`), `ppTraceDropOptions` takes it out of every command: a pattern per
+  argument, `*` for any text, or an option and its value as two words (`"-Xkq *"`). Take out only options that
+  don't change what the preprocessor sees: one that defines a macro or adds an include directory changes the names.
 - A driver named for its target (`aarch64-none-elf-clang`) gets that target passed as `--target`. `clang++` and the
   file's extension pick C++.
 - `.S` and `.sx` files run too: pp-trace parses them as C after preprocessing, so their parse errors are expected;
@@ -148,6 +162,9 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `world.ppTrace.missing.workDir` / `.source` / `.forcedInclude` | of `missingPaths`: what was missing |
 | `world.ppTrace.failedBy.crash` / `.headerNotFound` / `.option` / `.error` / `.noMessage` / `.notStarted` | of the commands that ran and failed within the time limit, why, by the first that applies: pp-trace crashed, an include wasn't found, the driver rejected an option, another error, no error printed, pp-trace didn't start |
 | `world.ppTrace.failedBy.headerNotFound.cLibrary` / `world.ppTrace.headersNotFound` | of `headerNotFound`, those whose header is the C standard library's (`stdio.h`, `string.h`, ...); and the distinct headers not found |
+| `world.ppTrace.optionErrors` | runs, clean or not, that printed an option the driver rejected |
+| `world.ppTrace.args` | arguments `ppTraceArgs` added to each command |
+| `world.ppTrace.dropped.commands` / `.options` / `.patternsUnused` | of `ppTraceDropOptions`: commands that had one, arguments taken out, patterns that matched nothing |
 | `world.ppTrace.ranWithoutOutsideDirs` / `.ranWithoutDirsInRoot` | commands that ran with an include directory missing here, outside the carve root / inside it |
 | `world.ppTrace.missingDirsInRoot` / `.missingDirsInRootFromBuild` | distinct include directories inside the carve root missing here, and of those, the ones at, above or under a folder some `-o` writes to |
 | `world.ppTrace.notPreprocessed` | `.s` and `.asm` commands, not run |

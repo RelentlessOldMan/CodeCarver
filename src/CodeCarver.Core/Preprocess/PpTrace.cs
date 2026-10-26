@@ -68,6 +68,14 @@ public sealed class PpTrace
     /// where the command says. And the distinct headers not found, by name.</summary>
     public int FailedHeaderNotFoundCLibrary { get; private set; }
     public int HeadersNotFound { get; private set; }
+    /// <summary>Runs, clean or not, that printed an option the driver rejected. Under pp-trace that is an error but
+    /// not a fatal one: the run goes on, and exits 0 when nothing else went wrong.</summary>
+    public int OptionErrors { get; private set; }
+    /// <summary>Of <c>ppTraceDropOptions</c>: the commands that had one, the arguments taken out, and the patterns
+    /// that matched none (a typo, or a flag this log doesn't have).</summary>
+    public int CommandsWithDropped { get; private set; }
+    public int OptionsDropped { get; private set; }
+    public int DropPatternsUnused { get; private set; }
     /// <summary>pp-trace's version line (<c>LLVM version 17.0.6</c>), or null when it printed none.</summary>
     public string? Version { get; private set; }
 
@@ -90,9 +98,14 @@ public sealed class PpTrace
     /// (default: <see cref="ChildMemoryGate.BudgetForRun"/>, what memoryStopMb leaves the carve) and run at most
     /// <paramref name="parallel"/> at once (default: one per core but one).
     /// </summary>
+    /// <paramref name="dropOptions"/> (<c>ppTraceDropOptions</c>) are taken out of every command first, and
+    /// <paramref name="extraArgs"/> (<c>ppTraceArgs</c>) are added after its flags (see <see cref="Drop"/>).
     public static PpTrace Run(string exe, IReadOnlyList<CompileCommand> commands, int timeoutMs = 1_800_000, int? parallel = null, long? memoryBudget = null,
-                              string? root = null)
+                              string? root = null, IReadOnlyList<string>? dropOptions = null, IReadOnlyList<string>? extraArgs = null)
     {
+        var drop = (dropOptions ?? Array.Empty<string>()).Select(DropPattern.Parse).ToList();
+        var dropUsed = new int[drop.Count];
+        var extra = extraArgs ?? Array.Empty<string>();
         var most = parallel ?? Math.Max(1, Environment.ProcessorCount - 1);
         using var gate = new ChildMemoryGate(memoryBudget ?? ChildMemoryGate.BudgetForRun(), most);
         var traced = commands.Where(c => Preprocessed(c.File)).ToList();
@@ -101,12 +114,17 @@ public sealed class PpTrace
         var missingBy = new int[4];
         var missingInRoot = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(PathComparer.Default);
         var failedBy = new int[Enum.GetValues<Failure>().Length];
-        int cLibrary = 0;
+        int cLibrary = 0, optionErrors = 0, withDropped = 0, dropped = 0;
         var notFound = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
         var namesLock = new object();
         Parallel.ForEach(traced, new ParallelOptions { MaxDegreeOfParallelism = most }, cmd =>
         {
             if (cmd.Incomplete || cmd.AlternativeDirectories.Count > 0) { Interlocked.Increment(ref incomplete); return; }
+            if (drop.Count > 0)
+            {
+                var (kept, n) = Drop(cmd.Arguments, drop, dropUsed);
+                if (n > 0) { Interlocked.Increment(ref withDropped); Interlocked.Add(ref dropped, n); cmd = cmd with { Arguments = kept }; }
+            }
             if (CompilerPreprocess.Refuse(cmd.Arguments)) { Interlocked.Increment(ref refused); return; }
             var dirs = new List<(string Dir, bool Inside)>();
             var why = Missing(cmd, root, dirs);
@@ -120,17 +138,18 @@ public sealed class PpTrace
             if (dirs.Any(d => d.Inside)) Interlocked.Increment(ref inRoot);
             foreach (var d in dirs) if (d.Inside) missingInRoot.TryAdd(d.Dir, 0);
             var names = new HashSet<ulong>();
-            bool ok, late;
+            bool ok, late, optionError;
             Failure failure;
             string? header;
             while (true)
             {
                 using var lease = gate.Admit();
-                (ok, late, failure, header) = TraceOne(exe, cmd, names, timeoutMs, lease);
+                (ok, late, failure, header, optionError) = TraceOne(exe, cmd, extra, names, timeoutMs, lease);
                 if (!lease.Evicted) break;
                 names.Clear();   // stopped for memory: run again when there is room
             }
             if (late) Interlocked.Increment(ref timedOut);
+            if (optionError) Interlocked.Increment(ref optionErrors);
             if (!ok && !late)
             {
                 Interlocked.Increment(ref failedBy[(int)failure]);
@@ -165,6 +184,10 @@ public sealed class PpTrace
         r.FailedNotStarted = failedBy[(int)Failure.NotStarted];
         r.FailedHeaderNotFoundCLibrary = cLibrary;
         r.HeadersNotFound = notFound.Count;
+        r.OptionErrors = optionErrors;
+        r.CommandsWithDropped = withDropped;
+        r.OptionsDropped = dropped;
+        r.DropPatternsUnused = dropUsed.Count(u => u == 0);
         r.BudgetBytes = gate.Budget;
         r.PeakChildBytes = gate.PeakChildBytes;
         r.PeakTotalBytes = gate.PeakTotalBytes;
@@ -215,8 +238,10 @@ public sealed class PpTrace
     }
 
     /// <summary>The command line pp-trace is given for <paramref name="cmd"/>: the driver's name (which says C or C++),
-    /// its target when only the name says it, the command's flags without outputs or other sources, then the source.</summary>
-    internal static List<string> CompileArguments(CompileCommand cmd)
+    /// its target when only the name says it, the command's flags without outputs or other sources,
+    /// <paramref name="extra"/> (<c>ppTraceArgs</c>), then the source. After the command's own flags, an added
+    /// <c>-isystem</c> is searched after the build's own directories.</summary>
+    internal static List<string> CompileArguments(CompileCommand cmd, IReadOnlyList<string>? extra = null)
     {
         var driver = cmd.Driver is { } d ? d.Replace('\\', '/').Split('/')[^1] : "clang";
         if (driver.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) driver = driver[..^4];
@@ -226,8 +251,46 @@ public sealed class PpTrace
             args.Add("--target=" + t);
         if (AssemblyWithCpp(cmd.File)) args.Add("-ferror-limit=0");   // past 20 errors Clang stops, preprocessing too
         args.AddRange(flags.Where(a => !BuildLogScraper.IsSourceFile(a)));
+        if (extra is not null) args.AddRange(extra);
         args.Add(cmd.File);
         return args;
+    }
+
+    /// <summary>One <c>ppTraceDropOptions</c> entry: a pattern for one argument (<c>*</c> matches any text), or two
+    /// separated by a space, an option and its value in the next argument (<c>"-Xkq *"</c>).</summary>
+    internal sealed record DropPattern(Regex Option, Regex? Value)
+    {
+        public static DropPattern Parse(string pattern)
+        {
+            var parts = pattern.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            static Regex Glob(string g) => new("^" + string.Join(".*", g.Split('*').Select(Regex.Escape)) + "$", RegexOptions.CultureInvariant);
+            return new DropPattern(Glob(parts.Length > 0 ? parts[0] : ""), parts.Length > 1 ? Glob(parts[1]) : null);
+        }
+    }
+
+    /// <summary><paramref name="args"/> without what <paramref name="patterns"/> match, and how many arguments went;
+    /// <paramref name="used"/> counts the matches of each pattern. The first pattern that matches an argument applies.</summary>
+    internal static (List<string> Kept, int Dropped) Drop(IReadOnlyList<string> args, IReadOnlyList<DropPattern> patterns, int[] used)
+    {
+        var kept = new List<string>(args.Count);
+        var dropped = 0;
+        for (var i = 0; i < args.Count; i++)
+        {
+            var hit = -1;
+            for (var k = 0; k < patterns.Count && hit < 0; k++)
+            {
+                var p = patterns[k];
+                if (!p.Option.IsMatch(args[i])) continue;
+                if (p.Value is not null && !(i + 1 < args.Count && p.Value.IsMatch(args[i + 1]))) continue;
+                hit = k;
+            }
+            if (hit < 0) { kept.Add(args[i]); continue; }
+            Interlocked.Increment(ref used[hit]);
+            var n = patterns[hit].Value is null ? 1 : 2;
+            dropped += n;
+            i += n - 1;
+        }
+        return (kept, dropped);
     }
 
     /// <summary>Run pp-trace on one command and add the names it prints. Ok: it exited 0 within the time limit.</summary>
@@ -309,10 +372,13 @@ public sealed class PpTrace
     };
 
     static readonly Regex NotFoundLine = new(@"fatal error: '([^']+)' file not found", RegexOptions.CultureInvariant);
-    static readonly string[] OptionErrors = { "unknown argument", "unsupported option", "unsupported argument", "unknown target", "invalid value", "invalid argument", "unsupported target" };
+    static readonly string[] OptionErrorTexts = { "unknown argument", "unsupported option", "unsupported argument", "unknown target", "invalid value", "invalid argument", "unsupported target" };
 
     /// <summary>Why a run failed, from the lines it printed to stderr (see <see cref="FailedCrash"/>); the header it
     /// couldn't find, for a fatal one.</summary>
+    internal static bool IsOptionError(string line) =>
+        line.Contains("error:", StringComparison.Ordinal) && OptionErrorTexts.Any(o => line.Contains(o, StringComparison.Ordinal));
+
     internal static (Failure Why, string? Header) Classify(IEnumerable<string> stderr)
     {
         bool crash = false, option = false, error = false;
@@ -323,13 +389,13 @@ public sealed class PpTrace
             if (header is null && NotFoundLine.Match(line) is { Success: true } m) header = m.Groups[1].Value;
             if (!line.Contains("error:", StringComparison.Ordinal)) continue;
             error = true;
-            if (OptionErrors.Any(o => line.Contains(o, StringComparison.Ordinal))) option = true;
+            if (IsOptionError(line)) option = true;
         }
         var why = crash ? Failure.Crash : header is not null ? Failure.HeaderNotFound : option ? Failure.Option : error ? Failure.Error : Failure.NoMessage;
         return (why, header);
     }
 
-    private static (bool Ok, bool TimedOut, Failure Why, string? Header) TraceOne(string exe, CompileCommand cmd, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease)
+    private static (bool Ok, bool TimedOut, Failure Why, string? Header, bool OptionError) TraceOne(string exe, CompileCommand cmd, IReadOnlyList<string> extra, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease)
     {
         // The command goes in a compile database of its own: no command-line quoting or length limit to meet.
         var db = Path.Combine(Path.GetTempPath(), "codecarver-ppt-" + Guid.NewGuid().ToString("N"));
@@ -339,7 +405,7 @@ public sealed class PpTrace
             var source = Path.GetFullPath(Path.Combine(cmd.Directory, cmd.File));
             File.WriteAllText(Path.Combine(db, "compile_commands.json"), JsonSerializer.Serialize(new[]
             {
-                new Dictionary<string, object> { ["directory"] = cmd.Directory, ["file"] = source, ["arguments"] = CompileArguments(cmd) },
+                new Dictionary<string, object> { ["directory"] = cmd.Directory, ["file"] = source, ["arguments"] = CompileArguments(cmd, extra) },
             }));
             var psi = new ProcessStartInfo(exe)
             {
@@ -353,15 +419,16 @@ public sealed class PpTrace
 
             using var launch = IoMeter.Start(IoMeter.Kind.Launch);   // until pp-trace exits
             using var p = Process.Start(psi);
-            if (p is null) return (false, false, Failure.NotStarted, null);
+            if (p is null) return (false, false, Failure.NotStarted, null, false);
             lease.Track(p);
             p.StandardInput.Close();
-            var fatal = false;   // drained so a full stderr pipe can't block it
+            bool fatal = false, optionError = false;   // drained so a full stderr pipe can't block it
             var said = new List<string>();   // what's needed to say why it failed: error lines and a crash's
             p.ErrorDataReceived += (_, e) =>
             {
                 if (e.Data is not { } line) return;
                 if (line.Contains("fatal error:", StringComparison.Ordinal)) fatal = true;
+                if (IsOptionError(line)) optionError = true;
                 if (said.Count < 64 && (line.Contains("error:", StringComparison.Ordinal) || line.Contains("PLEASE submit", StringComparison.Ordinal) || line.StartsWith("Stack dump:", StringComparison.Ordinal)))
                     said.Add(line);
             };
@@ -377,9 +444,9 @@ public sealed class PpTrace
             var clean = p.ExitCode == 0 || (AssemblyWithCpp(cmd.File) && p.ExitCode == 1 && !fatal);
             var ok = !timedOut && !lease.Evicted && clean;
             var (why, header) = ok ? (Failure.NoMessage, null) : Classify(said);
-            return (ok, timedOut, why, header);
+            return (ok, timedOut, why, header, optionError);
         }
-        catch (Exception ex) when (ex is not OutOfMemoryException) { return (false, false, Failure.NotStarted, null); }
+        catch (Exception ex) when (ex is not OutOfMemoryException) { return (false, false, Failure.NotStarted, null, false); }
         finally
         {
             try { Directory.Delete(db, true); } catch { /* best effort */ }

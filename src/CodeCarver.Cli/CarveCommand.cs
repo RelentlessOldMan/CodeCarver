@@ -1320,7 +1320,7 @@ public static class CarveCommand
             var logged = buildCmds.Select(CmdRel).Where(r => r is not null).Select(r => r!).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var unitsWithout = parseRels.Count(r => !notBuilt.Contains(r) && usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !logged.Contains(r));
             err.WriteLine($"  config  : running pp-trace on {absCmds.Count:N0} compile command(s) ...");
-            var trace = CodeCarver.Core.Preprocess.PpTrace.Run(exe, absCmds, root: dir);
+            var trace = CodeCarver.Core.Preprocess.PpTrace.Run(exe, absCmds, root: dir, dropOptions: cv.PpTraceDropOptions, extraArgs: cv.PpTraceArgs);
             var trusted = trace.Complete;   // source files without a command: checked per stage, kept ones only
             summary["world.ppTrace.version"] = trace.Version ?? "unknown";
             summary["world.ppTrace.commands"] = trace.Commands;
@@ -1346,6 +1346,11 @@ public static class CarveCommand
             summary["world.ppTrace.failedBy.noMessage"] = trace.FailedNoMessage;
             summary["world.ppTrace.failedBy.notStarted"] = trace.FailedNotStarted;
             summary["world.ppTrace.headersNotFound"] = trace.HeadersNotFound;
+            summary["world.ppTrace.optionErrors"] = trace.OptionErrors;
+            summary["world.ppTrace.args"] = cv.PpTraceArgs.Count;
+            summary["world.ppTrace.dropped.commands"] = trace.CommandsWithDropped;
+            summary["world.ppTrace.dropped.options"] = trace.OptionsDropped;
+            summary["world.ppTrace.dropped.patternsUnused"] = trace.DropPatternsUnused;
             summary["world.ppTrace.names"] = trace.Names.Count;
             summary["world.ppTrace.unitsWithoutCommand"] = unitsWithout;
             summary["world.ppTrace.trusted"] = trusted ? 1 : 0;
@@ -1364,7 +1369,7 @@ public static class CarveCommand
                          trace.Commands == 0 ? "no command to run" : null,
                          ran > 0 ? $"{ran:N0} failed: " + string.Join(", ", new[] {
                              trace.TimedOut > 0 ? $"{trace.TimedOut:N0} over the time limit" : null,
-                             trace.FailedHeaderNotFound > 0 ? $"{trace.FailedHeaderNotFound:N0} an include not found ({trace.HeadersNotFound:N0} header(s); {trace.FailedHeaderNotFoundCLibrary:N0} the C library's: its toolchain folders, pathMap?)" : null,
+                             trace.FailedHeaderNotFound > 0 ? $"{trace.FailedHeaderNotFound:N0} an include not found ({trace.HeadersNotFound:N0} header(s); {trace.FailedHeaderNotFoundCLibrary:N0} the C library's: its toolchain folders, pathMap or ppTraceArgs?)" : null,
                              trace.FailedOption > 0 ? $"{trace.FailedOption:N0} an option the driver rejected" : null,
                              trace.FailedError > 0 ? $"{trace.FailedError:N0} another error" : null,
                              trace.FailedCrash > 0 ? $"{trace.FailedCrash:N0} pp-trace crashed" : null,
@@ -1379,6 +1384,11 @@ public static class CarveCommand
                          trace.Refused > 0 ? $"{trace.Refused:N0} refused" : null,
                          trace.Incomplete > 0 ? $"{trace.Incomplete:N0} not fully in the log" : null,
                      }.Where(x => x is not null))}), so the header carve models the paste macros itself"));
+            if (trace.OptionErrors > 0)
+                err.WriteLine($"  config  : pp-trace: {trace.OptionErrors:N0} run(s) printed an option the driver rejected; that alone doesn't fail a run (ppTraceDropOptions takes one out)");
+            if (cv.PpTraceDropOptions.Count > 0)
+                err.WriteLine($"  config  : pp-trace: ppTraceDropOptions took {trace.OptionsDropped:N0} argument(s) out of {trace.CommandsWithDropped:N0} command(s)"
+                    + (trace.DropPatternsUnused > 0 ? $"; {trace.DropPatternsUnused:N0} pattern(s) matched nothing" : ""));
             if (trace.MissingDirsInRoot > 0)
                 err.WriteLine($"  config  : pp-trace: {trace.RanWithoutDirsInRoot:N0} command(s) ran without {trace.MissingDirsInRoot:N0} include director(ies) missing from the tree"
                     + $" ({trace.MissingDirsInRootFromBuild:N0} where the build writes its output), as Clang skips them; a header only they held fails its command");
@@ -3815,6 +3825,8 @@ public static class CarveCommand
             sb.AppendLine($"buildTraceFiles = {L(buildFileTraces)}");
             sb.AppendLine($"usedMacros = {L(cv.UsedMacros)}");
         sb.AppendLine($"ppTrace = {L(cv.PpTraces)}");
+            sb.AppendLine($"ppTraceArgs = {L(cv.PpTraceArgs)}");
+            sb.AppendLine($"ppTraceDropOptions = {L(cv.PpTraceDropOptions)}");
             sb.AppendLine("[runs.resolved]");
             sb.AppendLine($"runTraceFiles = {L(runFileTraces)}");
             sb.AppendLine($"runTraceLogs = {L(traceList)}");

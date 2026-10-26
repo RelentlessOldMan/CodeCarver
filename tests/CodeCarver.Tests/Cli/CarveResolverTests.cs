@@ -16,6 +16,30 @@ public sealed class CarveResolverTests
         return r.Config!;
     }
 
+    /// <summary>ppTraceArgs come in pairs (-isystem DIR), so a build's list is added whole, once; drop patterns union.</summary>
+    [Fact]
+    public void PpTraceArgs_AddEachBuildsListOnce_AndDropOptionsUnion()
+    {
+        var cfg = Cfg("""
+            outputDirectory = "out"
+            [common]
+            entryPoints = ["main"]
+            [builds.a]
+            buildLogs = ["a.log"]
+            ppTrace = "pp-trace"
+            ppTraceArgs = ["-isystem", "/kq/libc/include"]
+            ppTraceDropOptions = ["-fkq-*"]
+            [builds.b]
+            buildLogs = ["b.log"]
+            ppTrace = "pp-trace"
+            ppTraceArgs = ["-isystem", "/kq/libc/include"]
+            ppTraceDropOptions = ["-fkq-*", "-Xkq *"]
+            """);
+        var c = CarveResolver.Resolve(cfg, null).Carve!;
+        Assert.Equal(new[] { "-isystem", "/kq/libc/include" }, c.PpTraceArgs);
+        Assert.Equal(new[] { "-fkq-*", "-Xkq *" }, c.PpTraceDropOptions);
+    }
+
     [Fact]
     public void UnionsSelectedBuildsAndRuns_DerivesClosedWorld()
     {

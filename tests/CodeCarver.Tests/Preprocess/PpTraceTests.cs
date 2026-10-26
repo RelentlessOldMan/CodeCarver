@@ -56,6 +56,21 @@ public sealed class PpTraceTests
         var given = Cmd("/w", "a.c", "aarch64-none-elf-clang", "--target=aarch64-none-elf", "-c");
         Assert.Equal(new[] { "aarch64-none-elf-clang", "--target=aarch64-none-elf", "a.c" }, PpTrace.CompileArguments(given));
         Assert.Contains("-ferror-limit=0", PpTrace.CompileArguments(Cmd("/w", "start.S", "clang", "-c")));
+        // ppTraceArgs go after the command's own flags, so an added -isystem is searched after the build's directories.
+        Assert.Equal(new[] { "clang", "-Iinc", "-isystem", "/kq/libc", "a.c" },
+                     PpTrace.CompileArguments(Cmd("/w", "a.c", "clang", "-Iinc", "-c"), new[] { "-isystem", "/kq/libc" }));
+    }
+
+    [Fact]
+    public void Drop_TakesOutWhatThePatternsMatch_AndCountsEach()
+    {
+        var patterns = new[] { "-fkq-*", "-Xkq *", "-mkq=fast", "-fnever-*" }.Select(PpTrace.DropPattern.Parse).ToList();
+        var used = new int[patterns.Count];
+        var (kept, n) = PpTrace.Drop(new[] { "-O2", "-fkq-a", "-Xkq", "v", "-fkq-b=1", "-mkq=fast", "-mkq=slow", "-Xkq" }, patterns, used);
+        // A two-word pattern needs its value: the last -Xkq has none and stays.
+        Assert.Equal(new[] { "-O2", "-mkq=slow", "-Xkq" }, kept);
+        Assert.Equal(5, n);
+        Assert.Equal(new[] { 2, 1, 1, 0 }, used);
     }
 
     [Theory]
@@ -138,6 +153,19 @@ public sealed class PpTraceTests
             File.WriteAllText(Path.Combine(dir, "lib.c"), "#include <string.h>\nint l;\n");
             var lib = PpTrace.Run(exe!, new[] { Cmd(dir, "lib.c", "aarch64-none-elf-clang", "-c"), Cmd(dir, "g.c", "clang", "-c") }, parallel: 2, root: dir);
             Assert.Equal((2, 1, 2), (lib.FailedHeaderNotFound, lib.FailedHeaderNotFoundCLibrary, lib.HeadersNotFound));
+
+            // ppTraceArgs point it at a C library here. An option the driver doesn't know is an error pp-trace prints and
+            // goes on from: the run still exits 0 (optionErrors). ppTraceDropOptions takes it out.
+            Directory.CreateDirectory(Path.Combine(dir, "libc"));
+            File.WriteAllText(Path.Combine(dir, "libc", "string.h"), "#define KQ_STRING_H 1\n");
+            var vendor = new[] { Cmd(dir, "lib.c", "aarch64-none-elf-clang", "-fkq-vendor", "-c"), Cmd(dir, "a.c", "clang", "-Iinc", "-fkq-vendor", "-c") };
+            var withLib = PpTrace.Run(exe!, vendor, parallel: 2, root: dir, extraArgs: new[] { "-isystem", Path.Combine(dir, "libc") });
+            Assert.True(withLib.Complete, $"{withLib.Succeeded} of {withLib.Commands}");
+            Assert.Equal(2, withLib.OptionErrors);
+            var dropped = PpTrace.Run(exe!, vendor, parallel: 2, root: dir, extraArgs: new[] { "-isystem", Path.Combine(dir, "libc") },
+                                      dropOptions: new[] { "-fkq-*", "-Xnever *" });
+            Assert.True(dropped.Complete, $"{dropped.Succeeded} of {dropped.Commands}");
+            Assert.Equal((0, 2, 2, 1), (dropped.OptionErrors, dropped.CommandsWithDropped, dropped.OptionsDropped, dropped.DropPatternsUnused));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
