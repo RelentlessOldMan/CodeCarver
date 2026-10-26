@@ -4,7 +4,7 @@
   and check the result against the truth in its manifest.
 
 .DESCRIPTION
-  Generates the corpus with the pinned tools/codespawner/codespawner.exe (or takes one already generated), verifies
+  Generates the corpus with the pinned tools/codespawner/codespawner.exe, or -Spawner (or takes one already generated), verifies
   it, carves its fw/ root twice with every file forced kept (the truth is about the header carve alone) and fails when:
     - a mustKeepDefines name is not defined in the carved tree, or a mustDropDefines name is;
     - a mustKeepFiles file is missing;
@@ -26,10 +26,12 @@ param(
     [double] $Scale = 0.01,
     [string[]] $Compilers = @('gcc', 'clang'),
     [switch] $RequireCompilers,
-    [int] $MemoryStopMb = 4000
+    [int] $MemoryStopMb = 4000,
+    [string] $Spawner                               # codespawner.exe for gen and verify (default: the pinned one)
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot)
+if (-not $Spawner) { $Spawner = Join-Path $repo 'tools/codespawner/codespawner.exe' }
 $fails = New-Object System.Collections.Generic.List[string]
 function Fail($m) { $fails.Add($m); Write-Host "FAIL $m" }
 function Run-Carver([string[]] $a) {
@@ -42,8 +44,7 @@ $Work = (Resolve-Path $Work).Path
 if (-not $Corpus) {
     $Corpus = Join-Path $Work 'corpus'
     if (Test-Path $Corpus) { Remove-Item -Recurse -Force $Corpus }
-    $spawner = Join-Path $repo 'tools/codespawner/codespawner.exe'
-    & $spawner gen --out $Corpus --preset firmware --scale $Scale
+    & $Spawner gen --out $Corpus --preset firmware --scale $Scale
     if ($LASTEXITCODE -ne 0) { Write-Host "codespawner gen failed ($LASTEXITCODE)"; exit 2 }
 }
 $Corpus = (Resolve-Path $Corpus).Path
@@ -53,7 +54,7 @@ $fwm = (Get-Content -Raw $manifestPath | ConvertFrom-Json).firmware
 if (-not $fwm) { Write-Host "$manifestPath has no firmware object"; exit 2 }
 
 # verify recomputes the truth and treeSha256 from the tree: a stale or damaged copy fails here, not as a carve miss.
-& (Join-Path $repo 'tools/codespawner/codespawner.exe') verify --corpus $Corpus --manifest $manifestPath | Select-Object -Last 3
+& $Spawner verify --corpus $Corpus --manifest $manifestPath | Select-Object -Last 3
 if ($LASTEXITCODE -ne 0) { Write-Host "codespawner verify failed: the corpus does not match its manifest"; exit 2 }
 
 $root = Join-Path $Corpus $fwm.root
@@ -146,7 +147,10 @@ foreach ($cc in $Compilers) {
     foreach ($e in $entries) {
         $a = @($e.arguments | Select-Object -Skip 1 | ForEach-Object { $_.Replace($root, $carved) })
         $a = @($a | Where-Object { $_ -ne '-c' }) + @('-Wall', '-Werror', '-fsyntax-only')
+        # Under Stop, Windows PowerShell turns the compiler's first stderr line into a terminating error.
+        $ErrorActionPreference = 'Continue'
         $o = & $cc @a 2>&1
+        $ErrorActionPreference = 'Stop'
         if ($LASTEXITCODE -ne 0) {
             $bad++
             if ($bad -le 3) { Write-Host "  $cc $($e.file): $(($o | Select-Object -First 3) -join ' | ')" }

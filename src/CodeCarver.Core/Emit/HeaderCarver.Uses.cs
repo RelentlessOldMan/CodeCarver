@@ -271,8 +271,8 @@ public static partial class HeaderCarver
     private sealed class FileFacts
     {
         public readonly List<ulong> EdgeFrom = new(), EdgeTo = new(), Called = new(), Forwarders = new(), Direct = new(), Under = new();
-        public readonly List<ulong> EmptyName = new(), EmptyItems = new();
-        public readonly List<int> EmptyCount = new();
+        public readonly List<ulong> EmptyName = new(), EmptyItems = new(), AliasName = new(), AliasItems = new();
+        public readonly List<int> EmptyCount = new(), AliasCount = new();
         public int Defines;
         private readonly List<bool> parenIsCall = new();
 
@@ -293,8 +293,17 @@ public static partial class HeaderCarver
                 if (big && !pastes) Forwarders.Add(key);
             }
             // A body ending in a name forwards to it: an alias, or a function-like macro whose result is called
-            // (`#define PICK(x) CAT`, then `PICK(1)(A, B)`).
-            else if (b.Count > 0 && b[^1].Kind == PpTok.Ident && !d.IsParam(d.Tok(b.Count - 1))) { EdgeFrom.Add(key); EdgeTo.Add(NameKey.Short(d.Tok(b.Count - 1))); }
+            // (`#define PICK(x) CAT`, then `PICK(1)(A, B)`). One ending in names and parameters forwards to the last name
+            // and, past names that can expand to nothing, to each before it: those after it can be empty (`CAT E`) or
+            // a parameter can supply the ( (`CAT x`, x = (A, 1)). Which names can be empty is known once every define
+            // is: the tail's names wait in Alias*, last first, for DefineFacts.Resolve.
+            else
+            {
+                var start = AliasItems.Count;
+                for (var k = b.Count - 1; k >= 0 && b[k].Kind == PpTok.Ident; k--)
+                    if (!d.IsParam(d.Tok(k))) AliasItems.Add(NameKey.Short(d.Tok(k)));
+                if (AliasItems.Count > start) { AliasName.Add(key); AliasCount.Add(AliasItems.Count - start); }
+            }
             if (d.NameSpan.StartsWith("__", StringComparison.Ordinal)) Under.Add(key);
             ScanCalls(d);
             EmptyCandidate(d, key);
@@ -368,8 +377,9 @@ public static partial class HeaderCarver
     /// </summary>
     private sealed class DefineFacts
     {
-        private ULongs edgeFrom = new(), edgeTo = new(), called = new(), forwarders = new(), emptyName = new(), emptyItems = new();
-        private List<int> emptyCount = new();
+        private ULongs edgeFrom = new(), edgeTo = new(), called = new(), forwarders = new(), emptyName = new(), emptyItems = new(),
+                       aliasName = new(), aliasItems = new();
+        private List<int> emptyCount = new(), aliasCount = new();
         private readonly HashSet<ulong> direct = new();
         public readonly HashSet<ulong> Under = new();
         public HashSet<ulong> Pasters { get; private set; } = new();
@@ -404,10 +414,57 @@ public static partial class HeaderCarver
             emptyName.AddRange(f.EmptyName);
             emptyItems.AddRange(f.EmptyItems);
             emptyCount.AddRange(f.EmptyCount);
+            aliasName.AddRange(f.AliasName);
+            aliasItems.AddRange(f.AliasItems);
+            aliasCount.AddRange(f.AliasCount);
         }
 
         public void Resolve()
         {
+            // Which names can expand to nothing: a least fixpoint, a name being so when any of its defines is.
+            var names = emptyName.ToArray();
+            var items = emptyItems.ToArray();
+            var counts = emptyCount.ToArray();
+            emptyName = emptyItems = new ULongs();
+            emptyCount = new List<int>();
+            var cand = new int[items.Length];
+            var waiting = new int[names.Length];
+            var ready = new Stack<int>();
+            for (int i = 0, at = 0; i < names.Length; i++)
+            {
+                waiting[i] = counts[i];
+                for (var j = 0; j < counts[i]; j++) cand[at++] = i;
+                if (counts[i] == 0) ready.Push(i);
+            }
+            Array.Sort(items, cand);
+            while (ready.Count > 0)
+            {
+                var name = names[ready.Pop()];
+                if (!Emptyable.Add(name)) continue;
+                for (var k = LowerBound(items, name); k < items.Length && items[k] == name; k++)
+                    if (--waiting[cand[k]] == 0) ready.Push(cand[k]);
+            }
+            names = items = Array.Empty<ulong>();
+            cand = waiting = Array.Empty<int>();
+
+            // An alias's tail, last first: an edge to each name until one that can't be empty (`CAT E N`, N = ", 3",
+            // forwards to N only: CAT is followed by N's text, with no ( to call it). A name followed only by names that
+            // can be empty is called, as an object-like body's last name is (`CAT E`).
+            var aNames = aliasName.ToArray();
+            var aItems = aliasItems.ToArray();
+            var aCounts = aliasCount.ToArray();
+            aliasName = aliasItems = new ULongs();
+            aliasCount = new List<int>();
+            for (int i = 0, at = 0; i < aNames.Length; at += aCounts[i], i++)
+                for (var j = at; j < at + aCounts[i]; j++)
+                {
+                    edgeFrom.Add(aNames[i]);
+                    edgeTo.Add(aItems[j]);
+                    if (!Emptyable.Contains(aItems[j])) break;
+                    if (j + 1 < at + aCounts[i]) called.Add(aItems[j + 1]);
+                }
+            aNames = aItems = Array.Empty<ulong>();
+
             Edges = edgeFrom.Count;
             // Rule 1: a name forwarding to a paste macro is one (a reverse closure from the direct ones).
             var from = edgeFrom.ToArray();
@@ -441,30 +498,6 @@ public static partial class HeaderCarver
             var f = forwarders.ToArray();
             forwarders = new ULongs();
             ForwardingMacros = f.Distinct().Count();
-
-            // Which names can expand to nothing: a least fixpoint, a name being so when any of its defines is.
-            var names = emptyName.ToArray();
-            var items = emptyItems.ToArray();
-            var counts = emptyCount.ToArray();
-            emptyName = emptyItems = new ULongs();
-            emptyCount = new List<int>();
-            var cand = new int[items.Length];
-            var waiting = new int[names.Length];
-            var ready = new Stack<int>();
-            for (int i = 0, at = 0; i < names.Length; i++)
-            {
-                waiting[i] = counts[i];
-                for (var j = 0; j < counts[i]; j++) cand[at++] = i;
-                if (counts[i] == 0) ready.Push(i);
-            }
-            Array.Sort(items, cand);
-            while (ready.Count > 0)
-            {
-                var name = names[ready.Pop()];
-                if (!Emptyable.Add(name)) continue;
-                for (var k = LowerBound(items, name); k < items.Length && items[k] == name; k++)
-                    if (--waiting[cand[k]] == 0) ready.Push(cand[k]);
-            }
         }
 
         private static int LowerBound(ulong[] a, ulong x)
@@ -1594,15 +1627,25 @@ public static partial class HeaderCarver
             {
                 if (pool)
                 {
-                    PoolArgs(args);
-                    if (eof) poolAnyE = true;   // its later arguments are unknown: they can end a name
+                    Val? hv = null;
                     if (head is not null)
                     {
-                        // A computed call calls the last token of its head's result: each name that can be is called too.
-                        Val hv;
                         noPool++;
                         try { hv = HeadResult(head); }
                         finally { noPool--; }
+                    }
+                    // A computed call's own pool is for a head that can end in a name not known (a pattern's): one known
+                    // is instantiated. A head with no define yet runs again when one arrives, and one with none at all
+                    // is a function, whose call pastes nothing. Pooled always, a use of KM() = kcat E N, N(a, b) = ", 3"
+                    // kept every name its arguments' pieces could make.
+                    if (hv is null || crossed || eof || HasPattern(hv.Last))
+                    {
+                        PoolArgs(args);
+                        if (eof) poolAnyE = true;   // its later arguments are unknown: they can end a name
+                    }
+                    if (hv is not null)
+                    {
+                        // A computed call calls the last token of its head's result: each name that can be is called too.
                         foreach (var e in hv.Last.ToArray())
                             if (e.IsExact && Instantiable(e.Pre, args)) InstantiateEach(e.Pre, args, eof, crossed);
                     }
@@ -1627,6 +1670,12 @@ public static partial class HeaderCarver
             }
             finally { eofArgs = null; }
             FinishPool();
+        }
+
+        private static bool HasPattern(HashSet<El> s)
+        {
+            foreach (var e in s) if (!e.IsExact && !e.IsEps) return true;
+            return false;
         }
 
         /// <summary>What a computed call's head gives: its callee instantiated, or for a computed head each name its own
@@ -1891,6 +1940,56 @@ public static partial class HeaderCarver
                 if (pv.Count == 1 && pv[0].K == XTok.Ident) Call(site, pv[0].Id);
                 else if (pv.Count > 0) { PoolArgs(site.Args); site.Inst = true; }
             }
+
+            // A parameter whose argument starts with ( calls the name before it (P(x) = CAT x, P((A, 1)) is CAT(A, 1)), and
+            // past names and parameters that can be empty, each one before them too (CAT E x, E empty).
+            if (a is not null)
+                for (var k = 1; k < n; k++)
+                {
+                    if (b[k].K != XTok.Param || chainStart[k] >= 0 || chainEnd[k] >= 0) continue;
+                    var arg = a[b[k].Id];
+                    if (arg.Count == 0 || arg[0].K != XTok.LParen) continue;
+                    var callees = new List<int>();
+                    for (var j = k - 1; j >= 0;)
+                    {
+                        if (chainStart[j] >= 0)
+                        {
+                            var st = chainStart[j];
+                            foreach (var e in chainSet![st]!) if (e.IsExact) callees.Add(e.Pre);
+                            if (!chainEps![st]) break;
+                            j = st - 1;
+                        }
+                        else if (b[j].K == XTok.Ident)
+                        {
+                            callees.Add(b[j].Id);
+                            if (!Emptyable(b[j].Id)) break;
+                            j--;
+                        }
+                        else if (b[j].K == XTok.Param)
+                        {
+                            var s = EdgeSet(a[b[j].Id], true, forceExp: true);
+                            foreach (var e in s) if (e.IsExact) callees.Add(e.Pre);
+                            if (!s.Contains(El.Eps)) break;
+                            j--;
+                        }
+                        else if (b[j].K == XTok.RParen && open[j] >= 0 && sites?[open[j]] is { } ps)
+                        {
+                            // a call's result: each name it can end in
+                            foreach (var e in ps.V.Last) if (e.IsExact) callees.Add(e.Pre);
+                            break;
+                        }
+                        else break;
+                    }
+                    if (callees.Count == 0) continue;
+                    // its ) can be past the argument, in the body or after it: the rest of its arguments are unknown
+                    var c = MatchClose(arg, 0);
+                    var args = UseTracker.Split(arg.GetRange(1, (c < 0 ? arg.Count : c) - 1));
+                    if (c < 0) args[^1].Add(new XTok(XTok.Wild, WildAny));
+                    var savedEof = eofArgs;
+                    eofArgs = c < 0 ? args : null;
+                    try { foreach (var q in callees) if (Instantiable(q, args)) Instantiate(q, args); }
+                    finally { eofArgs = savedEof; }
+                }
 
             // A call the body leaves open (OPENF(x) = CAT(x,): the rest of its arguments come after the body, unseen, so
             // they are wildcards.

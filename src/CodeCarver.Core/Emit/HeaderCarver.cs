@@ -602,12 +602,15 @@ public static partial class HeaderCarver
         using var r = new StreamReader(path, Encoding.Latin1);
         string? line;
         var inComment = Comment.None;
+        var lineStart = true;
         while ((line = r.ReadLine()) is not null)
         {
-            line = CommentsBlanked(Digraphs(line));
-            var commented = inComment != Comment.None;   // a #define inside a comment is comment text
-            var (isDefine, isCond) = commented ? (false, false) : Directive(line);
-            inComment = CommentOpenAfter(line, inComment);
+            // a #define inside a comment is comment text, but not one after the end of a comment that a line starts in
+            var view = DirectiveView(line, inComment, out _);
+            var (isDefine, isCond) = view is null ? (false, false) : Directive(view);
+            inComment = CommentOpenAfter(line, inComment, lineStart);
+            line = isDefine || isCond ? view! : CommentsBlanked(Digraphs(line));
+            lineStart = !EndsWithContinuation(line);
             // A line is copied only when continuation lines join it (each line was copied three more times).
             var full = line;
             if ((isDefine || isCond) && EndsWithContinuation(line))
@@ -615,11 +618,12 @@ public static partial class HeaderCarver
                 var sb = new StringBuilder(line);
                 while (EndsWithContinuation(line) && (line = r.ReadLine()) is not null)
                 {
+                    inComment = CommentOpenAfter(line, inComment, false);
                     line = CommentsBlanked(Digraphs(line));
                     sb.Append('\n').Append(line);
-                    inComment = CommentOpenAfter(line, inComment);
                 }
                 full = sb.ToString();
+                lineStart = true;
             }
             // A define that leaves a comment open is kept whatever it names (the rewrite can't cut the comment):
             // read it as plain text, so what it names counts.
@@ -682,26 +686,46 @@ public static partial class HeaderCarver
 
     /// <summary>Is a comment open after <paramref name="line"/>, given whether one was open before it? A block
     /// comment, or a line comment ending in a backslash: the splice makes the next line comment text too
-    /// (<c>// path: C:\vendor\regs\</c>). String and character literals open nothing.</summary>
-    private static Comment CommentOpenAfter(string line, Comment open)
+    /// (<c>// path: C:\vendor\regs\</c>). String and character literals open nothing. <paramref name="lineStart"/>: the
+    /// line starts a line of its own (the one before it doesn't end in a backslash).</summary>
+    private static Comment CommentOpenAfter(string line, Comment open, bool lineStart)
     {
         if (open == Comment.Line) return EndsWithContinuation(line) ? Comment.Line : Comment.None;   // all comment text
-        var inBlock = open == Comment.Block;
+        var inBlock = open is Comment.Block or Comment.BlockAtStart;
+        var clean = open == Comment.BlockAtStart || (open == Comment.None && lineStart);   // only white space and comments yet
+        var blockClean = open == Comment.BlockAtStart;
         var quote = '\0';
         for (var c = 0; c < line.Length; c++)
         {
             var ch = line[c];
             if (inBlock) { if (ch == '*' && c + 1 < line.Length && line[c + 1] == '/') { inBlock = false; c++; } }
             else if (quote != '\0') { if (ch == '\\') c++; else if (ch == quote) quote = '\0'; }
-            else if (ch is '"' or '\'') quote = ch;
+            else if (ch is '"' or '\'') { quote = ch; clean = false; }
             else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '/') return EndsWithContinuation(line) ? Comment.Line : Comment.None;
-            else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '*') { inBlock = true; c++; }
+            else if (ch == '/' && c + 1 < line.Length && line[c + 1] == '*') { inBlock = true; blockClean = clean; c++; }
+            else if (!char.IsWhiteSpace(ch)) clean = false;
         }
-        return inBlock ? Comment.Block : Comment.None;
+        return !inBlock ? Comment.None : blockClean ? Comment.BlockAtStart : Comment.Block;
     }
 
-    /// <summary>What comment is open at a line's end: none, a block comment, or a line comment a backslash continues.</summary>
-    private enum Comment { None, Block, Line }
+    /// <summary>What comment is open at a line's end: none, a block comment, or a line comment a backslash continues.
+    /// <see cref="BlockAtStart"/>: a block comment with only white space and comments before it on its line. A comment
+    /// is a space, so a <c>#</c> right after it starts a directive (<c>/* over</c>, then <c>two lines */ #define X 1</c>).</summary>
+    private enum Comment { None, Block, Line, BlockAtStart }
+
+    /// <summary>A line as a directive reads it, or null for comment text: <paramref name="line"/> after
+    /// <paramref name="open"/>, with a <see cref="Comment.BlockAtStart"/> comment's end blanked. <paramref name="end"/>:
+    /// where the text after that comment starts, else 0.</summary>
+    private static string? DirectiveView(string line, Comment open, out int end)
+    {
+        end = 0;
+        if (open == Comment.None) return CommentsBlanked(Digraphs(line));
+        if (open != Comment.BlockAtStart) return null;
+        var close = line.IndexOf("*/", StringComparison.Ordinal);
+        if (close < 0) return null;
+        end = close + 2;
+        return CommentsBlanked(Digraphs(new string(' ', end) + line[end..]));
+    }
 
     /// <summary>Copy <paramref name="src"/> to <paramref name="dst"/>, omitting #defines the predicate rejects.
     /// Byte-transparent (Latin-1) and every kept line keeps its own line ending (review E1). A line inside a comment
@@ -712,33 +736,42 @@ public static partial class HeaderCarver
         using var w = new StreamWriter(dst, false, Encoding.Latin1);
         using var e = ReadLinesWithEol(src).GetEnumerator();
         var inComment = Comment.None;
+        var lineStart = true;
         var define = new List<(string Line, string Eol)>();
         while (e.MoveNext())
         {
             var (line, eol) = e.Current;
-            var view = inComment == Comment.None ? CommentsBlanked(Digraphs(line)) : line;
-            if (inComment == Comment.None && IsDefineDirective(view.TrimStart()))
+            var view = DirectiveView(line, inComment, out var head);
+            if (view is not null && IsDefineDirective(view.TrimStart()))
             {
                 // Read the whole (possibly multi-line) define, then decide.
                 define.Clear();
                 define.Add((line, eol));
-                inComment = CommentOpenAfter(line, inComment);
+                inComment = CommentOpenAfter(line, inComment, lineStart);
                 var cont = line;
                 while (EndsWithContinuation(cont) && e.MoveNext())
                 {
                     (cont, eol) = e.Current;
                     define.Add((cont, eol));
-                    inComment = CommentOpenAfter(cont, inComment);
+                    inComment = CommentOpenAfter(cont, inComment, false);
                 }
+                lineStart = true;
                 var name = DefineName(view);
                 if (name is not null) defined(name);
                 var drop = name is not null && inComment == Comment.None && !wanted(name);
-                if (drop) { dropped++; continue; }
+                if (drop)
+                {
+                    dropped++;
+                    // the end of the comment the line started in stays: the lines after it are comment text without it
+                    if (head > 0) { w.Write(line.AsSpan(0, head)); w.Write(define[0].Eol); }
+                    continue;
+                }
                 kept++;
                 foreach (var (l, el) in define) { w.Write(l); w.Write(el); }
                 continue;
             }
-            inComment = CommentOpenAfter(line, inComment);
+            inComment = CommentOpenAfter(line, inComment, lineStart);
+            lineStart = !EndsWithContinuation(line);
             w.Write(line);
             w.Write(eol);
         }

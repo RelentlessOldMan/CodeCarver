@@ -42,6 +42,39 @@ public class HeaderCarverShapeTests
     }
 
     [Fact]
+    public void A_comment_that_opens_on_the_line_before_the_hash_is_a_space()
+    {
+        // The comment is one space, so the # is the line's first token; not so when code comes before the comment.
+        var carved = Carve("#include \"chip.h\"\nint u(void){ return CAT1(ZG, 1); }\n",
+            "#define CAT1(a, b) a##b\n/* a comment over\n   two lines */ # define ZG1 1\n/* another\n   */ # define ZG3 3\n" +
+            "int kq_v; /* not\n   a directive */ # define ZG4 4\n#define ZG2 2\n");
+        Assert.Contains("   two lines */ # define ZG1 1", carved);
+        Assert.Contains("/* another\n   */", carved);
+        Assert.DoesNotContain("ZG3", carved);
+        Assert.Contains("a directive */ # define ZG4 4", carved);
+        Assert.DoesNotContain("ZG2", carved);
+    }
+
+    [Fact]
+    public void A_body_ending_in_a_name_calls_it_with_what_follows()
+    {
+        // KQM() gives "CAT KQE", KQE is empty, so CAT takes (KQX_, 1); KQP() gives "CAT" and KQP((KQZ_, 2)) "CAT (KQZ_, 2)".
+        // kcat isn't CAT: KQN's comma leaves it nothing to paste, so ZQW_2Z isn't built. KQC and KQD call CAT and kcat, so
+        // neither gets an every-name use (a paste macro only named does), and only the tails keep KQX_1, KQY_1 and KQZ_2.
+        var carved = Carve("#include \"chip.h\"\nint u(void){ return KID(KQM()(KQX_, 1)) + ((void)KQK()(ZQW_, 2Z)) + KQP()(KQY_, 1) + KQP((KQZ_, 2)); }\n",
+            "#define CAT_(a, b) a##b\n#define CAT(a, b) CAT_(a, b)\n#define KID(x) x\n#define kcat(a, b) a##b\n" +
+            "#define KQC(a, b) CAT(a, b)\n#define KQD(a, b) kcat(a, b)\n#define KQE\n#define KQM() CAT KQE\n#define KQN(a, b) , 3\n#define KQK() kcat KQE KQN\n#define KQP(x) CAT x\n" +
+            "#define KQX_1 43\n#define KQY_1 44\n#define KQZ_2 45\n#define KQX_2 1\n#define KQY_2 2\n#define KQZ_1 3\n#define ZQW_2Z 4\n");
+        Assert.Contains("#define KQX_1 43", carved);
+        Assert.Contains("#define KQY_1 44", carved);
+        Assert.Contains("#define KQZ_2 45", carved);
+        Assert.DoesNotContain("KQX_2", carved);
+        Assert.DoesNotContain("KQY_2", carved);
+        Assert.DoesNotContain("KQZ_1", carved);
+        Assert.DoesNotContain("ZQW_2Z", carved);
+    }
+
+    [Fact]
     public void A_splice_with_a_space_after_it_and_a_lone_carriage_return_end_lines()
     {
         var carved = Carve("#include \"chip.h\"\nint u(void){ return CAT1(ZD, 1) + CAT2(ZE, 2); }\n",
