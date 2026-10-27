@@ -85,6 +85,11 @@ public sealed class PpTrace
     /// <summary>The warning flags of the errors runs printed (<c>-Wmacro-redefined</c>), each with the runs that
     /// printed one, most first: Clang's own flag names, nothing of the source.</summary>
     public IReadOnlyList<(string Flag, int Runs)> ErrorFlags { get; private set; } = Array.Empty<(string, int)>();
+    /// <summary>What the errors the preprocessor reported said, each with the runs that
+    /// printed one, most first: Clang's wording with what it quoted taken out, and any word not all lower-case letters
+    /// too (<c>function-like macro '' is not defined</c>), and an <c>#error</c>'s or <c>#warning</c>'s text all of it, so nothing
+    /// of the source.</summary>
+    public IReadOnlyList<(string Kind, int Runs)> ErrorKinds { get; private set; } = Array.Empty<(string, int)>();
     public int FailedNoMessage { get; private set; }
     public int FailedNotStarted { get; private set; }
     /// <summary>Of <see cref="FailedHeaderNotFound"/>, those whose header is one of the C standard library's
@@ -151,6 +156,7 @@ public sealed class PpTrace
         var failedBy = new int[Enum.GetValues<Failure>().Length];
         int cLibrary = 0, optionErrors = 0, withDropped = 0, dropped = 0, pastParse = 0, pastWarnings = 0, ppNoFlag = 0;
         var errorFlags = new System.Collections.Concurrent.ConcurrentDictionary<string, int>(StringComparer.Ordinal);
+        var errorKinds = new System.Collections.Concurrent.ConcurrentDictionary<string, int>(StringComparer.Ordinal);
         var notFound = new System.Collections.Concurrent.ConcurrentDictionary<string, HeaderSeen>(StringComparer.Ordinal);
         var outDirs = OutputDirs(commands);
         var rootFull = root is null ? null : Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
@@ -191,6 +197,7 @@ public sealed class PpTrace
             if (late) Interlocked.Increment(ref timedOut);
             if (optionError) Interlocked.Increment(ref optionErrors);
             foreach (var flag in errs.Flags) errorFlags.AddOrUpdate(flag, 1, (_, n) => n + 1);
+            foreach (var kind in errs.Kinds) errorKinds.AddOrUpdate(kind, 1, (_, n) => n + 1);
             if (!ok && !late && failure == Failure.PreprocessorError && errs.PreprocessorNoFlag) Interlocked.Increment(ref ppNoFlag);
             if (!ok && !late)
             {
@@ -234,6 +241,7 @@ public sealed class PpTrace
         r.SucceededPastWarningsAsErrors = pastWarnings;
         r.FailedPreprocessorErrorNoFlag = ppNoFlag;
         r.ErrorFlags = errorFlags.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => (kv.Key, kv.Value)).ToList();
+        r.ErrorKinds = errorKinds.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => (kv.Key, kv.Value)).ToList();
         r.FailedNoMessage = failedBy[(int)Failure.NoMessage];
         r.FailedNotStarted = failedBy[(int)Failure.NotStarted];
         r.FailedHeaderNotFoundCLibrary = cLibrary;
@@ -454,6 +462,7 @@ public sealed class PpTrace
         public HashSet<string> Flags { get; } = new(StringComparer.Ordinal);
         public bool WarningAsError { get; set; }
         public bool PreprocessorNoFlag { get; set; }
+        public HashSet<string> Kinds { get; } = new(StringComparer.Ordinal);
 
         public void Add(string line, Stage stage)
         {
@@ -464,10 +473,31 @@ public sealed class PpTrace
                     if (w.Value != "-Werror") { Flags.Add(w.Value); any = true; }
             if (stage == Stage.Warning) WarningAsError = true;
             if (stage == Stage.Preprocessor && !any) PreprocessorNoFlag = true;
+            if (stage == Stage.Preprocessor && ErrorKind(line) is { Length: > 0 } kind) Kinds.Add(kind);
         }
     }
 
     static readonly Regex WarningFlag = new(@"-W[^,\]]+", RegexOptions.CultureInvariant);
+    static readonly Regex Quoted = new(@"'[^']*'|""[^""]*""", RegexOptions.CultureInvariant);
+    static readonly Regex KindWord = new(@"[^\s,;:()]+", RegexOptions.CultureInvariant);
+
+    /// <summary>An error line's message with nothing of the source: what Clang quoted is emptied, and a word that isn't
+    /// all lower-case letters (bar a leading <c>#</c> or <c>__</c>, and hyphens) becomes <c>…</c>.</summary>
+    internal static string ErrorKind(string line)
+    {
+        var at = line.IndexOf("error:", StringComparison.Ordinal);
+        if (at < 0) return "";
+        var text = line[(at + 6)..];
+        if (CategoryTail.Match(text) is { Success: true } m)
+        {
+            if (m.Groups["cat"].Value == "User-Defined Issue") return "#error or #warning";   // its text is the source's
+            text = text[..m.Index];
+        }
+        text = Quoted.Replace(text, m2 => m2.Value[0] == '\'' ? "''" : "\"\"");
+        text = KindWord.Replace(text, w => w.Value is "''" or "\"\"" || Regex.IsMatch(w.Value, @"^(?:#|__)?[a-z][a-z-]*(?:''|\.)?$") ? w.Value : "…");
+        text = Regex.Replace(text, @"\s+", " ").Trim();
+        return text.Length > 100 ? text[..100] : text;
+    }
 
     /// <summary>Clang's categories (<c>-fdiagnostics-show-category=name</c>) of errors the parse reports after the
     /// preprocessor gave it the tokens. Not "Lexical or Preprocessor Issue" (an <c>#if</c>, a paste, an include),

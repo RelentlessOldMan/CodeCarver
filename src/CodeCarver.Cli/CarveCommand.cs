@@ -1349,6 +1349,7 @@ public static class CarveCommand
             summary["world.ppTrace.failedBy.error.hashError"] = trace.FailedHashError;
             summary["world.ppTrace.failedBy.error.preprocessor"] = trace.FailedPreprocessorError;
             summary["world.ppTrace.failedBy.error.preprocessor.noFlag"] = trace.FailedPreprocessorErrorNoFlag;
+            summary["world.ppTrace.errorKinds"] = trace.ErrorKinds.Count == 0 ? "none" : string.Join(" | ", trace.ErrorKinds.Select(k => $"{k.Kind}:{k.Runs}"));
             summary["world.ppTrace.errorFlags"] = trace.ErrorFlags.Count == 0 ? "none" : string.Join(",", trace.ErrorFlags.Select(f => $"{f.Flag}:{f.Runs}"));
             summary["world.ppTrace.failedBy.error.other"] = trace.FailedOtherError;
             summary["world.ppTrace.failedBy.noMessage"] = trace.FailedNoMessage;

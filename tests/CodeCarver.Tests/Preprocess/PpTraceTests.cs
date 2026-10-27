@@ -26,6 +26,16 @@ public sealed class PpTraceTests
     static CompileCommand Cmd(string dir, string file, string? driver, params string[] args) =>
         new() { Directory = dir, File = file, Driver = driver, Arguments = args.Append(file).ToList() };
 
+    [Theory]
+    [InlineData("a.c:1:5: error: function-like macro 'KQ_V' is not defined [Lexical or Preprocessor Issue]", "function-like macro '' is not defined")]
+    [InlineData("a.c:3:2: error: invalid preprocessing directive [Lexical or Preprocessor Issue]", "invalid preprocessing directive")]
+    [InlineData("a.c:8:2: error: unterminated conditional directive", "unterminated conditional directive")]
+    [InlineData("a.c:1:2: error: \"kq secret\" [-Werror,-W#warnings,User-Defined Issue]", "#error or #warning")]
+    [InlineData("a.c:1:2: error: kq needs the vendor board [User-Defined Issue]", "#error or #warning")]
+    [InlineData("a.c:4:9: error: pasting formed 'KQ+', an invalid preprocessing token [-Winvalid-token-paste,Lexical or Preprocessor Issue]", "pasting formed '', an invalid preprocessing token")]
+    [InlineData("a.c:2:1: error: KQ_ZG 42 is bad in kq/zg.h", "… … is bad in …")]
+    public void ErrorKind_KeepsClangsWords_AndNothingOfTheSource(string line, string kind) => Assert.Equal(kind, PpTrace.ErrorKind(line));
+
     static HashSet<ulong> Keys(params string[] names) => names.Select(n => NameKey.Short(n)).ToHashSet();
 
     [Fact]
@@ -228,6 +238,7 @@ public sealed class PpTraceTests
             Assert.Equal((2, 1), (warned.FailedPreprocessorError, warned.FailedPreprocessorErrorNoFlag));
             Assert.Contains(NameKey.Short("KQ_W"), warned.Names);
             Assert.Equal(new[] { ("-W#warnings", 1), ("-Winvalid-token-paste", 1), ("-Wmacro-redefined", 1) }, warned.ErrorFlags.OrderBy(f => f.Flag, StringComparer.Ordinal));
+            Assert.Equal(new[] { ("expected value in expression", 1), ("pasting formed '', an invalid preprocessing token", 1) }, warned.ErrorKinds.OrderBy(k => k.Kind, StringComparer.Ordinal));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
