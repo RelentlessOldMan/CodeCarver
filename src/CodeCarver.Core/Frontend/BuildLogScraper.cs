@@ -534,22 +534,31 @@ public static class BuildLogScraper
 
     /// <summary>Whitespace tokenizer honouring single/double quotes, with backslash-escaped quotes. A
     /// compile_commands.json <c>command</c> string carries shell escaping, so <c>-DVER=\"1.0\"</c> must keep
-    /// its quotes and <c>-I\"path\"</c> must NOT become a literal-backslash dir (eval-#9). Only <c>\"</c> and
-    /// <c>\'</c> are treated as escapes; a bare <c>\</c> (Windows path separators, which live inside quotes
-    /// here) is kept literally so <c>C:\foo</c> is unharmed.</summary>
+    /// its quotes, as a shell keeps them (the macro is the string <c>"1.0"</c>; a header name for a computed
+    /// <c>#include VER</c>), and <c>-I\"path\"</c> must NOT become a literal-backslash dir (eval-#9). Only
+    /// <c>\"</c> and <c>\'</c> are treated as escapes; a bare <c>\</c> (Windows path separators, which live
+    /// inside quotes here) is kept literally so <c>C:\foo</c> is unharmed.</summary>
     private static List<string> Tokenize(string line)
     {
         var tokens = new List<string>();
         var cur = new System.Text.StringBuilder();
         var quote = '\0';
+        var escapedOpen = false;   // the open quote was an escaped one, so an escaped one closes it
         for (var i = 0; i < line.Length; i++)
         {
             var ch = line[i];
-            // Shell-escaped quote (\" or \'): consume the backslash and treat the quote as a NORMAL quote —
-            // it groups (so -I\"inc dir\" is one dir) and is stripped (so -DVER=\"1.0\" -> VER=1.0, and
-            // -I\"path\" -> path, not a literal-backslash/quote dir). Only quotes are unescaped; a bare
-            // backslash (Windows separators, inside quotes here) is left literal so C:\foo survives.
-            if (ch == '\\' && i + 1 < line.Length && (line[i + 1] is '"' or '\'')) ch = line[++i];
+            var escaped = false;
+            // Shell-escaped quote (\" or \'): consume the backslash. In a define's value, or inside double
+            // quotes, it is the quote itself, as a shell has it: -DVER=\"1.0\" -> VER="1.0". Elsewhere it is
+            // taken as a NORMAL quote — it groups (so -I\"inc dir\" is one dir) and is stripped (-I\"path\" ->
+            // path, not a literal-backslash/quote dir). Only quotes are unescaped; a bare backslash (Windows
+            // separators, inside quotes here) is left literal so C:\foo survives.
+            if (ch == '\\' && i + 1 < line.Length && (line[i + 1] is '"' or '\''))
+            {
+                ch = line[++i];
+                escaped = true;
+                if ((quote == '"' && !escapedOpen) || (quote == '\0' && InDefine(cur, tokens))) { cur.Append(ch); continue; }
+            }
             if (quote != '\0')
             {
                 if (ch == quote) quote = '\0';
@@ -558,6 +567,7 @@ public static class BuildLogScraper
             else if (ch is '"' or '\'')
             {
                 quote = ch;
+                escapedOpen = escaped;
             }
             else if (char.IsWhiteSpace(ch))
             {
@@ -578,4 +588,8 @@ public static class BuildLogScraper
         if (cur.Length > 0) tokens.Add(cur.ToString());
         return tokens;
     }
+
+    // The word being read is a -D's: "-DX=..." itself, or the value after a "-D" on its own.
+    static bool InDefine(System.Text.StringBuilder cur, List<string> tokens) =>
+        (cur.Length >= 2 && cur[0] == '-' && cur[1] == 'D') || (tokens.Count > 0 && tokens[^1] == "-D");
 }

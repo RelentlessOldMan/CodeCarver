@@ -241,14 +241,19 @@ public class BuildLogScraperTests
     }
 
     [Fact]
-    public void BackslashEscapedQuote_InCommand_IsStrippedAndGroups()
+    public void BackslashEscapedQuote_InCommand_KeptInADefine_StrippedAndGroupsElsewhere()
     {
         // A shell/command-string form carries \"...\" escaping (compile_commands.json 'command', shell logs).
-        // Escaped quotes group and strip like normal quotes: -DVER=\"1.0\" -> VER=1.0 (no stray \1.0\), and
-        // -I\"inc dir\" -> one include dir "inc dir" (space grouped, no literal backslashes/quotes).
-        var c = Assert.Single(BuildLogScraper.Parse("gcc -DVER=\\\"1.0\\\" -I\\\"inc dir\\\" -c a.c"));
-        Assert.Contains("VER=1.0", c.Defines);
+        // In a define the quote is the value's, as a shell has it: -DVER=\"1.0\" -> VER="1.0", so a computed
+        // #include KQ_CFG of -DKQ_CFG=\"kq_cfg.h\" names a header. Elsewhere escaped quotes group and strip like
+        // normal quotes: -I\"inc dir\" -> one include dir "inc dir" (no literal backslashes/quotes).
+        var c = Assert.Single(BuildLogScraper.Parse("gcc -DVER=\\\"1.0\\\" -D KQ_CFG=\\\"kq_cfg.h\\\" \"-DKQ_S=\\\"s\\\"\" '-DKQ_T=\"t\"' -I\\\"inc dir\\\" -c a.c"));
+        Assert.Contains("VER=\"1.0\"", c.Defines);
+        Assert.Contains("KQ_CFG=\"kq_cfg.h\"", c.Defines);
+        Assert.Contains("KQ_S=\"s\"", c.Defines);
+        Assert.Contains("KQ_T=\"t\"", c.Defines);
         Assert.Contains("inc dir", c.Includes);
+        Assert.Contains("-DVER=\"1.0\"", c.Arguments);
     }
 
     [Fact]
