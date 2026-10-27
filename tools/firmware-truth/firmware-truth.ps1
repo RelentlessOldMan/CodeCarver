@@ -147,6 +147,11 @@ foreach ($cc in $Compilers) {
     foreach ($e in $entries) {
         $a = @($e.arguments | Select-Object -Skip 1 | ForEach-Object { $_.Replace($root, $carved) })
         $a = @($a | Where-Object { $_ -ne '-c' }) + @('-Wall', '-Werror', '-fsyntax-only')
+        # Windows PowerShell (and 7.x before Standard argument passing) drops a quote inside an argument, so
+        # -DFW_HDR="fw_cfg.h" reached the compiler as -DFW_HDR=fw_cfg.h; escape it the way the C runtime reads it.
+        if ($PSVersionTable.PSVersion.Major -lt 7 -or $PSNativeCommandArgumentPassing -eq 'Legacy') {
+            $a = @($a | ForEach-Object { $_.Replace('"', '\"') })
+        }
         # Under Stop, Windows PowerShell turns the compiler's first stderr line into a terminating error.
         $ErrorActionPreference = 'Continue'
         $o = & $cc @a 2>&1
