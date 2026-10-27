@@ -200,6 +200,16 @@ public sealed class PpTraceTests
             var lib = PpTrace.Run(exe!, new[] { Cmd(dir, "lib.c", "aarch64-none-elf-clang", "-c"), Cmd(dir, "g.c", "clang", "-c") }, parallel: 2, root: dir);
             Assert.Equal((2, 1, 2), (lib.FailedHeaderNotFound, lib.FailedHeaderNotFoundCLibrary, lib.HeadersNotFound));
 
+            // A vendor header only a folder outside the root held: each header not found comes with the outside dirs
+            // its commands named and this machine lacks, so the console can say where to point pathMap.
+            File.WriteAllText(Path.Combine(dir, "v.c"), "#include <kq_vend.h>\nint v;\n");
+            var vendDir = Path.Combine(Path.GetDirectoryName(outside)!, "vend");
+            var vend = PpTrace.Run(exe!, new[] { Cmd(dir, "v.c", "clang", "-isystem", vendDir, "-isystem", outside, "-c"), Cmd(dir, "g.c", "clang", "-c") }, parallel: 2, root: dir);
+            Assert.Equal(new[] { "gen.h", "kq_vend.h" }, vend.HeadersNotFoundWhere.Select(h => h.Header));
+            Assert.Empty(vend.HeadersNotFoundWhere[0].MissingOutsideDirs);
+            Assert.Equal(new[] { outside, vendDir }.OrderBy(d => d, StringComparer.Ordinal).Select(Path.GetFullPath),
+                         vend.HeadersNotFoundWhere[1].MissingOutsideDirs.Select(Path.GetFullPath));
+
             // ppTraceArgs point it at a C library here. An option the driver doesn't know is an error pp-trace prints and
             // goes on from: the run still exits 0 (optionErrors). ppTraceDropOptions takes it out.
             Directory.CreateDirectory(Path.Combine(dir, "libc"));

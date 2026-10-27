@@ -1375,6 +1375,11 @@ public static class CarveCommand
             summary["world.ppTrace.mem.rerunForMemory"] = trace.Evictions;
             summary["world.ppTrace.mem.overBudgetAlone"] = trace.OverBudgetAlone;
             if (trusted) { usedMacros = trace.Names; usedLogged = logged; }
+            // Where the missing headers might be: this machine's console only (names and paths), never a summary key.
+            foreach (var (header, dirs) in trace.HeadersNotFoundWhere.Take(20))
+                err.WriteLine($"  warn    : pp-trace: '{header}' not found" + (dirs.Count == 0 ? "" :
+                    $"; the commands failing on it name {dirs.Count:N0} include dir(s) outside the root that aren't on this machine (pathMap or ppTraceArgs): "
+                    + string.Join(", ", dirs.Take(10)) + (dirs.Count > 10 ? $", +{dirs.Count - 10:N0} more" : "")));
             var ran = trace.Failed - trace.MissingPaths - trace.Refused - trace.Incomplete;
             err.WriteLine($"  config  : pp-trace ({trace.Version ?? "version unknown"}): {trace.Succeeded:N0} of {trace.Commands:N0} compile command(s) ran clean, {trace.Names.Count:N0} name(s)"
                 + (trusted ? UsedFor(unitsWithout)

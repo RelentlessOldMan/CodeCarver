@@ -105,6 +105,11 @@ public sealed class PpTrace
     public int HeadersNotFoundIncludedOutside { get; private set; }
     public int HeadersNotFoundWithoutBuildDir { get; private set; }
     public int HeadersNotFoundWithoutOutsideDir { get; private set; }
+    /// <summary>Each header not found, with the include directories outside the carve root that the commands failing
+    /// on it named but this machine lacks, sorted: where to point pathMap or ppTraceArgs. Names and paths, so it is
+    /// for this machine's console only, never a summary key.</summary>
+    public IReadOnlyList<(string Header, IReadOnlyList<string> MissingOutsideDirs)> HeadersNotFoundWhere { get; private set; } =
+        Array.Empty<(string, IReadOnlyList<string>)>();
     /// <summary>Runs, clean or not, that printed an option the driver rejected. Under pp-trace that is an error but
     /// not a fatal one: the run goes on, and exits 0 when nothing else went wrong.</summary>
     public int OptionErrors { get; private set; }
@@ -158,6 +163,7 @@ public sealed class PpTrace
         var errorFlags = new System.Collections.Concurrent.ConcurrentDictionary<string, int>(StringComparer.Ordinal);
         var errorKinds = new System.Collections.Concurrent.ConcurrentDictionary<string, int>(StringComparer.Ordinal);
         var notFound = new System.Collections.Concurrent.ConcurrentDictionary<string, HeaderSeen>(StringComparer.Ordinal);
+        var notFoundDirs = new System.Collections.Concurrent.ConcurrentDictionary<string, System.Collections.Concurrent.ConcurrentDictionary<string, byte>>(StringComparer.Ordinal);
         var outDirs = OutputDirs(commands);
         var rootFull = root is null ? null : Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
         var namesLock = new object();
@@ -209,6 +215,8 @@ public sealed class PpTrace
                     if (dirs.Any(d => d.Inside && outDirs.Any(o => Within(o, d.Dir) || Within(d.Dir, o)))) seen |= HeaderSeen.WithoutBuildDir;
                     if (dirs.Any(d => !d.Inside)) seen |= HeaderSeen.WithoutOutsideDir;
                     notFound.AddOrUpdate(header, seen, (_, was) => was | seen);
+                    var where = notFoundDirs.GetOrAdd(header, _ => new(PathComparer.Default));
+                    foreach (var d in dirs) if (!d.Inside) where.TryAdd(d.Dir, 0);
                     if (CLibraryHeaders.Contains(header)) Interlocked.Increment(ref cLibrary);
                 }
             }
@@ -249,6 +257,8 @@ public sealed class PpTrace
         r.HeadersNotFoundIncludedOutside = notFound.Values.Count(v => v.HasFlag(HeaderSeen.IncludedOutside));
         r.HeadersNotFoundWithoutBuildDir = notFound.Values.Count(v => v.HasFlag(HeaderSeen.WithoutBuildDir));
         r.HeadersNotFoundWithoutOutsideDir = notFound.Values.Count(v => v.HasFlag(HeaderSeen.WithoutOutsideDir));
+        r.HeadersNotFoundWhere = notFoundDirs.OrderBy(kv => kv.Key, StringComparer.Ordinal)
+            .Select(kv => (kv.Key, (IReadOnlyList<string>)kv.Value.Keys.OrderBy(d => d, StringComparer.Ordinal).ToList())).ToList();
         if (!notFound.IsEmpty && treeFiles is not null)
         {
             var spelled = notFound.Keys.Select(h => h.Replace('\\', '/')).ToList();
