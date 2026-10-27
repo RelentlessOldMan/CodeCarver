@@ -74,8 +74,17 @@ public sealed class PpTrace
     /// <summary>Of <see cref="Succeeded"/>, runs that exited 1 although every error they printed came from the parse
     /// after preprocessing (Clang's "Semantic Issue", "Parse Issue", ...), such as a builtin, attribute or asm only
     /// the build's compiler knows, or from an option the driver rejected. The preprocessor ran to the end of the
-    /// source, as Clang's error limit is off, so the names are all there.</summary>
+    /// source, as Clang's error limit is off, so the names are all there. And of those, the runs where some error was
+    /// a warning the command's <c>-Werror</c> made one (a macro redefined, a <c>#warning</c>, extra tokens after a
+    /// directive): a warning changes nothing the preprocessor puts out, at any stage.</summary>
     public int SucceededPastParseErrors { get; private set; }
+    public int SucceededPastWarningsAsErrors { get; private set; }
+    /// <summary>Of <see cref="FailedPreprocessorError"/>, runs where some preprocessor error had no warning flag: an
+    /// error by itself, not a warning made one.</summary>
+    public int FailedPreprocessorErrorNoFlag { get; private set; }
+    /// <summary>The warning flags of the errors runs printed (<c>-Wmacro-redefined</c>), each with the runs that
+    /// printed one, most first: Clang's own flag names, nothing of the source.</summary>
+    public IReadOnlyList<(string Flag, int Runs)> ErrorFlags { get; private set; } = Array.Empty<(string, int)>();
     public int FailedNoMessage { get; private set; }
     public int FailedNotStarted { get; private set; }
     /// <summary>Of <see cref="FailedHeaderNotFound"/>, those whose header is one of the C standard library's
@@ -140,7 +149,8 @@ public sealed class PpTrace
         var missingBy = new int[4];
         var missingInRoot = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(PathComparer.Default);
         var failedBy = new int[Enum.GetValues<Failure>().Length];
-        int cLibrary = 0, optionErrors = 0, withDropped = 0, dropped = 0, pastParse = 0;
+        int cLibrary = 0, optionErrors = 0, withDropped = 0, dropped = 0, pastParse = 0, pastWarnings = 0, ppNoFlag = 0;
+        var errorFlags = new System.Collections.Concurrent.ConcurrentDictionary<string, int>(StringComparer.Ordinal);
         var notFound = new System.Collections.Concurrent.ConcurrentDictionary<string, HeaderSeen>(StringComparer.Ordinal);
         var outDirs = OutputDirs(commands);
         var rootFull = root is null ? null : Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
@@ -167,17 +177,21 @@ public sealed class PpTrace
             foreach (var d in dirs) if (d.Inside) missingInRoot.TryAdd(d.Dir, 0);
             var names = new HashSet<ulong>();
             bool ok, late, optionError, pastErrors;
+            RunErrors errs;
             Failure failure;
             string? header, includer;
             while (true)
             {
                 using var lease = gate.Admit();
-                (ok, late, failure, header, includer, optionError, pastErrors) = TraceOne(exe, cmd, extra, names, timeoutMs, lease);
+                errs = new RunErrors();
+                (ok, late, failure, header, includer, optionError, pastErrors) = TraceOne(exe, cmd, extra, names, timeoutMs, lease, errs);
                 if (!lease.Evicted) break;
                 names.Clear();   // stopped for memory: run again when there is room
             }
             if (late) Interlocked.Increment(ref timedOut);
             if (optionError) Interlocked.Increment(ref optionErrors);
+            foreach (var flag in errs.Flags) errorFlags.AddOrUpdate(flag, 1, (_, n) => n + 1);
+            if (!ok && !late && failure == Failure.PreprocessorError && errs.PreprocessorNoFlag) Interlocked.Increment(ref ppNoFlag);
             if (!ok && !late)
             {
                 Interlocked.Increment(ref failedBy[(int)failure]);
@@ -194,6 +208,7 @@ public sealed class PpTrace
             if (!ok) return;
             Interlocked.Increment(ref succeeded);
             if (pastErrors) Interlocked.Increment(ref pastParse);
+            if (pastErrors && errs.WarningAsError) Interlocked.Increment(ref pastWarnings);
             lock (namesLock) r.Names.UnionWith(names);
         });
         r.Succeeded = succeeded;
@@ -216,6 +231,9 @@ public sealed class PpTrace
         r.FailedPreprocessorError = failedBy[(int)Failure.PreprocessorError];
         r.FailedOtherError = failedBy[(int)Failure.Error];
         r.SucceededPastParseErrors = pastParse;
+        r.SucceededPastWarningsAsErrors = pastWarnings;
+        r.FailedPreprocessorErrorNoFlag = ppNoFlag;
+        r.ErrorFlags = errorFlags.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => (kv.Key, kv.Value)).ToList();
         r.FailedNoMessage = failedBy[(int)Failure.NoMessage];
         r.FailedNotStarted = failedBy[(int)Failure.NotStarted];
         r.FailedHeaderNotFoundCLibrary = cLibrary;
@@ -425,8 +443,31 @@ public sealed class PpTrace
     public enum Failure { NotStarted, Crash, HeaderNotFound, Option, Error, NoMessage, ErrorLimit, HashError, PreprocessorError }
 
     /// <summary>What a line of stderr is: not an error, an option the driver rejected, an error the parse after
-    /// preprocessing reported, one the preprocessor did, a fatal one, or another.</summary>
-    public enum Stage { None, Option, Parse, Preprocessor, Fatal, Other }
+    /// preprocessing reported, one the preprocessor did, a fatal one, another, or a warning <c>-Werror</c> made an
+    /// error (at any stage: a warning changes nothing the preprocessor puts out).</summary>
+    public enum Stage { None, Option, Parse, Preprocessor, Fatal, Other, Warning }
+
+    /// <summary>What one run's errors said beyond why it failed: the warning flags they named, whether one was a
+    /// warning made an error, and whether one the preprocessor reported had no warning flag.</summary>
+    internal sealed class RunErrors
+    {
+        public HashSet<string> Flags { get; } = new(StringComparer.Ordinal);
+        public bool WarningAsError { get; set; }
+        public bool PreprocessorNoFlag { get; set; }
+
+        public void Add(string line, Stage stage)
+        {
+            if (stage is Stage.None or Stage.Option or Stage.Fatal) return;
+            var any = false;
+            if (CategoryTail.Match(line) is { Success: true } m)
+                foreach (Match w in WarningFlag.Matches(m.Value))
+                    if (w.Value != "-Werror") { Flags.Add(w.Value); any = true; }
+            if (stage == Stage.Warning) WarningAsError = true;
+            if (stage == Stage.Preprocessor && !any) PreprocessorNoFlag = true;
+        }
+    }
+
+    static readonly Regex WarningFlag = new(@"-W[^,\]]+", RegexOptions.CultureInvariant);
 
     /// <summary>Clang's categories (<c>-fdiagnostics-show-category=name</c>) of errors the parse reports after the
     /// preprocessor gave it the tokens. Not "Lexical or Preprocessor Issue" (an <c>#if</c>, a paste, an include),
@@ -447,6 +488,7 @@ public sealed class PpTrace
         if (line.Contains("fatal error:", StringComparison.Ordinal)) return Stage.Fatal;
         if (IsOptionError(line)) return Stage.Option;
         if (CategoryTail.Match(line) is not { Success: true } m) return Stage.Other;
+        if (m.Value.StartsWith("[-Werror,", StringComparison.Ordinal)) return Stage.Warning;
         var cat = m.Groups["cat"].Value;
         return ParseCategories.Contains(cat) ? Stage.Parse
              : cat is "Lexical or Preprocessor Issue" or "User-Defined Issue" ? Stage.Preprocessor : Stage.Other;
@@ -494,14 +536,14 @@ public sealed class PpTrace
             afterError = true;
             if (stage == Stage.Option) option = true;
             else if (stage == Stage.Preprocessor) pp = true;
-            else if (!NotFoundLine.IsMatch(line)) other = true;
+            else if (stage != Stage.Warning && !NotFoundLine.IsMatch(line)) other = true;
         }
         var why = crash ? Failure.Crash : header is not null ? Failure.HeaderNotFound : limit ? Failure.ErrorLimit : hash ? Failure.HashError
                 : pp ? Failure.PreprocessorError : other ? Failure.Error : option ? Failure.Option : Failure.NoMessage;
         return (why, header, includer);
     }
 
-    private static (bool Ok, bool TimedOut, Failure Why, string? Header, string? Includer, bool OptionError, bool PastParseErrors) TraceOne(string exe, CompileCommand cmd, IReadOnlyList<string> extra, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease)
+    private static (bool Ok, bool TimedOut, Failure Why, string? Header, string? Includer, bool OptionError, bool PastParseErrors) TraceOne(string exe, CompileCommand cmd, IReadOnlyList<string> extra, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease, RunErrors errs)
     {
         // The command goes in a compile database of its own: no command-line quoting or length limit to meet.
         var db = Path.Combine(Path.GetTempPath(), "codecarver-ppt-" + Guid.NewGuid().ToString("N"));
@@ -530,7 +572,7 @@ public sealed class PpTrace
             p.StandardInput.Close();
             // Drained so a full stderr pipe can't block it. Unsafe: a crash, or an error neither the parse after
             // preprocessing nor a rejected option gave.
-            bool fatal = false, optionError = false, parseError = false, unsafeError = false;
+            bool fatal = false, optionError = false, parseError = false, unsafeError = false;   // parseError: or a warning made one
             var said = new List<string>();   // what's needed to say why it failed: error lines, the source line under each, and a crash's
             var afterError = false;
             p.ErrorDataReceived += (_, e) =>
@@ -540,7 +582,8 @@ public sealed class PpTrace
                 var crash = line.Contains("PLEASE submit", StringComparison.Ordinal) || line.StartsWith("Stack dump:", StringComparison.Ordinal);
                 if (stage == Stage.Fatal) fatal = true;
                 if (stage == Stage.Option) optionError = true;
-                if (stage == Stage.Parse) parseError = true;
+                if (stage is Stage.Parse or Stage.Warning) parseError = true;
+                errs.Add(line, stage);
                 var isUnsafe = crash || stage is Stage.Fatal or Stage.Preprocessor or Stage.Other;
                 if (isUnsafe) unsafeError = true;
                 // Past the first 128 lines only those that say why it failed: the parse's errors can be thousands.
@@ -557,7 +600,8 @@ public sealed class PpTrace
             }, null, timeoutMs, Timeout.Infinite);
             ReadNames(p.StandardOutput, names);
             p.WaitForExit();   // also waits for stderr's last line
-            // Exit 1 and only the parse's errors: nothing stopped the preprocessor before the end of the source.
+            // Exit 1 and only the parse's errors, or warnings made errors: nothing stopped the preprocessor before the
+            // end of the source, and it put out what it would have without them.
             var pastParse = p.ExitCode == 1 && !fatal && !unsafeError && parseError;
             var clean = p.ExitCode == 0 || pastParse || (AssemblyWithCpp(cmd.File) && p.ExitCode == 1 && !fatal);
             var ok = !timedOut && !lease.Evicted && clean;

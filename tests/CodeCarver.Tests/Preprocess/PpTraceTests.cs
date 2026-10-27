@@ -117,6 +117,9 @@ public sealed class PpTraceTests
     [InlineData("a.c:4:9: error: pasting formed 'x+', an invalid preprocessing token [-Winvalid-token-paste,Lexical or Preprocessor Issue]", PpTrace.Stage.Preprocessor)]
     [InlineData("a.c:1:2: error: \"kq\" [User-Defined Issue]", PpTrace.Stage.Preprocessor)]
     [InlineData("a.c:1:2: error: \"kq\"", PpTrace.Stage.Other)]
+    [InlineData("a.c:3:9: error: 'KQ_A' macro redefined [-Werror,-Wmacro-redefined,Lexical or Preprocessor Issue]", PpTrace.Stage.Warning)]
+    [InlineData("a.c:1:2: error: \"kq\" [-Werror,-W#warnings,User-Defined Issue]", PpTrace.Stage.Warning)]
+    [InlineData("a.c:4:9: error: pasting formed 'x+' [-Winvalid-token-paste,Lexical or Preprocessor Issue]", PpTrace.Stage.Preprocessor)]
     [InlineData("a.c:1:10: fatal error: 'k.h' file not found [Lexical or Preprocessor Issue]", PpTrace.Stage.Fatal)]
     [InlineData("error: unknown argument: '-mkq-vendor'", PpTrace.Stage.Option)]
     [InlineData("a.c:5:16: warning: unknown attribute 'kq' ignored [-Wunknown-attributes]", PpTrace.Stage.None)]
@@ -211,6 +214,20 @@ public sealed class PpTraceTests
             Assert.Equal((2, 2, 0), (errs.Succeeded, errs.SucceededPastParseErrors, errs.FailedOption));
             Assert.Equal((1, 1, 0, 0), (errs.FailedHashError, errs.FailedPreprocessorError, errs.FailedErrorLimit, errs.FailedOtherError));
             Assert.Contains(NameKey.Short("KQ_LATE"), errs.Names);
+            Assert.Equal(1, errs.FailedPreprocessorErrorNoFlag);   // the #if: an error by itself, no warning made one
+
+            // A warning made an error (the carve takes -Werror off every command, but a #pragma can still make one)
+            // changes nothing the preprocessor puts out, a preprocessor one neither: the run counts. An error that is
+            // a warning by default too, like a paste that forms no token, does change it: the run fails. The flags say
+            // which warnings they were.
+            File.WriteAllText(Path.Combine(dir, "warn.c"), "#pragma clang diagnostic error \"-Wmacro-redefined\"\n#pragma clang diagnostic error \"-W#warnings\"\n"
+                + "#define KQ_W 1\n#define KQ_W 2\n#warning \"kq\"\nint w = KQ_W;\n");
+            File.WriteAllText(Path.Combine(dir, "paste.c"), "#define KQ_P(a) a##+\nint p = KQ_P(1);\n");
+            var warned = PpTrace.Run(exe!, new[] { "warn.c", "pp.c", "paste.c" }.Select(f => Cmd(dir, f, "clang", "-Werror", "-c")).ToList(), parallel: 2, root: dir);
+            Assert.Equal((1, 1, 1), (warned.Succeeded, warned.SucceededPastParseErrors, warned.SucceededPastWarningsAsErrors));
+            Assert.Equal((2, 1), (warned.FailedPreprocessorError, warned.FailedPreprocessorErrorNoFlag));
+            Assert.Contains(NameKey.Short("KQ_W"), warned.Names);
+            Assert.Equal(new[] { ("-W#warnings", 1), ("-Winvalid-token-paste", 1), ("-Wmacro-redefined", 1) }, warned.ErrorFlags.OrderBy(f => f.Flag, StringComparer.Ordinal));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }

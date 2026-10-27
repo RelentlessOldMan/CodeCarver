@@ -1327,6 +1327,7 @@ public static class CarveCommand
             summary["world.ppTrace.notPreprocessed"] = trace.NotPreprocessed;
             summary["world.ppTrace.succeeded"] = trace.Succeeded;
             summary["world.ppTrace.succeeded.pastParseErrors"] = trace.SucceededPastParseErrors;
+            summary["world.ppTrace.succeeded.pastWarningsAsErrors"] = trace.SucceededPastWarningsAsErrors;
             summary["world.ppTrace.failed"] = trace.Failed;
             summary["world.ppTrace.missingPaths"] = trace.MissingPaths;
             summary["world.ppTrace.missing.workDir"] = trace.MissingWorkDir;
@@ -1347,6 +1348,8 @@ public static class CarveCommand
             summary["world.ppTrace.failedBy.error.errorLimit"] = trace.FailedErrorLimit;
             summary["world.ppTrace.failedBy.error.hashError"] = trace.FailedHashError;
             summary["world.ppTrace.failedBy.error.preprocessor"] = trace.FailedPreprocessorError;
+            summary["world.ppTrace.failedBy.error.preprocessor.noFlag"] = trace.FailedPreprocessorErrorNoFlag;
+            summary["world.ppTrace.errorFlags"] = trace.ErrorFlags.Count == 0 ? "none" : string.Join(",", trace.ErrorFlags.Select(f => $"{f.Flag}:{f.Runs}"));
             summary["world.ppTrace.failedBy.error.other"] = trace.FailedOtherError;
             summary["world.ppTrace.failedBy.noMessage"] = trace.FailedNoMessage;
             summary["world.ppTrace.failedBy.notStarted"] = trace.FailedNotStarted;
@@ -1397,7 +1400,8 @@ public static class CarveCommand
                          trace.Incomplete > 0 ? $"{trace.Incomplete:N0} not fully in the log" : null,
                      }.Where(x => x is not null))}), so the header carve models the paste macros itself"));
             if (trace.SucceededPastParseErrors > 0)
-                err.WriteLine($"  config  : pp-trace: {trace.SucceededPastParseErrors:N0} run(s) counted clean although the parse after preprocessing reported errors (a builtin, attribute or asm only the build's compiler knows): the preprocessor ran to the end");
+                err.WriteLine($"  config  : pp-trace: {trace.SucceededPastParseErrors:N0} run(s) counted clean although the parse after preprocessing reported errors (a builtin, attribute or asm only the build's compiler knows)"
+                    + (trace.SucceededPastWarningsAsErrors > 0 ? $" or -Werror made warnings errors ({trace.SucceededPastWarningsAsErrors:N0})" : "") + ": the preprocessor ran to the end");
             if (trace.OptionErrors > 0)
                 err.WriteLine($"  config  : pp-trace: {trace.OptionErrors:N0} run(s) printed an option the driver rejected; that alone doesn't fail a run (ppTraceDropOptions takes one out)");
             if (cv.PpTraceDropOptions.Count > 0)

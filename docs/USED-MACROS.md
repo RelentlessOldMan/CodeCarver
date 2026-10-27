@@ -128,7 +128,9 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
   run that exits 1 with only the parse's errors ("Semantic Issue", "Parse Issue", "Inline Assembly Issue", ...) and
   rejected options counts as clean (`succeeded.pastParseErrors`). An error the preprocessor reports ("Lexical or
   Preprocessor Issue", such as an `#if` it couldn't evaluate, or an `#error`) still fails it: what it preprocessed
-  isn't what the build did.
+  isn't what the build did. A warning made an error (`[-Werror,-Wfoo,...]`, by a `#pragma clang diagnostic error`:
+  the carve takes `-Werror` off the command) changes nothing the preprocessor puts out, at any stage, so it doesn't
+  fail a run either (`succeeded.pastWarningsAsErrors`). `errorFlags` names the warning flags the errors carried.
 - A driver named for its target (`aarch64-none-elf-clang`) gets that target passed as `--target`. `clang++` and the
   file's extension pick C++.
 - `.S` and `.sx` files run too: pp-trace parses them as C after preprocessing, so their parse errors are expected;
@@ -166,11 +168,14 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `world.usedMacros.trusted` | `1` when the header carve used the files |
 | `world.ppTrace.version` | the `LLVM version` line pp-trace printed, or `unknown` |
 | `world.ppTrace.commands` / `.succeeded` / `.failed` | commands pp-trace was to run, ran clean, and didn't |
-| `world.ppTrace.succeeded.pastParseErrors` | of `succeeded`, runs whose only errors came from the parse after preprocessing (or a rejected option) |
+| `world.ppTrace.succeeded.pastParseErrors` | of `succeeded`, runs whose only errors came from the parse after preprocessing (or a rejected option, or a warning made an error) |
+| `world.ppTrace.succeeded.pastWarningsAsErrors` | of `pastParseErrors`, runs where some error was a warning made one |
 | `world.ppTrace.missingPaths` / `.refused` / `.incomplete` / `.timedOut` | of the failed: a path missing here, a flag that loads other code, not all of it in the log (an unreadable response file), over the time limit |
 | `world.ppTrace.missing.workDir` / `.source` / `.forcedInclude` | of `missingPaths`: what was missing |
 | `world.ppTrace.failedBy.crash` / `.headerNotFound` / `.error` / `.option` / `.noMessage` / `.notStarted` | of the commands that ran and failed within the time limit, why, by the first that applies: pp-trace crashed, an include wasn't found, another error, only an option the driver rejected (which alone doesn't fail a run), no error printed, pp-trace didn't start |
 | `world.ppTrace.failedBy.error.errorLimit` / `.hashError` / `.preprocessor` / `.other` | of `failedBy.error`: Clang stopped at its error limit (the preprocessor too; only when `ppTraceArgs` sets one), an `#error` fired (this Clang's predefined macros or target differ from the build compiler's), another error the preprocessor reported, another error still (no category, or one neither the parse's nor the preprocessor's) |
+| `world.ppTrace.failedBy.error.preprocessor.noFlag` | of `failedBy.error.preprocessor`, runs where some preprocessor error had no warning flag (an error by itself, such as an `#if` that can't be evaluated) |
+| `world.ppTrace.errorFlags` | Clang's warning flags on the errors runs printed, each with the runs that printed one, most first (`-Winvalid-token-paste:12,...`), or `none`: Clang's own names, nothing of the source |
 | `world.ppTrace.failedBy.headerNotFound.cLibrary` / `world.ppTrace.headersNotFound` | of `headerNotFound`, those whose header is the C standard library's (`stdio.h`, `string.h`, ...); and the distinct headers not found |
 | `world.ppTrace.headersNotFound.inTree` / `.includedOutside` / `.withoutBuildDir` / `.withoutOutsideDir` | of `headersNotFound`: those a file of the tree ends in (the tree has it, in a directory the command doesn't search); those a file outside the carve root includes (a toolchain's header); those a command failed on that ran without an include directory inside the root where the build writes its output (a header the build makes), or without one outside the root |
 | `world.ppTrace.optionErrors` | runs, clean or not, that printed an option the driver rejected |
