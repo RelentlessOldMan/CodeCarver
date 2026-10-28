@@ -17,6 +17,10 @@ public sealed record EmitResult(int FilesWritten, long BytesWritten, IReadOnlyLi
     /// <summary>The size of each written file, by its relative path: what a later check round can keep (file-level emit), and
     /// the summary's split of the bytes by extension.</summary>
     public IReadOnlyDictionary<string, long>? Sizes { get; init; }
+
+    /// <summary>The pruned emitter's files copied byte for byte from the source: the link check needn't compare them with
+    /// their originals.</summary>
+    public IReadOnlySet<string>? Verbatim { get; init; }
 }
 
 /// <summary>
@@ -144,10 +148,10 @@ public static class FileTreeEmitter
             }
             cuts[i] = (ranges, stubs, removed);
         }
-        var done = new (long Bytes, long Cut, int Stubs)[kept.Count];
+        var done = new (long Bytes, long Cut, int Stubs, bool Whole)[kept.Count];
         CodeCarver.Core.Util.ReadAhead.For(kept.Count, i =>
         {
-            done[i] = (-1, 0, 0);
+            done[i] = (-1, 0, 0, false);
             var rel = kept[i];
             var src = Path.Combine(sourceRoot, rel);
             if (!File.Exists(src)) return;
@@ -169,6 +173,7 @@ public static class FileTreeEmitter
             {
                 long cut = 0;
                 var stubbed = 0;
+                var whole = false;
                 if (removed is not null && !IsUtf16(src))
                 {
                     // Bytes in, bytes out: ReadAllText would honour (and strip) a UTF-8 BOM even when told Latin-1.
@@ -183,16 +188,21 @@ public static class FileTreeEmitter
                     cut = original.Length - pruned.Length;
                 }
                 else
+                {
                     IoMeter.Copy(src, dst, overwrite: true);
-                done[i] = (new FileInfo(dst).Length, cut, stubbed);
+                    whole = true;
+                }
+                done[i] = (new FileInfo(dst).Length, cut, stubbed, whole);
             }
             // A locked/vanished file must not sink the whole emit (review RB5) — same tolerance as Emit.
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         });
         var sizes = new Dictionary<string, long>(CodeCarver.Core.Util.PathComparer.Default);
+        var verbatim = new HashSet<string>(StringComparer.Ordinal);
         for (var i = 0; i < kept.Count; i++)
         {
             if (done[i].Bytes < 0) continue;
+            if (done[i].Whole) verbatim.Add(kept[i]);
             bytes += done[i].Bytes;
             written.Add(kept[i]);
             sizes[kept[i]] = done[i].Bytes;
@@ -201,7 +211,7 @@ public static class FileTreeEmitter
         }
 
         CopyUnscannedIncludes(plan.KeptFiles, plan.DroppedFiles, sourceRoot, outDir, written, ref bytes, sizes: sizes, scan: scan);
-        return new EmitResult(written.Count, bytes, written, prunedFiles, prunedBytes) { StubbedFunctions = stubbedFunctions, Sizes = sizes };
+        return new EmitResult(written.Count, bytes, written, prunedFiles, prunedBytes) { StubbedFunctions = stubbedFunctions, Sizes = sizes, Verbatim = verbatim };
     }
 
     /// <summary>

@@ -119,7 +119,8 @@ public static class EmittedLinkCheck
         IReadOnlySet<string>? c99InlineFns = null,
         IReadOnlySet<string>? wrapped = null,
         LinkCheckCache? cache = null,
-        Action<string, long>? report = null)
+        Action<string, long>? report = null,
+        IReadOnlySet<string>? verbatim = null)
     {
         var emittedList = emitted.ToList();
         var droppedList = dropped.ToList();
@@ -145,7 +146,7 @@ public static class EmittedLinkCheck
         // Each loop's time, and memory as it ends: the process's private bytes, the managed heap the last GC left, and
         // managed bytes allocated in the loop (MB). A "Max" key is kept at its largest over a stage's rounds.
         var allocatedAt = GC.GetTotalAllocatedBytes();
-        long filesRead = 0, fromCache = 0, headersHandedOn = 0, scansOutsideBudget = 0, handedOnHeld = 0, handedOnMax = 0, instancesRedone = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
+        long filesRead = 0, fromCache = 0, headersHandedOn = 0, scansOutsideBudget = 0, handedOnHeld = 0, handedOnMax = 0, instancesRedone = 0, verbatimSkipped = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
         // The tree's shape, for sizing a test corpus like it (shape.*): each header's size, each walk's include closure.
         var headerSizes = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
         // Headers spilled to the local disk (see ReadAgain), removed when the check is done.
@@ -211,7 +212,7 @@ public static class EmittedLinkCheck
             var shape = new Dictionary<string, long>(StringComparer.Ordinal);
             Shape(shape, headerSizes.Values, closures, templateWalks, templateWalksSkipped);
             s_shapeNow = Frozen(shape);
-            stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["headersHandedOn"] = headersHandedOn; stats["scansOutsideBudget"] = scansOutsideBudget; stats["instancesRedone"] = instancesRedone;
+            stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["headersHandedOn"] = headersHandedOn; stats["scansOutsideBudget"] = scansOutsideBudget; stats["instancesRedone"] = instancesRedone; stats["verbatimSkipped"] = verbatimSkipped;
             stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits; stats["parseWaits"] = parseGate.Waits;
             stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;
             stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped; stats["templateWalksReused"] = templateWalksReused;
@@ -219,7 +220,7 @@ public static class EmittedLinkCheck
             stats["walkNames"] = walkNames.Count;
             stats["headersSpilled"] = spilled.Count; stats["spillReads"] = spillReads; stats["spillMb"] = spillBytes >> 20;
             try { if (Directory.Exists(spillDir)) Directory.Delete(spillDir, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
-            foreach (var k in new[] { "filesRead", "fromCache", "headersHandedOn", "scansOutsideBudget", "instancesRedone", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames", "headersSpilled", "spillReads", "spillMb" })
+            foreach (var k in new[] { "filesRead", "fromCache", "headersHandedOn", "scansOutsideBudget", "instancesRedone", "verbatimSkipped", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames", "headersSpilled", "spillReads", "spillMb" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -771,6 +772,8 @@ public static class EmittedLinkCheck
         IEnumerable<Definition>? Pruned((string Rel, string Path) f)
         {
             if (IsAssembly(f.Rel) || original!(f.Rel) is not { } op) return null;
+            // Copied byte for byte: nothing pruned, so neither copy is read or scanned (every round read and scanned both).
+            if (verbatim is not null && verbatim.Contains(f.Rel)) { Interlocked.Increment(ref verbatimSkipped); return null; }
             var header = IsHeader(f.Rel);
             var key = (header ? "h|" : "c|") + op;
             var cached = Cached(op);

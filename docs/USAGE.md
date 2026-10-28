@@ -746,7 +746,7 @@ per-file work allocated and took: `check.<loop>.part.<part>.allocatedMb`, `.item
 the walks), and a memory stop adds `stop.part.<part>.*` and `stop.readyAhead` for the loop it stopped in.
 `check.templateWalks` counts the units' template walks, `check.templateWalksSkipped` the ones not needed (no head and no
 template reachable), `check.templateWalksReused` an emitted unit's walk served from an earlier check round (same text,
-the headers it read unchanged), and `check.instancesRedone` a dropped file's walk done again.
+the headers it read unchanged), and `check.instancesRedone` a dropped file's walk done again. `check.verbatimSkipped` counts the files a carved stage copied byte for byte, which the check doesn't compare with their originals (neither copy is read).
 
 A header without a template is held for the walks with only the defines of names some walk has looked up (a
 register-map header comes down to its guard and includes; a header under 64K chars is held whole), so the check can

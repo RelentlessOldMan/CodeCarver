@@ -2835,6 +2835,7 @@ public static class CarveCommand
         var asmText = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // AsmTexts
         long asmTextChars = 0;
         Dictionary<string, List<string>>? asmByName = null;   // BySuffix
+        var asmIncludeHits = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);   // AsmIncludes
         var asmRoots = new List<Root>();
         var asmFilesInTree = new List<string>();   // every in-scope assembly file (verify reads their symbols)
         if (lang is "c" or "cpp")
@@ -2868,13 +2869,41 @@ public static class CarveCommand
                 // Streamed: the provider takes each text's names and lets it go. Held in a list, every assembly file and
                 // what it includes stayed live for the rest of the run (a work run kept 9 GB from here to its stop).
                 var asmIncs = AsmIncludes(asmPaths);
-                var asmTexts = AsmTexts(asmPaths).Select(t => t.Text).Concat(AsmTexts(asmIncs).Select(t =>
-                    Path.GetExtension(t.Path).ToLowerInvariant() is ".h" or ".hh" or ".hpp" or ".hxx"
-                        ? string.Join('\n', t.Text.Split('\n').Where(l => l.TrimStart().StartsWith('.')))
-                        : t.Text));
+                static string AsmPart(string path, string text) =>
+                    Path.GetExtension(path).ToLowerInvariant() is ".h" or ".hh" or ".hpp" or ".hxx"
+                        ? string.Join('\n', text.Split('\n').Where(l => l.TrimStart().StartsWith('.')))
+                        : text;
                 // What they include is read first for its .macro and #define definitions, so a name the assembly
-                // pastes from them (def_vec USART1, H(UART)) is rooted too.
-                asmRoots = new AsmReferenceRootProvider(asmTexts, AsmTexts(asmIncs).Select(t => t.Text)).Discover(graph).ToList();
+                // pastes from them (def_vec USART1, H(UART)) is rooted too. That one read also keeps each include's
+                // assembly part (a header's directive lines; 64M chars in all) for after the assembly files: read for
+                // each, a tree's register headers came over the share twice more (15 GB of 19 read again). A file past
+                // maxParseBytes, or past the budget, is read again in its place.
+                var bigIncs = asmIncs.Where(p => SafeLength(p) > maxParseBytes).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var incParts = new List<(string Path, string? Part)>();
+                long incPartChars = 0;
+                IEnumerable<string> Definitions()
+                {
+                    foreach (var (path, text) in AsmTexts(asmIncs))
+                    {
+                        var part = bigIncs.Contains(path) ? null : AsmPart(path, text);
+                        if (part is not null && incPartChars + part.Length > 64L << 20) part = null;
+                        if (part is not null) incPartChars += part.Length;
+                        // A big file's pieces: read again once, whole.
+                        if (part is not null || incParts.Count == 0 || incParts[^1] != (path, null))
+                            incParts.Add((path, part));
+                        yield return text;
+                    }
+                }
+                IEnumerable<string> IncParts()
+                {
+                    foreach (var (path, part) in incParts)
+                        if (part is not null) yield return part;
+                        else foreach (var t in AsmTexts(new[] { path })) yield return AsmPart(t.Path, t.Text);
+                }
+                // The provider takes every definition before the first assembly text, so the parts are all in by then.
+                var asmTexts = AsmTexts(asmPaths).Select(t => t.Text).Concat(IncParts());
+                asmRoots = new AsmReferenceRootProvider(asmTexts, Definitions()).Discover(graph).ToList();
+                incParts.Clear();
             }
             // Every assembly file is copied whole, so the headers it includes are kept whole (review S1, D10).
             var asmIncludedFiles = AsmIncludes(asmFilesInTree)
@@ -2888,6 +2917,8 @@ public static class CarveCommand
 
         // Review S1: what assembly pulls in with `.include "x"` or `#include "x"` (a vector table in a .inc, a register
         // header), transitively. Resolved beside the includer, else by path suffix anywhere in the tree (over-approximate).
+        // What each file includes, resolved, is kept: the walk over every assembly file reuses what the walk from the
+        // startup files read (it read them all again).
         List<string> AsmIncludes(IEnumerable<string> asmPaths)
         {
             var includeRe = new System.Text.RegularExpressions.Regex(@"^[ \t]*(?:#[ \t]*include|\.include)[ \t]*[""<]([^"">\r\n]+)["">]",
@@ -2900,19 +2931,25 @@ public static class CarveCommand
                 // Everything queued, read ahead; scanned in queue order, so what it adds is queued as before.
                 var batch = queue;
                 queue = new List<string>();
-                foreach (var (path, text) in AsmTexts(batch))
+                foreach (var (path, text) in AsmTexts(batch.Where(p => !asmIncludeHits.ContainsKey(p)).ToList()))
+                {
+                    if (!asmIncludeHits.TryGetValue(path, out var all)) asmIncludeHits[path] = all = new List<string>();
                     foreach (System.Text.RegularExpressions.Match m in includeRe.Matches(text))
                     {
                         var raw = m.Groups[1].Value.Trim().Replace('\\', '/');
                         string? beside = null;
                         try { beside = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(path) ?? dir, raw)); } catch { }
                         var inTree = beside is not null && !Path.GetRelativePath(dir, beside).StartsWith("..", StringComparison.Ordinal);
-                        var hits = inTree && fileLookup.Exists(beside!) && !Excluded(beside!)
+                        all.AddRange(inTree && fileLookup.Exists(beside!) && !Excluded(beside!)
                             ? new List<string> { beside! }
-                            : BySuffix(raw.TrimStart('.', '/'));
+                            : BySuffix(raw.TrimStart('.', '/')));
+                    }
+                }
+                // In the order a read gives them (a file past maxParseBytes first), as when each walk read them all.
+                foreach (var path in batch.Where(p => SafeLength(p) > maxParseBytes).Concat(batch.Where(p => SafeLength(p) <= maxParseBytes)))
+                    if (asmIncludeHits.TryGetValue(path, out var hits))
                         foreach (var hit in hits)
                             if (seen.Add(hit)) { queue.Add(hit); found.Add(hit); }
-                    }
             }
             return found;
         }
@@ -2978,6 +3015,8 @@ public static class CarveCommand
         asmText.Clear();
         asmText.TrimExcess();
         asmTextChars = 0;
+        asmIncludeHits.Clear();
+        asmIncludeHits.TrimExcess();
         asmByName = null;
         RootsPart("asmAndForceKeep");
         var forcedGraphFiles = forcedRel.Where(r => fullByRel.ContainsKey(r)).ToList();
@@ -3453,14 +3492,14 @@ public static class CarveCommand
             catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return false; }
         });
         (LinkCheckResult R, List<LinkViolation> Hard, List<LinkViolation> NotBuiltOnly) CheckEmitted(
-            CarvePlan p, IReadOnlyList<(string Rel, string Path)> emittedFiles, bool pruned)
+            CarvePlan p, IReadOnlyList<(string Rel, string Path)> emittedFiles, bool pruned, IReadOnlySet<string>? verbatim = null)
         {
             var droppedForCheck = p.DroppedFiles.Select(r => (r, Path.Combine(dir, r)));
             var r = EmittedLinkCheck.Run(emittedFiles, droppedForCheck, deadLinesFor, maxParseBytes,
                                          original: pruned ? rel => Path.Combine(dir, rel) : null,
                                          definerMacros: (fe as TreeSitterFrontEnd)?.DefinerSet, linkUses: linkUses,
                                          commandLineMacros: commandLineMacros, c99InlineFns: (fe as TreeSitterFrontEnd)?.C99InlineFunctions,
-                                         wrapped: wrapped, cache: linkCache,
+                                         wrapped: wrapped, cache: linkCache, verbatim: verbatim,
                                          // Summed over the stage's rounds; a "Max" key keeps its largest.
                                          report: (k, v) =>
                                          {
@@ -4033,7 +4072,7 @@ public static class CarveCommand
                                           .Where(a => !droppedInfra.Contains(a.Rel) && !written.Contains(a.Rel)))
                     .ToList();
                 if (!linkCheck || !closeOverEmit) break;
-                checkedAlready = CheckEmitted(splan, verifyFiles, prune);
+                checkedAlready = CheckEmitted(splan, verifyFiles, prune, res.Verbatim);
                 Step("check");
                 if (round >= MaxCheckRounds || checkedAlready.Value.Hard.Count == 0) break;
                 var (add, kept) = RootsForMissing(splan, checkedAlready.Value.Hard, keptByCheck, verifyFiles);
