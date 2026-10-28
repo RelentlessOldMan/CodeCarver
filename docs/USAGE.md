@@ -98,6 +98,12 @@ Every carve is sound with just `entryPoints`. Each extra input lets it carve **t
 > `roots.heldUntilLinked`, `roots.heldUntilLinkedReleased`, `link.links`, `link.archivesSearched`). An archive
 > linked whole (`--whole-archive`), an object no link or archive in the log names, a link with a response file
 > that can't be read, and a log without link lines keep every root as above.
+>
+> The same lines say whether the log is the whole build: `link.inputsNotFromLog` counts the objects its links
+> take that no compile in the log wrote, where the build's own would be (in the carve root, or beside the objects
+> the log's compiles write; an archive beside them). An incremental build's log, which skips compiles that were up to
+> date, shows them here. At `0` (`link.coversTheImages = 1`) no compile the log lacks is in an image; the used
+> macros ([USED-MACROS.md](USED-MACROS.md)) rely on it.
 
 ## The CLI
 

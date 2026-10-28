@@ -2536,12 +2536,15 @@ public static class CarveCommand
         // carve keeps the file (a self-registering driver the image doesn't link stays out). Anything the log doesn't
         // settle keeps them, as without a link line.
         var heldUntilLinked = new Dictionary<string, List<Root>>(StringComparer.Ordinal);
+        LinkModel? links = null;
         if (linkSteps.Count > 0)
         {
-            var links = new LinkModel(buildCmds, linkSteps,
-                d => Path.IsPathFullyQualified(d) ? d : Path.Combine(dir, d), CmdRel);
+            links = new LinkModel(buildCmds, linkSteps,
+                d => Path.IsPathFullyQualified(d) ? d : Path.Combine(dir, d), CmdRel, dir);
             summary["link.links"] = links.Links;
             summary["link.archivesSearched"] = links.ArchivesSearched;
+            summary["link.inputsNotFromLog"] = links.InputsNotFromLog;
+            summary["link.coversTheImages"] = links.CoversTheImages ? 1 : 0;
             bool Held(Root r) => graph.GetNode(r.Node).FilePath is { } f && links.StatusOf(f) == LinkStatus.ArchiveOnly;
             foreach (var r in implicitRoots.Concat(sectionRoots).Where(Held))
             {
@@ -4158,8 +4161,19 @@ public static class CarveCommand
                     // A kept one the build links (compiled code uses what only it defines) means the logs lack its compile.
                     // One kept only because a compiled file's call matches a name it also defines (another chip's variant)
                     // is never built: its macros don't matter to the build.
-                    var (keptWithout, keptVariants) = usedLogged is null ? (0, 0)
-                        : UncompiledUnits.Split(graph, splan, usedLogged.Contains, r => usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)));
+                    // The log's links settle it when every object they take came from a compile in the log: then no
+                    // compile the log lacks is in the image, whatever the carve's name-matched calls say.
+                    var split = usedLogged is null ? default
+                        : UncompiledUnits.Split(graph, splan, usedLogged.Contains, r => usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)),
+                                                linkCovers: links?.CoversTheImages == true);
+                    var (keptWithout, keptVariants) = (split.Needed, split.Variants);
+                    if (usedLogged is not null && keptWithout > 0)
+                    {
+                        HcKey("keptUnitsWithoutCommand.byRoot", split.ByRoot);
+                        HcKey("keptUnitsWithoutCommand.byCall", split.ByCall);
+                        HcKey("keptUnitsWithoutCommand.byReference", split.ByReference);
+                        HcKey("keptUnitsWithoutCommand.fromHeader", split.FromHeader);
+                    }
                     if (usedMacros is not null) { HcKey("keptUnitsWithoutCommand", keptWithout); HcKey("keptUnitsNotBuilt", keptVariants); }
                     if (keptVariants > 0)
                         err.WriteLine($"  headers : {keptVariants:N0} kept source file(s) the build doesn't compile, kept for a name compiled code also defines: not built, so their macros aren't kept for them");

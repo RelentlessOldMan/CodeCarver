@@ -11,12 +11,18 @@ namespace CodeCarver.Core.Reachability;
 /// </summary>
 public static class UncompiledUnits
 {
+    /// <summary>How many kept uncompiled files the build links (<c>Needed</c>) and how many it doesn't; of the
+    /// needed, how many were found through a root, a call, a reference to a variable, and through code in a header.</summary>
+    public readonly record struct Result(int Needed, int Variants, int ByRoot, int ByCall, int ByReference, int FromHeader);
+
     /// <param name="compiled">Is this file one the build's compiles read (a compiled unit, or a file one included)?</param>
     /// <param name="unit">Is this file a source file a compile command would name (.c, .cpp ...)?</param>
-    public static (int Needed, int Variants) Split(CodeGraph graph, CarvePlan plan, Func<string, bool> compiled, Func<string, bool> unit)
+    /// <param name="linkCovers">The build log's links take only objects its compiles made (<c>LinkModel.CoversTheImages</c>):
+    /// no compile the log lacks is in an image, so only a root one of them alone defines makes it needed.</param>
+    public static Result Split(CodeGraph graph, CarvePlan plan, Func<string, bool> compiled, Func<string, bool> unit, bool linkCovers = false)
     {
         var suspects = plan.KeptFiles.Where(f => unit(f) && !compiled(f)).ToHashSet(StringComparer.Ordinal);
-        if (suspects.Count == 0) return (0, 0);
+        if (suspects.Count == 0) return new Result(0, 0, 0, 0, 0, 0);
 
         // What the compiled files define: global names, and file-local ones per file (a static resolves only there).
         var defined = new HashSet<(NodeKind, string)>();
@@ -28,6 +34,10 @@ public static class UncompiledUnits
             defined.Contains((n.Kind, n.Name)) || from is not null && definedLocal.Contains((n.Kind, n.Name, from));
 
         var needed = new HashSet<string>(StringComparer.Ordinal);
+        var byRoot = new HashSet<string>(StringComparer.Ordinal);
+        var byCall = new HashSet<string>(StringComparer.Ordinal);
+        var byReference = new HashSet<string>(StringComparer.Ordinal);
+        var fromHeader = new HashSet<string>(StringComparer.Ordinal);
         foreach (var id in plan.ReachedNodes)
         {
             var n = graph.GetNode(id);
@@ -36,18 +46,22 @@ public static class UncompiledUnits
             {
                 // A root only an uncompiled file defines: the build's entry point is there.
                 if (n.Kind is NodeKind.Function or NodeKind.Global && plan.Why.TryGetValue(id, out var why) && why.IsRoot && !Provided(n, null))
-                    needed.Add(file);
+                { needed.Add(file); byRoot.Add(file); }
                 continue;
             }
-            if (!compiled(file)) continue;
+            if (linkCovers || !compiled(file)) continue;
             foreach (var e in graph.OutEdges(id))
             {
                 if (e.Kind is EdgeKind.Contains or EdgeKind.DefinedIn or EdgeKind.Includes or EdgeKind.Expands) continue;
                 var t = graph.GetNode(e.To);
                 if (t.Kind is NodeKind.Function or NodeKind.Global && t.File is { } tf && suspects.Contains(tf) && !Provided(t, file))
+                {
                     needed.Add(tf);
+                    (e.Kind == EdgeKind.Calls ? byCall : byReference).Add(tf);
+                    if (!unit(file)) fromHeader.Add(tf);
+                }
             }
         }
-        return (needed.Count, suspects.Count - needed.Count);
+        return new Result(needed.Count, suspects.Count - needed.Count, byRoot.Count, byCall.Count, byReference.Count, fromHeader.Count);
     }
 }

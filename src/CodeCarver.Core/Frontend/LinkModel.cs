@@ -28,13 +28,24 @@ public sealed class LinkModel
     public int Links { get; }
     /// <summary>Archives the links search (named, or found through <c>-l</c>/<c>-L</c>) that an archive command built.</summary>
     public int ArchivesSearched { get; }
+    /// <summary>Objects and archives the links take that no command in the log made, where the build's own could be: an
+    /// object inside the carve root or beside the objects the log's compiles write, an archive beside them. An
+    /// incremental build's log skips the compiles that were up to date, and their objects show up here.</summary>
+    public int InputsNotFromLog { get; private set; } = -1;
+    /// <summary>The log's links read whole, every input they take that the build could have made made by a command in
+    /// the log: no compile the log lacks is in an image, so a source file no command compiles isn't built.</summary>
+    public bool CoversTheImages => Links > 0 && InputsNotFromLog == 0;
+
+    static readonly string[] ObjectExts = { ".o", ".obj" };
+    static readonly string[] ArchiveExts = { ".a", ".lib" };
 
     /// <param name="compiles">The log's compiles.</param>
     /// <param name="steps">The log's link and archive commands.</param>
     /// <param name="fullDir">A command's directory as written to a full path (relative ones against the carve root).</param>
     /// <param name="relOf">A compile's file relative to the carve root, or null outside it.</param>
+    /// <param name="root">The carve root as a full path, for <see cref="InputsNotFromLog"/>; without it that stays -1.</param>
     public LinkModel(IEnumerable<CompileCommand> compiles, IEnumerable<BuildLogScraper.ToolStep> steps,
-                     Func<string, string> fullDir, Func<CompileCommand, string?> relOf)
+                     Func<string, string> fullDir, Func<CompileCommand, string?> relOf, string? root = null)
     {
         var stepList = steps.ToList();
         var links = stepList.Where(s => s.Kind == BuildLogScraper.ToolStepKind.Link).ToList();
@@ -127,6 +138,21 @@ public sealed class LinkModel
             }
         }
         ArchivesSearched = archivesSearched.Count;
+
+        if (root is not null)
+        {
+            var made = new HashSet<string>(objectsOf.Values.SelectMany(o => o), StringComparer.Ordinal);
+            made.UnionWith(members.Keys);
+            var outDirs = made.Select(Path.GetDirectoryName).Where(d => d is not null).Select(d => d!).ToHashSet(StringComparer.Ordinal);
+            var rootKey = Key(Path.GetFullPath(root)).TrimEnd('\\', '/');
+            bool InRoot(string full) => full.StartsWith(rootKey, StringComparison.Ordinal) && full.Length > rootKey.Length
+                                        && full[rootKey.Length] is '\\' or '/';
+            bool HasExt(string full, string[] exts) => exts.Any(e => full.EndsWith(e, StringComparison.OrdinalIgnoreCase));
+            InputsNotFromLog = direct.Concat(searched).Distinct(StringComparer.Ordinal).Count(full =>
+                !made.Contains(full) && !sourceRel.ContainsKey(full)
+                && (HasExt(full, ObjectExts) ? InRoot(full) || outDirs.Contains(Path.GetDirectoryName(full) ?? "")
+                    : HasExt(full, ArchiveExts) && outDirs.Contains(Path.GetDirectoryName(full) ?? "")));
+        }
 
         foreach (var (full, rel) in sourceRel)
             if (direct.Contains(full)) _status[rel] = LinkStatus.Linked;

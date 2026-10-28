@@ -60,6 +60,9 @@ The carve trusts the names only when:
 2. in each stage, every source file the stage keeps that the build links has a compile command in the logs, or
    (with `ppTrace`) a command that ran clean read it: a `.c` another source `#include`s was traced in that compile.
    The build links a kept file when compiled code, or a root, uses a function or variable that only it defines.
+   When the log's link lines take only objects its compiles wrote (`link.coversTheImages = 1`, see
+   [USAGE.md](USAGE.md)), the log is the whole build, so only a root counts: the carve's calls are matched by name and
+   seen in every `#if` branch, which over-counts uses that the link proves the build never had.
 
 A compile the carve hasn't heard from could use a define the others didn't. If the first check fails, the run says why
 (`NOT trusted (...)`) and the header carve models the paste macros itself, as it does without the key. The second is
@@ -207,6 +210,7 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `world.ppTrace.mem.rerunForMemory` / `.overBudgetAlone` | runs stopped and run again to stay in the budget; runs that alone needed more |
 | `stageN.headerCarve.fromUsedMacros` | `1` when this stage's header carve used them (from either key) |
 | `stageN.headerCarve.keptUnitsWithoutCommand` | source files this stage keeps that no compile command compiles and the build links (compiled code or a root uses what only they define); above `0`, the stage models the paste macros itself |
+| `stageN.headerCarve.keptUnitsWithoutCommand.byRoot` / `.byCall` / `.byReference` / `.fromHeader` | of those, the files a root, a call, a use of a variable, or code in a header made the build link (a file can count in several) |
 | `stageN.headerCarve.keptUnitsNotBuilt` | source files this stage keeps that no compile command compiles, kept only for names compiled files also define (another chip's copy): not built, their macros are not kept for them |
 | `stageN.headerCarve.keptByUsed` / `.keptByOther` | defines kept because a compile used them, or a non-C file names them |
 | `stageN.headerCarve.used.otherFiles` / `.otherNames` | non-C files read, and the names they gave |
