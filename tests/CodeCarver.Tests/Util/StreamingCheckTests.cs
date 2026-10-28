@@ -212,6 +212,47 @@ public sealed class StreamingCheckTests
     }
 
     [Fact]
+    public void LinkCheck_AnEmittedFilesScan_IsServedWhileTheRoundWantsNoNewName()
+    {
+        // Round 1 drops a.c and b.c; round 2 keeps b.c (fewer dropped names): main.c's scan is served, and the answer is
+        // round 2's. Round 3 drops c.c, whose name round 1 let go of main.c's uses: main.c is scanned again and c_fn found.
+        var root = Path.Combine(Path.GetTempPath(), "cc-edigest-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            (string, string) W(string rel, string text)
+            {
+                var p = Path.Combine(root, rel);
+                File.WriteAllText(p, text);
+                return (rel, p);
+            }
+            var main = W("main.c", "int a_fn(void);\nint b_fn(void);\nint c_fn(void);\n#define WRAP(x) x\n"
+                                   + "int main(void) { return a_fn() + b_fn() + c_fn(); }\n");
+            var a = W("a.c", "int a_fn(void) { return 1; }\n");
+            var b = W("b.c", "int b_fn(void) { return 2; }\n");
+            var c = W("c.c", "int c_fn(void) { return 3; }\n");
+            var cache = new LinkCheckCache(_ => false);
+            string[] Names(LinkCheckResult r) => r.Violations.Select(v => v.Name).Order().ToArray();
+
+            var first = EmittedLinkCheck.Run(new[] { main, c }, new[] { a, b }, cache: cache);
+            Assert.Equal(new[] { "a_fn", "b_fn" }, Names(first));
+            Assert.Equal(0, first.Stats["digestsReused"]);
+
+            var second = EmittedLinkCheck.Run(new[] { main, b, c }, new[] { a }, cache: cache);
+            Assert.Equal(new[] { "a_fn" }, Names(second));
+            Assert.Equal(2, second.Stats["digestsReused"]);
+
+            var third = EmittedLinkCheck.Run(new[] { main, b }, new[] { a, c }, cache: cache);
+            Assert.Equal(new[] { "a_fn", "c_fn" }, Names(third));
+            Assert.Equal(0, third.Stats["digestsReused"]);
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
+    [Fact]
     public void LinkCheck_WalksThatReadHeadersAgain_WaitForTheWalkBudget_SameAnswer()
     {
         // 48 dropped files each walk cfg.h, a big register header and the template t.h. With no header text held every

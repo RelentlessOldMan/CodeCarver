@@ -57,6 +57,12 @@ public sealed class LinkCheckCache
     // round emitting the same text serves it while those headers read as they did. Every round walked every emitted
     // unit again (C24: a round's 3,308 walks took about 30 min at work, and a carve runs several rounds).
     internal readonly ConcurrentDictionary<(int Length, ulong Hash), (List<(string Raw, EmittedLinkCheck.HeaderInfo? Read)> Deps, List<EmittedLinkCheck.Definition> Defs)> Walks = new();
+    // Each emitted file's scan as the last round that scanned it left it (EmittedLinkCheck.EmittedDigest): a later round
+    // emitting the same text serves it while it wants no name that round let go. Every round scanned every emitted file
+    // again (work, 1.0.373: about 145 s a stage, most of it the headers' scans).
+    internal readonly ConcurrentDictionary<string, EmittedLinkCheck.EmittedDigest> Emitted = new(StringComparer.Ordinal);
+    internal readonly CodeCarver.Core.Util.NamePool Names = new();
+    internal long EmittedItems;
 
     private object?[]? _inputs;
 
@@ -146,7 +152,7 @@ public static class EmittedLinkCheck
         // Each loop's time, and memory as it ends: the process's private bytes, the managed heap the last GC left, and
         // managed bytes allocated in the loop (MB). A "Max" key is kept at its largest over a stage's rounds.
         var allocatedAt = GC.GetTotalAllocatedBytes();
-        long filesRead = 0, fromCache = 0, headersHandedOn = 0, scansOutsideBudget = 0, handedOnHeld = 0, handedOnMax = 0, instancesRedone = 0, verbatimSkipped = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
+        long filesRead = 0, fromCache = 0, headersHandedOn = 0, scansOutsideBudget = 0, handedOnHeld = 0, handedOnMax = 0, instancesRedone = 0, verbatimSkipped = 0, digestsReused = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
         // The tree's shape, for sizing a test corpus like it (shape.*): each header's size, each walk's include closure.
         var headerSizes = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
         // Headers spilled to the local disk (see ReadAgain), removed when the check is done.
@@ -172,6 +178,7 @@ public static class EmittedLinkCheck
             stats["held.cacheDroppedMax"] = cache?.Dropped.Count ?? 0;
             stats["held.cacheDefinitionsMax"] = cache?.Dropped.Values.Sum(e => (long)(e?.Definitions.Count ?? 0)) ?? 0;
             stats["held.cacheOriginalsMax"] = cache?.Originals.Count ?? 0;
+            stats["held.cacheDigestItemsMax"] = cache?.EmittedItems ?? 0;
             stats["held.droppedDefsMax"] = droppedDefs.Count;
             stats["held.macroCallsMax"] = macroCalls.Count;
             stats["held.usesMax"] = live.Count + dead.Count;
@@ -212,7 +219,7 @@ public static class EmittedLinkCheck
             var shape = new Dictionary<string, long>(StringComparer.Ordinal);
             Shape(shape, headerSizes.Values, closures, templateWalks, templateWalksSkipped);
             s_shapeNow = Frozen(shape);
-            stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["headersHandedOn"] = headersHandedOn; stats["scansOutsideBudget"] = scansOutsideBudget; stats["instancesRedone"] = instancesRedone; stats["verbatimSkipped"] = verbatimSkipped;
+            stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["headersHandedOn"] = headersHandedOn; stats["scansOutsideBudget"] = scansOutsideBudget; stats["instancesRedone"] = instancesRedone; stats["verbatimSkipped"] = verbatimSkipped; stats["digestsReused"] = digestsReused;
             stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits; stats["parseWaits"] = parseGate.Waits;
             stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;
             stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped; stats["templateWalksReused"] = templateWalksReused;
@@ -220,7 +227,7 @@ public static class EmittedLinkCheck
             stats["walkNames"] = walkNames.Count;
             stats["headersSpilled"] = spilled.Count; stats["spillReads"] = spillReads; stats["spillMb"] = spillBytes >> 20;
             try { if (Directory.Exists(spillDir)) Directory.Delete(spillDir, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
-            foreach (var k in new[] { "filesRead", "fromCache", "headersHandedOn", "scansOutsideBudget", "instancesRedone", "verbatimSkipped", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames", "headersSpilled", "spillReads", "spillMb" })
+            foreach (var k in new[] { "filesRead", "fromCache", "headersHandedOn", "scansOutsideBudget", "instancesRedone", "verbatimSkipped", "digestsReused", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames", "headersSpilled", "spillReads", "spillMb" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -832,7 +839,7 @@ public static class EmittedLinkCheck
         // it never reaches the linker, whatever a same-named function elsewhere does.
         var fileMacros = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         var fileIncludes = new Dictionary<string, List<string>>(StringComparer.Ordinal);   // include basenames
-        var keptNames = new CodeCarver.Core.Util.NamePool();
+        var keptNames = cache?.Names ?? new CodeCarver.Core.Util.NamePool();
         var aliasMacros = new HashSet<string>(StringComparer.Ordinal);
         var macroDeclarators = new List<(string Name, string Macro, string Target, string Rel, int Line)>();
         // Weak: declared weak in a header (it may be included anywhere), or every use sits in a file that declares it weak
@@ -842,25 +849,68 @@ public static class EmittedLinkCheck
         var weakUse = new HashSet<string>(StringComparer.Ordinal);
         // Only a symbol the build wraps (--wrap=X): a __wrap_X elsewhere is a unit-test mock, not part of this link.
         var anyWrap = wrapped is { Count: > 0 } && droppedDefs.Keys.Any(k => k.StartsWith("__wrap_", StringComparison.Ordinal));
-        (ScanResult Scan, bool[]? Map)? ScanEmitted((string Rel, string Path) f)
+        // The names this round wants uses of in every file (a file's pruned statics aside). A digest from a round that
+        // wanted all of these (an earlier round of a stage drops more) holds every use this round reads.
+        HashSet<string>? wantedNow = null;
+        if (cache is not null)
+        {
+            wantedNow = new HashSet<string>(droppedDefs.Keys, StringComparer.Ordinal);
+            if (anyWrap) wantedNow.UnionWith(wrapped!);
+        }
+        var covers = new ConcurrentDictionary<HashSet<string>, bool>(ReferenceEqualityComparer.Instance);
+        bool Covers(EmittedDigest d, Dictionary<string, int>? prunedHere) =>
+            ReferenceEquals(d.DeadLines, deadLines)
+            && covers.GetOrAdd(d.Wanted, w => ReferenceEquals(w, wantedNow) || wantedNow!.IsSubsetOf(w))
+            && (prunedHere is null || d.Pruned is { } had && prunedHere.Keys.All(had.ContainsKey));
+        // A file's scan, or the digest an earlier round left of the same text; and its template instances, with the
+        // dead-line map when they need it.
+        (EmittedDigest? Had, ScanResult? Scan, List<Definition> Inst, bool[]? Map, ulong Hash, int Length, Dictionary<string, int>? Pruned)? ScanEmitted((string Rel, string Path) f)
         {
             var text = TakeHandedOn(f.Path);
             if (text is null)
                 using (Activity.Part("emitted.read")) text = TryRead(f.Path, maxBytes);
             if (text is null) return null;
-            bool[]? map;
-            using (Activity.Part("emitted.deadLines", text.Length)) map = deadLines?.Invoke(f.Rel, text);
+            var prunedHere = prunedStatics.TryGetValue(f.Rel, out var ph) ? ph : null;
+            var hash = cache is null ? 0 : ContentHash(text);
+            var had = cache is not null && cache.Emitted.TryGetValue(f.Rel, out var d) && d.Length == text.Length && d.Hash == hash
+                      && Covers(d, prunedHere) ? d : null;
+            var inst = new ScanResult();
+            using (Activity.Part("emitted.instances", text.Length)) inst.Definitions.AddRange(Instances(f.Rel, text));
+            Renamed(inst);
+            bool[]? map = null;
+            if (had is null || inst.Definitions.Count > 0)
+                using (Activity.Part("emitted.deadLines", text.Length)) map = deadLines?.Invoke(f.Rel, text);
+            if (had is not null) { Interlocked.Increment(ref digestsReused); return (had, null, inst.Definitions, map, hash, text.Length, prunedHere); }
             ScanResult s;
             using (Activity.Part("emitted.scan", text.Length)) s = IsAssembly(f.Rel) ? ScanAssembly(text) : BudgetedScan(text, IsHeader(f.Rel), definerMacros: definerMacros);
-            using (Activity.Part("emitted.instances", text.Length)) s.Definitions.AddRange(Instances(f.Rel, text));
             Renamed(s);
             // A use is read below only for a name a dropped file defines, a static pruned from this file, or a wrapped
             // symbol: the others are let go here, so a result waiting its turn holds little.
-            var prunedHere = prunedStatics.TryGetValue(f.Rel, out var ph) ? ph : null;
             bool Wanted(string n) => droppedDefs.ContainsKey(n) || (prunedHere?.ContainsKey(n) ?? false) || (anyWrap && wrapped!.Contains(n));
             s.Uses.RemoveAll(u => !Wanted(u.Name));
             s.CallUses.RemoveWhere(u => !Wanted(u.Name));
-            return (s, map);
+            return (null, s, inst.Definitions, map, hash, text.Length, prunedHere);
+        }
+        string Pooled(string n) => keptNames.Get(n, 0, n.Length);
+        EmittedDigest Digest(string rel, ScanResult scan, bool[]? map, ulong hash, int length, Dictionary<string, int>? prunedHere)
+        {
+            bool IsDead(int line) => map is not null && line < map.Length && map[line];
+            // Held for every emitted file until the end: only what Sees reads (a file with neither sees no macro), each
+            // name one string for the run.
+            var liveMacros = scan.FunctionMacroLines.Where(m => !IsDead(m.Line)).Select(m => Pooled(m.Name)).ToHashSet(StringComparer.Ordinal);
+            return new EmittedDigest
+            {
+                Length = length, Hash = hash, DeadLines = deadLines, Wanted = wantedNow ?? new HashSet<string>(), Pruned = prunedHere,
+                Definitions = scan.Definitions.Select(x => (x with { Name = Pooled(x.Name) }, IsDead(x.Line))).ToArray(),
+                Uses = scan.Uses.Select(u => (Pooled(u.Name), u.Line, IsDead(u.Line), scan.CallUses.Contains(u))).ToArray(),
+                LiveMacros = liveMacros.Count > 0 ? liveMacros : null,
+                DeadMacros = scan.FunctionMacros.Where(m => !liveMacros.Contains(m)).Select(Pooled).ToArray(),
+                Includes = scan.Includes.Count == 0 ? null
+                    : scan.Includes.Select(i => keptNames.Get(i, i.Length - Path.GetFileName(i.AsSpan()).Length, i.Length)).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                AliasMacros = scan.AliasMacros.Select(Pooled).ToArray(),
+                Declarators = scan.MacroDeclarators.Where(m => !IsDead(m.Line)).Select(m => (Pooled(m.Name), Pooled(m.Macro), Pooled(m.Target), m.Line)).ToArray(),
+                Weak = scan.WeakDeclarations.Count == 0 ? null : scan.WeakDeclarations.Select(Pooled).ToHashSet(StringComparer.Ordinal),
+            };
         }
         var emittedSorted = emittedList.OrderBy(e => e.Rel, StringComparer.Ordinal).ToList();
         Activity.Begin("check: emitted files scanned", emittedSorted.Count);
@@ -869,41 +919,55 @@ public static class EmittedLinkCheck
             using var consume = Activity.Part("emitted.consume");
             var rel = emittedSorted[ei].Rel;
             if (scanned is not { } got) { skipped++; continue; }
-            var (scan, map) = got;
+            var (had, fresh, inst, map, hash, length, prunedHere) = got;
+            var dg = had ?? Digest(rel, fresh!, map, hash, length, prunedHere);
+            if (had is null && cache is not null)
+            {
+                // Bounded: past it a file is scanned again next round (a digest is held for the run).
+                var items = dg.Items;
+                if (cache.EmittedItems + items <= EmittedDigestItems)
+                {
+                    if (cache.Emitted.TryGetValue(rel, out var old)) cache.EmittedItems -= old.Items;
+                    cache.Emitted[rel] = dg;
+                    cache.EmittedItems += items;
+                }
+            }
             checkedFiles++;
             bool IsDead(int line) => map is not null && line < map.Length && map[line];
-            functionMacros.UnionWith(scan.FunctionMacros);
-            // Held for every emitted file until the end: only what Sees reads (a file with neither sees no macro), each
-            // name one string for the run.
-            var liveMacros = scan.FunctionMacroLines.Where(m => !IsDead(m.Line)).Select(m => keptNames.Get(m.Name, 0, m.Name.Length)).ToHashSet(StringComparer.Ordinal);
-            if (liveMacros.Count > 0) fileMacros[rel] = liveMacros;
-            if (scan.Includes.Count > 0)
-                fileIncludes[rel] = scan.Includes.Select(i => keptNames.Get(i, i.Length - Path.GetFileName(i.AsSpan()).Length, i.Length)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            foreach (var d in scan.Definitions)
-                if (IsDead(d.Line)) continue;
-                else if (d.Inline && !d.Static && IsHeader(rel)) inlineHeaderDefs.Add(d.Name);
-                else emittedDefs.Add(d.Name);
-            aliasMacros.UnionWith(scan.AliasMacros);
-            foreach (var md in scan.MacroDeclarators) if (!IsDead(md.Line)) macroDeclarators.Add((md.Name, md.Macro, md.Target, rel, md.Line));
-            if (IsHeader(rel)) weakNames.UnionWith(scan.WeakDeclarations);
-            foreach (var (name, _) in scan.Uses) (scan.WeakDeclarations.Contains(name) ? weakUse : strongUse).Add(name);
-            if (prunedStatics.TryGetValue(rel, out var pruned))
+            functionMacros.UnionWith(dg.DeadMacros);
+            if (dg.LiveMacros is { } liveMacros) { functionMacros.UnionWith(liveMacros); fileMacros[rel] = liveMacros; }
+            if (dg.Includes is { } incs) fileIncludes[rel] = incs;
+            void Defined(Definition d)
             {
-                var definedHere = scan.Definitions.Select(d => d.Name).ToHashSet(StringComparer.Ordinal);
+                if (d.Inline && !d.Static && IsHeader(rel)) inlineHeaderDefs.Add(d.Name);
+                else emittedDefs.Add(d.Name);
+            }
+            foreach (var (d, isDead) in dg.Definitions) if (!isDead) Defined(d);
+            foreach (var d in inst) if (!IsDead(d.Line)) Defined(d);
+            aliasMacros.UnionWith(dg.AliasMacros);
+            foreach (var md in dg.Declarators) macroDeclarators.Add((md.Name, md.Macro, md.Target, rel, md.Line));
+            if (IsHeader(rel) && dg.Weak is not null) weakNames.UnionWith(dg.Weak);
+            // Only the uses this round wants: a digest from an earlier round may hold more.
+            bool Wanted(string n) => droppedDefs.ContainsKey(n) || (prunedHere?.ContainsKey(n) ?? false) || (anyWrap && wrapped!.Contains(n));
+            var uses = had is null ? dg.Uses : dg.Uses.Where(u => Wanted(u.Name)).ToArray();
+            foreach (var u in uses) (dg.Weak?.Contains(u.Name) == true ? weakUse : strongUse).Add(u.Name);
+            if (prunedHere is { } pruned)
+            {
+                var definedHere = dg.Definitions.Select(d => d.D.Name).Concat(inst.Select(d => d.Name)).ToHashSet(StringComparer.Ordinal);
                 var reported = new HashSet<string>(StringComparer.Ordinal);
-                foreach (var (name, line) in scan.Uses)
+                foreach (var (name, line, isDead, call) in uses)
                     if (pruned.TryGetValue(name, out var defLine) && !definedHere.Contains(name) && reported.Add(name)
-                        && !(scan.CallUses.Contains((name, line)) && scan.FunctionMacros.Contains(name)))
-                        staticViolations.Add(new LinkViolation(name, rel, rel, line, DeadOnly: IsDead(line), DefinedLine: defLine)
+                        && !(call && (dg.LiveMacros?.Contains(name) == true || dg.DeadMacros.Contains(name))))
+                        staticViolations.Add(new LinkViolation(name, rel, rel, line, DeadOnly: isDead, DefinedLine: defLine)
                                              { DefinedInAll = new[] { rel } });
             }
-            foreach (var (name, line) in scan.Uses)
+            foreach (var (name, line, isDead, call) in uses)
             {
                 // Linked with --wrap=X, every X call goes to __wrap_X: a dropped wrapper breaks the link.
-                if (anyWrap && wrapped!.Contains(name) && droppedDefs.ContainsKey("__wrap_" + name)) (IsDead(line) ? dead : live).TryAdd("__wrap_" + name, (rel, line));
+                if (anyWrap && wrapped!.Contains(name) && droppedDefs.ContainsKey("__wrap_" + name)) (isDead ? dead : live).TryAdd("__wrap_" + name, (rel, line));
                 if (!droppedDefs.ContainsKey(name)) continue;
-                if (scan.CallUses.Contains((name, line))) { macroCalls.Add((name, rel, line, IsDead(line))); continue; }
-                var into = IsDead(line) ? dead : live;
+                if (call) { macroCalls.Add((name, rel, line, isDead)); continue; }
+                var into = isDead ? dead : live;
                 into.TryAdd(name, (rel, line));
             }
         }
@@ -1022,6 +1086,17 @@ public static class EmittedLinkCheck
     /// <summary>A header of up to this many chars that the header pass read is handed on to its scan (see HandOn).</summary>
     const int EarlyChars = 1 << 20;
 
+    /// <summary>Items (a definition, a use, a name) the emitted files' digests hold at most for the run: about a 32nd of
+    /// the memory budget at 32 bytes an item.</summary>
+    static long EmittedDigestItems
+    {
+        get
+        {
+            var total = CodeCarver.Core.Util.MemoryGate.BudgetBytes();
+            return Math.Max(1L << 20, (total > 0 ? total : 4L << 30) / 1024);
+        }
+    }
+
     /// <summary>Bytes of header text the header pass holds for the scans at most: 256 MB, or CODECARVER_CHECK_HANDON_MB.</summary>
     static long HandedOnBudget() =>
         long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_CHECK_HANDON_MB"), out var mb) && mb >= 0 ? mb << 20 : 256L << 20;
@@ -1134,6 +1209,31 @@ public static class EmittedLinkCheck
     /// <param name="Bare">Nothing but #define lines precedes the name in its statement (no return type).</param>
     /// <param name="Data">A file-scope variable, not a function.</param>
     public readonly record struct Definition(string Name, int Line, bool Static, bool Inline, bool Bare = false, bool Data = false);
+
+    /// <summary>What the emitted-file loop reads of one file's scan, its names pooled and each line already told live or
+    /// dead, and the uses only of the names that round wanted. The template instances aren't in it: they depend on the
+    /// headers, and are found again each round.</summary>
+    internal sealed class EmittedDigest
+    {
+        public required int Length { get; init; }
+        public required ulong Hash { get; init; }
+        public required object? DeadLines { get; init; }
+        /// <summary>The names the round wanted uses of (the dropped definitions and wrapped symbols), and this file's
+        /// pruned statics.</summary>
+        public required HashSet<string> Wanted { get; init; }
+        public required Dictionary<string, int>? Pruned { get; init; }
+        public required (Definition D, bool Dead)[] Definitions { get; init; }
+        public required (string Name, int Line, bool Dead, bool Call)[] Uses { get; init; }
+        public required HashSet<string>? LiveMacros { get; init; }
+        /// <summary>Function-like macros #defined only on dead lines.</summary>
+        public required string[] DeadMacros { get; init; }
+        public required List<string>? Includes { get; init; }
+        public required string[] AliasMacros { get; init; }
+        public required (string Name, string Macro, string Target, int Line)[] Declarators { get; init; }
+        public required HashSet<string>? Weak { get; init; }
+        public long Items => Definitions.Length + Uses.Length + DeadMacros.Length + AliasMacros.Length + Declarators.Length
+                             + (LiveMacros?.Count ?? 0) + (Includes?.Count ?? 0) + (Weak?.Count ?? 0);
+    }
 
     public sealed class ScanResult
     {
