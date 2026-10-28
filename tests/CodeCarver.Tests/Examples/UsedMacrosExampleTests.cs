@@ -78,6 +78,27 @@ public sealed class UsedMacrosExampleTests
         Assert.Contains("KQ_SPI_CTRL_OFF", Defines(kept.Carved("max", "inc/kq_regs.h")));
     }
 
+    /// <summary>A source file no command compiles but one that does #includes: pp-trace read it in that compile, so its
+    /// macros are among the names and the stage still carves from them.</summary>
+    [SkippableFact]
+    public void PpTrace_ASourceFileACompileIncludes_IsCovered()
+    {
+        var exe = CodeCarver.Tests.Preprocess.PpTraceTests.Find();
+        Skip.If(exe is null, "pp-trace (LLVM) not installed");
+        using var r = new Run($"[builds.main]\nbuildLogs = [\"inputs/build.log\"]\nppTrace = \"{exe!.Replace('\\', '/')}\"\n"
+                              + "ppTraceArgs = [\"-w\"]\nppTraceDropOptions = [\"-fkq-never-*\"]\n", d =>
+        {
+            File.WriteAllText(Path.Combine(d, "src", "part.c"), "unsigned kq_part(void) { return KQ_SPI_CTRL_OFF; }\n");
+            File.AppendAllText(Path.Combine(d, "src", "uart.c"), "\n#include \"part.c\"\n");
+        });
+        Assert.True(r.Code == 0, r.Output);
+        Assert.Contains("world.ppTrace.unitsWithoutCommand = 1", r.Summary("max"));
+        Assert.Contains("world.ppTrace.unitsWithoutCommandRead = 1", r.Summary("max"));
+        Assert.Contains("headerCarve.keptUnitsWithoutCommand = 0", r.Summary("max"));
+        Assert.Contains("headerCarve.fromUsedMacros = 1", r.Summary("max"));
+        Assert.Contains("KQ_SPI_CTRL_OFF", Defines(r.Carved("max", "inc/kq_regs.h")));
+    }
+
     /// <summary>Without the files the static carve models the paste macros itself: sound, and on this sample it also
     /// keeps the DMA fields behind dma.c's #if KQ_HAS_DMA, which this configuration turns off.</summary>
     [Fact]

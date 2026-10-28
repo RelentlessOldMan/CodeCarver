@@ -1384,6 +1384,11 @@ public static class CarveCommand
             summary["world.ppTrace.dropped.patternsUnused"] = trace.DropPatternsUnused;
             summary["world.ppTrace.names"] = trace.Names.Count;
             summary["world.ppTrace.unitsWithoutCommand"] = unitsWithout;
+            // A source file no command compiles that a compile read (a .c another one #includes): its macros are traced.
+            var read = trace.FilesRead.Select(f => CmdRel(new CompileCommand { Directory = dir, File = f })).Where(r => r is not null).Select(r => r!)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            summary["world.ppTrace.unitsWithoutCommandRead"] = parseRels.Count(r => !notBuilt.Contains(r) && usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase))
+                && !logged.Contains(r) && read.Contains(r));
             summary["world.ppTrace.trusted"] = trusted ? 1 : 0;
             const long Mb = 1024 * 1024;
             summary["world.ppTrace.mem.budgetMb"] = trace.BudgetBytes / Mb;
@@ -1392,7 +1397,7 @@ public static class CarveCommand
             summary["world.ppTrace.mem.peakRunning"] = trace.PeakRunning;
             summary["world.ppTrace.mem.rerunForMemory"] = trace.Evictions;
             summary["world.ppTrace.mem.overBudgetAlone"] = trace.OverBudgetAlone;
-            if (trusted) { usedMacros = trace.Names; usedLogged = logged; }
+            if (trusted) { usedMacros = trace.Names; usedLogged = logged; usedLogged.UnionWith(read); }
             // Where the missing headers might be: this machine's console only (names and paths), never a summary key.
             foreach (var (header, dirs) in trace.HeadersNotFoundWhere.Take(20))
                 err.WriteLine($"  warn    : pp-trace: '{header}' not found" + (dirs.Count == 0 ? "" :

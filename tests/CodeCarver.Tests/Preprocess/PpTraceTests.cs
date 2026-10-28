@@ -48,6 +48,39 @@ public sealed class PpTraceTests
         Assert.Equal(Keys("KQ_CAT", "KQ_HAS_DMA"), names);
     }
 
+    [Fact]
+    public void ReadNames_TakesTheFilesEnteredFromFileChanged()
+    {
+        var yaml = """
+            ---
+            - Callback: FileChanged
+              Loc: "C:/t/m.c:1:1"
+              Reason: EnterFile
+              FileType: C_User
+              PrevFID: (invalid)
+            - Callback: FileChanged
+              Loc: "<built-in>:1:1"
+              Reason: EnterFile
+            - Callback: FileChanged
+              Loc: "C:/t/sub dir/inc.c:1:1"
+              Reason: EnterFile
+            - Callback: FileChanged
+              Loc: "C:/t/m.c:2:1"
+              Reason: ExitFile
+            - Callback: FileChanged
+              Loc: "C:/t/gone.c:1:1"
+              Reason: ExitFile
+            - Callback: MacroExpands
+              MacroNameTok: KQ_A
+            ...
+            """;
+        var names = new HashSet<ulong>();
+        var read = new HashSet<string>();
+        PpTrace.ReadNames(new StringReader(yaml), names, read);
+        Assert.Equal(new[] { "C:/t/m.c", "C:/t/sub dir/inc.c" }, read.OrderBy(f => f, StringComparer.Ordinal));
+        Assert.Equal(Keys("KQ_A"), names);
+    }
+
     [Theory]
     [InlineData("aarch64-none-elf-clang", "aarch64-none-elf")]
     [InlineData("/opt/llvm/bin/arm-none-eabi-gcc", "arm-none-eabi")]
@@ -235,6 +268,7 @@ public sealed class PpTraceTests
             Assert.True(pt.Complete, $"{pt.Succeeded} of {pt.Commands}");
             Assert.Superset(Keys("KQ_ON", "KQ_CAT", "KQ_A_OFF", "KQ_B_OFF"), pt.Names);
             Assert.DoesNotContain(NameKey.Short("KQ_UNUSED"), pt.Names);
+            Assert.Contains(Path.Combine(dir, "inc", "k.h"), pt.FilesRead.Select(Path.GetFullPath));
 
             // A missing include is a failed command: the names it would have used are not all there.
             File.WriteAllText(Path.Combine(dir, "b.c"), "#include \"gone.h\"\nint z;\n");

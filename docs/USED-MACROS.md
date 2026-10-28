@@ -57,7 +57,8 @@ The carve trusts the names only when:
 
 1. every compile command in the build logs is matched, by its source file, by a complete file (a source compiled
    twice, say in two configurations, needs two files), and
-2. in each stage, every source file the stage keeps has a compile command in the logs.
+2. in each stage, every source file the stage keeps has a compile command in the logs, or (with `ppTrace`) a
+   command that ran clean read it: a `.c` another source `#include`s was traced in that compile.
 
 A compile the carve hasn't heard from could use a define the others didn't. If the first check fails, the run says why
 (`NOT trusted (...)`) and the header carve models the paste macros itself, as it does without the key. The second is
@@ -196,6 +197,7 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `world.ppTrace.missingDirsInRoot` / `.missingDirsInRootFromBuild` | distinct include directories inside the carve root missing here, and of those, the ones at, above or under a folder some `-o` writes to |
 | `world.ppTrace.notPreprocessed` | `.s` and `.asm` commands, not run |
 | `world.ppTrace.names` / `.unitsWithoutCommand` / `.trusted` | as for `usedMacros` |
+| `world.ppTrace.unitsWithoutCommandRead` | of `unitsWithoutCommand`, those a command that ran clean read (a `.c` another source `#include`s): they count as covered |
 | `world.ppTrace.mem.budgetMb` | the memory the runs shared |
 | `world.ppTrace.mem.peakOneMb` / `.peakAllMb` / `.peakRunning` | the most one run held, the most all held at once, and the most at once |
 | `world.ppTrace.mem.rerunForMemory` / `.overBudgetAlone` | runs stopped and run again to stay in the budget; runs that alone needed more |

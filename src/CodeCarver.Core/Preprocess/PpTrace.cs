@@ -19,12 +19,14 @@ namespace CodeCarver.Core.Preprocess;
 /// </summary>
 public sealed class PpTrace
 {
-    /// <summary>The callbacks that name a macro the compile used or tested.</summary>
-    public const string Callbacks = "MacroExpands,Defined,Ifdef,Ifndef,Elifdef,Elifndef";
+    /// <summary>The callbacks that name a macro the compile used or tested, and the files it read.</summary>
+    public const string Callbacks = "MacroExpands,Defined,Ifdef,Ifndef,Elifdef,Elifndef,FileChanged";
 
     /// <summary>Every name some command used or tested, by key (<see cref="NameKey"/>); two names on one key keep a
     /// define more, never one less.</summary>
     public HashSet<ulong> Names { get; } = new();
+    /// <summary>The files the runs that succeeded read (sources and every header), full paths.</summary>
+    public HashSet<string> FilesRead { get; } = new(PathComparer.Default);
 
     /// <summary>Commands pp-trace runs: every one but those assembling a file the preprocessor never reads (<c>.s</c>, <c>.asm</c>).</summary>
     public int Commands { get; private set; }
@@ -204,6 +206,7 @@ public sealed class PpTrace
             if (dirs.Any(d => d.Inside)) Interlocked.Increment(ref inRoot);
             foreach (var d in dirs) if (d.Inside) missingInRoot.TryAdd(d.Dir, 0);
             var names = new HashSet<ulong>();
+            var read = new HashSet<string>(StringComparer.Ordinal);   // the files it entered
             bool ok, late, optionError, pastErrors;
             RunErrors errs;
             Failure failure;
@@ -223,9 +226,9 @@ public sealed class PpTrace
                     {
                         using var lease = gate.Admit();
                         errs = new RunErrors();
-                        (ok, late, failure, header, includer, optionError, pastErrors) = TraceOne(exe, cmd, runExtra, names, timeoutMs, lease, errs);
+                        (ok, late, failure, header, includer, optionError, pastErrors) = TraceOne(exe, cmd, runExtra, names, read, timeoutMs, lease, errs);
                         if (!lease.Evicted) break;
-                        names.Clear();   // stopped for memory: run again when there is room
+                        names.Clear(); read.Clear();   // stopped for memory: run again when there is room
                     }
                     if (ok || late || failure != Failure.HeaderNotFound || header is null) break;
                     first ??= (failure, header, includer);
@@ -245,7 +248,7 @@ public sealed class PpTrace
                     Directory.CreateDirectory(Path.GetDirectoryName(stub)!);
                     File.WriteAllText(stub, "");
                     stubbed.Add(header);
-                    names.Clear();
+                    names.Clear(); read.Clear();
                 }
             }
             finally
@@ -286,7 +289,8 @@ public sealed class PpTrace
             Interlocked.Increment(ref succeeded);
             if (pastErrors) Interlocked.Increment(ref pastParse);
             if (pastErrors && errs.WarningAsError) Interlocked.Increment(ref pastWarnings);
-            lock (namesLock) r.Names.UnionWith(names);
+            var full = read.Select(f => FullIn(cmd.Directory, f)).Where(f => f is not null).Select(f => f!).ToList();   // a header found by -Iinc is inc/x.h
+            lock (namesLock) { r.Names.UnionWith(names); r.FilesRead.UnionWith(full); }
         });
         r.Succeeded = succeeded;
         r.SucceededPastStubbedHeaders = pastStubs;
@@ -674,7 +678,7 @@ public sealed class PpTrace
         return (why, header, includer);
     }
 
-    private static (bool Ok, bool TimedOut, Failure Why, string? Header, string? Includer, bool OptionError, bool PastParseErrors) TraceOne(string exe, CompileCommand cmd, IReadOnlyList<string> extra, HashSet<ulong> names, int timeoutMs, ChildMemoryGate.Lease lease, RunErrors errs)
+    private static (bool Ok, bool TimedOut, Failure Why, string? Header, string? Includer, bool OptionError, bool PastParseErrors) TraceOne(string exe, CompileCommand cmd, IReadOnlyList<string> extra, HashSet<ulong> names, HashSet<string> read, int timeoutMs, ChildMemoryGate.Lease lease, RunErrors errs)
     {
         // The command goes in a compile database of its own: no command-line quoting or length limit to meet.
         var db = Path.Combine(Path.GetTempPath(), "codecarver-ppt-" + Guid.NewGuid().ToString("N"));
@@ -729,7 +733,7 @@ public sealed class PpTrace
                 timedOut = true;
                 try { p.Kill(entireProcessTree: true); } catch { /* already gone */ }
             }, null, timeoutMs, Timeout.Infinite);
-            ReadNames(p.StandardOutput, names);
+            ReadNames(p.StandardOutput, names, read);
             p.WaitForExit();   // also waits for stderr's last line
             // Exit 1 and only the parse's errors, or warnings made errors: nothing stopped the preprocessor before the
             // end of the source, and it put out what it would have without them.
@@ -748,12 +752,27 @@ public sealed class PpTrace
 
     private const string NameField = "MacroNameTok: ";
 
-    /// <summary>The names of pp-trace's YAML output: one <c>MacroNameTok: NAME</c> line per callback.</summary>
-    internal static void ReadNames(TextReader output, HashSet<ulong> names)
+    private const string LocField = "Loc: \"";
+
+    /// <summary>The names of pp-trace's YAML output: one <c>MacroNameTok: NAME</c> line per callback. And the files it
+    /// read: a <c>FileChanged</c> callback's <c>Loc: "PATH:1:1"</c>, then <c>Reason: EnterFile</c>.</summary>
+    internal static void ReadNames(TextReader output, HashSet<ulong> names, HashSet<string>? read = null)
     {
+        string? loc = null;
         for (var line = output.ReadLine(); line is not null; line = output.ReadLine())
         {
             var s = line.AsSpan().TrimStart();
+            if (read is not null)
+            {
+                if (s.StartsWith(LocField, StringComparison.Ordinal))
+                {
+                    var at = s[LocField.Length..];
+                    loc = at.EndsWith(":1:1\"", StringComparison.Ordinal) && at.Length > 5 && at[0] != '<' ? at[..^5].ToString() : null;
+                    continue;
+                }
+                if (s.StartsWith("- Callback:", StringComparison.Ordinal)) loc = null;
+                else if (loc is not null && s.SequenceEqual("Reason: EnterFile")) read.Add(loc);
+            }
             if (!s.StartsWith(NameField, StringComparison.Ordinal)) continue;
             s = s[NameField.Length..];
             var n = 0;
