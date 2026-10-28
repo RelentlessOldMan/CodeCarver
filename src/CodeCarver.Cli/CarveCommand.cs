@@ -4155,11 +4155,16 @@ public static class CarveCommand
                     void HcKey(string key, long value) => summary[$"{summaryStage}.headerCarve.{key}"] = value;
                     // The compiles said what they used: no model of the paste macros needed (docs/USED-MACROS.md). A kept
                     // source file no command compiles used macros nobody saw: then the stage models them itself.
-                    var keptWithout = usedLogged is null ? 0
-                        : splan.KeptFiles.Count(r => usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !usedLogged.Contains(r));
-                    if (usedMacros is not null) HcKey("keptUnitsWithoutCommand", keptWithout);
+                    // A kept one the build links (compiled code uses what only it defines) means the logs lack its compile.
+                    // One kept only because a compiled file's call matches a name it also defines (another chip's variant)
+                    // is never built: its macros don't matter to the build.
+                    var (keptWithout, keptVariants) = usedLogged is null ? (0, 0)
+                        : UncompiledUnits.Split(graph, splan, usedLogged.Contains, r => usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)));
+                    if (usedMacros is not null) { HcKey("keptUnitsWithoutCommand", keptWithout); HcKey("keptUnitsNotBuilt", keptVariants); }
+                    if (keptVariants > 0)
+                        err.WriteLine($"  headers : {keptVariants:N0} kept source file(s) the build doesn't compile, kept for a name compiled code also defines: not built, so their macros aren't kept for them");
                     if (keptWithout > 0)
-                        err.WriteLine($"  headers : {keptWithout:N0} kept source file(s) in no compile command: the used macros don't cover them, so the header carve models the paste macros itself");
+                        err.WriteLine($"  headers : {keptWithout:N0} kept source file(s) in no compile command define what compiled code uses: the used macros don't cover them, so the header carve models the paste macros itself");
                     var stageUsed = keptWithout > 0 ? null : usedMacros;
                     var hc = stageUsed is not null
                         ? HeaderCarver.CarveFromUsed(stageDir, keptBig, stageUsed, HcKey)

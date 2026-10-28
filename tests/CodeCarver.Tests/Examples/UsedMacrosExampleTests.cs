@@ -78,6 +78,21 @@ public sealed class UsedMacrosExampleTests
         Assert.Contains("KQ_SPI_CTRL_OFF", Defines(kept.Carved("max", "inc/kq_regs.h")));
     }
 
+    /// <summary>Another chip's variant of a compiled function: kept, since the carve resolves the call by name, but the
+    /// build compiles the other one, so the stage still carves from the names and drops what only the variant uses.</summary>
+    [Fact]
+    public void AVariantNoCommandCompiles_DoesNotStopTheNames()
+    {
+        using var r = new Run(before: d => File.WriteAllText(Path.Combine(d, "src", "uart_b.c"),
+            "#include \"kq_regs.h\"\nunsigned kq_uart_setup(void) { return KQ_SPI_CTRL_OFF; }\n"));
+        Assert.True(r.Code == 0, r.Output);
+        Assert.Contains("headerCarve.keptUnitsNotBuilt = 1", r.Summary("max"));
+        Assert.Contains("headerCarve.keptUnitsWithoutCommand = 0", r.Summary("max"));
+        Assert.Contains("headerCarve.fromUsedMacros = 1", r.Summary("max"));
+        Assert.True(File.Exists(r.Carved("max", "uart_b.c")));
+        Assert.DoesNotContain("KQ_SPI_CTRL_OFF", Defines(r.Carved("max", "inc/kq_regs.h")));
+    }
+
     /// <summary>A source file no command compiles but one that does #includes: pp-trace read it in that compile, so its
     /// macros are among the names and the stage still carves from them.</summary>
     [SkippableFact]
