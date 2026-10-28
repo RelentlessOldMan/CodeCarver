@@ -137,6 +137,53 @@ public sealed class PpTraceTests
         Assert.Equal(stage, PpTrace.ErrorStage(line));
 
     [SkippableFact]
+    public void Run_PutsAnEmptyHeaderInPlaceOfOneOutsideTheTreeThisMachineLacks()
+    {
+        var exe = Find();
+        Skip.If(exe is null, "pp-trace (LLVM) not installed");
+        var dir = Path.Combine(Path.GetTempPath(), "cc-ppt-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(dir, "inc"));
+        try
+        {
+            // A host-side unit: two host headers this machine lacks, then the tree's own. The rest of it is still read.
+            File.WriteAllText(Path.Combine(dir, "inc", "k.h"), "#define KQ_HOST_OFF 4\n#define KQ_UNUSED 1\n");
+            File.WriteAllText(Path.Combine(dir, "h.c"), "#include <kq_host/one.h>\n#include <kq_two.h>\n#include \"k.h\"\nint h = KQ_HOST_OFF;\n");
+            File.WriteAllText(Path.Combine(dir, "t.c"), "#include \"gen.h\"\nint t;\n");
+            File.WriteAllText(Path.Combine(dir, "l.c"), "#include <string.h>\nint l;\n");
+            var tree = new[] { "h.c", "t.c", "l.c", "inc/k.h", "old/gen.h" };
+            var pt = PpTrace.Run(exe!, new[] { Cmd(dir, "h.c", "clang", "-Iinc", "-c") }, parallel: 1, root: dir, treeFiles: tree);
+            Assert.True(pt.Complete, $"{pt.Succeeded} of {pt.Commands}");
+            Assert.Equal((1, 2), (pt.SucceededPastStubbedHeaders, pt.HeadersStubbed));
+            Assert.Contains(NameKey.Short("KQ_HOST_OFF"), pt.Names);
+            Assert.Equal(0, pt.HeadersNotFound);
+
+            // Never one the tree has (elsewhere), one an include dir in the root the build made might hold, or the C
+            // library's: those fail as before.
+            var not = PpTrace.Run(exe!, new[]
+            {
+                Cmd(dir, "t.c", "clang", "-c"),
+                Cmd(dir, "h.c", "clang", "-Iinc", "-Iout/gen", "-c"),
+                Cmd(dir, "l.c", "aarch64-none-elf-clang", "-c"),
+            }, parallel: 2, root: dir, treeFiles: tree);
+            Assert.Equal((0, 0, 3), (not.Succeeded, not.SucceededPastStubbedHeaders, not.FailedHeaderNotFound));
+            Assert.Equal(1, not.HeadersNotFoundInTree);
+
+            // Without the tree's file list it can't tell a header outside the tree: no stand-in.
+            Assert.Equal(0, PpTrace.Run(exe!, new[] { Cmd(dir, "h.c", "clang", "-Iinc", "-c") }, parallel: 1, root: dir).Succeeded);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    [Theory]
+    [InlineData("kq/x.h", true)]
+    [InlineData("x.h", true)]
+    [InlineData("../x.h", false)]
+    [InlineData("/usr/x.h", false)]
+    [InlineData("C:/x.h", false)]
+    [InlineData("a//x.h", false)]
+    public void Stubbable_OnlyARelativeIncludeWithoutDotDot(string header, bool ok) => Assert.Equal(ok, PpTrace.Stubbable(header));
+
+    [SkippableFact]
     public void Run_GivesTheNamesTheLiveCodeUsed_AndCountsWhatDidNotRun()
     {
         var exe = Find();

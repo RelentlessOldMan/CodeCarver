@@ -1342,6 +1342,8 @@ public static class CarveCommand
             summary["world.ppTrace.succeeded"] = trace.Succeeded;
             summary["world.ppTrace.succeeded.pastParseErrors"] = trace.SucceededPastParseErrors;
             summary["world.ppTrace.succeeded.pastWarningsAsErrors"] = trace.SucceededPastWarningsAsErrors;
+            summary["world.ppTrace.succeeded.pastStubbedHeaders"] = trace.SucceededPastStubbedHeaders;
+            summary["world.ppTrace.headersStubbed"] = trace.HeadersStubbed;
             summary["world.ppTrace.failed"] = trace.Failed;
             summary["world.ppTrace.missingPaths"] = trace.MissingPaths;
             summary["world.ppTrace.missing.workDir"] = trace.MissingWorkDir;
@@ -1394,6 +1396,9 @@ public static class CarveCommand
                 err.WriteLine($"  warn    : pp-trace: '{header}' not found" + (dirs.Count == 0 ? "" :
                     $"; the commands failing on it name {dirs.Count:N0} include dir(s) outside the root that aren't on this machine (pathMap or ppTraceArgs): "
                     + string.Join(", ", dirs.Take(10)) + (dirs.Count > 10 ? $", +{dirs.Count - 10:N0} more" : "")));
+            if (trace.SucceededPastStubbedHeaders > 0)
+                err.WriteLine($"  config  : pp-trace: {trace.SucceededPastStubbedHeaders:N0} run(s) lacked only header(s) outside the tree that aren't on this machine "
+                    + $"({trace.HeadersStubbed:N0} in all) and ran clean with an empty one in each one's place: the tree's macros they use are counted");
             var ran = trace.Failed - trace.MissingPaths - trace.Refused - trace.Incomplete;
             err.WriteLine($"  config  : pp-trace ({trace.Version ?? "version unknown"}): {trace.Succeeded:N0} of {trace.Commands:N0} compile command(s) ran clean, {trace.Names.Count:N0} name(s)"
                 + (trusted ? UsedFor(unitsWithout)

@@ -104,6 +104,12 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
   those `missingDirsInRootFromBuild`: at, above or under a folder some `-o` writes to). If a header only such a
   directory held is needed, the compile fails and says so. Generate those headers in the tree before the carve, or
   the commands that include them fail.
+- A header outside the tree that this machine lacks (a host system header, included by a host-side unit that the target's
+  toolchain has no copy of) doesn't fail the command. It's run again with an empty header in its place, searched after
+  every real include directory, up to 16 such headers per command (`succeeded.pastStubbedHeaders`, `headersStubbed`).
+  The carve carves no define of such a header. All that's lost is a branch of the unit on that header's own macros.
+  This never applies to a header the tree has elsewhere, a C standard library header, or a command missing an
+  include directory inside the root (a header the build makes): those still fail it.
 - The `failedBy.*` keys say why commands failed. Many `headerNotFound.cLibrary` means the build's C library isn't
   found here. When the log names its folders (`-isystem`), map them to a copy on the carve machine with
   `[advanced] pathMap`. When it doesn't, the build's driver found it by itself, beside the compiler, and pp-trace's
@@ -170,6 +176,7 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `world.ppTrace.commands` / `.succeeded` / `.failed` | commands pp-trace was to run, ran clean, and didn't |
 | `world.ppTrace.succeeded.pastParseErrors` | of `succeeded`, runs whose only errors came from the parse after preprocessing (or a rejected option, or a warning made an error) |
 | `world.ppTrace.succeeded.pastWarningsAsErrors` | of `pastParseErrors`, runs where some error was a warning made one |
+| `world.ppTrace.succeeded.pastStubbedHeaders` / `world.ppTrace.headersStubbed` | runs that lacked only headers outside the tree and ran clean with an empty one in each one's place; and those headers, distinct |
 | `world.ppTrace.missingPaths` / `.refused` / `.incomplete` / `.timedOut` | of the failed: a path missing here, a flag that loads other code, not all of it in the log (an unreadable response file), over the time limit |
 | `world.ppTrace.missing.workDir` / `.source` / `.forcedInclude` | of `missingPaths`: what was missing |
 | `world.ppTrace.failedBy.crash` / `.headerNotFound` / `.error` / `.option` / `.noMessage` / `.notStarted` | of the commands that ran and failed within the time limit, why, by the first that applies: pp-trace crashed, an include wasn't found, another error, only an option the driver rejected (which alone doesn't fail a run), no error printed, pp-trace didn't start |

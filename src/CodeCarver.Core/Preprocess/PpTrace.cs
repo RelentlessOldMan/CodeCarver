@@ -79,6 +79,11 @@ public sealed class PpTrace
     /// directive): a warning changes nothing the preprocessor puts out, at any stage.</summary>
     public int SucceededPastParseErrors { get; private set; }
     public int SucceededPastWarningsAsErrors { get; private set; }
+    /// <summary>Runs that failed only on headers outside the tree this machine lacks and ran clean with an empty one in
+    /// each one's place (after every real include dir); <see cref="HeadersStubbed"/> such headers in all.</summary>
+    public int SucceededPastStubbedHeaders { get; private set; }
+    public int HeadersStubbed { get; private set; }
+    internal const int MaxStubbedHeaders = 16;
     /// <summary>Of <see cref="FailedPreprocessorError"/>, runs where some preprocessor error had no warning flag: an
     /// error by itself, not a warning made one.</summary>
     public int FailedPreprocessorErrorNoFlag { get; private set; }
@@ -167,6 +172,11 @@ public sealed class PpTrace
         var outDirs = OutputDirs(commands);
         var rootFull = root is null ? null : Path.TrimEndingDirectorySeparator(Path.GetFullPath(root));
         var namesLock = new object();
+        var tree = treeFiles?.Select(t => t.Replace('\\', '/')).ToList();
+        var inTreeSeen = new System.Collections.Concurrent.ConcurrentDictionary<string, bool>(StringComparer.Ordinal);
+        bool InTree(string header) => tree is not null && inTreeSeen.GetOrAdd(header, h => TreeHas(tree, h.Replace('\\', '/')));
+        int pastStubs = 0;
+        var stubbedHeaders = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
         Parallel.ForEach(traced, new ParallelOptions { MaxDegreeOfParallelism = most }, cmd =>
         {
             if (cmd.Incomplete || cmd.AlternativeDirectories.Count > 0) { Interlocked.Increment(ref incomplete); return; }
@@ -192,14 +202,49 @@ public sealed class PpTrace
             RunErrors errs;
             Failure failure;
             string? header, includer;
-            while (true)
+            // A header outside the tree that this machine lacks (a host C library's, for a unit the target never
+            // builds): run again with an empty one in its place, after every real include dir, so the rest of the
+            // unit is read. The carve carves no define of such a header; what's lost is only a branch on its macros.
+            string? stubDir = null;
+            var stubbed = new List<string>();
+            (Failure Why, string? Header, string? Includer)? first = null;
+            try
             {
-                using var lease = gate.Admit();
-                errs = new RunErrors();
-                (ok, late, failure, header, includer, optionError, pastErrors) = TraceOne(exe, cmd, extra, names, timeoutMs, lease, errs);
-                if (!lease.Evicted) break;
-                names.Clear();   // stopped for memory: run again when there is room
+                while (true)
+                {
+                    var runExtra = stubDir is null ? extra : extra.Concat(new[] { "-idirafter", stubDir }).ToList();
+                    while (true)
+                    {
+                        using var lease = gate.Admit();
+                        errs = new RunErrors();
+                        (ok, late, failure, header, includer, optionError, pastErrors) = TraceOne(exe, cmd, runExtra, names, timeoutMs, lease, errs);
+                        if (!lease.Evicted) break;
+                        names.Clear();   // stopped for memory: run again when there is room
+                    }
+                    if (ok || late || failure != Failure.HeaderNotFound || header is null) break;
+                    first ??= (failure, header, includer);
+                    // Not when it could be the tree's or the build's own (an include dir in the root missing: made by the
+                    // build), nor the C library's (the toolchain's folders are missing: pathMap or ppTraceArgs).
+                    if (tree is null || stubbed.Count >= MaxStubbedHeaders || !Stubbable(header) || stubbed.Contains(header, StringComparer.Ordinal)
+                        || InTree(header) || CLibraryHeaders.Contains(header) || dirs.Any(d => d.Inside)) break;
+                    stubDir ??= Path.Combine(Path.GetTempPath(), "codecarver-stub-" + Guid.NewGuid().ToString("N"));
+                    var stub = Path.Combine(stubDir, header.Replace('\\', '/'));
+                    Directory.CreateDirectory(Path.GetDirectoryName(stub)!);
+                    File.WriteAllText(stub, "");
+                    stubbed.Add(header);
+                    names.Clear();
+                }
             }
+            finally
+            {
+                if (stubDir is not null) try { Directory.Delete(stubDir, true); } catch { /* best effort */ }
+            }
+            if (ok && stubbed.Count > 0)
+            {
+                Interlocked.Increment(ref pastStubs);
+                foreach (var h in stubbed) stubbedHeaders.TryAdd(h, 0);
+            }
+            else if (!ok && first is { } f) (failure, header, includer) = f;   // say what the build's own run lacked
             if (late) Interlocked.Increment(ref timedOut);
             if (optionError) Interlocked.Increment(ref optionErrors);
             foreach (var flag in errs.Flags) errorFlags.AddOrUpdate(flag, 1, (_, n) => n + 1);
@@ -227,6 +272,8 @@ public sealed class PpTrace
             lock (namesLock) r.Names.UnionWith(names);
         });
         r.Succeeded = succeeded;
+        r.SucceededPastStubbedHeaders = pastStubs;
+        r.HeadersStubbed = stubbedHeaders.Count;
         r.MissingPaths = missing;
         r.MissingWorkDir = missingBy[(int)MissingKind.WorkDir];
         r.MissingSource = missingBy[(int)MissingKind.Source];
@@ -259,16 +306,8 @@ public sealed class PpTrace
         r.HeadersNotFoundWithoutOutsideDir = notFound.Values.Count(v => v.HasFlag(HeaderSeen.WithoutOutsideDir));
         r.HeadersNotFoundWhere = notFoundDirs.OrderBy(kv => kv.Key, StringComparer.Ordinal)
             .Select(kv => (kv.Key, (IReadOnlyList<string>)kv.Value.Keys.OrderBy(d => d, StringComparer.Ordinal).ToList())).ToList();
-        if (!notFound.IsEmpty && treeFiles is not null)
-        {
-            var spelled = notFound.Keys.Select(h => h.Replace('\\', '/')).ToList();
-            var inTree = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var rel in treeFiles)
-                foreach (var h in spelled)
-                    if (rel.EndsWith(h, StringComparison.OrdinalIgnoreCase) && (rel.Length == h.Length || rel[rel.Length - h.Length - 1] is '/' or '\\'))
-                        inTree.Add(h);
-            r.HeadersNotFoundInTree = inTree.Count;
-        }
+        if (!notFound.IsEmpty && tree is not null)
+            r.HeadersNotFoundInTree = notFound.Keys.Count(InTree);
         r.OptionErrors = optionErrors;
         r.CommandsWithDropped = withDropped;
         r.OptionsDropped = dropped;
@@ -280,6 +319,22 @@ public sealed class PpTrace
         r.Evictions = gate.Evictions;
         r.OverBudgetAlone = gate.OverBudgetAlone;
         return r;
+    }
+
+    /// <summary>Whether the tree holds a file the include spells (<c>sys/kq.h</c> ends a path at a separator).</summary>
+    internal static bool TreeHas(IReadOnlyList<string> tree, string header)
+    {
+        foreach (var rel in tree)
+            if (rel.EndsWith(header, StringComparison.OrdinalIgnoreCase) && (rel.Length == header.Length || rel[rel.Length - header.Length - 1] == '/'))
+                return true;
+        return false;
+    }
+
+    /// <summary>An include spelled relative, without <c>..</c>: one an empty stand-in can be put in place of.</summary>
+    internal static bool Stubbable(string header)
+    {
+        var h = header.Replace('\\', '/');
+        return h.Length > 0 && !Path.IsPathRooted(h) && !h.Contains(':') && h.Split('/').All(part => part.Length > 0 && part is not "." and not "..");
     }
 
     /// <summary>The preprocessor reads every source but plain assembly: <c>.s</c> (lower case) and <c>.asm</c>.</summary>
