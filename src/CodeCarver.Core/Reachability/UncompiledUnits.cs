@@ -1,4 +1,5 @@
 using CodeCarver.Core.Graph;
+using CodeCarver.Core.Roots;
 
 namespace CodeCarver.Core.Reachability;
 
@@ -17,10 +18,15 @@ public static class UncompiledUnits
 
     /// <param name="compiled">Is this file one the build's compiles read (a compiled unit, or a file one included)?</param>
     /// <param name="unit">Is this file a source file a compile command would name (.c, .cpp ...)?</param>
-    /// <param name="linkCovers">The build log's links take only objects its compiles made (<c>LinkModel.CoversTheImages</c>):
-    /// no compile the log lacks is in an image, so only a root one of them alone defines makes it needed.</param>
-    public static Result Split(CodeGraph graph, CarvePlan plan, Func<string, bool> compiled, Func<string, bool> unit, bool linkCovers = false)
+    /// <param name="linkedWhole">Could the build's links take this uncompiled file's object whole (<c>LinkModel.MayLinkUncompiled</c>)?
+    /// Null: any. A file they can't take isn't in an image unless an archive holds it, so its implicit roots (a
+    /// self-registering driver's) don't count; only a root the configuration names, defined only there, does.</param>
+    /// <param name="archiveMayHold">Could an archive the links search hold it (<c>LinkModel.ArchiveMayHoldUncompiled</c>)? A
+    /// linker takes a member when the image refers to it, so a use from compiled code still counts. If not, nothing does.</param>
+    public static Result Split(CodeGraph graph, CarvePlan plan, Func<string, bool> compiled, Func<string, bool> unit,
+                               Func<string, bool>? linkedWhole = null, bool archiveMayHold = true)
     {
+        bool Whole(string f) => linkedWhole?.Invoke(f) ?? true;
         var suspects = plan.KeptFiles.Where(f => unit(f) && !compiled(f)).ToHashSet(StringComparer.Ordinal);
         if (suspects.Count == 0) return new Result(0, 0, 0, 0, 0, 0);
 
@@ -45,16 +51,17 @@ public static class UncompiledUnits
             if (suspects.Contains(file))
             {
                 // A root only an uncompiled file defines: the build's entry point is there.
-                if (n.Kind is NodeKind.Function or NodeKind.Global && plan.Why.TryGetValue(id, out var why) && why.IsRoot && !Provided(n, null))
+                if (n.Kind is NodeKind.Function or NodeKind.Global && plan.Why.TryGetValue(id, out var why) && why.IsRoot && !Provided(n, null)
+                    && (Whole(file) || why.AsRoot is RootKind.ExplicitSymbol or RootKind.ExplicitFile or RootKind.EntryPoint))
                 { needed.Add(file); byRoot.Add(file); }
                 continue;
             }
-            if (linkCovers || !compiled(file)) continue;
+            if (!compiled(file)) continue;
             foreach (var e in graph.OutEdges(id))
             {
                 if (e.Kind is EdgeKind.Contains or EdgeKind.DefinedIn or EdgeKind.Includes or EdgeKind.Expands) continue;
                 var t = graph.GetNode(e.To);
-                if (t.Kind is NodeKind.Function or NodeKind.Global && t.File is { } tf && suspects.Contains(tf) && !Provided(t, file))
+                if (t.Kind is NodeKind.Function or NodeKind.Global && t.File is { } tf && suspects.Contains(tf) && !Provided(t, file) && (archiveMayHold || Whole(tf)))
                 {
                     needed.Add(tf);
                     (e.Kind == EdgeKind.Calls ? byCall : byReference).Add(tf);

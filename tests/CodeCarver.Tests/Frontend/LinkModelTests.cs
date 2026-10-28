@@ -38,6 +38,9 @@ public class LinkModelTests
         var m = Model(log);
         Assert.Equal(1, m.InputsNotFromLog);
         Assert.False(m.CoversTheImages);
+        Assert.True(m.MayLinkUncompiled("drv/b.c"));    // b.o: its object
+        Assert.False(m.MayLinkUncompiled("drv/c.c"));   // nothing named after it
+        Assert.False(m.ArchiveMayHoldUncompiled);
     }
 
     [Fact]
@@ -47,6 +50,8 @@ public class LinkModelTests
         Assert.Equal(1, obj.InputsNotFromLog);
         var stale = Model(Compiles + "arm-none-eabi-gcc -o out/fw.axf out/main.o out/libold.a\n");   // beside the build's own
         Assert.Equal(1, stale.InputsNotFromLog);
+        Assert.True(stale.ArchiveMayHoldUncompiled);
+        Assert.False(stale.MayLinkUncompiled("drv/c.c"));
     }
 
     [Fact]
@@ -55,5 +60,6 @@ public class LinkModelTests
         var m = Model(Compiles);
         Assert.Equal(0, m.Links);
         Assert.False(m.CoversTheImages);
+        Assert.True(m.MayLinkUncompiled("drv/c.c"));   // the log can't say
     }
 }

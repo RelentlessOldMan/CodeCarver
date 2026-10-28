@@ -60,9 +60,10 @@ The carve trusts the names only when:
 2. in each stage, every source file the stage keeps that the build links has a compile command in the logs, or
    (with `ppTrace`) a command that ran clean read it: a `.c` another source `#include`s was traced in that compile.
    The build links a kept file when compiled code, or a root, uses a function or variable that only it defines.
-   When the log's link lines take only objects its compiles wrote (`link.coversTheImages = 1`, see
-   [USAGE.md](USAGE.md)), the log is the whole build, so only a root counts: the carve's calls are matched by name and
-   seen in every `#if` branch, which over-counts uses that the link proves the build never had.
+   The log's link lines narrow that (see [USAGE.md](USAGE.md)): a file whose object no link takes counts only through a
+   root the configuration names, or through a use when an archive the log didn't build could hold it. Its implicit
+   roots (a self-registering driver of another chip) aren't in the image, and the carve's calls, matched by name and
+   seen in every `#if` branch, over-count uses the build never had.
 
 A compile the carve hasn't heard from could use a define the others didn't. If the first check fails, the run says why
 (`NOT trusted (...)`) and the header carve models the paste macros itself, as it does without the key. The second is

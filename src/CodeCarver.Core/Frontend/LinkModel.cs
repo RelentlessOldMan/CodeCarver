@@ -35,6 +35,26 @@ public sealed class LinkModel
     /// <summary>The log's links read whole, every input they take that the build could have made made by a command in
     /// the log: no compile the log lacks is in an image, so a source file no command compiles isn't built.</summary>
     public bool CoversTheImages => Links > 0 && InputsNotFromLog == 0;
+    /// <summary>Of <see cref="InputsNotFromLog"/>, the archives: what's in them the log doesn't say.</summary>
+    public int ArchivesNotFromLog { get; private set; }
+
+    /// <summary>Could a link take an uncompiled file's object from an archive: no link read whole, or one the log didn't build?</summary>
+    public bool ArchiveMayHoldUncompiled => InputsNotFromLog < 0 || ArchivesNotFromLog > 0;
+
+    readonly HashSet<string> _objectNamesNotFromLog = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Could a link in the log take <paramref name="rel"/>'s object whole though no command in it compiles the file?
+    /// Only if an object the links take that the log didn't write is named after it (<c>a.o</c>, <c>a.obj</c>, <c>a.c.o</c>),
+    /// or no link was read whole. Otherwise only an archive the log didn't build could hold it
+    /// (<see cref="ArchiveMayHoldUncompiled"/>), and a linker takes a member only when the image refers to it.</summary>
+    public bool MayLinkUncompiled(string rel)
+    {
+        if (InputsNotFromLog < 0) return true;
+        var name = Path.GetFileName(rel);
+        var stem = Path.GetFileNameWithoutExtension(rel);
+        return _objectNamesNotFromLog.Contains(stem + ".o") || _objectNamesNotFromLog.Contains(stem + ".obj")
+            || _objectNamesNotFromLog.Contains(name + ".o") || _objectNamesNotFromLog.Contains(name + ".obj");
+    }
 
     static readonly string[] ObjectExts = { ".o", ".obj" };
     static readonly string[] ArchiveExts = { ".a", ".lib" };
@@ -148,10 +168,13 @@ public sealed class LinkModel
             bool InRoot(string full) => full.StartsWith(rootKey, StringComparison.Ordinal) && full.Length > rootKey.Length
                                         && full[rootKey.Length] is '\\' or '/';
             bool HasExt(string full, string[] exts) => exts.Any(e => full.EndsWith(e, StringComparison.OrdinalIgnoreCase));
-            InputsNotFromLog = direct.Concat(searched).Distinct(StringComparer.Ordinal).Count(full =>
+            var notFromLog = direct.Concat(searched).Distinct(StringComparer.Ordinal).Where(full =>
                 !made.Contains(full) && !sourceRel.ContainsKey(full)
                 && (HasExt(full, ObjectExts) ? InRoot(full) || outDirs.Contains(Path.GetDirectoryName(full) ?? "")
-                    : HasExt(full, ArchiveExts) && outDirs.Contains(Path.GetDirectoryName(full) ?? "")));
+                    : HasExt(full, ArchiveExts) && outDirs.Contains(Path.GetDirectoryName(full) ?? ""))).ToList();
+            InputsNotFromLog = notFromLog.Count;
+            ArchivesNotFromLog = notFromLog.Count(f => HasExt(f, ArchiveExts));
+            foreach (var f in notFromLog.Where(f => HasExt(f, ObjectExts))) _objectNamesNotFromLog.Add(Path.GetFileName(f));
         }
 
         foreach (var (full, rel) in sourceRel)

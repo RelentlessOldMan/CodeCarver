@@ -12,9 +12,10 @@ public class UncompiledUnitsTests
     static (int Needed, int Variants) Split(GraphBuilder b, params NodeId[] roots) =>
         All(b, roots) is var r ? (r.Needed, r.Variants) : default;
 
-    static UncompiledUnits.Result All(GraphBuilder b, NodeId[] roots, bool linkCovers = false) =>
-        UncompiledUnits.Split(b.Graph, ReachabilityEngine.Compute(b.Graph, roots.Select(r => new Root(r, RootKind.ExplicitSymbol))),
-                              Compiled.Contains, f => f.EndsWith(".c", StringComparison.Ordinal), linkCovers);
+    static UncompiledUnits.Result All(GraphBuilder b, NodeId[] roots, bool linkCovers = false, RootKind kind = RootKind.ExplicitSymbol) =>
+        UncompiledUnits.Split(b.Graph, ReachabilityEngine.Compute(b.Graph, roots.Select(r => new Root(r, kind))),
+                              Compiled.Contains, f => f.EndsWith(".c", StringComparison.Ordinal),
+                              linkCovers ? _ => false : null, archiveMayHold: !linkCovers);
 
     [Fact]
     public void AVariantOfACompiledFunction_IsNotNeeded()
@@ -74,6 +75,31 @@ public class UncompiledUnitsTests
         b2.Func("kq_entry", "main.c");
         var copy = b2.Func("kq_entry", "lost.c");
         Assert.Equal((0, 1), Split(b2, copy));
+    }
+
+    [Fact]
+    public void AnImplicitRoot_InAFileNoLinkTakes_IsNotNeeded()
+    {
+        var b = new GraphBuilder();
+        var reg = b.Func("kq_drv_register", "lost.c");   // a self-registering driver of another chip
+        Assert.Equal((1, 0), (All(b, new[] { reg }, kind: RootKind.LinkerKeep) is var r ? (r.Needed, r.Variants) : default));
+        Assert.Equal((0, 1), (All(b, new[] { reg }, linkCovers: true, kind: RootKind.LinkerKeep) is var c ? (c.Needed, c.Variants) : default));
+        // Its object linked whole, a stale one the log didn't write: its roots are in the image.
+        var whole = UncompiledUnits.Split(b.Graph, ReachabilityEngine.Compute(b.Graph, new[] { new Root(reg, RootKind.LinkerKeep) }),
+            Compiled.Contains, f => f.EndsWith(".c", StringComparison.Ordinal), f => f == "lost.c", archiveMayHold: false);
+        Assert.Equal(1, whole.ByRoot);
+    }
+
+    [Fact]
+    public void AUse_CountsWhenAnArchiveTheLogDidNotBuildMayHoldIt()
+    {
+        var b = new GraphBuilder();
+        var main = b.Func("main", "main.c");
+        var only = b.Func("kq_only", "lost.c");
+        b.Calls(main, only);
+        var r = UncompiledUnits.Split(b.Graph, ReachabilityEngine.Compute(b.Graph, new[] { new Root(main, RootKind.ExplicitSymbol) }),
+            Compiled.Contains, f => f.EndsWith(".c", StringComparison.Ordinal), _ => false, archiveMayHold: true);
+        Assert.Equal(1, r.ByCall);
     }
 
     [Fact]

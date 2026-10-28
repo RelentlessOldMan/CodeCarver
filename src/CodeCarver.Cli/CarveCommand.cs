@@ -2545,6 +2545,7 @@ public static class CarveCommand
             summary["link.archivesSearched"] = links.ArchivesSearched;
             summary["link.inputsNotFromLog"] = links.InputsNotFromLog;
             summary["link.coversTheImages"] = links.CoversTheImages ? 1 : 0;
+            summary["link.archivesNotFromLog"] = links.ArchivesNotFromLog;
             bool Held(Root r) => graph.GetNode(r.Node).FilePath is { } f && links.StatusOf(f) == LinkStatus.ArchiveOnly;
             foreach (var r in implicitRoots.Concat(sectionRoots).Where(Held))
             {
@@ -4161,11 +4162,11 @@ public static class CarveCommand
                     // A kept one the build links (compiled code uses what only it defines) means the logs lack its compile.
                     // One kept only because a compiled file's call matches a name it also defines (another chip's variant)
                     // is never built: its macros don't matter to the build.
-                    // The log's links settle it when every object they take came from a compile in the log: then no
-                    // compile the log lacks is in the image, whatever the carve's name-matched calls say.
+                    // The log's links settle it per file: one whose object no link takes (no input the log didn't write is
+                    // named after it) is in the image only through an archive the log didn't build, and only if used.
                     var split = usedLogged is null ? default
                         : UncompiledUnits.Split(graph, splan, usedLogged.Contains, r => usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)),
-                                                linkCovers: links?.CoversTheImages == true);
+                                                links is null ? null : links.MayLinkUncompiled, links?.ArchiveMayHoldUncompiled ?? true);
                     var (keptWithout, keptVariants) = (split.Needed, split.Variants);
                     if (usedLogged is not null && keptWithout > 0)
                     {
