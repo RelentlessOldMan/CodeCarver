@@ -47,7 +47,8 @@ public sealed class ResolvedCarve
     public int? ParseTimeout;                      // seconds
     public long? MemoryStopMb;                     // see CarveTomlConfig.MemoryStopMb
     public int? MaxSymbolsPerFile;
-    public long? HeaderCarveMinutes;               // see CarveTomlConfig.HeaderCarveMinutes
+    public long? HeaderCarveMinutes;
+    public long? DecisionsMaxNodes;                // see CarveTomlConfig.DecisionsMaxNodes               // see CarveTomlConfig.HeaderCarveMinutes
 }
 
 public static class CarveResolver
@@ -116,6 +117,7 @@ public static class CarveResolver
         r.MemoryStopMb = cfg.MemoryStopMb;
         r.MaxSymbolsPerFile = cfg.MaxSymbolsPerFile;
         r.HeaderCarveMinutes = cfg.HeaderCarveMinutes;
+        r.DecisionsMaxNodes = cfg.DecisionsMaxNodes;
 
         // Selected builds/runs (UNION). Null selection = all defined.
         var buildNames = cfg.UseBuilds ?? cfg.Builds.Keys.ToList();

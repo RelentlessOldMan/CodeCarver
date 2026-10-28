@@ -184,6 +184,7 @@ A stage may also set `stubUnexecuted = true` (with `carveSourceFileContents = tr
 | `maxParseBytes` | `20000000` (bytes) | files larger than this are not parsed; they are kept whole via `#include` closure |
 | `parseTimeout` | `20` (seconds) | per-file parse budget; a file that exceeds it is kept whole. `0` disables the budget |
 | `maxSymbolsPerFile` | `50000` | a file with more symbols than this is kept whole instead of exploding the graph |
+| `decisionsMaxNodes` | `500000` | past this many graph nodes, `decisions.txt` (the per-symbol KEPT/CARVED ledger) is only a short note; raise it to get the ledger of a big tree |
 | `headerCarveMinutes` | `30` | the static header carve's time limit for each stage: past it, the carve gives up and leaves the big headers whole (`stageN.headerCarve.abandonedOverTime = 1`) and the stage goes on. `0`: no limit. Not used when the header carve works from `usedMacros` or `ppTrace` |
 | `pathMap = [{ from = "/build/agent/repo", to = "." }]` | none | rewrites a path prefix captured elsewhere (CI agent, other drive, WSL vs Windows) onto the carve root. `to` is relative to the carve root. Applies to trace paths and to compile commands (directory, file, `-I`, response files) |
 | `allowUnmatchedTraces = true` | `false` | a file trace with no path under the carve root becomes a warning instead of exit 2 |

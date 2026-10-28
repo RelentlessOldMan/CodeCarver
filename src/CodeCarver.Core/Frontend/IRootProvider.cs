@@ -97,14 +97,31 @@ public sealed class AsmReferenceRootProvider : IRootProvider
 {
     private static readonly Regex Ident = new(@"[A-Za-z_]\w*", RegexOptions.Compiled);
     private readonly IEnumerable<string> _asmTexts;
+    private readonly IEnumerable<string> _definitionTexts;
     // Consumed lazily and exactly once in Discover — do NOT materialise (see LinkerSectionRootProvider).
-    public AsmReferenceRootProvider(IEnumerable<string> asmTexts) => _asmTexts = asmTexts;
+    // definitionTexts (what the assembly includes) give only their .macro and #define definitions, read first, so a
+    // macro an included file defines expands where the assembly calls it (AsmMacros).
+    public AsmReferenceRootProvider(IEnumerable<string> asmTexts, IEnumerable<string>? definitionTexts = null)
+    {
+        _asmTexts = asmTexts;
+        _definitionTexts = definitionTexts ?? Array.Empty<string>();
+    }
 
     public IEnumerable<Root> Discover(CodeGraph graph)
     {
         var names = new HashSet<string>(StringComparer.Ordinal);
+        var macros = new AsmMacros();
+        foreach (var t in _definitionTexts) macros.Feed(t, expand: false);
         foreach (var t in _asmTexts)
+        {
             foreach (Match m in Ident.Matches(t))
+                names.Add(m.Value);
+            foreach (Match m in Ident.Matches(macros.Feed(t)))
+                names.Add(m.Value);
+        }
+        // A name an object-like #define stands for (.word VEC, #define VEC CAT(KQ_, UART)), and what it expands to.
+        foreach (var body in macros.ObjectBodies(names.ToList()))
+            foreach (Match m in Ident.Matches(body + "\n" + macros.Feed(body)))
                 names.Add(m.Value);
 
         foreach (var node in graph.Nodes)

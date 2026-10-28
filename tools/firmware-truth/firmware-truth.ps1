@@ -13,6 +13,10 @@
     - the two carves differ (emittedFilesSha or any headerCarve count);
     - a unit of the compile db does not compile against the carved tree with -std=c11 -Wall -Werror (each compiler
       given in -Compilers that is found; -RequireCompilers fails when one is not).
+  When the manifest names roots (CodeSpawner 1.5+), it also carves each build (main, and union with compileDbUnion)
+  from those entry points with nothing forced and source contents carved, and fails when a mustKeepFunctions name is
+  carved away, a mustDropFunctions name is kept, a mustKeepFiles file is missing, or a db unit doesn't compile or
+  assemble against that tree with clang.
   Exit 0 = pass, 1 = a check failed, 2 = bad input.
 
 .EXAMPLE
@@ -163,6 +167,72 @@ foreach ($cc in $Compilers) {
     }
     if ($bad) { Fail "$cc`: $bad of $($entries.Count) unit(s) do not compile against the carved tree" }
     else { Write-Host "ok    $cc compiles all $($entries.Count) units" }
+}
+
+# Functions (a manifest with roots): carve each build from its entry points with nothing forced, source contents
+# carved, and check its function lists against the ledger, its mustKeepFiles against the carved tree, and that each
+# unit of its db still compiles there (assembly assembles).
+if ($fwm.roots) {
+    $dbs = @{ main = @($db) }
+    if ($fwm.compileDbUnion) { $dbs.union = @($db, (Join-Path $Corpus $fwm.compileDbUnion)) }
+    foreach ($b in 'main', 'union') {
+        if (-not $dbs[$b] -or -not $fwm.builds.$b.mustKeepFunctions) { continue }
+        $out = Join-Path $Work "fn-$b"
+        if (Test-Path $out) { Remove-Item -Recurse -Force $out }
+        $toml = Join-Path $Work "fn-$b.toml"
+        @"
+outputDirectory = '$(& $fwd $out)'
+[common]
+entryPoints = [$(($fwm.roots | ForEach-Object { "'$_'" }) -join ', ')]
+[builds.main]
+buildLogs = [$(($dbs[$b] | ForEach-Object { "'$(& $fwd $_)'" }) -join ', ')]
+[stages.fn]
+carveSourceFileContents = true
+[advanced]
+maxParseBytes = $($fwm.maxParseBytes)
+memoryStopMb = $MemoryStopMb
+decisionsMaxNodes = 100000000
+"@ | Set-Content -Encoding ascii $toml
+        $code = Run-Carver @('carve', $root, '--config', $toml)
+        if ($code -ne 0) { Fail "$b function carve exited $code"; continue }
+        $kept = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($l in [IO.File]::ReadLines((Join-Path $out 'fn/codecarver/decisions.txt'))) {
+            if ($l -match '^(KEPT|CARVED)\s+(?:Function|Global)\s+(\S+)') {
+                [void]$seen.Add($Matches[2]); if ($Matches[1] -eq 'KEPT') { [void]$kept.Add($Matches[2]) }
+            }
+        }
+        if ($seen.Count -eq 0) { Fail "$b`: decisions.txt lists no functions"; continue }
+        $fb = $fwm.builds.$b
+        $missFn = @(Read-List $fb.mustKeepFunctions | Where-Object { -not $kept.Contains($_) })
+        $keptFn = @(Read-List $fb.mustDropFunctions | Where-Object { $kept.Contains($_) })
+        if ($missFn.Count) { Fail "$b`: $($missFn.Count) mustKeep function(s) carved away, e.g. $(($missFn | Select-Object -First 10) -join ' ')" }
+        if ($keptFn.Count) { Fail "$b`: $($keptFn.Count) mustDrop function(s) kept, e.g. $(($keptFn | Select-Object -First 10) -join ' ')" }
+        $fnCarved = Join-Path $out 'fn/carved'
+        $missF = @(Read-List $fb.mustKeepFiles | Where-Object { -not (Test-Path -LiteralPath (Join-Path $fnCarved $_)) })
+        if ($missF.Count) { Fail "$b`: $($missF.Count) mustKeep file(s) carved away, e.g. $(($missF | Select-Object -First 5) -join ' ')" }
+        $cc = Get-Command clang -ErrorAction SilentlyContinue
+        if ($cc) {
+            $bad = 0; $n = 0
+            foreach ($d in $dbs[$b]) {
+                foreach ($e in (Get-Content -Raw $d | ConvertFrom-Json)) {
+                    $n++
+                    $a = @($e.arguments | Select-Object -Skip 1 | ForEach-Object { $_.Replace($root, $fnCarved) })
+                    $a = @($a | Where-Object { $_ -ne '-c' }) + @('-fsyntax-only')
+                    if ($PSVersionTable.PSVersion.Major -lt 7 -or $PSNativeCommandArgumentPassing -eq 'Legacy') {
+                        $a = @($a | ForEach-Object { $_.Replace('"', '\"') })
+                    }
+                    $ErrorActionPreference = 'Continue'
+                    $o = & $cc @a 2>&1
+                    $ErrorActionPreference = 'Stop'
+                    if ($LASTEXITCODE -ne 0) { $bad++; if ($bad -le 3) { Write-Host "  $b $($e.file): $(($o | Select-Object -First 3) -join ' | ')" } }
+                }
+            }
+            if ($bad) { Fail "$b`: $bad of $n unit(s) do not compile or assemble against the function-carved tree" }
+        }
+        Write-Host ("{0}: functions kept {1:N0} of {2:N0}; mustKeep {3:N0}, mustDrop {4:N0}" -f $b, $kept.Count, $seen.Count, `
+            [int]$fb.mustKeepFunctions.count, [int]$fb.mustDropFunctions.count)
+    }
 }
 
 Write-Host ("defines kept {0:N0}, dropped {1:N0} (truth: dropped {2:N0}..{3:N0}); mustKeep {4:N0}, mustDrop {5:N0}" -f `

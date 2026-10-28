@@ -1146,6 +1146,20 @@ public static class CarveCommand
             Scan(parseRels.Where(r => !bigRels.Contains(r) && !notBuilt.Contains(r)).Select(r => fullByRel[r]));
             if (check.AnyPending) Scan(buildLogs.Distinct());
             if (check.AnyPending && buildOpenedOutside is not null) Scan(buildOpenedOutside);
+            // An entry point only assembly defines (Reset_Handler in a startup .S); one past maxParseBytes in pieces.
+            if (check.AnyPending)
+                Parallel.ForEach(treeFiles.Where(p => EmittedLinkCheck.IsAssembly(p) && !Excluded(p)),
+                    new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, (f, state) =>
+                    {
+                        if (!check.AnyPending) { state.Stop(); return; }
+                        try
+                        {
+                            if (SafeLength(f) <= maxParseBytes) check.Add(CodeCarver.Core.Util.IoMeter.ReadAllText(f));
+                            else foreach (var chunk in CodeCarver.Core.Util.TextChunks.WithoutBlockComments(CodeCarver.Core.Util.IoMeter.ReadLines(f)))
+                                    check.Add(chunk);
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                    });
             RootNamesPart("built");
             var missing = check.Missing();
             if (missing.Count > 0)
@@ -2314,6 +2328,9 @@ public static class CarveCommand
             explicitRoots.Where(r => r.Kind == RootKind.ExplicitSymbol && r.Note is not null).Select(r => r.Note!),
             StringComparer.Ordinal);
         var unresolvedRoots = roots.Where(r => !resolvedNames.Contains(r)).ToList();
+        // Assembly files that define an entry point (Reset_Handler in a startup .S, the linker script's ENTRY): the
+        // assembly scan below always reads them, whatever the build log names or their size, so what they call is rooted.
+        var asmEntryFiles = new List<string>();
         if (unresolvedRoots.Count > 0)
         {
             var near = NearMisses(graph, unresolvedRoots);
@@ -2396,6 +2413,32 @@ public static class CarveCommand
                 }
                 summary["roots.entryPointsCalledButDefinedInBinaries"] = inBinaries.Count;
             }
+            // An entry point the tree defines only in assembly has no C body for the graph: the code it calls is what
+            // the carve keeps, and the assembly scan roots that. Taken from a label (`Reset_Handler:`) in any tree
+            // assembly file, read whatever its size.
+            var inAsm = new HashSet<string>(StringComparer.Ordinal);
+            if (unresolvedRoots.Count > 0 && closureLang)
+            {
+                var pending = unresolvedRoots.ToHashSet(StringComparer.Ordinal);
+                foreach (var f in treeFiles.Where(p => EmittedLinkCheck.IsAssembly(p) && !Excluded(p)))
+                {
+                    var hit = false;
+                    foreach (var text in SafeLength(f) <= maxParseBytes ? new[] { SafeRead(f) } : BigTextChunks(f))
+                        foreach (var n in pending)
+                            if (AsmLabel(n).IsMatch(text)) { inAsm.Add(n); hit = true; }
+                    if (hit) { asmEntryFiles.Add(f); pending.ExceptWith(inAsm); }
+                    if (pending.Count == 0) break;
+                }
+                if (inAsm.Count > 0)
+                {
+                    roots = roots.Where(r => !inAsm.Contains(r)).ToArray();
+                    unresolvedRoots = unresolvedRoots.Where(r => !inAsm.Contains(r)).ToList();
+                    reasonCounts[3] -= inAsm.Count;
+                    err.WriteLine($"  roots   : {inAsm.Count:N0} entry point(s) are defined in {asmEntryFiles.Count:N0} assembly file(s) -> "
+                        + "what they reference is rooted from that assembly");
+                }
+            }
+            summary["roots.entryPointsDefinedInAssembly"] = inAsm.Count;
             foreach (var u in unresolvedRoots)
                 err.WriteLine($"  warn    : requested root '{u}' was NOT found as a symbol — nothing rooted for it: "
                               + (why.TryGetValue(u, out var w) ? w : "it is not defined anywhere in the tree or a prebuilt binary (typo? defined by a macro? in an excluded directory?)")
@@ -2419,6 +2462,19 @@ public static class CarveCommand
         // Guarded read for the root-discovery scans below. Like ReadRel, an unreadable/locked/vanished file must
         // not sink the run: a bare File.ReadAllText inside these LAZY projections would throw mid-Discover (after
         // the graph was already built) on a file locked between the walk and the read — routine on a live tree.
+        IEnumerable<string> BigTextChunks(string full)
+        {
+            IEnumerable<string> lines;
+            try { lines = CodeCarver.Core.Util.IoMeter.ReadLines(full); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (readWarned.Add(full)) err.WriteLine($"  warn    : could not read {Path.GetFileName(full)} for root scan ({ex.GetType().Name}) — skipped");
+                yield break;
+            }
+            foreach (var chunk in CodeCarver.Core.Util.TextChunks.WithoutBlockComments(lines)) yield return chunk;
+        }
+        static System.Text.RegularExpressions.Regex AsmLabel(string name) =>
+            new(@"(?m)^[ 	]*" + System.Text.RegularExpressions.Regex.Escape(name) + @"[ 	]*:");
         string SafeRead(string full)
         {
             try { return CodeCarver.Core.Util.IoMeter.ReadAllText(full); }
@@ -2437,8 +2493,8 @@ public static class CarveCommand
         {
             var linkerScripts = treeFiles
                 .Where(IsLinkerScript)
-                .Where(p => !Excluded(p)).Where(p => SafeLength(p) <= maxParseBytes)
-                .Select(SafeRead).ToList();
+                .Where(p => !Excluded(p))
+                .Select(p => SafeLength(p) <= maxParseBytes ? SafeRead(p) : string.Concat(BigTextChunks(p))).ToList();
             if (linkerScripts.Count > 0)
             {
                 // Stream the source text one file at a time — the provider consumes this lazily; a .ToList() here
@@ -2771,7 +2827,6 @@ public static class CarveCommand
             var asmPaths = asmFilesInTree
                 .Where(p => Path.GetExtension(p).ToLowerInvariant() is ".s" or ".asm" or ".sx")
                 .Where(p => !Excluded(p))
-                .Where(p => SafeLength(p) <= maxParseBytes)
                 .ToList(); // paths only (cheap); texts are streamed one file at a time below, never all held at once
             // P6: when the build's own evidence names assembly files (a build log compiling them, or a build trace
             // that opened them), only those are startup code for THIS image — another target's startup file would
@@ -2788,6 +2843,8 @@ public static class CarveCommand
                 if (asmPaths.Count < before)
                     err.WriteLine($"  asm     : {asmPaths.Count} of {before} assembly file(s) used for roots (the others are not in the build log/trace)");
             }
+            foreach (var f in asmEntryFiles)
+                if (!asmPaths.Contains(f)) asmPaths.Add(f);
             if (asmPaths.Count > 0)
             {
                 // What the startup code includes names handlers too; a C header's prototypes would root everything it
@@ -2799,10 +2856,12 @@ public static class CarveCommand
                     Path.GetExtension(t.Path).ToLowerInvariant() is ".h" or ".hh" or ".hpp" or ".hxx"
                         ? string.Join('\n', t.Text.Split('\n').Where(l => l.TrimStart().StartsWith('.')))
                         : t.Text));
-                asmRoots = new AsmReferenceRootProvider(asmTexts).Discover(graph).ToList();
+                // What they include is read first for its .macro and #define definitions, so a name the assembly
+                // pastes from them (def_vec USART1, H(UART)) is rooted too.
+                asmRoots = new AsmReferenceRootProvider(asmTexts, AsmTexts(asmIncs).Select(t => t.Text)).Discover(graph).ToList();
             }
             // Every assembly file is copied whole, so the headers it includes are kept whole (review S1, D10).
-            var asmIncludedFiles = AsmIncludes(asmFilesInTree.Where(p => SafeLength(p) <= maxParseBytes))
+            var asmIncludedFiles = AsmIncludes(asmFilesInTree)
                 .Select(p => Path.GetRelativePath(dir, p).Replace('\\', '/')).Where(r => fullByRel.ContainsKey(r)).ToList();
             if (asmIncludedFiles.Count > 0)
             {
@@ -2823,7 +2882,7 @@ public static class CarveCommand
             while (queue.Count > 0)
             {
                 // Everything queued, read ahead; scanned in queue order, so what it adds is queued as before.
-                var batch = queue.Where(p => SafeLength(p) <= maxParseBytes).ToList();
+                var batch = queue;
                 queue = new List<string>();
                 foreach (var (path, text) in AsmTexts(batch))
                     foreach (System.Text.RegularExpressions.Match m in includeRe.Matches(text))
@@ -2861,8 +2920,14 @@ public static class CarveCommand
         // Assembly files and what they include are read by the include walk and by the roots: many at a time (a share's
         // round trips), in order, and what is read ahead held under 256 MB. Texts totalling 128M chars are kept for the
         // second read and let go when this part ends. Read all at once, a batch of the tree's assembly was held whole.
-        IEnumerable<(string Path, string Text)> AsmTexts(IReadOnlyList<string> files)
+        // A file past maxParseBytes is read too (its calls and KEEPs are the only ones for what it names), a piece at a
+        // time and without its /* */ comments, after the others.
+        IEnumerable<(string Path, string Text)> AsmTexts(IReadOnlyList<string> all)
         {
+            var files = all.Where(p => SafeLength(p) <= maxParseBytes).ToList();
+            foreach (var p in all.Where(p => SafeLength(p) > maxParseBytes))
+                foreach (var chunk in BigTextChunks(p))
+                    yield return (p, chunk);
             foreach (var (p, read) in CodeCarver.Core.Util.ReadAhead.Prefetch(files, p =>
             {
                 lock (asmText) if (asmText.TryGetValue(p, out var t)) return t;
@@ -3185,7 +3250,8 @@ public static class CarveCommand
         @out.WriteLine($"CodeCarver {Version()} — carve of {dir}");
         // Show what actually rooted; call out unresolved names inline so a partial resolution can't read as
         // a clean success (see the per-root warnings above).
-        @out.WriteLine($"  roots   : {string.Join(", ", roots.Where(resolvedNames.Contains))}"
+        var rootedInC = string.Join(", ", roots.Where(resolvedNames.Contains));
+        @out.WriteLine($"  roots   : {(rootedInC.Length > 0 ? rootedInC : "(none in C source; entry points in assembly or binaries are above)")}"
                           + (unresolvedRoots.Count > 0 ? $"   [{unresolvedRoots.Count} UNRESOLVED: {string.Join(", ", unresolvedRoots)}]" : ""));
         if (implicitRoots.Count > 0)
             @out.WriteLine($"  implicit: {implicitRoots.Count} constructor/used/init-array symbol(s) auto-kept: "
@@ -3687,8 +3753,9 @@ public static class CarveCommand
         // graph would be a multi-GB text dump no one reads — and it's written on EVERY run, incl. the oracle's
         // analysis-only passes. Unlike the repro bundle (machine-replayable, so worth streaming at any size), a
         // giant human ledger has no value, so above this cap we write a short note and defer to manifest.json /
-        // `--why`. (The cap is only about the ledger now; the repro bundle streams uncapped.)
-        const int decisionsNodeCap = 500_000;
+        // `--why`. (The cap is only about the ledger now; the repro bundle streams uncapped.) [advanced] decisionsMaxNodes
+        // raises it for a check that reads the ledger (the T2 grader's function truth).
+        var decisionsNodeCap = cv.DecisionsMaxNodes ?? 500_000;
         void WriteDecisions(string ccDir, string stageName, CarvePlan plan)
         {
             if (graph.NodeCount > decisionsNodeCap)
