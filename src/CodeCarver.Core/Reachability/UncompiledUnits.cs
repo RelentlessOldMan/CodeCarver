@@ -13,8 +13,9 @@ namespace CodeCarver.Core.Reachability;
 public static class UncompiledUnits
 {
     /// <summary>How many kept uncompiled files the build links (<c>Needed</c>) and how many it doesn't; of the
-    /// needed, how many were found through a root, a call, a reference to a variable, and through code in a header.</summary>
-    public readonly record struct Result(int Needed, int Variants, int ByRoot, int ByCall, int ByReference, int FromHeader);
+    /// needed, how many were found through a root (of those, a root the configuration names), a call, a reference to a
+    /// variable, and through code in a header.</summary>
+    public readonly record struct Result(int Needed, int Variants, int ByRoot, int ByCall, int ByReference, int FromHeader, int ByNamedRoot = 0);
 
     /// <param name="compiled">Is this file one the build's compiles read (a compiled unit, or a file one included)?</param>
     /// <param name="unit">Is this file a source file a compile command would name (.c, .cpp ...)?</param>
@@ -41,6 +42,7 @@ public static class UncompiledUnits
 
         var needed = new HashSet<string>(StringComparer.Ordinal);
         var byRoot = new HashSet<string>(StringComparer.Ordinal);
+        var byNamedRoot = new HashSet<string>(StringComparer.Ordinal);
         var byCall = new HashSet<string>(StringComparer.Ordinal);
         var byReference = new HashSet<string>(StringComparer.Ordinal);
         var fromHeader = new HashSet<string>(StringComparer.Ordinal);
@@ -51,9 +53,12 @@ public static class UncompiledUnits
             if (suspects.Contains(file))
             {
                 // A root only an uncompiled file defines: the build's entry point is there.
-                if (n.Kind is NodeKind.Function or NodeKind.Global && plan.Why.TryGetValue(id, out var why) && why.IsRoot && !Provided(n, null)
-                    && (Whole(file) || why.AsRoot is RootKind.ExplicitSymbol or RootKind.ExplicitFile or RootKind.EntryPoint))
-                { needed.Add(file); byRoot.Add(file); }
+                if (n.Kind is NodeKind.Function or NodeKind.Global && plan.Why.TryGetValue(id, out var why) && why.IsRoot && !Provided(n, null))
+                {
+                    var named = why.AsRoot is RootKind.ExplicitSymbol or RootKind.ExplicitFile or RootKind.EntryPoint;
+                    if (named || Whole(file)) { needed.Add(file); byRoot.Add(file); }
+                    if (named) byNamedRoot.Add(file);
+                }
                 continue;
             }
             if (!compiled(file)) continue;
@@ -69,6 +74,6 @@ public static class UncompiledUnits
                 }
             }
         }
-        return new Result(needed.Count, suspects.Count - needed.Count, byRoot.Count, byCall.Count, byReference.Count, fromHeader.Count);
+        return new Result(needed.Count, suspects.Count - needed.Count, byRoot.Count, byCall.Count, byReference.Count, fromHeader.Count, byNamedRoot.Count);
     }
 }

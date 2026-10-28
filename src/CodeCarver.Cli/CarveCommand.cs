@@ -4164,13 +4164,16 @@ public static class CarveCommand
                     // is never built: its macros don't matter to the build.
                     // The log's links settle it per file: one whose object no link takes (no input the log didn't write is
                     // named after it) is in the image only through an archive the log didn't build, and only if used.
+                    bool IsUnit(string r) => usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase));
                     var split = usedLogged is null ? default
-                        : UncompiledUnits.Split(graph, splan, usedLogged.Contains, r => usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)),
-                                                links is null ? null : links.MayLinkUncompiled, links?.ArchiveMayHoldUncompiled ?? true);
+                        : UncompiledUnits.Split(graph, splan, usedLogged.Contains, IsUnit,
+                                                links?.UncompiledLinkedWhole(splan.KeptFiles.Where(f => IsUnit(f) && !usedLogged.Contains(f))),
+                                                links?.ArchiveMayHoldUncompiled ?? true);
                     var (keptWithout, keptVariants) = (split.Needed, split.Variants);
                     if (usedLogged is not null && keptWithout > 0)
                     {
                         HcKey("keptUnitsWithoutCommand.byRoot", split.ByRoot);
+                        HcKey("keptUnitsWithoutCommand.byNamedRoot", split.ByNamedRoot);
                         HcKey("keptUnitsWithoutCommand.byCall", split.ByCall);
                         HcKey("keptUnitsWithoutCommand.byReference", split.ByReference);
                         HcKey("keptUnitsWithoutCommand.fromHeader", split.FromHeader);

@@ -70,7 +70,8 @@ public class UncompiledUnitsTests
         var b = new GraphBuilder();
         var entry = b.Func("kq_entry", "lost.c");
         Assert.Equal((1, 0), Split(b, entry));
-        Assert.Equal(1, All(b, new[] { entry }, linkCovers: true).ByRoot);   // the link can't settle a root the build never compiles
+        Assert.Equal(1, All(b, new[] { entry }, linkCovers: true).ByRoot);
+        Assert.Equal(1, All(b, new[] { entry }, linkCovers: true).ByNamedRoot);   // the link can't settle a root the build never compiles
         var b2 = new GraphBuilder();
         b2.Func("kq_entry", "main.c");
         var copy = b2.Func("kq_entry", "lost.c");

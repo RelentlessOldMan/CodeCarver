@@ -104,7 +104,8 @@ Every carve is sound with just `entryPoints`. Each extra input lets it carve **t
 > the log's compiles write; an archive beside them). An incremental build's log, which skips compiles that were up to
 > date, shows them here (`link.archivesNotFromLog` of them archives). At `0` (`link.coversTheImages = 1`) no compile
 > the log lacks is in an image. Otherwise a source file no compile in the log names is in an image only if one of those
-> objects is named after it (`a.o`, `a.obj`, `a.c.o`), or, if one of those archives could hold it, when the image
+> objects is named after it (`a.o`, `a.obj`, `a.c.o`; of several files with that name, the ones whose directories
+> best match the object's), or, if one of those archives could hold it, when the image
 > uses it. The used macros ([USED-MACROS.md](USED-MACROS.md)) rely on it.
 
 ## The CLI

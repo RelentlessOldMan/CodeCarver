@@ -55,6 +55,25 @@ public class LinkModelTests
     }
 
     [Fact]
+    public void OfCopiesWithTheObjectsName_TheOneInItsDirectoryIsLinked()
+    {
+        const string log = """
+            make[1]: Entering directory '/w/fw'
+            arm-none-eabi-gcc -Iinc -c main.c -o out/main.o
+            arm-none-eabi-gcc -o out/fw.axf out/main.o out/drv/a/init.o
+
+            """;
+        var whole = Model(log).UncompiledLinkedWhole(new[] { "drv/a/init.c", "drv/b/init.c", "chip/init.c", "drv/a/other.c" });
+        Assert.True(whole("drv/a/init.c"));
+        Assert.False(whole("drv/b/init.c"));
+        Assert.False(whole("chip/init.c"));
+        Assert.False(whole("drv/a/other.c"));
+
+        var flat = Model(log.Replace("out/drv/a/init.o", "out/init.o")).UncompiledLinkedWhole(new[] { "drv/a/init.c", "drv/b/init.c" });
+        Assert.True(flat("drv/a/init.c") && flat("drv/b/init.c"));   // nothing tells them apart
+    }
+
+    [Fact]
     public void WithoutALink_NothingIsCovered()
     {
         var m = Model(Compiles);

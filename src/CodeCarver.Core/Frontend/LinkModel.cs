@@ -41,19 +41,47 @@ public sealed class LinkModel
     /// <summary>Could a link take an uncompiled file's object from an archive: no link read whole, or one the log didn't build?</summary>
     public bool ArchiveMayHoldUncompiled => InputsNotFromLog < 0 || ArchivesNotFromLog > 0;
 
-    readonly HashSet<string> _objectNamesNotFromLog = new(StringComparer.OrdinalIgnoreCase);
+    readonly List<string> _objectsNotFromLog = new();
 
-    /// <summary>Could a link in the log take <paramref name="rel"/>'s object whole though no command in it compiles the file?
-    /// Only if an object the links take that the log didn't write is named after it (<c>a.o</c>, <c>a.obj</c>, <c>a.c.o</c>),
-    /// or no link was read whole. Otherwise only an archive the log didn't build could hold it
-    /// (<see cref="ArchiveMayHoldUncompiled"/>), and a linker takes a member only when the image refers to it.</summary>
-    public bool MayLinkUncompiled(string rel)
+    /// <summary>Could a link in the log take <paramref name="rel"/>'s object whole though no command in it compiles the file?</summary>
+    public bool MayLinkUncompiled(string rel) => UncompiledLinkedWhole(new[] { rel })(rel);
+
+    /// <summary>Of <paramref name="rels"/>, source files no command in the log compiles, those a link could take the object
+    /// of whole: one the links take that the log didn't write is named after it (<c>a.o</c>, <c>a.obj</c>, <c>a.c.o</c>).
+    /// Of several files with the name (a copy per chip), the ones whose directories best match the object's (out/drv/a/x.o
+    /// is drv/a/x.c's, not drv/b/x.c's). All of them when no link was read whole. Any other is in an image only from an
+    /// archive the log didn't build (<see cref="ArchiveMayHoldUncompiled"/>), and only if the image refers to it.</summary>
+    public Func<string, bool> UncompiledLinkedWhole(IEnumerable<string> rels)
     {
-        if (InputsNotFromLog < 0) return true;
-        var name = Path.GetFileName(rel);
-        var stem = Path.GetFileNameWithoutExtension(rel);
-        return _objectNamesNotFromLog.Contains(stem + ".o") || _objectNamesNotFromLog.Contains(stem + ".obj")
-            || _objectNamesNotFromLog.Contains(name + ".o") || _objectNamesNotFromLog.Contains(name + ".obj");
+        if (InputsNotFromLog < 0) return _ => true;
+        static string[] Dirs(string p) => (Path.GetDirectoryName(p) ?? "").Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
+        var byObjectName = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var rel in rels)
+        {
+            var name = Path.GetFileName(rel);
+            var stem = Path.GetFileNameWithoutExtension(rel);
+            foreach (var o in new[] { stem + ".o", stem + ".obj", name + ".o", name + ".obj" }.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (!byObjectName.TryGetValue(o, out var l)) byObjectName[o] = l = new List<string>();
+                l.Add(rel);
+            }
+        }
+        var linked = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var obj in _objectsNotFromLog)
+        {
+            if (!byObjectName.TryGetValue(Path.GetFileName(obj), out var candidates)) continue;   // a prebuilt object
+            var od = Dirs(obj);
+            int Score(string rel)
+            {
+                var rd = Dirs(rel);
+                var k = 0;
+                while (k < rd.Length && k < od.Length && string.Equals(rd[^(k + 1)], od[^(k + 1)], StringComparison.OrdinalIgnoreCase)) k++;
+                return k;
+            }
+            var best = candidates.Max(Score);
+            linked.UnionWith(candidates.Where(c => Score(c) == best));
+        }
+        return linked.Contains;
     }
 
     static readonly string[] ObjectExts = { ".o", ".obj" };
@@ -174,7 +202,7 @@ public sealed class LinkModel
                     : HasExt(full, ArchiveExts) && outDirs.Contains(Path.GetDirectoryName(full) ?? ""))).ToList();
             InputsNotFromLog = notFromLog.Count;
             ArchivesNotFromLog = notFromLog.Count(f => HasExt(f, ArchiveExts));
-            foreach (var f in notFromLog.Where(f => HasExt(f, ObjectExts))) _objectNamesNotFromLog.Add(Path.GetFileName(f));
+            _objectsNotFromLog.AddRange(notFromLog.Where(f => HasExt(f, ObjectExts)));
         }
 
         foreach (var (full, rel) in sourceRel)
