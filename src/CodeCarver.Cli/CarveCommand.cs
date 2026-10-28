@@ -3070,6 +3070,11 @@ public static class CarveCommand
 
         var rootSet = explicitRoots.Concat(implicitRoots).Concat(asmRoots).Concat(sectionRoots).Concat(linkRoots)
                                    .Concat(forceKeepRoots).Concat(forcedRoots).Concat(traceRoots).Concat(fileTraceRoots).Concat(outsideRoots).ToList();
+        // What named each root, for the header carve's count of uncompiled files a named root keeps.
+        var rootSourceOf = new Dictionary<NodeId, string>();
+        foreach (var (src, rs) in new[] { ("config", explicitRoots), ("assembly", asmRoots), ("link", linkRoots), ("keptWhole", forceKeepRoots),
+                                          ("keepFiles", forcedRoots), ("functionTrace", traceRoots), ("fileTrace", fileTraceRoots) })
+            foreach (var r in rs) rootSourceOf.TryAdd(r.Node, src);
         if (rootSet.Count == 0)
         {
             err.WriteLine("no roots to carve from: list the entry symbols in [common] entryPoints");
@@ -4168,8 +4173,15 @@ public static class CarveCommand
                     var split = usedLogged is null ? default
                         : UncompiledUnits.Split(graph, splan, usedLogged.Contains, IsUnit,
                                                 links?.UncompiledLinkedWhole(splan.KeptFiles.Where(f => IsUnit(f) && !usedLogged.Contains(f))),
-                                                links?.ArchiveMayHoldUncompiled ?? true);
+                                                links?.ArchiveMayHoldUncompiled ?? true,
+                                                id => rootSourceOf.GetValueOrDefault(id, "stage"));
                     var (keptWithout, keptVariants) = (split.Needed, split.Variants);
+                    // Uncompiled files a named root is in, by what named it; and those no link can take, so not needed.
+                    if (usedLogged is not null && split.NamedBy is { } namedBy)
+                    {
+                        foreach (var (src, count) in namedBy) HcKey($"namedRootFiles.{src}", count);
+                        HcKey("namedRootFiles.notLinked", split.NamedRootNotLinked);
+                    }
                     if (usedLogged is not null && keptWithout > 0)
                     {
                         HcKey("keptUnitsWithoutCommand.byRoot", split.ByRoot);

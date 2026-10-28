@@ -60,10 +60,11 @@ The carve trusts the names only when:
 2. in each stage, every source file the stage keeps that the build links has a compile command in the logs, or
    (with `ppTrace`) a command that ran clean read it: a `.c` another source `#include`s was traced in that compile.
    The build links a kept file when compiled code, or a root, uses a function or variable that only it defines.
-   The log's link lines narrow that (see [USAGE.md](USAGE.md)): a file whose object no link takes counts only through a
-   root the configuration names, or through a use when an archive the log didn't build could hold it. Its implicit
-   roots (a self-registering driver of another chip) aren't in the image, and the carve's calls, matched by name and
-   seen in every `#if` branch, over-count uses the build never had.
+   The log's link lines narrow that (see [USAGE.md](USAGE.md)): a file whose object no link takes counts only when an
+   archive the log didn't build could hold it, through a use or a root the configuration names. Otherwise it isn't in
+   any image: its implicit roots (a self-registering driver of another chip) and named roots (another target's entry
+   point, a function trace's name) don't put it there, and the carve's calls, matched by name and seen in every `#if`
+   branch, over-count uses the build never had.
 
 A compile the carve hasn't heard from could use a define the others didn't. If the first check fails, the run says why
 (`NOT trusted (...)`) and the header carve models the paste macros itself, as it does without the key. The second is
@@ -212,6 +213,7 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `stageN.headerCarve.fromUsedMacros` | `1` when this stage's header carve used them (from either key) |
 | `stageN.headerCarve.keptUnitsWithoutCommand` | source files this stage keeps that no compile command compiles and the build links (compiled code or a root uses what only they define); above `0`, the stage models the paste macros itself |
 | `stageN.headerCarve.keptUnitsWithoutCommand.byRoot` / `.byCall` / `.byReference` / `.fromHeader` | of those, the files a root (`.byNamedRoot`: one the configuration names), a call, a use of a variable, or code in a header made the build link (a file can count in several) |
+| `stageN.headerCarve.namedRootFiles.<source>` / `.notLinked` | the uncompiled files a named root is in, by what named it (`config`, `functionTrace`, `fileTrace`, `keepFiles`, `keptWhole`, `assembly`, `stage`); `.notLinked`, those no link can take and no archive could hold, so not counted |
 | `stageN.headerCarve.keptUnitsNotBuilt` | source files this stage keeps that no compile command compiles, kept only for names compiled files also define (another chip's copy): not built, their macros are not kept for them |
 | `stageN.headerCarve.keptByUsed` / `.keptByOther` | defines kept because a compile used them, or a non-C file names them |
 | `stageN.headerCarve.used.otherFiles` / `.otherNames` | non-C files read, and the names they gave |

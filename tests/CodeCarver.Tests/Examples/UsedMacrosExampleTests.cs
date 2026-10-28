@@ -53,7 +53,8 @@ public sealed class UsedMacrosExampleTests
     }
 
     /// <summary>The names cover what the carve keeps: a source file no command compiles doesn't stop them while the carve
-    /// drops it (a tree holds many a build never compiles), and makes the header carve model the macros once it is kept.</summary>
+    /// drops it (a tree holds many a build never compiles), nor while a root names it but the link can't take it (another
+    /// target's entry point), and makes the header carve model the macros once the link takes its object.</summary>
     [Fact]
     public void ASourceFileInNoCommand_MattersOnlyWhenKept()
     {
@@ -66,13 +67,29 @@ public sealed class UsedMacrosExampleTests
             Assert.Contains("headerCarve.fromUsedMacros = 1", dropped.Summary("max"));
             Assert.DoesNotContain("KQ_SPI_CTRL_OFF", Defines(dropped.Carved("max", "inc/kq_regs.h")));
         }
-        using var kept = new Run(before: d =>
+        void Named(string d)
         {
             File.WriteAllText(Path.Combine(d, "src", "spare.c"), Spare);
             var cfg = Path.Combine(d, "carve.toml");
             File.WriteAllText(cfg, File.ReadAllText(cfg).Replace("entryPoints = [\"main\"]", "entryPoints = [\"main\", \"kq_spare\"]"));
+        }
+        using (var notLinked = new Run(before: Named))
+        {
+            Assert.True(notLinked.Code == 0, notLinked.Output);
+            Assert.Contains("headerCarve.keptUnitsWithoutCommand = 0", notLinked.Summary("max"));
+            Assert.Contains("headerCarve.namedRootFiles.config = 1", notLinked.Summary("max"));
+            Assert.Contains("headerCarve.namedRootFiles.notLinked = 1", notLinked.Summary("max"));
+            Assert.Contains("headerCarve.fromUsedMacros = 1", notLinked.Summary("max"));
+        }
+        // The link takes a spare.o the log didn't write (an incremental build skipped its compile): it's in the image.
+        using var kept = new Run(before: d =>
+        {
+            Named(d);
+            var log = Path.Combine(d, "inputs", "build.log");
+            File.WriteAllText(log, File.ReadAllText(log).Replace("/obj/dma.o\ngcc -E", "/obj/dma.o /build/used-macros/obj/spare.o\ngcc -E"));
         });
         Assert.True(kept.Code == 0, kept.Output);
+        Assert.Contains("link.inputsNotFromLog = 1", kept.Summary("max"));
         Assert.Contains("headerCarve.keptUnitsWithoutCommand = 1", kept.Summary("max"));
         Assert.Contains("headerCarve.fromUsedMacros = 0", kept.Summary("max"));
         Assert.Contains("KQ_SPI_CTRL_OFF", Defines(kept.Carved("max", "inc/kq_regs.h")));

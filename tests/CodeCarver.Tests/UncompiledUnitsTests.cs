@@ -70,8 +70,17 @@ public class UncompiledUnitsTests
         var b = new GraphBuilder();
         var entry = b.Func("kq_entry", "lost.c");
         Assert.Equal((1, 0), Split(b, entry));
-        Assert.Equal(1, All(b, new[] { entry }, linkCovers: true).ByRoot);
-        Assert.Equal(1, All(b, new[] { entry }, linkCovers: true).ByNamedRoot);   // the link can't settle a root the build never compiles
+        Assert.Equal(1, All(b, new[] { entry }).ByNamedRoot);
+        // The links take every object the log didn't write and none is its, and no archive could hold it: another target's name.
+        var notLinked = UncompiledUnits.Split(b.Graph, ReachabilityEngine.Compute(b.Graph, new[] { new Root(entry, RootKind.ExplicitSymbol) }),
+            Compiled.Contains, f => f.EndsWith(".c", StringComparison.Ordinal), _ => false, archiveMayHold: false, rootSource: _ => "config");
+        Assert.Equal((0, 1, 0, 1), (notLinked.Needed, notLinked.Variants, notLinked.ByNamedRoot, notLinked.NamedRootNotLinked));
+        Assert.Equal(1, notLinked.NamedBy!["config"]);
+        // An archive the log didn't build may hold it, or its object is one the links take: the entry point is there.
+        Assert.Equal(1, UncompiledUnits.Split(b.Graph, ReachabilityEngine.Compute(b.Graph, new[] { new Root(entry, RootKind.ExplicitSymbol) }),
+            Compiled.Contains, f => f.EndsWith(".c", StringComparison.Ordinal), _ => false, archiveMayHold: true).ByNamedRoot);
+        Assert.Equal(1, UncompiledUnits.Split(b.Graph, ReachabilityEngine.Compute(b.Graph, new[] { new Root(entry, RootKind.ExplicitSymbol) }),
+            Compiled.Contains, f => f.EndsWith(".c", StringComparison.Ordinal), f => f == "lost.c", archiveMayHold: false).ByNamedRoot);
         var b2 = new GraphBuilder();
         b2.Func("kq_entry", "main.c");
         var copy = b2.Func("kq_entry", "lost.c");
