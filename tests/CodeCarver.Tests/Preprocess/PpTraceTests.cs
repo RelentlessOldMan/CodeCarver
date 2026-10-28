@@ -157,19 +157,35 @@ public sealed class PpTraceTests
             Assert.Contains(NameKey.Short("KQ_HOST_OFF"), pt.Names);
             Assert.Equal(0, pt.HeadersNotFound);
 
-            // Never one the tree has (elsewhere), one an include dir in the root the build made might hold, or the C
-            // library's: those fail as before.
+            // An include dir in the root that the build never wrote to and the tree doesn't have doesn't stop it; one
+            // where the build writes (out/gen beside the out/ its -o names) does, unless the header is a host system
+            // one, which a firmware build never makes.
+            File.WriteAllText(Path.Combine(dir, "s.c"), "#include <sys/kq_sock.h>\n#include <unistd.h>\n#include \"k.h\"\nint s = KQ_HOST_OFF;\n");
+            File.WriteAllText(Path.Combine(dir, "e.c"), "#include <kq_err.h>\n#error kq\n");
+            var dirs = PpTrace.Run(exe!, new[]
+            {
+                Cmd(dir, "h.c", "clang", "-Iinc", "-Ignone", "-c"),
+                Cmd(dir, "s.c", "clang", "-Iinc", "-Iout/gen", "-c", "-o", "out/s.o"),
+            }, parallel: 2, root: dir, treeFiles: tree);
+            Assert.Equal((2, 2, 4), (dirs.Succeeded, dirs.SucceededPastStubbedHeaders, dirs.HeadersStubbed));
+
+            // Never one the tree has (elsewhere), one an include dir where the build writes might hold, or the C
+            // library's: those fail as before. A run past stand-ins that fails another way fails as the first did.
             var not = PpTrace.Run(exe!, new[]
             {
                 Cmd(dir, "t.c", "clang", "-c"),
-                Cmd(dir, "h.c", "clang", "-Iinc", "-Iout/gen", "-c"),
+                Cmd(dir, "h.c", "clang", "-Iinc", "-Iout/gen", "-c", "-o", "out/h.o"),
                 Cmd(dir, "l.c", "aarch64-none-elf-clang", "-c"),
+                Cmd(dir, "e.c", "clang", "-c"),
             }, parallel: 2, root: dir, treeFiles: tree);
-            Assert.Equal((0, 0, 3), (not.Succeeded, not.SucceededPastStubbedHeaders, not.FailedHeaderNotFound));
+            Assert.Equal((0, 0, 4), (not.Succeeded, not.SucceededPastStubbedHeaders, not.FailedHeaderNotFound));
             Assert.Equal(1, not.HeadersNotFoundInTree);
+            Assert.Equal((1, 1, 1, 1), (not.StubStoppedBy[(int)PpTrace.StubStop.InTree], not.StubStoppedBy[(int)PpTrace.StubStop.BuildDir],
+                                        not.StubStoppedBy[(int)PpTrace.StubStop.CLibrary], not.StubStoppedBy[(int)PpTrace.StubStop.RerunFailed]));
 
             // Without the tree's file list it can't tell a header outside the tree: no stand-in.
-            Assert.Equal(0, PpTrace.Run(exe!, new[] { Cmd(dir, "h.c", "clang", "-Iinc", "-c") }, parallel: 1, root: dir).Succeeded);
+            var none = PpTrace.Run(exe!, new[] { Cmd(dir, "h.c", "clang", "-Iinc", "-c") }, parallel: 1, root: dir);
+            Assert.Equal((0, 1), (none.Succeeded, none.StubStoppedBy[(int)PpTrace.StubStop.NoTree]));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
@@ -182,6 +198,16 @@ public sealed class PpTraceTests
     [InlineData("C:/x.h", false)]
     [InlineData("a//x.h", false)]
     public void Stubbable_OnlyARelativeIncludeWithoutDotDot(string header, bool ok) => Assert.Equal(ok, PpTrace.Stubbable(header));
+
+    [Theory]
+    [InlineData("unistd.h", true)]
+    [InlineData("sys/socket.h", true)]
+    [InlineData("netinet/in.h", true)]
+    [InlineData("windows.h", true)]
+    [InlineData("kq_gen.h", false)]
+    [InlineData("kq/sys/x.h", false)]
+    [InlineData("stdio.h", false)]
+    public void HostSystemHeader_KnowsAHostOsHeader(string header, bool host) => Assert.Equal(host, PpTrace.HostSystemHeader(header));
 
     [SkippableFact]
     public void Run_GivesTheNamesTheLiveCodeUsed_AndCountsWhatDidNotRun()

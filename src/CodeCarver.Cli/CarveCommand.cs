@@ -1344,6 +1344,8 @@ public static class CarveCommand
             summary["world.ppTrace.succeeded.pastWarningsAsErrors"] = trace.SucceededPastWarningsAsErrors;
             summary["world.ppTrace.succeeded.pastStubbedHeaders"] = trace.SucceededPastStubbedHeaders;
             summary["world.ppTrace.headersStubbed"] = trace.HeadersStubbed;
+            foreach (var stop in Enum.GetValues<CodeCarver.Core.Preprocess.PpTrace.StubStop>().Skip(1))
+                summary["world.ppTrace.stubStoppedBy." + char.ToLowerInvariant(stop.ToString()[0]) + stop.ToString()[1..]] = trace.StubStoppedBy[(int)stop];
             summary["world.ppTrace.failed"] = trace.Failed;
             summary["world.ppTrace.missingPaths"] = trace.MissingPaths;
             summary["world.ppTrace.missing.workDir"] = trace.MissingWorkDir;

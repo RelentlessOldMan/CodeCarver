@@ -83,6 +83,11 @@ public sealed class PpTrace
     /// each one's place (after every real include dir); <see cref="HeadersStubbed"/> such headers in all.</summary>
     public int SucceededPastStubbedHeaders { get; private set; }
     public int HeadersStubbed { get; private set; }
+    /// <summary>Of the commands that failed on a header not found, by <see cref="StubStop"/>: why no empty stand-in got them through.</summary>
+    public IReadOnlyList<int> StubStoppedBy { get; private set; } = new int[Enum.GetValues<StubStop>().Length];
+
+    /// <summary>Why a command failing on a header not found wasn't run again past it, or that its run past stand-ins failed.</summary>
+    public enum StubStop { None, NoTree, Limit, NotStubbable, CLibrary, InTree, BuildDir, RerunFailed }
     internal const int MaxStubbedHeaders = 16;
     /// <summary>Of <see cref="FailedPreprocessorError"/>, runs where some preprocessor error had no warning flag: an
     /// error by itself, not a warning made one.</summary>
@@ -176,6 +181,7 @@ public sealed class PpTrace
         var inTreeSeen = new System.Collections.Concurrent.ConcurrentDictionary<string, bool>(StringComparer.Ordinal);
         bool InTree(string header) => tree is not null && inTreeSeen.GetOrAdd(header, h => TreeHas(tree, h.Replace('\\', '/')));
         int pastStubs = 0;
+        var stubStopped = new int[Enum.GetValues<StubStop>().Length];
         var stubbedHeaders = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
         Parallel.ForEach(traced, new ParallelOptions { MaxDegreeOfParallelism = most }, cmd =>
         {
@@ -223,10 +229,17 @@ public sealed class PpTrace
                     }
                     if (ok || late || failure != Failure.HeaderNotFound || header is null) break;
                     first ??= (failure, header, includer);
-                    // Not when it could be the tree's or the build's own (an include dir in the root missing: made by the
-                    // build), nor the C library's (the toolchain's folders are missing: pathMap or ppTraceArgs).
-                    if (tree is null || stubbed.Count >= MaxStubbedHeaders || !Stubbable(header) || stubbed.Contains(header, StringComparer.Ordinal)
-                        || InTree(header) || CLibraryHeaders.Contains(header) || dirs.Any(d => d.Inside)) break;
+                    // Not when it could be the tree's or the build's own (a missing include dir in the root where the
+                    // build writes: a header it makes, unless a host system one), nor the C library's (the toolchain's
+                    // folders are missing: pathMap or ppTraceArgs).
+                    var stop = tree is null ? StubStop.NoTree
+                        : stubbed.Count >= MaxStubbedHeaders ? StubStop.Limit
+                        : !Stubbable(header) || stubbed.Contains(header, StringComparer.Ordinal) ? StubStop.NotStubbable
+                        : CLibraryHeaders.Contains(header) ? StubStop.CLibrary
+                        : InTree(header) ? StubStop.InTree
+                        : !HostSystemHeader(header) && dirs.Any(d => d.Inside && outDirs.Any(o => Within(o, d.Dir) || Within(d.Dir, o))) ? StubStop.BuildDir
+                        : StubStop.None;
+                    if (stop != StubStop.None) { Interlocked.Increment(ref stubStopped[(int)stop]); break; }
                     stubDir ??= Path.Combine(Path.GetTempPath(), "codecarver-stub-" + Guid.NewGuid().ToString("N"));
                     var stub = Path.Combine(stubDir, header.Replace('\\', '/'));
                     Directory.CreateDirectory(Path.GetDirectoryName(stub)!);
@@ -244,7 +257,11 @@ public sealed class PpTrace
                 Interlocked.Increment(ref pastStubs);
                 foreach (var h in stubbed) stubbedHeaders.TryAdd(h, 0);
             }
-            else if (!ok && first is { } f) (failure, header, includer) = f;   // say what the build's own run lacked
+            else if (!ok && first is { } f)
+            {
+                if (stubbed.Count > 0 && (late || failure != Failure.HeaderNotFound)) Interlocked.Increment(ref stubStopped[(int)StubStop.RerunFailed]);
+                (failure, header, includer) = f;
+            }   // say what the build's own run lacked
             if (late) Interlocked.Increment(ref timedOut);
             if (optionError) Interlocked.Increment(ref optionErrors);
             foreach (var flag in errs.Flags) errorFlags.AddOrUpdate(flag, 1, (_, n) => n + 1);
@@ -274,6 +291,7 @@ public sealed class PpTrace
         r.Succeeded = succeeded;
         r.SucceededPastStubbedHeaders = pastStubs;
         r.HeadersStubbed = stubbedHeaders.Count;
+        r.StubStoppedBy = stubStopped;
         r.MissingPaths = missing;
         r.MissingWorkDir = missingBy[(int)MissingKind.WorkDir];
         r.MissingSource = missingBy[(int)MissingKind.Source];
@@ -588,6 +606,24 @@ public sealed class PpTrace
         return ParseCategories.Contains(cat) ? Stage.Parse
              : cat is "Lexical or Preprocessor Issue" or "User-Defined Issue" ? Stage.Preprocessor : Stage.Other;
     }
+
+    /// <summary>A host operating system's header (POSIX, Linux, Windows): never one a firmware build makes.</summary>
+    internal static bool HostSystemHeader(string header)
+    {
+        var h = header.Replace('\\', '/');
+        var slash = h.IndexOf('/');
+        return slash > 0 ? HostSystemDirs.Contains(h[..slash]) : HostSystemFiles.Contains(h);
+    }
+
+    static readonly HashSet<string> HostSystemDirs = new(StringComparer.Ordinal) { "sys", "netinet", "arpa", "net", "linux", "asm", "bits", "mach" };
+
+    static readonly HashSet<string> HostSystemFiles = new(StringComparer.Ordinal)
+    {
+        "unistd.h", "pthread.h", "fcntl.h", "dirent.h", "dlfcn.h", "termios.h", "poll.h", "sched.h", "semaphore.h",
+        "syslog.h", "getopt.h", "netdb.h", "mqueue.h", "spawn.h", "grp.h", "pwd.h", "glob.h", "regex.h", "strings.h",
+        "libgen.h", "err.h", "ifaddrs.h", "endian.h", "byteswap.h", "features.h", "alloca.h", "malloc.h", "utime.h",
+        "windows.h", "winsock2.h", "ws2tcpip.h", "io.h", "direct.h", "process.h", "conio.h",
+    };
 
     /// <summary>The C standard library's headers, C89 to C23.</summary>
     internal static readonly HashSet<string> CLibraryHeaders = new(StringComparer.Ordinal)

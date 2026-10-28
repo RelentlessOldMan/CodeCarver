@@ -108,8 +108,10 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
   toolchain has no copy of) doesn't fail the command. It's run again with an empty header in its place, searched after
   every real include directory, up to 16 such headers per command (`succeeded.pastStubbedHeaders`, `headersStubbed`).
   The carve carves no define of such a header. All that's lost is a branch of the unit on that header's own macros.
-  This never applies to a header the tree has elsewhere, a C standard library header, or a command missing an
-  include directory inside the root (a header the build makes): those still fail it.
+  This never applies to a header the tree has elsewhere, a C standard library header, or, for a command missing an
+  include directory inside the root where the build writes its output, a header the build could have made there (a
+  host system header such as `unistd.h` or `sys/*.h` is stubbed even then). Those still fail it. `stubStoppedBy.*`
+  says, for the commands that failed on a header not found, why no stand-in got them through.
 - The `failedBy.*` keys say why commands failed. Many `headerNotFound.cLibrary` means the build's C library isn't
   found here. When the log names its folders (`-isystem`), map them to a copy on the carve machine with
   `[advanced] pathMap`. When it doesn't, the build's driver found it by itself, beside the compiler, and pp-trace's
@@ -177,6 +179,7 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `world.ppTrace.succeeded.pastParseErrors` | of `succeeded`, runs whose only errors came from the parse after preprocessing (or a rejected option, or a warning made an error) |
 | `world.ppTrace.succeeded.pastWarningsAsErrors` | of `pastParseErrors`, runs where some error was a warning made one |
 | `world.ppTrace.succeeded.pastStubbedHeaders` / `world.ppTrace.headersStubbed` | runs that lacked only headers outside the tree and ran clean with an empty one in each one's place; and those headers, distinct |
+| `world.ppTrace.stubStoppedBy.noTree` / `.limit` / `.notStubbable` / `.cLibrary` / `.inTree` / `.buildDir` / `.rerunFailed` | of the commands that failed on a header not found, why no empty stand-in got them through: no tree file list; 16 headers already stubbed; an include spelled with `..` or a full path (or already stubbed); a C standard library header; one the tree has elsewhere; one an include directory where the build writes might have held; or the run past the stand-ins failed another way |
 | `world.ppTrace.missingPaths` / `.refused` / `.incomplete` / `.timedOut` | of the failed: a path missing here, a flag that loads other code, not all of it in the log (an unreadable response file), over the time limit |
 | `world.ppTrace.missing.workDir` / `.source` / `.forcedInclude` | of `missingPaths`: what was missing |
 | `world.ppTrace.failedBy.crash` / `.headerNotFound` / `.error` / `.option` / `.noMessage` / `.notStarted` | of the commands that ran and failed within the time limit, why, by the first that applies: pp-trace crashed, an include wasn't found, another error, only an option the driver rejected (which alone doesn't fail a run), no error printed, pp-trace didn't start |
