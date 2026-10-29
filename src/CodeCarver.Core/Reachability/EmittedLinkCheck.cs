@@ -228,7 +228,7 @@ public static class EmittedLinkCheck
             stats["walkNames"] = walkNames.Count;
             stats["headersSpilled"] = spilled.Count; stats["spillReads"] = spillReads; stats["spillMb"] = spillBytes >> 20;
             try { if (Directory.Exists(spillDir)) Directory.Delete(spillDir, true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
-            foreach (var k in new[] { "filesRead", "fromCache", "headersHandedOn", "scansOutsideBudget", "instancesRedone", "verbatimSkipped", "digestsReused", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames", "headersSpilled", "spillReads", "spillMb" })
+            foreach (var k in new[] { "filesRead", "fromCache", "headersHandedOn", "scansOutsideBudget", "instancesRedone", "verbatimSkipped", "digestsReused", "digestsMissingNamesMax", "scanWaits", "readWaits", "walkWaits", "parseWaits", "walkCostMaxMb", "templateWalks", "templateWalksSkipped", "templateWalksReused", "templateWalksRedone", "templateWalksWhole", "headersRefiltered", "templateWalkHashHits", "walkNames", "headersSpilled", "spillReads", "spillMb" })
                 report?.Invoke(k, stats[k]);
             return new LinkCheckResult(v, checkedFiles, skipped) { Stats = stats };
         }
@@ -902,12 +902,20 @@ public static class EmittedLinkCheck
             using (Activity.Part("emitted.scan", text.Length)) s = IsAssembly(f.Rel) ? ScanAssembly(text) : BudgetedScan(text, IsHeader(f.Rel), definerMacros: definerMacros);
             Renamed(s);
             // Every name the file uses, for a later round wanting names this one doesn't (Covers).
+            // A register header's names are nearly all distinct: sorted, then the repeats closed up, with no set.
             if (cache is not null)
-            {
-                var all = s.Uses.Select(u => NameHash(u.Name)).Concat(s.CallUses.Select(u => NameHash(u.Name))).Distinct().ToArray();
-                Array.Sort(all);
-                s.UseHashes = all;
-            }
+                using (Activity.Part("emitted.useHashes", text.Length))
+                {
+                    var all = new int[s.Uses.Count + s.CallUses.Count];
+                    var n = 0;
+                    foreach (var u in s.Uses) all[n++] = NameHash(u.Name);
+                    foreach (var u in s.CallUses) all[n++] = NameHash(u.Name);
+                    Array.Sort(all);
+                    var w = 0;
+                    for (var i = 0; i < all.Length; i++) if (w == 0 || all[i] != all[w - 1]) all[w++] = all[i];
+                    if (w < all.Length) Array.Resize(ref all, w);
+                    s.UseHashes = all;
+                }
             // A use is read below only for a name a dropped file defines, a static pruned from this file, or a wrapped
             // symbol: the others are let go here, so a result waiting its turn holds little.
             bool Wanted(string n) => droppedDefs.ContainsKey(n) || (prunedHere?.ContainsKey(n) ?? false) || (anyWrap && wrapped!.Contains(n))
