@@ -15,9 +15,9 @@
 # (not hardcoded). Toolchain-generic too: -Cc lets you point at arm-none-eabi-gcc etc. Runs the compile/link via
 # WSL by default (Windows has no native gcc here); -NativeBash runs `bash` directly if you have one on PATH.
 #
-# -Corpus may be a full path, or a name resolved under $env:CODECARVER_TESTHOLE (local dir or share):
-#   ./carve-build-oracle.ps1 -Corpus C:\path\to\TestHole\carve_r75
-#   ./carve-build-oracle.ps1 -Corpus carve_r50 -Cc arm-none-eabi-gcc     # $env:CODECARVER_TESTHOLE\carve_r50
+# -Corpus may be a full path, or a name resolved under $env:CODECARVER_CORPORA (local dir or share):
+#   ./carve-build-oracle.ps1 -Corpus C:\path\to\corpora\carve_r75
+#   ./carve-build-oracle.ps1 -Corpus carve_r50 -Cc arm-none-eabi-gcc     # $env:CODECARVER_CORPORA\carve_r50
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$Corpus,
@@ -38,10 +38,10 @@ $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 # No -CliDll: build Release incrementally and refuse a DLL not stamped from HEAD (review SC-D1).
 if (-not $CliDll) { $CliDll = Resolve-CarverDll -RepoRoot $repoRoot }
 if (-not (Test-Path $CliDll)) { throw "CLI dll not found: $CliDll" }
-if (-not (Test-Path $Corpus) -and $env:CODECARVER_TESTHOLE -and -not [IO.Path]::IsPathRooted($Corpus)) {
-  $Corpus = Join-Path $env:CODECARVER_TESTHOLE $Corpus
+if (-not (Test-Path $Corpus) -and $env:CODECARVER_CORPORA -and -not [IO.Path]::IsPathRooted($Corpus)) {
+  $Corpus = Join-Path $env:CODECARVER_CORPORA $Corpus
 }
-if (-not (Test-Path $Corpus)) { throw "corpus not found: $Corpus (pass a path, or a name under `$env:CODECARVER_TESTHOLE)" }
+if (-not (Test-Path $Corpus)) { throw "corpus not found: $Corpus (pass a path, or a name under `$env:CODECARVER_CORPORA)" }
 $corpusFull = (Resolve-Path $Corpus).ProviderPath.TrimEnd('\', '/')
 if (-not $Manifest) {
   $Manifest = Join-Path (Split-Path $corpusFull) ((Split-Path $corpusFull -Leaf) + '-manifest.json')

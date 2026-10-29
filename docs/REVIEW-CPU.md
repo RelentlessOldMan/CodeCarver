@@ -371,7 +371,7 @@ C1, C2, C3, C4, C5, C7, C13, C14, C17 and C22 are each a few lines, low risk, an
 - Each run records process CPU time (`TotalProcessorTime`), wall time, and every `cpu.*`/`time.*` summary key.
 - The builds being compared run interleaved (A, B, C, A, B, C, ...) for 3-5 rounds, and the minimum and median of each key are reported. Back-to-back runs of one build drifted by up to 50% with machine load; interleaving gives every build the same conditions.
 - Three generated trees: `w` (the workload above, 1,351 files), `L` (log-heavy: 6,000 C and 10 C++ files, 300 `-D` per command, a 30.8 MB build log) and `T` (12 files, to catch start-up costs).
-- Timing runs hold a ComputeWarden CPU lease, so no other heavy job is running.
+- Timing runs wait for a quiet machine, so no other heavy job is running.
 - The machine has 12 logical cores; the runtime is .NET 8.
 
 **Correctness.**

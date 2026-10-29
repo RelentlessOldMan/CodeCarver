@@ -24,8 +24,6 @@
   On Windows the builds run in WSL; under PowerShell on Linux they run directly, which is how CI runs both examples
   before every release. Needs gcc, make and strace.
 
-  Not ComputeWarden-gated: a few dozen tiny compiles.
-
 .EXAMPLE
   ./tools/eldritch/eldritch-oracle.ps1
   ./tools/eldritch/eldritch-oracle.ps1 -Example hellbuild

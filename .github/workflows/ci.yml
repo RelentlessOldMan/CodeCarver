@@ -32,7 +32,7 @@ jobs:
         run: dotnet build CodeCarver.sln -c Release
 
       # Fast suite. The BuildVerify namespace compiles carved output with pinned toolchains that are not
-      # committed, so it runs locally (and under ComputeWarden), not here; its compiler-free halves live in
+      # committed, so it runs locally, not here; its compiler-free halves live in
       # the fast suite.
       - name: Test (fast)
         run: dotnet test CodeCarver.sln -c Release --no-build --filter "FullyQualifiedName!~BuildVerify" --blame-hang-timeout 5m

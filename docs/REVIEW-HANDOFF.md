@@ -24,9 +24,6 @@ code; this file is the only output.
   - Never write commit messages into `.git\`. Use `git commit -m` or a temp file in the repo root.
   - The real target tree is proprietary. Never ask the owner for a trace, log, source file, path list or any
     artifact. All validation here uses in-repo examples, scratch trees, or public corpora.
-  - The Discord `code-carver` channel is read-only unless the owner directs a post.
-  - ComputeWarden gates machine-saturating work (oracles, sweeps, corpus generation). A single
-    `dotnet build`, a small carve, or the fast test suite is not gated.
   - Design contract: correct by construction, over-approximate at anything unresolved, never drop
     infrastructure the tool does not model. A fix that makes a carve tighter at the cost of soundness is
     wrong. A fix that makes it looser to become sound is right.
@@ -898,7 +895,7 @@ keeps. Fix SC-A1 to SC-B4 before the next real-tree capture.
   binary says `1.0.0+d9402bf`, no source commit, checksum or licence recorded. Record all three.
 - **SC-F7 [CODE]** `.gitignore`: add `presets/*.toml` (the preset writes the real repo path and root
   names there) and `examples/cmm-trace/out/`. `.gitattributes` covers only `*.sh` and the exe.
-- **SC-F8 (S3)** The internal host name `\\IRISH\TestHole` appears in two scripts and `CLAUDE.md` of a
+- **SC-F8 (S3)** An internal host and share name appeared (since removed) in two scripts and `CLAUDE.md` of a
   public repo.
 
 ## 8c. Test suite
@@ -1049,8 +1046,7 @@ Each step is one commit (commit and push, report the version).
 10. **CI and tests** (8b SC-E, 8c): Linux leg, BuildVerify split, example tests, skippable facts.
 11. **Docs** (section 8) and the README drift test; dead-code removal; remaining RB and SC-D/SC-F items.
 
-After steps 2–5 run the full fast suite, then the gated oracles once (ground truth, build report) under
-ComputeWarden to confirm nothing regressed in keep counts beyond what the fixes intend.
+After steps 2–5 run the full fast suite, then the oracles once (ground truth, build report) to confirm nothing regressed in keep counts beyond what the fixes intend.
 
 ## 10. Repro appendix
 

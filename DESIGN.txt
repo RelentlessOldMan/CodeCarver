@@ -210,7 +210,7 @@ Fidelity ladder (ship the bottom rung first)
 Why CodeCarver is a SEPARATE project from CodeCompass
 -----------------------------------------------------
 
-CodeCompass (C:\Playground\CodeCompass) is an in-use local code-search engine that already
+CodeCompass is an in-use local code-search engine that already
 has much of the substrate: go-to-definition + find-references (= graph edges), semantic
 refs for C# (Roslyn) and C/C++ (clang), tree-sitter symbols, a vendored TRACE32 .cmm
 grammar, and 90 GB / memory-mapped scale engineering. Reuse is tempting.

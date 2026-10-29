@@ -11,10 +11,6 @@
   comparable. It includes a large macro-DENSE register header to exercise the auto-skip path, and a
   shared header included by every TU (realistic include-closure fan-out).
 
-  ComputeWarden: a DEFAULT-size run (a single carve of a few thousand files) is a single `carve` and is
-  NOT machine-saturating. A LARGE run (-Files in the tens of thousands) approaches a build sweep - gate
-  it via computewarden_acquire/release before starting, per this repo's CLAUDE.md.
-
 .PARAMETER Files        Number of .c translation units to generate (default 2000).
 .PARAMETER FuncsPerFile Functions per TU (default 30).
 .PARAMETER Baseline     Path to a baseline JSON to compare against (optional).

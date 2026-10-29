@@ -8,9 +8,9 @@
 # dial -- GRADED. This is the strongest correctness test we can run without a real build, and it scales to
 # 100 GB (giant register headers carry no call edges, so we skip them via -MaxParseBytes to bound memory).
 #
-# The correctness corpora live in TestHole (small, ~200 KB each), reproducible from their recipes there.
-# -Corpus may be a full path, or a name resolved under $env:CODECARVER_TESTHOLE (local dir or share):
-#   ./carver-groundtruth-oracle.ps1 -Corpus carve_r25                      # $env:CODECARVER_TESTHOLE\carve_r25
+# The correctness corpora are small (~200 KB each) and reproducible from their recipes.
+# -Corpus may be a full path, or a name resolved under $env:CODECARVER_CORPORA (local dir or share):
+#   ./carver-groundtruth-oracle.ps1 -Corpus carve_r25                      # $env:CODECARVER_CORPORA\carve_r25
 #   ./carver-groundtruth-oracle.ps1 -Corpus C:\path\to\corpora\carve_r75
 #   ./carver-groundtruth-oracle.ps1 -Corpus <tree> -Root func_0,func_7 -ExpectedReachableFrac 0.5
 # NOTE: these graded corpora need CodeSpawner >= 1.0.9 to (re)generate (the --oracle-* knobs, indirectEdges,
@@ -40,10 +40,10 @@ $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 # No -CliDll: build Release incrementally and refuse a DLL not stamped from HEAD (review SC-D1).
 if (-not $CliDll) { $CliDll = Resolve-CarverDll -RepoRoot $repoRoot }
 if (-not (Test-Path $CliDll)) { throw "CLI dll not found: $CliDll" }
-if (-not (Test-Path $Corpus) -and $env:CODECARVER_TESTHOLE -and -not [IO.Path]::IsPathRooted($Corpus)) {
-  $Corpus = Join-Path $env:CODECARVER_TESTHOLE $Corpus
+if (-not (Test-Path $Corpus) -and $env:CODECARVER_CORPORA -and -not [IO.Path]::IsPathRooted($Corpus)) {
+  $Corpus = Join-Path $env:CODECARVER_CORPORA $Corpus
 }
-if (-not (Test-Path $Corpus)) { throw "corpus not found: $Corpus (pass a path, or a name under `$env:CODECARVER_TESTHOLE)" }
+if (-not (Test-Path $Corpus)) { throw "corpus not found: $Corpus (pass a path, or a name under `$env:CODECARVER_CORPORA)" }
 $corpusFull = (Resolve-Path $Corpus).ProviderPath.TrimEnd('\', '/')   # ProviderPath: no provider prefix on UNC
 
 # Comparison key for a corpus file (review SC-D6): the path RELATIVE to the corpus root, '/'-separated,

@@ -2,7 +2,7 @@
 
 ## Resource needs
 - Carves cap their own memory with `[advanced] memoryStopMb` (local runs use 4000); the ground-truth oracle and build sweeps run carves.
-- An A/B carve of the synthetic 546 MB tree takes ~5-6 min; a death-scale carve ~2.5 min on local TestHole, ~12 min on `\\IRISH\TestHole`.
+- An A/B carve of the synthetic 546 MB tree takes ~5-6 min; a death-scale carve ~2.5 min from a local disk, ~12 min over a network share.
 - Every carve writes a full carved copy of its tree, and a T2 run carves a corpus of millions of defines: scratch output from A/B rounds and T2 runs reached 400 GB.
 
 ## Scratch carve output

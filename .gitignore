@@ -35,8 +35,7 @@ dist/
 *.tmp
 .claude/scheduled_tasks.lock
 
-# Discordinator MCP: machine-local config (points at a global server + a Discord channel/token);
-# never belongs in the repo. The server itself lives outside the tree (a global Python module).
+# Machine-local MCP config; never belongs in the repo.
 .mcp.json
 **/discordinator/
 
