@@ -411,6 +411,26 @@ public static class CarveCommand
         // The parse, pre-pass and check budgets are fractions of this when it is less than the machine.
         CodeCarver.Core.Util.MemoryGate.RunLimitBytes = _memoryStop;
         var _stopping = 0;
+        // Past memoryStopMb, one full compacting collection first: much of a step's private memory can be garbage the GC
+        // has not handed back (the 1x T2 firmware corpus read its big headers to 4,132 MB private with 2.4 GB live, and
+        // the run stopped or not by when the heartbeat looked). Still past, the run stops. Not again for 2 s.
+        var _stopGcGate = new object();
+        long _stopGcNext = 0, _stopGcs = 0;
+        bool StillOver(ref long priv)
+        {
+            if (!Monitor.TryEnter(_stopGcGate)) return false;   // another thread is collecting: it decides
+            try
+            {
+                if (System.Diagnostics.Stopwatch.GetTimestamp() < _stopGcNext) return false;
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                using (var p = System.Diagnostics.Process.GetCurrentProcess()) priv = p.PrivateMemorySize64;
+                Interlocked.Increment(ref _stopGcs);
+                if (priv > _memoryStop) return true;
+                _stopGcNext = System.Diagnostics.Stopwatch.GetTimestamp() + 2 * System.Diagnostics.Stopwatch.Frequency;
+                return false;
+            }
+            finally { Monitor.Exit(_stopGcGate); }
+        }
         var _memGate = new object();
         void NoteMemory(long priv, long workingSet, (long Total, long Free, long CommitFree)? machine)
         {
@@ -454,7 +474,7 @@ public static class CarveCommand
             catch (InvalidOperationException) { now = 0; }
             // Also looked at as each step ends, not only by the heartbeat: a short run is measured and stopped too.
             NoteMemory(now, ws, CodeCarver.Core.Util.SystemMemory.Now());
-            if (_memoryStop > 0 && now > _memoryStop && Interlocked.Exchange(ref _stopping, 1) == 0)
+            if (_memoryStop > 0 && now > _memoryStop && StillOver(ref now) && Interlocked.Exchange(ref _stopping, 1) == 0)
                 StopForMemory(now, ws, CodeCarver.Core.Util.SystemMemory.Now(), _run.Elapsed);
             return Math.Max(Interlocked.Exchange(ref _peakPrivate, 0), now) / (1024 * 1024);
         }
@@ -494,7 +514,7 @@ public static class CarveCommand
             // stop it had not reached.
             _memoryNow = MemoryLine(priv, workingSet, machine)
                 + (_memoryStop > 0 ? $"; {priv / (1024 * 1024):N0} of memoryStopMb {_memoryStop / (1024 * 1024):N0} MB" : "");
-            if (_memoryStop > 0 && priv > _memoryStop && Interlocked.Exchange(ref _stopping, 1) == 0)
+            if (_memoryStop > 0 && priv > _memoryStop && StillOver(ref priv) && Interlocked.Exchange(ref _stopping, 1) == 0)
                 StopForMemory(priv, workingSet, machine, runAt);
             _cpu.Enqueue((runAt, self.TotalProcessorTime));
             while (_cpu.Count > 1 && runAt - _cpu.Peek().At > _quiet) _cpu.Dequeue();
@@ -3709,6 +3729,7 @@ public static class CarveCommand
             if (_minMachineFree != long.MaxValue) into["mem.run.minMachineFreeMb"] = _minMachineFree / MB;
             if (_minCommitFree != long.MaxValue) into["mem.run.minCommitRoomMb"] = _minCommitFree / MB;
             into["mem.stopMb"] = _memoryStop / MB;
+            into["mem.stopCollections"] = Interlocked.Read(ref _stopGcs);   // collections past memoryStopMb before the stop
         }
         // memoryStopMb passed: say so, write what the run counted so far where it can be found, and end the process
         // (the run's own threads are mid-step; nothing they hold is worth finishing). Never the source or a name.

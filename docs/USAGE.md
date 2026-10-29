@@ -726,7 +726,9 @@ link check, header text held (`headerTextMb`), text handed on to its scans (`han
 budget (`scanningMb`, `readingMb`, `walkingMb`, `parsingMb`) and its tables (`headerInfos`, `droppedDefs`, `uses`, ...).
 
 `[advanced] memoryStopMb` stops a run whose private memory passes it, before it runs the machine out of memory.
-A `memory  : STOPPED` line names the step, and `<outputDirectory>/codecarver/stopped-summary.txt` holds every
+Past it, the run first does one full compacting collection, since much of that memory can be garbage the GC has not
+handed back yet. It stops only if it is still past, and it doesn't collect again for 2 s. `mem.stopCollections`
+counts those collections. A `memory  : STOPPED` line names the step, and `<outputDirectory>/codecarver/stopped-summary.txt` holds every
 summary key written so far, the run's memory keys, and `stop.reason`, `stop.afterStep`, `stop.minutesInStep`,
 `stop.runSeconds`, `stop.count`, `stop.doing`, `stop.privateMb`, `stop.workingSetMb`, `stop.managedMb`, `stop.machineFreeMb`,
 `stop.commitRoomMb`, `stop.heapMb` / `stop.heapFragmentedMb` / `stop.gcCommittedMb` (the heap as the last collection left it), `stop.held.<part>.<what>` (the `held    :` numbers as it stopped), and `stop.inHandKb` / `stop.largestFileInStepKb` (the files being scanned when it stopped,
