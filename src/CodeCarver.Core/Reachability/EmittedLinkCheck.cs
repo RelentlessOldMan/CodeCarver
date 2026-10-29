@@ -126,7 +126,8 @@ public static class EmittedLinkCheck
         IReadOnlySet<string>? wrapped = null,
         LinkCheckCache? cache = null,
         Action<string, long>? report = null,
-        IReadOnlySet<string>? verbatim = null)
+        IReadOnlySet<string>? verbatim = null,
+        IReadOnlySet<string>? alsoWanted = null)
     {
         var emittedList = emitted.ToList();
         var droppedList = dropped.ToList();
@@ -851,17 +852,20 @@ public static class EmittedLinkCheck
         var anyWrap = wrapped is { Count: > 0 } && droppedDefs.Keys.Any(k => k.StartsWith("__wrap_", StringComparison.Ordinal));
         // The names this round wants uses of in every file (a file's pruned statics aside). A digest from a round that
         // wanted all of these (an earlier round of a stage drops more) holds every use this round reads.
+        // A later stage's names (alsoWanted): kept only where a digest can serve that stage.
+        var keepAlso = cache is not null ? alsoWanted : null;
         HashSet<string>? wantedNow = null;
         if (cache is not null)
         {
             wantedNow = new HashSet<string>(droppedDefs.Keys, StringComparer.Ordinal);
             if (anyWrap) wantedNow.UnionWith(wrapped!);
+            if (alsoWanted is not null) wantedNow.UnionWith(alsoWanted);
         }
         var covers = new ConcurrentDictionary<HashSet<string>, bool>(ReferenceEqualityComparer.Instance);
         bool Covers(EmittedDigest d, Dictionary<string, int>? prunedHere) =>
             ReferenceEquals(d.DeadLines, deadLines)
             && covers.GetOrAdd(d.Wanted, w => ReferenceEquals(w, wantedNow) || wantedNow!.IsSubsetOf(w))
-            && (prunedHere is null || d.Pruned is { } had && prunedHere.Keys.All(had.ContainsKey));
+            && (prunedHere is null || prunedHere.Keys.All(k => d.Wanted.Contains(k) || (d.Pruned?.ContainsKey(k) ?? false)));
         // A file's scan, or the digest an earlier round left of the same text; and its template instances, with the
         // dead-line map when they need it.
         (EmittedDigest? Had, ScanResult? Scan, List<Definition> Inst, bool[]? Map, ulong Hash, int Length, Dictionary<string, int>? Pruned)? ScanEmitted((string Rel, string Path) f)
@@ -886,7 +890,8 @@ public static class EmittedLinkCheck
             Renamed(s);
             // A use is read below only for a name a dropped file defines, a static pruned from this file, or a wrapped
             // symbol: the others are let go here, so a result waiting its turn holds little.
-            bool Wanted(string n) => droppedDefs.ContainsKey(n) || (prunedHere?.ContainsKey(n) ?? false) || (anyWrap && wrapped!.Contains(n));
+            bool Wanted(string n) => droppedDefs.ContainsKey(n) || (prunedHere?.ContainsKey(n) ?? false) || (anyWrap && wrapped!.Contains(n))
+                                     || (keepAlso?.Contains(n) ?? false);
             s.Uses.RemoveAll(u => !Wanted(u.Name));
             s.CallUses.RemoveWhere(u => !Wanted(u.Name));
             return (null, s, inst.Definitions, map, hash, text.Length, prunedHere);
@@ -949,7 +954,7 @@ public static class EmittedLinkCheck
             if (IsHeader(rel) && dg.Weak is not null) weakNames.UnionWith(dg.Weak);
             // Only the uses this round wants: a digest from an earlier round may hold more.
             bool Wanted(string n) => droppedDefs.ContainsKey(n) || (prunedHere?.ContainsKey(n) ?? false) || (anyWrap && wrapped!.Contains(n));
-            var uses = had is null ? dg.Uses : dg.Uses.Where(u => Wanted(u.Name)).ToArray();
+            var uses = had is null && keepAlso is null ? dg.Uses : dg.Uses.Where(u => Wanted(u.Name)).ToArray();
             foreach (var u in uses) (dg.Weak?.Contains(u.Name) == true ? weakUse : strongUse).Add(u.Name);
             if (prunedHere is { } pruned)
             {

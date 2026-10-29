@@ -3491,6 +3491,10 @@ public static class CarveCommand
             try { return Path.GetFullPath(p).StartsWith(sourceRoot, StringComparison.OrdinalIgnoreCase); }
             catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return false; }
         });
+        // A file-level stage before a pruned one: the names the pruned stage drops from kept files are graph functions and
+        // globals, so the check keeps their uses too and the pruned stage's first round serves its unchanged files from it.
+        IReadOnlySet<string>? checkAlsoWanted = null;
+        HashSet<string>? graphNames = null;
         (LinkCheckResult R, List<LinkViolation> Hard, List<LinkViolation> NotBuiltOnly) CheckEmitted(
             CarvePlan p, IReadOnlyList<(string Rel, string Path)> emittedFiles, bool pruned, IReadOnlySet<string>? verbatim = null)
         {
@@ -3499,7 +3503,7 @@ public static class CarveCommand
                                          original: pruned ? rel => Path.Combine(dir, rel) : null,
                                          definerMacros: (fe as TreeSitterFrontEnd)?.DefinerSet, linkUses: linkUses,
                                          commandLineMacros: commandLineMacros, c99InlineFns: (fe as TreeSitterFrontEnd)?.C99InlineFunctions,
-                                         wrapped: wrapped, cache: linkCache, verbatim: verbatim,
+                                         wrapped: wrapped, cache: linkCache, verbatim: verbatim, alsoWanted: checkAlsoWanted,
                                          // Summed over the stage's rounds; a "Max" key keeps its largest.
                                          report: (k, v) =>
                                          {
@@ -4000,6 +4004,9 @@ public static class CarveCommand
         foreach (var stage in cv.Stages)
         {
             prune = stage.CarveSourceFileContents;
+            checkAlsoWanted = !prune && cv.Stages.SkipWhile(s => !ReferenceEquals(s, stage)).Skip(1).Any(s => s.CarveSourceFileContents)
+                ? graphNames ??= graph.Nodes.Where(n => n.Kind is NodeKind.Function or NodeKind.Global).Select(n => n.Name).ToHashSet(StringComparer.Ordinal)
+                : null;
             pruneHeaders = stage.CarveHeaderFileContents;
             // Intra-file pruning is C/C++ only: C# method pruning is unsound without semantic analysis, and .cmm
             // is not pruned (review CS1). Applied per stage — before, the guard ran before `prune` was ever set.

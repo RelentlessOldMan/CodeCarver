@@ -245,6 +245,13 @@ public sealed class StreamingCheckTests
             var third = EmittedLinkCheck.Run(new[] { main, b }, new[] { a, c }, cache: cache);
             Assert.Equal(new[] { "a_fn", "c_fn" }, Names(third));
             Assert.Equal(0, third.Stats["digestsReused"]);
+
+            // A round that also keeps a later stage's names (alsoWanted) serves that stage's first round.
+            var later = new LinkCheckCache(_ => false);
+            EmittedLinkCheck.Run(new[] { main, b, c }, new[] { a }, cache: later, alsoWanted: new HashSet<string> { "b_fn", "c_fn" });
+            var pruned = EmittedLinkCheck.Run(new[] { main }, new[] { a, b, c }, cache: later);
+            Assert.Equal(new[] { "a_fn", "b_fn", "c_fn" }, Names(pruned));
+            Assert.Equal(1, pruned.Stats["digestsReused"]);
         }
         finally
         {
