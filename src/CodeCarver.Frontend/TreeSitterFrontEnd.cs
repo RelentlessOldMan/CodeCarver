@@ -203,6 +203,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // Functions with internal linkage (`static` at file scope in a .c/.cpp): only their own translation unit
     // can call them (P2). Filled while parsing, consulted when uses are resolved.
     private readonly HashSet<NodeId> _fileLocal = new();
+    // A C file's static that no #if surrounds: every use of its name in that file is this one (C gives one
+    // meaning per name in a translation unit), so the file's uses don't reach another file's global of the name.
+    private readonly HashSet<NodeId> _shadowing = new();
     // One parser per thread of the parse loop: a native TSParser is cheap to re-use but not free to create/destroy,
     // and one is never used by two threads at once. The budgeted (large-file) path still uses its OWN parser on its
     // own thread. Lazily created; disposed with the front-end.
@@ -524,6 +527,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _renamedFrom.Clear();
         _wordInvocations.Clear();
         _fileLocal.Clear();
+        _shadowing.Clear();
         _condExternMacros.Clear();
         _callFreeMacros.Clear();
         _headerData.Clear();
@@ -679,8 +683,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             // static's own TU, and an included .c is part of its includer.
             return ff is null || tf is null || ff == tf || !IsTranslationUnit(ff) || includedFiles.Contains(tf);
         }
+        bool Shadows(NodeId from, NodeId target) =>
+            _shadowing.Contains(target) && graph.GetNode(from).FilePath is { } ff && ff == graph.GetNode(target).FilePath;
         foreach (var (from, name) in pendingCalls)
-            ResolveUse(graph, from, name, functionsByName, macrosByName, globalsByName, EdgeKind.Calls, Visible);
+            ResolveUse(graph, from, name, functionsByName, macrosByName, globalsByName, EdgeKind.Calls, Visible, Shadows);
         // `static REGISTER(fn);`: words before the call. A prototype looks the same (`static int f(int x);`), so the call
         // counts only when nothing in the tree is a function or macro of that name (see FileScopeInvocations).
         foreach (var (from, macro, names) in _wordInvocations)
@@ -688,7 +694,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 foreach (var name in names) pendingRefs.Add((from, name));
         _wordInvocations.Clear();
         foreach (var (from, name) in pendingRefs)
-            ResolveUse(graph, from, name, functionsByName, macrosByName, globalsByName, EdgeKind.AddressTaken, Visible);
+            ResolveUse(graph, from, name, functionsByName, macrosByName, globalsByName, EdgeKind.AddressTaken, Visible, Shadows);
         // A macro that expands to a call/another macro reaches those — so a function or global used ONLY
         // through a macro body (e.g. `#define getSBox(n) sbox[n]`) is not lost when its callers are pruned.
         foreach (var (from, name) in pendingMacroRefs)
@@ -1972,6 +1978,25 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     }
 
     /// <summary>A .c/.cc/.cpp/.cxx/.c++ source file — a translation unit we must always parse.</summary>
+    /// <summary>For each 1-based line, whether an #if/#ifdef/#ifndef block surrounds it.</summary>
+    internal static bool[] ConditionalLines(string text)
+    {
+        var lines = text.Split('\n');
+        var inside = new bool[lines.Length + 2];
+        var depth = 0;
+        for (var i = 0; i < lines.Length; i++)
+        {
+            if (ConditionalLine.Match(lines[i]) is { Success: true } c)
+            {
+                var d = c.Groups[1].Value;
+                if (d.StartsWith("if", StringComparison.Ordinal)) depth++;
+                else if (d == "endif") depth = Math.Max(0, depth - 1);
+            }
+            inside[i + 1] = depth > 0;
+        }
+        return inside;
+    }
+
     private static bool IsTranslationUnit(string path)
     {
         var dot = path.LastIndexOf('.');
@@ -2007,8 +2032,28 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                                    Dictionary<string, List<NodeId>> functionsByName,
                                    Dictionary<string, List<NodeId>> macrosByName,
                                    Dictionary<string, List<NodeId>> globalsByName,
-                                   EdgeKind functionEdge, Func<NodeId, NodeId, bool>? visible = null)
+                                   EdgeKind functionEdge, Func<NodeId, NodeId, bool>? visible = null,
+                                   Func<NodeId, NodeId, bool>? shadows = null)
     {
+        // The use's own file has a static of the name that no #if surrounds: the use is that one and no other.
+        if (shadows is not null)
+        {
+            var own = (functionsByName.TryGetValue(name, out var f1) ? f1 : Enumerable.Empty<NodeId>())
+                .Concat(globalsByName.TryGetValue(name, out var g1) ? g1 : Enumerable.Empty<NodeId>())
+                .Where(t => shadows(from, t)).ToList();
+            if (own.Count > 0)
+            {
+                foreach (var target in own)
+                {
+                    var fn = graph.GetNode(target).Kind == NodeKind.Function;
+                    graph.AddEdge(from, target, fn ? functionEdge : EdgeKind.References);
+                    if (fn && functionEdge == EdgeKind.AddressTaken) graph.AddFlag(target, NodeFlags.AddressTaken);
+                }
+                if (macrosByName.TryGetValue(name, out var m1))
+                    foreach (var target in m1) graph.AddEdge(from, target, EdgeKind.Expands);
+                return;
+            }
+        }
         // Link the name to EVERY kind that defines it. One tree holds many targets/configurations, so a name
         // can be a function in one place and a macro or a global in another; picking the first kind found
         // dropped the others (review N1).
@@ -2060,6 +2105,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         public readonly List<string> Warnings = new();
         public readonly List<string> ForceKeeps = new();
         public readonly List<NodeId> FileLocal = new();
+        public readonly List<NodeId> Shadowing = new();
         public readonly List<(NodeId Id, string Header, bool CondExtern)> HeaderData = new();
         public readonly List<(NodeId Id, string Class)> StartupObjects = new();
         public readonly List<(NodeId Id, string Class)> Companions = new();
@@ -2161,6 +2207,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _warnings.AddRange(w.Warnings);
         foreach (var p in w.ForceKeeps) ForceKeep(p);
         foreach (var id in w.FileLocal) _fileLocal.Add(M(id));
+        foreach (var id in w.Shadowing) _shadowing.Add(M(id));
         foreach (var (id, header, condExtern) in w.HeaderData) _headerData.Add((M(id), header, condExtern));
         foreach (var (id, cls) in w.StartupObjects) _startupObjects.Add((M(id), cls));
         foreach (var (id, cls) in w.Companions) _companions.Add((M(id), cls));
@@ -2262,6 +2309,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var scopes = new ScopeIndex(_scopes, root);
         var fileNode = w.FileNode(path);
         var srcLines = new TextLines(text);
+        bool[]? conditional = null;
+        bool Shadows(int row) => path.EndsWith(".c", StringComparison.OrdinalIgnoreCase)
+                                 && (conditional ??= ConditionalLines(text)) is var c && (row >= c.Length || !c[row]);
 
         // When configured, code in dead #ifdef branches is skipped (config-specific carve).
         var dead = ExactDeadLines?.Invoke(path, text)
@@ -2295,7 +2345,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 graph.AddEdge(fid, fileNode, EdgeKind.DefinedIn);
                 Add(functionsByName, name, fid);
                 funcSpans.Add((span.Value.Start, span.Value.End, fid));
-                if (IsTranslationUnit(path) && IsFileScopeStatic(node)) { w.FileLocal.Add(fid); graph.AddFlag(fid, NodeFlags.FileLocal); }
+                if (IsTranslationUnit(path) && IsFileScopeStatic(node))
+                {
+                    w.FileLocal.Add(fid); graph.AddFlag(fid, NodeFlags.FileLocal);
+                    if (Shadows(row)) w.Shadowing.Add(fid);
+                }
                 // `int CAT(TNAME, get)(void) { ... }`: the real name is computed (see TemplateInstances), so nothing
                 // calls this one by name. It stays whenever its file does.
                 if (_macroNamedHeaders.Contains(path) || (_funcLikeMacroNames.Contains(name) && ComputedName(node)))
@@ -2523,7 +2577,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var gid = graph.GetOrAddNode(NodeKind.Global, gname, path, new SourceSpan(span.Value.Start, span.Value.End));
             graph.AddEdge(gid, fileNode, EdgeKind.DefinedIn);
             Add(globalsByName, gname, gid);
-            if (isStatic && IsTranslationUnit(path)) { w.FileLocal.Add(gid); graph.AddFlag(gid, NodeFlags.FileLocal); }
+            if (isStatic && IsTranslationUnit(path))
+            {
+                w.FileLocal.Add(gid); graph.AddFlag(gid, NodeFlags.FileLocal);
+                if (Shadows(node.StartPosition.Row + 1)) w.Shadowing.Add(gid);
+            }
             if (headerDefinition) w.HeaderData.Add((gid, path, condExtern));
             // Not removable on its own: a declaration that also defines a named type (`struct cfg {...} dead_cfg;` — the
             // type goes with it), or a C++ object whose constructor can register something at start-up. Only in a unit:

@@ -372,7 +372,11 @@ root.
 ```
 
 - **`roots`**, **`compileDbUnion`** and **`functionCases`** (phase 2, 1.5.0; absent with `--fw-work`):
-  - `roots` are the functions execution starts from (the grader's entry points);
+  - `roots` are the functions execution starts from (the grader's entry points), always `["Reset_Handler"]`. Reach
+    starts from exactly these, plus what the assumed link itself keeps (its scripts' names and `KEEP`s, the prebuilt
+    object's undefined names, `retain`). The assumed link is C at `-ffunction-sections -fdata-sections`, then
+    `ld.lld --gc-sections -T fw/ld/fw.ld -L fw/ld`, with no `-u` and no `-e`. **An input section is kept whole once
+    any symbol in it is reached.** See firmware-design.md "Functions";
   - `compileDbUnion` is a second compile db (world.c at `-DFW_WORLD=2`) that only the union build compiles;
   - `functionCases` is a `name`, `case`, `site` TSV of the designed function cases.
 - **`treeSha256`** is a sha256 over every file under `root`, in ordinal order of its root-relative path (`/`
@@ -393,7 +397,9 @@ root.
     **`mustDropFunctions`** and **`openFunctions`**, and these three differ by build: `main` is the main db's world,
     `union` adds `compileDbUnion`'s. Each build names its own `main.`/`union.` file.
   - **`mustKeepFiles`** lists the files under `root` that define a must-keep name, and every file under `root` in a
-    unit's include closure. A carved header no unit includes is not listed (since 1.5.2).
+    unit's include closure. A file no build compiles and nothing includes is never listed, even if it defines a
+    must-keep name (Carver ruling, 1.5.3). An unlisted file is open (a carve may keep or drop it); this is the rule,
+    not a gap.
 - **`counts`** are exact, except the `…Min`/`…Max` pairs, which bound a sound carve: definesKept + definesDropped =
   `totalDefineLines`.
   - **`definesDroppedMin`** is the must-drop define lines in carved files, and **`definesDroppedMax`** every define

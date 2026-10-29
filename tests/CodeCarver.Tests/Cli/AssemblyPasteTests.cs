@@ -114,4 +114,35 @@ public class AssemblyPasteTests
         Assert.Equal("a \n  b\n  c \n \n", string.Concat(chunks));
         Assert.True(chunks.Count > 1);
     }
+    [Fact]
+    public void MacroArgumentTheBodyNeverUses_NamesNothing()
+    {
+        // `.macro call2 a, ab` / `bl \ab`: only the second argument is called.
+        using var t = Tree("    .macro call2 a, ab\n    bl \\ab\n    .endm\n" + Reset + "    call2 kq_dead, KQ_TIM_Handler\n");
+        var r = t.Carve(entry: "Reset_Handler");
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.True(t.Kept("handlers.c"), r.Out + r.Err);
+        Assert.False(t.Kept("dead.c"), r.Out + r.Err);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AStaticOfTheName_IsTheOnlyOneItsFileCalls(bool underIf)
+    {
+        // C gives a name one meaning per translation unit: init.c's static kq_shd hides other.c's global. Under an
+        // #if the static may not be there in another configuration, so then both stay.
+        var stat = "static int kq_shd(void){ return 3; }\n";
+        using var t = new TreeCarve()
+            .W("main.c", Main)
+            .W("init.c", (underIf ? "#ifdef KQ_OPT\n" + stat + "#endif\n" : stat) + "int kq_init(void){ return kq_shd(); }\n")
+            .W("other.c", "int kq_dead(void);\nint kq_shd(void){ return kq_dead(); }\n")
+            .W("dead.c", "int kq_dead(void){ return 2; }\n");
+        t.Compile("main.c").Compile("init.c").Compile("other.c").Compile("dead.c");
+        var r = t.Carve(entry: "main");
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.True(t.Kept("init.c"), r.Out + r.Err);
+        Assert.Equal(underIf, t.Kept("other.c"));
+        Assert.Equal(underIf, t.Kept("dead.c"));
+    }
 }

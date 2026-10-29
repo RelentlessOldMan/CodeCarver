@@ -114,9 +114,11 @@ public sealed class AsmReferenceRootProvider : IRootProvider
         foreach (var t in _definitionTexts) macros.Feed(t, expand: false);
         foreach (var t in _asmTexts)
         {
-            foreach (Match m in Ident.Matches(t))
+            // A gas macro's invocation names only what its expansion does (unused arguments name nothing).
+            var expanded = macros.Feed(t);
+            foreach (Match m in Ident.Matches(macros.WithoutInvocations(t)))
                 names.Add(m.Value);
-            foreach (Match m in Ident.Matches(macros.Feed(t)))
+            foreach (Match m in Ident.Matches(expanded))
                 names.Add(m.Value);
         }
         // A name an object-like #define stands for (.word VEC, #define VEC CAT(KQ_, UART)), and what it expands to.

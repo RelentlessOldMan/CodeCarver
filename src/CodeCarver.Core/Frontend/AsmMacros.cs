@@ -116,6 +116,37 @@ public sealed class AsmMacros
         return k < 0 ? s : s[..k];
     }
 
+    /// <summary><paramref name="text"/> with each statement that invokes a known gas macro blanked: what the assembler
+    /// reads there is the expansion (<see cref="Feed"/>), and an argument the body never uses (<c>.macro m a, ab</c> /
+    /// <c>bl \ab</c>) names nothing.</summary>
+    public string WithoutInvocations(string text)
+    {
+        if (_gas.Count == 0) return text;
+        var sb = new StringBuilder(text.Length);
+        foreach (var line in text.Split('\n'))
+        {
+            var parts = line.Split(';');
+            for (var i = 0; i < parts.Length; i++)
+            {
+                if (i > 0) sb.Append(';');
+                if (GasMacroOf(parts[i]) is null) sb.Append(parts[i]);
+                else if (parts[i].TrimStart() is var t && t.IndexOf(':') is var c && c > 0 && Ident.Match(t).Length == c)
+                    sb.Append(t, 0, c + 1);   // the label stays
+            }
+            sb.Append('\n');
+        }
+        return sb.ToString();
+    }
+
+    GasMacro? GasMacroOf(string statement)
+    {
+        var s = statement.TrimStart();
+        var colon = s.IndexOf(':');
+        if (colon > 0 && Ident.Match(s).Length == colon) s = s[(colon + 1)..].TrimStart();
+        var w = Regex.Match(s, @"^[A-Za-z_.$][\w.$]*");
+        return w.Success && _gas.TryGetValue(w.Value, out var mac) ? mac : null;
+    }
+
     void Expand(string line, int depth, StringBuilder sb)
     {
         if (depth >= MaxDepth) return;
