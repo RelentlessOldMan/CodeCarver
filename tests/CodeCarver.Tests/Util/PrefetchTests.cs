@@ -44,4 +44,55 @@ public class PrefetchTests
         Assert.Throws<InvalidOperationException>(() =>
             ReadAhead.Prefetch(items, i => i == 7 ? throw new InvalidOperationException() : i, _ => 1, 100).ToList());
     }
+
+    [Fact]
+    public void OrderedStream_InOrder_AndASlowItemLeavesTheOthersWorking()
+    {
+        // Item 0 waits until items 1..6 are done: with a handout that waits on its oldest item it would never finish.
+        var items = Enumerable.Range(0, 200).ToList();
+        var others = new CountdownEvent(6);
+        var waits = new ReadAhead.StreamWaits();
+        var got = ReadAhead.OrderedStream(items, i =>
+        {
+            if (i == 0) Assert.True(others.Wait(TimeSpan.FromSeconds(30)), "the other threads sat idle behind item 0");
+            else if (i <= 6) others.Signal();
+            return i * 3;
+        }, workers: 4, ahead: 32, _ => 1, maxWeight: 1_000, waits).ToList();
+        Assert.Equal(items, got.Select(x => x.Item));
+        Assert.Equal(items.Select(i => i * 3), got.Select(x => x.Value));
+    }
+
+    [Fact]
+    public void OrderedStream_HoldsNoMoreThanItsBounds()
+    {
+        var items = Enumerable.Range(0, 300).ToList();
+        int started = 0, consumed = 0, maxAhead = 0;
+        foreach (var _ in ReadAhead.OrderedStream(items, i =>
+                 {
+                     var s = Interlocked.Increment(ref started);
+                     InterlockedMax(ref maxAhead, s - Volatile.Read(ref consumed));
+                     return i;
+                 }, workers: 4, ahead: 8, _ => 1, maxWeight: 1_000))
+        {
+            Interlocked.Increment(ref consumed);
+            Thread.Sleep(1);
+        }
+        // At most ahead past the caller, plus one item in hand per other thread.
+        Assert.True(maxAhead <= 8 + 4, $"ahead {maxAhead}");
+    }
+
+    [Fact]
+    public void OrderedStream_AFailedItem_Throws_AndEmptyIsEmpty()
+    {
+        Assert.Throws<InvalidOperationException>(() =>
+            ReadAhead.OrderedStream(Enumerable.Range(0, 50), i => i == 9 ? throw new InvalidOperationException() : i,
+                                    4, 16, _ => 1, 100).ToList());
+        Assert.Empty(ReadAhead.OrderedStream(Enumerable.Empty<int>(), i => i, 4, 16, _ => 1, 100));
+    }
+
+    static void InterlockedMax(ref int target, int value)
+    {
+        int seen;
+        while ((seen = Volatile.Read(ref target)) < value && Interlocked.CompareExchange(ref target, value, seen) != seen) { }
+    }
 }

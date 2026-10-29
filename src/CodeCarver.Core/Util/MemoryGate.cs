@@ -43,6 +43,11 @@ public class MemoryGate
 
     public long Budget => _budget;
 
+    /// <summary>How long pieces waited for room, in Stopwatch ticks summed over the threads, and how many waited.</summary>
+    public long WaitTicks { get { lock (_gate) return _waitTicks; } }
+    public long Waits { get { lock (_gate) return _waits; } }
+    long _waitTicks, _waits;
+
     /// <summary>Waits for room for a piece of <paramref name="chars"/> characters; the lease gives it back.</summary>
     public Lease Acquire(int chars)
     {
@@ -50,7 +55,13 @@ public class MemoryGate
         var cost = Math.Min(_budget, chars * _bytesPerChar);
         lock (_gate)
         {
-            while (_inUse > 0 && _inUse + cost > _budget) Monitor.Wait(_gate);
+            if (_inUse > 0 && _inUse + cost > _budget)
+            {
+                var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                while (_inUse > 0 && _inUse + cost > _budget) Monitor.Wait(_gate);
+                _waitTicks += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                _waits++;
+            }
             _inUse += cost;
         }
         return new Lease(this, cost);

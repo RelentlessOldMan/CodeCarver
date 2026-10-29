@@ -298,6 +298,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         int.TryParse(Environment.GetEnvironmentVariable("CODECARVER_PARSE_THREADS"), out var t) && t > 0 ? t : Environment.ProcessorCount;
     // Text read ahead of the parses, at most, in chars (2 bytes each): enough to keep many reads in flight on a share.
     private const long ParseReadAheadChars = 32L << 20;
+    // Parsed files held ahead of the merge, at most: a slow file holds up only the merge, and the other threads go on
+    // parsing the files after it (handing out a file only once the oldest was done left them idle behind it). Past the
+    // next one, only while what is held parsed from under ParseAheadBytes of text.
+    private const int ParseAheadFiles = 8;
+    private const long ParseAheadBytes = 16L << 20;
     private const int BudgetMinBytes = 256 * 1024;
 
     /// <summary>Per-file SYMBOL budget: the max number of definitions (functions + macros + types +
@@ -596,6 +601,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // The files are read ahead on their own threads, many at once, and each parse thread takes its text as it frees
         // up: reading inside the parse threads kept only one read per core in flight, and on a share the cores sat
         // waiting on them. At most ParseReadAheadChars of text is held ahead of the parses.
+        var streamWaits = new CodeCarver.Core.Util.ReadAhead.StreamWaits();
         CodeCarver.Core.Util.Activity.Expect(paths.Count);
         string TimedRead(string p)
         {
@@ -604,9 +610,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             Interlocked.Add(ref _tRead, System.Diagnostics.Stopwatch.GetTimestamp() - t0);
             return text;
         }
-        foreach (var (file, w) in CodeCarver.Core.Util.ReadAhead.Map(
+        foreach (var (file, w) in CodeCarver.Core.Util.ReadAhead.OrderedStream(
                      CodeCarver.Core.Util.ReadAhead.Prefetch(paths, TimedRead, t => t.Length, ParseReadAheadChars),
-                     x => ParseOne(x.Item, _ => x.Value, fileNodeByPath, pathsByBasename, defines, closedWorldDefines), threads))
+                     x => ParseOne(x.Item, _ => x.Value, fileNodeByPath, pathsByBasename, defines, closedWorldDefines), threads,
+                     ParseAheadFiles * threads, fw => fw.Length, ParseAheadBytes, streamWaits))
         {
             var tGot = System.Diagnostics.Stopwatch.GetTimestamp();
             _tWaitHead += tGot - tDone;
@@ -649,6 +656,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _timing["parse-files.read"] = Ms(_tRead);
         _timing["parse-files.merge"] = Ms(_tMerge);
         _timing["parse-files.waitHead"] = Ms(_tWaitHead);
+        _timing["parse-files.waitText"] = Ms(streamWaits.TakeTicks);
+        _timing["parse-files.waitAhead"] = Ms(streamWaits.AheadTicks);
+        _timing["files.parseThreads"] = threads;
+        _timing["parse-files.memoryWait"] = Ms(s_parseMemory.Value.WaitTicks);
+        _timing["files.parseMemoryWaits"] = s_parseMemory.Value.Waits;
+        _timing["files.parseMemoryBudgetMb"] = s_parseMemory.Value.Budget >> 20;
         _timing["files.parsed"] = parsedFiles;
         _timing["files.parsedBytes"] = parsedBytes;
         _timing["files.largestBytes"] = largestBytes;

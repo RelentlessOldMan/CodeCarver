@@ -204,4 +204,99 @@ public static class ReadAhead
             yield return (i, t.GetAwaiter().GetResult());
         }
     }
+
+    /// <summary>Where <see cref="OrderedStream"/>'s threads waited: <see cref="TakeTicks"/> is the Stopwatch ticks spent
+    /// taking the next item (waiting on the reads that feed it, or on another thread taking one), <see cref="AheadTicks"/>
+    /// waiting for the caller to take results (the ahead limits), both summed over the threads.</summary>
+    public sealed class StreamWaits { public long TakeTicks, AheadTicks; }
+
+    /// <summary>Each item with <paramref name="f"/> of it, in order, on <paramref name="workers"/> threads, each item
+    /// handed out as a thread frees up: up to <paramref name="ahead"/> items past the one the caller waits on, and past
+    /// it only while the results held weigh (<paramref name="weigh"/>) under <paramref name="maxWeight"/>. <see cref="Map"/>
+    /// starts no item until its oldest is done, so one slow item left the other threads idle. <paramref name="items"/>
+    /// is enumerated under a lock, one item at a time.</summary>
+    public static IEnumerable<(T Item, R Value)> OrderedStream<T, R>(IEnumerable<T> items, Func<T, R> f, int workers,
+                                                                     int ahead, Func<R, long> weigh, long maxWeight,
+                                                                     StreamWaits? waits = null)
+    {
+        var e = items.GetEnumerator();
+        var results = new Dictionary<long, (T Item, R Value)>();
+        var gate = new object();
+        var take = new object();
+        long next = 0, cursor = 0, held = 0, count = -1;
+        var stop = false;
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo? failed = null;
+        void Work()
+        {
+            while (true)
+            {
+                long i; T item;
+                // Room first (another thread may take its item meanwhile: at most workers - 1 past the limits), then one
+                // thread takes the next item at a time, outside the results' lock: taking it can wait on a read.
+                var a0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                lock (gate)
+                {
+                    while (!stop && count < 0 && (next >= cursor + ahead || (next > cursor && held >= maxWeight))) Monitor.Wait(gate);
+                    if (stop || count >= 0) return;
+                }
+                var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                lock (take)
+                {
+                    bool more;
+                    try { more = e.MoveNext(); item = more ? e.Current : default!; }
+                    catch (Exception ex)
+                    {
+                        lock (gate) { failed ??= System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex); stop = true; Monitor.PulseAll(gate); }
+                        return;
+                    }
+                    if (waits is not null)
+                    {
+                        Interlocked.Add(ref waits.TakeTicks, System.Diagnostics.Stopwatch.GetTimestamp() - t0);
+                        Interlocked.Add(ref waits.AheadTicks, t0 - a0);
+                    }
+                    lock (gate)
+                    {
+                        if (!more) { count = next; Monitor.PulseAll(gate); return; }
+                        i = next++;
+                    }
+                }
+                R r;
+                try { r = f(item); }
+                catch (Exception ex)
+                {
+                    lock (gate) { failed ??= System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex); stop = true; Monitor.PulseAll(gate); }
+                    return;
+                }
+                var w = weigh(r);
+                lock (gate) { results[i] = (item, r); held += w; Monitor.PulseAll(gate); }
+            }
+        }
+        var tasks = new Task[Math.Max(1, workers)];
+        for (var k = 0; k < tasks.Length; k++) tasks[k] = new Task(Work, TaskCreationOptions.LongRunning);
+        foreach (var t in tasks) t.Start();
+        try
+        {
+            while (true)
+            {
+                (T Item, R Value) got;
+                lock (gate)
+                {
+                    while (!results.ContainsKey(cursor) && failed is null && (count < 0 || cursor < count)) Monitor.Wait(gate);
+                    failed?.Throw();
+                    if (!results.Remove(cursor, out got)) break;
+                    held -= weigh(got.Value);
+                    cursor++;
+                    Monitor.PulseAll(gate);
+                }
+                Activity.Tick();
+                yield return got;
+            }
+        }
+        finally
+        {
+            lock (gate) { stop = true; Monitor.PulseAll(gate); }
+            Task.WaitAll(tasks);
+            e.Dispose();
+        }
+    }
 }
