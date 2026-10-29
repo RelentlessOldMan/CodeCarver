@@ -244,7 +244,9 @@ public sealed class StreamingCheckTests
 
             var third = EmittedLinkCheck.Run(new[] { main, b }, new[] { a, c }, cache: cache);
             Assert.Equal(new[] { "a_fn", "c_fn" }, Names(third));
-            Assert.Equal(0, third.Stats["digestsReused"]);
+            // It wants c_fn, which the second didn't: main.c calls it and is scanned again; b.c doesn't use it and is served.
+            Assert.Equal(1, third.Stats["digestsReused"]);
+            Assert.Equal(1, third.Stats["digestsMissingNamesMax"]);
 
             // A round that also keeps a later stage's names (alsoWanted) serves that stage's first round.
             var later = new LinkCheckCache(_ => false);

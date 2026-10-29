@@ -153,7 +153,7 @@ public static class EmittedLinkCheck
         // Each loop's time, and memory as it ends: the process's private bytes, the managed heap the last GC left, and
         // managed bytes allocated in the loop (MB). A "Max" key is kept at its largest over a stage's rounds.
         var allocatedAt = GC.GetTotalAllocatedBytes();
-        long filesRead = 0, fromCache = 0, headersHandedOn = 0, scansOutsideBudget = 0, handedOnHeld = 0, handedOnMax = 0, instancesRedone = 0, verbatimSkipped = 0, digestsReused = 0, templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
+        long filesRead = 0, fromCache = 0, headersHandedOn = 0, scansOutsideBudget = 0, handedOnHeld = 0, handedOnMax = 0, instancesRedone = 0, verbatimSkipped = 0, digestsReused = 0, missingMaxOut = 0,templateWalks = 0, templateWalksSkipped = 0, templateWalksReused = 0, templateWalksRedone = 0, templateWalksWhole = 0, headersRefiltered = 0, templateWalkHashHits = 0;
         // The tree's shape, for sizing a test corpus like it (shape.*): each header's size, each walk's include closure.
         var headerSizes = new ConcurrentDictionary<string, long>(StringComparer.Ordinal);
         // Headers spilled to the local disk (see ReadAgain), removed when the check is done.
@@ -220,7 +220,7 @@ public static class EmittedLinkCheck
             var shape = new Dictionary<string, long>(StringComparer.Ordinal);
             Shape(shape, headerSizes.Values, closures, templateWalks, templateWalksSkipped);
             s_shapeNow = Frozen(shape);
-            stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["headersHandedOn"] = headersHandedOn; stats["scansOutsideBudget"] = scansOutsideBudget; stats["instancesRedone"] = instancesRedone; stats["verbatimSkipped"] = verbatimSkipped; stats["digestsReused"] = digestsReused;
+            stats["filesRead"] = filesRead; stats["fromCache"] = fromCache; stats["headersHandedOn"] = headersHandedOn; stats["scansOutsideBudget"] = scansOutsideBudget; stats["instancesRedone"] = instancesRedone; stats["verbatimSkipped"] = verbatimSkipped; stats["digestsReused"] = digestsReused; stats["digestsMissingNamesMax"] = missingMaxOut;
             stats["scanWaits"] = scanGate.Waits; stats["readWaits"] = readGate.Waits; stats["walkWaits"] = walkGate.Waits; stats["parseWaits"] = parseGate.Waits;
             stats["walkCostMaxMb"] = Math.Max(0, walkCost) >> 20;
             stats["templateWalks"] = templateWalks; stats["templateWalksSkipped"] = templateWalksSkipped; stats["templateWalksReused"] = templateWalksReused;
@@ -861,11 +861,24 @@ public static class EmittedLinkCheck
             if (anyWrap) wantedNow.UnionWith(wrapped!);
             if (alsoWanted is not null) wantedNow.UnionWith(alsoWanted);
         }
-        var covers = new ConcurrentDictionary<HashSet<string>, bool>(ReferenceEqualityComparer.Instance);
+        // The names this round wants that a digest's round didn't, by that round's set, as sorted name hashes (null: too many
+        // to look up). A digest serves a file that uses none of them: one name the graph doesn't have (the tokenizer finds
+        // definitions it doesn't model) made every digest of a later stage miss (work, 1.0.376: stage1 scanned all 10.7k
+        // files again).
+        var missing = new ConcurrentDictionary<HashSet<string>, int[]?>(ReferenceEqualityComparer.Instance);
+        int[]? Missing(HashSet<string> w)
+        {
+            if (ReferenceEquals(w, wantedNow)) return Array.Empty<int>();
+            var m = wantedNow!.Where(n => !w.Contains(n)).Take(MaxMissingNames + 1).Select(NameHash).Distinct().ToArray();
+            Array.Sort(m);
+            lock (missing) missingMaxOut = Math.Max(missingMaxOut, m.Length);
+            return m.Length > MaxMissingNames ? null : m;
+        }
         bool Covers(EmittedDigest d, Dictionary<string, int>? prunedHere) =>
             ReferenceEquals(d.DeadLines, deadLines)
-            && covers.GetOrAdd(d.Wanted, w => ReferenceEquals(w, wantedNow) || wantedNow!.IsSubsetOf(w))
-            && (prunedHere is null || prunedHere.Keys.All(k => d.Wanted.Contains(k) || (d.Pruned?.ContainsKey(k) ?? false)));
+            && missing.GetOrAdd(d.Wanted, Missing) is { } m && (m.Length == 0 || d.UseHashes is { } uh && !AnyCommon(m, uh))
+            && (prunedHere is null || prunedHere.Keys.All(k => d.Wanted.Contains(k) || (d.Pruned?.ContainsKey(k) ?? false)
+                                                               || d.UseHashes is { } h && Array.BinarySearch(h, NameHash(k)) < 0));
         // A file's scan, or the digest an earlier round left of the same text; and its template instances, with the
         // dead-line map when they need it.
         (EmittedDigest? Had, ScanResult? Scan, List<Definition> Inst, bool[]? Map, ulong Hash, int Length, Dictionary<string, int>? Pruned)? ScanEmitted((string Rel, string Path) f)
@@ -888,6 +901,13 @@ public static class EmittedLinkCheck
             ScanResult s;
             using (Activity.Part("emitted.scan", text.Length)) s = IsAssembly(f.Rel) ? ScanAssembly(text) : BudgetedScan(text, IsHeader(f.Rel), definerMacros: definerMacros);
             Renamed(s);
+            // Every name the file uses, for a later round wanting names this one doesn't (Covers).
+            if (cache is not null)
+            {
+                var all = s.Uses.Select(u => NameHash(u.Name)).Concat(s.CallUses.Select(u => NameHash(u.Name))).Distinct().ToArray();
+                Array.Sort(all);
+                s.UseHashes = all;
+            }
             // A use is read below only for a name a dropped file defines, a static pruned from this file, or a wrapped
             // symbol: the others are let go here, so a result waiting its turn holds little.
             bool Wanted(string n) => droppedDefs.ContainsKey(n) || (prunedHere?.ContainsKey(n) ?? false) || (anyWrap && wrapped!.Contains(n))
@@ -915,6 +935,7 @@ public static class EmittedLinkCheck
                 AliasMacros = scan.AliasMacros.Select(Pooled).ToArray(),
                 Declarators = scan.MacroDeclarators.Where(m => !IsDead(m.Line)).Select(m => (Pooled(m.Name), Pooled(m.Macro), Pooled(m.Target), m.Line)).ToArray(),
                 Weak = scan.WeakDeclarations.Count == 0 ? null : scan.WeakDeclarations.Select(Pooled).ToHashSet(StringComparer.Ordinal),
+                UseHashes = scan.UseHashes,
             };
         }
         var emittedSorted = emittedList.OrderBy(e => e.Rel, StringComparer.Ordinal).ToList();
@@ -1236,8 +1257,36 @@ public static class EmittedLinkCheck
         public required string[] AliasMacros { get; init; }
         public required (string Name, string Macro, string Target, int Line)[] Declarators { get; init; }
         public required HashSet<string>? Weak { get; init; }
+        /// <summary>The hash (<see cref="NameHash"/>) of every name the file uses, sorted: a name not among them is not used
+        /// here (a collision only makes the file scanned again).</summary>
+        public int[]? UseHashes { get; init; }
+        // A hash is 4 bytes, an item about 32.
         public long Items => Definitions.Length + Uses.Length + DeadMacros.Length + AliasMacros.Length + Declarators.Length
-                             + (LiveMacros?.Count ?? 0) + (Includes?.Count ?? 0) + (Weak?.Count ?? 0);
+                             + (LiveMacros?.Count ?? 0) + (Includes?.Count ?? 0) + (Weak?.Count ?? 0) + ((UseHashes?.Length ?? 0) + 7) / 8;
+    }
+
+    /// <summary>Names a later round wants that a digest's round didn't, past which its digests serve no file.</summary>
+    const int MaxMissingNames = 1 << 16;
+
+    static int NameHash(string n) => string.GetHashCode(n.AsSpan(), StringComparison.Ordinal);
+
+    /// <summary>Whether two sorted arrays share a value: a binary search per value of the short one when it is much
+    /// shorter, else a merge.</summary>
+    internal static bool AnyCommon(int[] a, int[] b)
+    {
+        if (a.Length > b.Length) (a, b) = (b, a);
+        if (a.Length == 0) return false;
+        if ((long)a.Length * 16 < b.Length)
+        {
+            foreach (var x in a) if (Array.BinarySearch(b, x) >= 0) return true;
+            return false;
+        }
+        for (int i = 0, j = 0; i < a.Length && j < b.Length;)
+        {
+            if (a[i] == b[j]) return true;
+            if (a[i] < b[j]) i++; else j++;
+        }
+        return false;
     }
 
     public sealed class ScanResult
@@ -1252,6 +1301,8 @@ public static class EmittedLinkCheck
         public List<string> Includes { get; } = new();
         /// <summary>Uses written as a call, <c>name(</c>: a function-like macro of that name would expand them.</summary>
         public HashSet<(string Name, int Line)> CallUses { get; } = new();
+        /// <summary>For a digest: every used name's hash, taken before the uses are filtered (see EmittedDigest.UseHashes).</summary>
+        internal int[]? UseHashes { get; set; }
         /// <summary>Function-like macros this file defines whose body is <c>alias(#arg)</c>.</summary>
         public HashSet<string> AliasMacros { get; } = new(StringComparer.Ordinal);
         /// <summary><c>decl(...) MACRO(target);</c>: a definition of decl when MACRO is an alias macro (which may be
