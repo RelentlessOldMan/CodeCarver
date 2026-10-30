@@ -2239,11 +2239,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             // per-file table exists (no build log, or a file absent from it).
             var fileDefines = PerFileDefines?.Invoke(path) ?? defines;
             w.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
+            // The file's share of the parse memory first, split or not, so the biggest files, started first, get theirs
+            // first: one waiting for most of the budget never gets it while smaller ones keep coming.
+            w.Lease = s_parseMemory.Value.Acquire(text.Length);
+            fsw.Restart();   // a file's time is its own work; the wait for memory is counted in memoryWait
             var split = text.Length >= SplitMinChars ? SplitInput(w, path, text) : null;
             if (split is not null) ParseSplit(w, path, split, fileNodeByPath, pathsByBasename, fileDefines, closedWorldDefines);
             else
             {
-                w.Lease = s_parseMemory.Value.Acquire(text.Length);
                 try { ProcessFile(w, path, text, fileNodeByPath, pathsByBasename, fileDefines, closedWorldDefines); }
                 finally { t_parents = null; }
             }
@@ -2356,6 +2359,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 || (_c99InlineFns.Count > 0 && IsTranslationUnit(path) && C99Inline.Emitters(text, _c99InlineFns).Any())
                 || (!_cGrammar && text.Contains("R\"", StringComparison.Ordinal)))
                 return null;
+            // The rewrites cost about as much as a pass: a file with no cut in its own text (a header in an include
+            // guard) is not rewritten twice to find none.
+            if (SplitLines(text, SplitPieceChars, SplitMaxPieces).Count < 2) return null;
             var parseText = PrepareParseText(path, text, out var bare, out var blanked);
             var cuts = SplitLines(parseText, SplitPieceChars, SplitMaxPieces);
             if (cuts.Count < 2) return null;
@@ -2403,18 +2409,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             var own = (i + 1 < k ? s.TextStarts[i + 1] : s.Text.Length) - s.TextStarts[i];
             var piece = new Piece(s.Text, pad + s.ParseText[s.ParseStarts[i]..(i + 1 < k ? s.ParseStarts[i + 1] : s.ParseText.Length)],
                                   s.BareKAndR?.Where(b => b.Line > s.Lines[i] && b.Line <= last).ToList(), dead, conditional, state);
-            part.Lease = s_parseMemory.Value.Acquire(own);
+            // The pieces hold the file's share of the parse memory between them; a piece that times out hands it to its
+            // parse, as the whole file's would.
+            part.Lease = w.Lease;
             try
             {
                 part.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
                 ProcessFile(part, path, pad + s.Text.Substring(s.TextStarts[i], own), fileNodeByPath, pathsByBasename,
                             defines, closedWorldDefines, piece);
             }
-            finally
-            {
-                t_parents = null;
-                if (!part.LeaseHandedOff) part.Lease.Release();
-            }
+            finally { t_parents = null; }
         }
         // Each piece past the first on a thread of its own while the parse has one to spare, the rest on this one.
         var tasks = new List<Task>();
@@ -2432,6 +2436,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             catch (Exception ex) { failure ??= ex; state.Failed = true; }
         try { Task.WaitAll(tasks.ToArray()); }
         catch (AggregateException ae) { failure ??= ae.InnerExceptions[0]; }
+        if (parts.Any(p => p?.LeaseHandedOff == true)) w.LeaseHandedOff = true;
         if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(failure);
 
         w.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -2485,13 +2490,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var step = t.Length / pieces;
         int braces = 0, parens = 0, pp = 0, line = 0, i = 0, n = t.Length;
         var last = ';';                      // the last significant character outside directives (a word is 'a')
-        string? word = null, parenWord = null;
+        int wordAt = -1, wordLen = 0, parenAt = -1, parenLen = 0;   // the last word, and the one before a top-level `(`
         bool bodyOpen = false, bodyClose = false, krHead = false, lineStart = true, directive = false;
         var externs = new Stack<bool>();     // per open `{`: an `extern "C" {`, which counts for nothing
         var next = step;
-        static bool IsAttribute(string? w) => w is "__attribute__" or "__attribute" or "__declspec" or "alignas" or "_Alignas"
+        static bool IsAttribute(ReadOnlySpan<char> w) => w is "__attribute__" or "__attribute" or "__declspec" or "alignas" or "_Alignas"
                                                    or "__asm__" or "__asm" or "asm" or "__align";
-        static bool LowerCaseName(string? w) => w is not null && w.Any(char.IsLower) && !IsAttribute(w);
+        static bool LowerCaseName(ReadOnlySpan<char> w) => w.Length > 0 && w.ContainsAnyInRange('a', 'z') && !IsAttribute(w);
         while (i < n)
         {
             var c = t[i];
@@ -2555,7 +2560,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 var j = i;
                 while (j < n && (char.IsAsciiLetterOrDigit(t[j]) || t[j] == '_')) j++;
                 if (last == ')' && braces == 0 && parens == 0) krHead = true;
-                word = char.IsAsciiDigit(c) ? null : t[i..j];
+                (wordAt, wordLen) = char.IsAsciiDigit(c) ? (-1, 0) : (i, j - i);
                 last = 'a';
                 i = j;
                 continue;
@@ -2563,11 +2568,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             switch (c)
             {
                 case '{':
-                    var isExtern = last == '"' && word == "extern";
+                    var isExtern = last == '"' && wordAt >= 0 && t.AsSpan(wordAt, wordLen) is "extern";
                     externs.Push(isExtern);
                     if (!isExtern)
                     {
-                        if (braces == 0 && parens == 0) bodyOpen = last == ')' && LowerCaseName(parenWord);
+                        if (braces == 0 && parens == 0) bodyOpen = last == ')' && parenAt >= 0 && LowerCaseName(t.AsSpan(parenAt, parenLen));
                         braces++;
                         krHead = false;
                         last = c;
@@ -2580,7 +2585,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                     last = c;
                     break;
                 case '(':
-                    if (braces == 0 && parens == 0) parenWord = last == 'a' ? word : null;
+                    if (braces == 0 && parens == 0) (parenAt, parenLen) = last == 'a' ? (wordAt, wordLen) : (-1, 0);
                     parens++;
                     last = c;
                     break;
