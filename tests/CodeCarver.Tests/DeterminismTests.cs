@@ -140,6 +140,30 @@ public sealed class DeterminismTests
             Assert.Equal(one, GraphOf(() => new CFrontEnd(), Shapes, 8));
     }
 
+    [Fact]
+    public void ParallelParse_WithBigFilesParsedFirst_BuildsTheSameGraph()
+    {
+        // Big files are parsed ahead of their turn and merged when the path order reaches them: two of them, between the
+        // small ones, each defining statics and calling across files.
+        static string Big(string tag)
+        {
+            var sb = new System.Text.StringBuilder($"#include \"a.h\"\nint {tag}_entry(void){{ return fa() + {tag}_0(); }}\n");
+            for (var i = 0; sb.Length < 300_000; i++)
+                sb.Append($"static int {tag}_s{i}(int x){{ return x + {i}; }}\nint {tag}_{i}(void){{ return {tag}_s{i}({i}) + fb(); }}\n");
+            return sb.ToString();
+        }
+        var files = Shapes.Concat(new[] { ("b0_big.c", Big("bx")), ("c0_big.c", Big("cx")) })
+                          .OrderBy(f => f.Item1, StringComparer.Ordinal).ToList();
+        var one = GraphOf(() => new CFrontEnd(), files, 1);
+        for (var run = 0; run < 3; run++)
+            Assert.Equal(one, GraphOf(() => new CFrontEnd(), files, 8));
+
+        using var fe = new CFrontEnd();
+        fe.ParseThreads = 8;
+        fe.BuildGraph(files);
+        Assert.Equal(2, fe.Timing["files.parsedEarly"]);
+    }
+
     /// <summary>The same on real code, when a corpus repo is fetched (.corpus): thousands of definitions, real parse
     /// errors and macros.</summary>
     [SkippableTheory]

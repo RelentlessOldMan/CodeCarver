@@ -303,6 +303,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     // next one, only while what is held parsed from under ParseAheadBytes of text.
     private const int ParseAheadFiles = 8;
     private const long ParseAheadBytes = 16L << 20;
+    // Files parsed first, biggest first, on threads of their own (as many as the parse has; the parse memory budget
+    // still holds how many big ones run at once): those of at least EarlyMinChars, up to EarlyMaxChars
+    // in all (each one's FileWork is held until the merge reaches it).
+    private const int EarlyMinChars = 256 * 1024;
+    private const long EarlyMaxChars = 64L << 20;
     private const int BudgetMinBytes = 256 * 1024;
 
     /// <summary>Per-file SYMBOL budget: the max number of definitions (functions + macros + types +
@@ -366,6 +371,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private Dictionary<string, (bool FnLike, List<string> Bodies)> _macroBodies = new(StringComparer.Ordinal);
     // How many #define lines the pre-pass found (to size the graph before the parse).
     private long _defineSites;
+    // Each non-empty file's length in chars, from the macro pre-pass: picks the files the parse starts first.
+    private readonly Dictionary<string, int> _parseLengths = new(StringComparer.Ordinal);
 
     /// <summary>The definitions in the tree of function-like macro <paramref name="name"/>: parameters and body (comments
     /// blanked), or null when the tree does not define it so. For diagnostics (UseShape).</summary>
@@ -610,33 +617,81 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             Interlocked.Add(ref _tRead, System.Diagnostics.Stopwatch.GetTimestamp() - t0);
             return text;
         }
-        foreach (var (file, w) in CodeCarver.Core.Util.ReadAhead.OrderedStream(
-                     CodeCarver.Core.Util.ReadAhead.Prefetch(paths, TimedRead, t => t.Length, ParseReadAheadChars),
-                     x => ParseOne(x.Item, _ => x.Value, fileNodeByPath, pathsByBasename, defines, closedWorldDefines), threads,
-                     ParseAheadFiles * threads, fw => fw.Length, ParseAheadBytes, streamWaits))
+        // The biggest files are parsed first, on their own threads, and merged when the path order reaches them: one
+        // file can take a minute, and when it came up in its turn the merge waited on it while the threads that had
+        // parsed the files after it sat idle (at work 32 threads waited 262 s each of a 330 s parse).
+        var early = new Dictionary<string, int>(StringComparer.Ordinal);   // path -> its place in earlyOrder; not changed once built
+        var earlyOrder = new List<string>();
+        long earlyChars = 0;
+        foreach (var p in paths.Where(p => _parseLengths.TryGetValue(p, out var n) && n >= EarlyMinChars)
+                               .OrderByDescending(p => _parseLengths[p]).ThenBy(p => p, StringComparer.Ordinal))
         {
-            var tGot = System.Diagnostics.Stopwatch.GetTimestamp();
-            _tWaitHead += tGot - tDone;
-            tDone = tGot;
-            var path = file.Item;
-            if (w.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
-            MergeFile(path, w, graph, functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
-                      pendingMacroRefs, pendingPastes, keepNames, keepAt);
-            tDone = System.Diagnostics.Stopwatch.GetTimestamp();
-            _tMerge += tDone - tGot;
-            var fileMs = w.Ms;
-            var length = w.Length;
-            if (timeFiles && fileMs >= 300)
-                lock (Log) Log.WriteLine($"  slowfile: {fileMs,6} ms  {path} ({length:N0} B)");
-            parsedFiles++; parsedBytes += length;
-            largestBytes = Math.Max(largestBytes, length);
-            if (length >= 1 << 20) filesOver1MB++;
-            if (fileMs >= 1000) { slowFiles++; slowMsTotal += fileMs; }
-            if (fileMs >= 10_000) verySlowFiles++;
-            if (fileMs > slowestMs) { slowestMs = fileMs; slowestBytes = length; }
+            var n = _parseLengths[p];
+            if (earlyChars + n > EarlyMaxChars) continue;
+            if (!early.TryAdd(p, earlyOrder.Count)) continue;
+            earlyOrder.Add(p); earlyChars += n;
+        }
+        // Each let go once merged, so a big file's FileWork is held only from its parse to its turn.
+        var earlyDone = earlyOrder.Select(_ => new TaskCompletionSource<FileWork>(TaskCreationOptions.RunContinuationsAsynchronously)).ToArray<TaskCompletionSource<FileWork>?>();
+        var earlyNext = -1;
+        var earlyStop = false;
+        void EarlyWork()
+        {
+            int k;
+            while (!Volatile.Read(ref earlyStop) && (k = Interlocked.Increment(ref earlyNext)) < earlyOrder.Count)
+            {
+                var p = earlyOrder[k];
+                var done = earlyDone[k]!;
+                try { done.SetResult(ParseOne(p, TimedRead, fileNodeByPath, pathsByBasename, defines, closedWorldDefines)); }
+                catch (Exception ex) { done.SetException(ex); }
+            }
+        }
+        var earlyTasks = Enumerable.Range(0, earlyOrder.Count == 0 ? 0 : Math.Clamp(threads, 1, earlyOrder.Count))
+                                   .Select(_ => Task.Factory.StartNew(EarlyWork, TaskCreationOptions.LongRunning)).ToArray();
+        long tWaitEarly = 0;
+        try
+        {
+            foreach (var (file, parsed) in CodeCarver.Core.Util.ReadAhead.OrderedStream(
+                         CodeCarver.Core.Util.ReadAhead.Prefetch(paths, p => early.ContainsKey(p) ? "" : TimedRead(p), t => t.Length, ParseReadAheadChars),
+                         x => ParseOne(x.Item, _ => x.Value, fileNodeByPath, pathsByBasename, defines, closedWorldDefines), threads,
+                         ParseAheadFiles * threads, fw => fw.Length, ParseAheadBytes, streamWaits))
+            {
+                var w = parsed;
+                var path = file.Item;
+                if (early.TryGetValue(path, out var ek))
+                {
+                    var e0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    w = earlyDone[ek]!.Task.GetAwaiter().GetResult();
+                    earlyDone[ek] = null;
+                    tWaitEarly += System.Diagnostics.Stopwatch.GetTimestamp() - e0;
+                }
+                var tGot = System.Diagnostics.Stopwatch.GetTimestamp();
+                _tWaitHead += tGot - tDone;
+                tDone = tGot;
+                if (w.Length == 0) continue; // oversized/empty file: File node already registered; nothing to parse
+                MergeFile(path, w, graph, functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
+                          pendingMacroRefs, pendingPastes, keepNames, keepAt);
+                tDone = System.Diagnostics.Stopwatch.GetTimestamp();
+                _tMerge += tDone - tGot;
+                var fileMs = w.Ms;
+                var length = w.Length;
+                if (timeFiles && fileMs >= 300)
+                    lock (Log) Log.WriteLine($"  slowfile: {fileMs,6} ms  {path} ({length:N0} B)");
+                parsedFiles++; parsedBytes += length;
+                largestBytes = Math.Max(largestBytes, length);
+                if (length >= 1 << 20) filesOver1MB++;
+                if (fileMs >= 1000) { slowFiles++; slowMsTotal += fileMs; }
+                if (fileMs >= 10_000) verySlowFiles++;
+                if (fileMs > slowestMs) { slowestMs = fileMs; slowestBytes = length; }
 
-            bytesDone += length; filesDone++;
-            OnParseProgress?.Invoke(filesDone, filesTotal, bytesDone, bytesTotal);
+                bytesDone += length; filesDone++;
+                OnParseProgress?.Invoke(filesDone, filesTotal, bytesDone, bytesTotal);
+            }
+        }
+        finally
+        {
+            Volatile.Write(ref earlyStop, true);
+            Task.WaitAll(earlyTasks);
         }
 
         // Reference-only includes (.inc/.def generated tables): not parsed as a TU, but every symbol they
@@ -656,6 +711,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _timing["parse-files.read"] = Ms(_tRead);
         _timing["parse-files.merge"] = Ms(_tMerge);
         _timing["parse-files.waitHead"] = Ms(_tWaitHead);
+        _timing["parse-files.waitEarly"] = Ms(tWaitEarly);
+        _timing["files.parsedEarly"] = earlyOrder.Count;
+        _timing["files.parsedEarlyBytes"] = earlyChars;
         _timing["parse-files.waitText"] = Ms(streamWaits.TakeTicks);
         _timing["parse-files.waitAhead"] = Ms(streamWaits.AheadTicks);
         _timing["files.parseThreads"] = threads;
@@ -921,6 +979,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var bodies = new Dictionary<string, (bool FnLike, List<string> Bodies)>(StringComparer.Ordinal);
         long bytesTotal = 0; var filesTotal = 0;
         _defineSites = 0;
+        _parseLengths.Clear();
         var clock = System.Diagnostics.Stopwatch.StartNew();
         long readTicks = 0;
 
@@ -940,6 +999,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (f.Length == 0) continue;
             var path = paths[i];
             bytesTotal += f.Length; filesTotal++;
+            _parseLengths[path] = f.Length;
             if (f.MacroNamedHead) _macroNamedHeaders.Add(path);
             if (f.C99Inline is not null) _c99InlineFns.UnionWith(f.C99Inline);
             foreach (var (cname, sym) in f.Renamed) Renamed(cname, sym);
