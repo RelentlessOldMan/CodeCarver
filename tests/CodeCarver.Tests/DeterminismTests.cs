@@ -164,6 +164,49 @@ public sealed class DeterminismTests
         Assert.Equal(2, fe.Timing["files.parsedEarly"]);
     }
 
+    [Fact]
+    public void SplitParse_FindsTheSameDefinitionsAndUses_AsOnePiece()
+    {
+        // A big file parsed in pieces cut between top-level definitions: K&R heads, multi-line initializers, comments and
+        // strings with braces, #if blocks, extern "C" and continued macros must not take a cut, and the graph must hold
+        // the same nodes and edges (by name) as the file parsed whole, the same on 1 thread as on 8.
+        var sb = new System.Text.StringBuilder("#include \"a.h\"\n");
+        for (var i = 0; i < 400; i++)
+        {
+            sb.Append($"/* {i}: {{ ; }} */\nstatic int t{i}[] = {{ {i},\n  {i + 1} }};\n");
+            if (i % 9 == 0) sb.Append($"#if CFG\nint cfg{i}(void) {{ return {i}; }}\n#endif\n");
+            if (i % 11 == 0) sb.Append($"#define M{i}(x) \\\n  ((x) + {i})\n");
+            if (i % 13 == 0) sb.Append($"int kr{i}(a)\nint a;\n{{ return a + {i}; }}\n");
+            if (i % 17 == 0) sb.Append($"extern \"C\" {{\nint ex{i}(void);\n}}\n");
+            sb.Append($"static int s{i}(int x)\n{{\n  const char *m = \"{{ {i}\";\n  return x + m[0];\n}}\n");
+            sb.Append($"int f{i}(void)\n{{\n  return s{i}(t{i}[0]) + {(i + 1 < 400 ? $"f{i + 1}()" : "fa()")};\n}}\n\n");
+        }
+        var files = Shapes.Append(("big.c", sb.ToString())).OrderBy(f => f.Item1, StringComparer.Ordinal).ToList();
+
+        static (List<string> Graph, double Split) Run(IReadOnlyList<(string, string)> files, int threads, bool split)
+        {
+            using var fe = new CFrontEnd { ParseThreads = threads, SplitMinChars = split ? 16 * 1024 : int.MaxValue, SplitPieceChars = 8 * 1024 };
+            var g = fe.BuildGraph(files);
+            string Name(NodeId id) { var n = g.GetNode(id); return $"{n.Kind} {n.Name} {n.File} {n.Span.StartLine}-{n.Span.EndLine}"; }
+            var dump = g.Nodes.Select(n => "N " + Name(n.Id))
+                .Concat(g.Nodes.SelectMany(n => g.OutEdges(n.Id).Select(e => $"E {Name(n.Id)} {e.Kind} {Name(e.To)}")))
+                .Concat(fe.Warnings.Select(w => "W " + w)).Concat(fe.ForceKeepFiles.Select(f => "K " + f))
+                .Distinct().OrderBy(l => l, StringComparer.Ordinal).ToList();
+            return (dump, fe.Timing["files.parsedSplit"]);
+        }
+        var whole = Run(files, 1, split: false);
+        var one = Run(files, 1, split: true);
+        Assert.Equal(1, one.Split);
+        Assert.Equal(whole.Graph, one.Graph);
+        Assert.Equal(one.Graph, Run(files, 8, split: true).Graph);
+
+        var cuts = TreeSitterFrontEnd.SplitLines(sb.ToString(), 8 * 1024, 16);
+        Assert.True(cuts.Count > 4);
+        var lines = sb.ToString().Split('\n');
+        foreach (var (line, _) in cuts.Skip(1))
+            Assert.True(lines[line - 1] is "}" or "" || lines[line - 1].EndsWith(";") || lines[line - 1].EndsWith("*/"), $"cut after '{lines[line - 1]}'");
+    }
+
     /// <summary>The same on real code, when a corpus repo is fetched (.corpus): thousands of definitions, real parse
     /// errors and macros.</summary>
     [SkippableTheory]

@@ -220,6 +220,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     public int DefinitionsRecoveredByScan => _recoveredByScan;
     // CODECARVER_TIMING: where the per-file parse time goes (Stopwatch ticks), and how many files parsed with errors.
     private long _tPrep, _tParse, _tScan, _tRead; private int _errorFiles;
+    private int _filesSplit, _splitPieces;
     // The merge, one file at a time on the calling thread, and its waits for the next file in path order: when the parse
     // threads are idle, which of the two holds them up.
     private long _tMerge, _tWaitHead;
@@ -309,6 +310,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private const int EarlyMinChars = 256 * 1024;
     private const long EarlyMaxChars = 64L << 20;
     private const int BudgetMinBytes = 256 * 1024;
+    // A file of at least SplitMinChars is parsed in pieces of about SplitPieceChars, cut between top-level definitions
+    // (see SplitLines), at once on threads of their own: at work one file was a parse of over a minute, and its tree held
+    // a big share of the parse memory all that time. At most SplitMaxPieces pieces. Settable for tests.
+    internal int SplitMinChars { get; set; } = 1 << 20;
+    internal int SplitPieceChars { get; set; } = 512 * 1024;
+    private const int SplitMaxPieces = 16;
+    // Threads a split file's pieces may take besides the one parsing the file: one fewer than the parse has.
+    private SemaphoreSlim? _pieceSlots;
 
     /// <summary>Per-file SYMBOL budget: the max number of definitions (functions + macros + types +
     /// globals) a single file may mint into the graph. A file that would exceed it is kept WHOLE instead
@@ -604,6 +613,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // Files are read and processed on ParseThreads threads at once, each into its own FileWork, and merged here one
         // at a time in path order: the graph is the one a one-file-at-a-time parse builds, in a fraction of the time.
         var threads = ParseThreads;
+        _pieceSlots = new SemaphoreSlim(Math.Max(0, threads - 1));
         var tDone = System.Diagnostics.Stopwatch.GetTimestamp();
         // The files are read ahead on their own threads, many at once, and each parse thread takes its text as it frees
         // up: reading inside the parse threads kept only one read per core in flight, and on a share the cores sat
@@ -714,6 +724,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _timing["parse-files.waitEarly"] = Ms(tWaitEarly);
         _timing["files.parsedEarly"] = earlyOrder.Count;
         _timing["files.parsedEarlyBytes"] = earlyChars;
+        _timing["files.parsedSplit"] = _filesSplit;
+        _timing["files.splitPieces"] = _splitPieces;
         _timing["parse-files.waitText"] = Ms(streamWaits.TakeTicks);
         _timing["parse-files.waitAhead"] = Ms(streamWaits.AheadTicks);
         _timing["files.parseThreads"] = threads;
@@ -979,6 +991,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var bodies = new Dictionary<string, (bool FnLike, List<string> Bodies)>(StringComparer.Ordinal);
         long bytesTotal = 0; var filesTotal = 0;
         _defineSites = 0;
+        _filesSplit = 0; _splitPieces = 0;
         _parseLengths.Clear();
         var clock = System.Diagnostics.Stopwatch.StartNew();
         long readTicks = 0;
@@ -2193,6 +2206,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         /// <summary>Adds the time since the last mark to pass k.</summary>
         public void Lap(int k) { var now = System.Diagnostics.Stopwatch.GetTimestamp(); Pass[k] += now - Mark; Mark = now; }
         public int ErrorFiles, Recovered, Length;
+        // A split file's pieces, merged in order before this one's own work (see ParseSplit).
+        public FileWork[]? Parts;
 
         public FileWork()
         {
@@ -2215,7 +2230,6 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         w.TRead = System.Diagnostics.Stopwatch.GetTimestamp() - tr;
         w.Length = text.Length;
         if (text.Length == 0) return w; // oversized/empty file: File node already registered; nothing to parse
-        w.Lease = s_parseMemory.Value.Acquire(text.Length);
         var fsw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
@@ -2225,8 +2239,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             // per-file table exists (no build log, or a file absent from it).
             var fileDefines = PerFileDefines?.Invoke(path) ?? defines;
             w.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
-            try { ProcessFile(w, path, text, fileNodeByPath, pathsByBasename, fileDefines, closedWorldDefines); }
-            finally { t_parents = null; }
+            var split = text.Length >= SplitMinChars ? SplitInput(w, path, text) : null;
+            if (split is not null) ParseSplit(w, path, split, fileNodeByPath, pathsByBasename, fileDefines, closedWorldDefines);
+            else
+            {
+                w.Lease = s_parseMemory.Value.Acquire(text.Length);
+                try { ProcessFile(w, path, text, fileNodeByPath, pathsByBasename, fileDefines, closedWorldDefines); }
+                finally { t_parents = null; }
+            }
             w.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
             foreach (var n in ScanKeepAttributes(text)) { w.KeepNames.Add(n); if (IsTranslationUnit(path)) w.KeepAt.Add((n, path)); }
             foreach (var n in ScanToolchainKeeps(text)) { w.KeepNames.Add(n); if (IsTranslationUnit(path)) w.KeepAt.Add((n, path)); }
@@ -2240,7 +2260,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             w.ForceKeeps.Add(path);
             if (fileNodeByPath.ContainsKey(path)) KeptWholeRefs(w, path, text, w.FileNode(path), w.Refs);
         }
-        finally { if (!w.LeaseHandedOff) w.Lease.Release(); }
+        finally { if (!w.LeaseHandedOff) w.Lease?.Release(); }
         w.Ms = fsw.ElapsedMilliseconds;
         return w;
     }
@@ -2256,6 +2276,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                            List<(NodeId Macro, PasteKind Kind, string Frag)> pendingPastes,
                            HashSet<string> keepNames, List<(string Name, string Path)> keepAt)
     {
+        if (w.Parts is { } parts)
+        {
+            foreach (var part in parts)
+                MergeFile(path, part, graph, functionsByName, macrosByName, globalsByName, pendingCalls, pendingRefs,
+                          pendingMacroRefs, pendingPastes, keepNames, keepAt);
+            _filesSplit++; _splitPieces += parts.Length;
+        }
         var local = w.Graph;
         var map = new NodeId[local.NodeCount];
         foreach (var n in local.Nodes) map[n.Id.Value] = graph.GetOrAddNode(n.Kind, n.Name, n.File, n.Span, n.Flags);
@@ -2295,11 +2322,344 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _errorFiles += w.ErrorFiles; _recoveredByScan += w.Recovered;
     }
 
+    /// <summary>A split file's text, made once for all its pieces: <see cref="Text"/> normalized, its parse text, and
+    /// where each piece starts (its first line, 0-based, and that line's offset in each text).</summary>
+    private sealed record SplitText(string Text, string ParseText, List<(string Name, int Line, int EndLine)>? BareKAndR,
+                                    int[] Lines, int[] TextStarts, int[] ParseStarts);
+
+    /// <summary>What a split file's pieces share: the symbols they would mint between them, and whether one could not
+    /// be parsed. Any of those keeps the whole file whole, as the same file parsed in one piece would be.</summary>
+    private sealed class SplitState
+    {
+        public int Symbols;
+        public volatile bool Over, TimedOut, Failed;
+        public bool Stop => Over || TimedOut || Failed;
+    }
+
+    /// <summary>One piece of a split file. Its text is the file's lines before it as empty lines, then its own lines, so
+    /// its lines and columns are the file's; what needs the whole file comes from it.</summary>
+    private sealed record Piece(string FileText, string ParseText, List<(string Name, int Line, int EndLine)>? BareKAndR,
+                                bool[]? Dead, bool[]? Conditional, SplitState State);
+
+    /// <summary>The cuts for parsing a big file in pieces, or null to parse it in one: a data fragment, a file whose
+    /// passes need to see its definitions all at once (an asm label, a renamed extern, a C99 inline emitter), C++ with
+    /// a raw string, or no place to cut. Adds the time taken to the file's rewrites.</summary>
+    private SplitText? SplitInput(FileWork w, string path, string text)
+    {
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            text = SourceText.Normalize(text);
+            if (!IsTranslationUnit(path) && LooksLikeIncludeFragment(text)) return null;
+            if ((text.Contains("asm", StringComparison.Ordinal) && AsmLabelDecl.IsMatch(text))
+                || text.Contains("redefine_extname", StringComparison.Ordinal)
+                || (_c99InlineFns.Count > 0 && IsTranslationUnit(path) && C99Inline.Emitters(text, _c99InlineFns).Any())
+                || (!_cGrammar && text.Contains("R\"", StringComparison.Ordinal)))
+                return null;
+            var parseText = PrepareParseText(path, text, out var bare, out var blanked);
+            var cuts = SplitLines(parseText, SplitPieceChars, SplitMaxPieces);
+            if (cuts.Count < 2) return null;
+            // Rewrites keep lines: a piece's lines are the same in both texts.
+            var textStarts = new int[cuts.Count];
+            for (int i = 0, line = 0, at = 0; i < cuts.Count; i++)
+            {
+                for (; line < cuts[i].Line; line++)
+                {
+                    at = text.IndexOf('\n', at) + 1;
+                    if (at == 0) return null;
+                }
+                textStarts[i] = at;
+            }
+            if (blanked.Length > 0) IdentifierRefs(blanked, w.FileNode(path), w.Refs, callShapedOnly: false);
+            return new SplitText(text, parseText, bare, cuts.Select(c => c.Line).ToArray(), textStarts, cuts.Select(c => c.Offset).ToArray());
+        }
+        finally { w.TPrep += System.Diagnostics.Stopwatch.GetTimestamp() - t0; }
+    }
+
+    /// <summary>
+    /// Parse a big file in pieces at once, each on its own thread with its own share of the parse memory, into
+    /// <see cref="FileWork.Parts"/>, merged in order: the definitions and uses are those of the file parsed whole, but
+    /// each piece's tree is a fraction of the size and lives a fraction of the time. Cuts fall between top-level
+    /// definitions (see <see cref="SplitLines"/>); dead lines, the include and template passes read the whole file. A
+    /// file over the symbol budget, or with a piece that times out or fails, is kept whole as it would be in one piece.
+    /// </summary>
+    private void ParseSplit(FileWork w, string path, SplitText s, Dictionary<string, NodeId> fileNodeByPath,
+                            Dictionary<string, List<string>> pathsByBasename, MacroTable? defines, bool closedWorldDefines)
+    {
+        w.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
+        var dead = ExactDeadLines?.Invoke(path, s.Text)
+                   ?? (defines is null ? null : PreprocessorScanner.DeadLineMap(s.Text, defines, closedWorldDefines));
+        var conditional = path.EndsWith(".c", StringComparison.OrdinalIgnoreCase) ? ConditionalLines(s.Text) : null;
+        w.Lap(1);
+        var state = new SplitState();
+        var k = s.Lines.Length;
+        var parts = new FileWork[k];
+        void Run(int i)
+        {
+            var part = parts[i] = new FileWork();
+            if (state.Stop) return;
+            var last = i + 1 < k ? s.Lines[i + 1] : int.MaxValue;   // the 1-based lines (s.Lines[i], last] are this piece's
+            var pad = new string('\n', s.Lines[i]);
+            var own = (i + 1 < k ? s.TextStarts[i + 1] : s.Text.Length) - s.TextStarts[i];
+            var piece = new Piece(s.Text, pad + s.ParseText[s.ParseStarts[i]..(i + 1 < k ? s.ParseStarts[i + 1] : s.ParseText.Length)],
+                                  s.BareKAndR?.Where(b => b.Line > s.Lines[i] && b.Line <= last).ToList(), dead, conditional, state);
+            part.Lease = s_parseMemory.Value.Acquire(own);
+            try
+            {
+                part.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
+                ProcessFile(part, path, pad + s.Text.Substring(s.TextStarts[i], own), fileNodeByPath, pathsByBasename,
+                            defines, closedWorldDefines, piece);
+            }
+            finally
+            {
+                t_parents = null;
+                if (!part.LeaseHandedOff) part.Lease.Release();
+            }
+        }
+        // Each piece past the first on a thread of its own while the parse has one to spare, the rest on this one.
+        var tasks = new List<Task>();
+        var here = new List<int> { 0 };
+        for (var i = 1; i < k; i++)
+        {
+            var at = i;
+            if (_pieceSlots?.Wait(0) == true)
+                tasks.Add(Task.Factory.StartNew(() => { try { Run(at); } finally { _pieceSlots.Release(); } }, TaskCreationOptions.LongRunning));
+            else here.Add(i);
+        }
+        Exception? failure = null;
+        foreach (var i in here)
+            try { Run(i); }
+            catch (Exception ex) { failure ??= ex; state.Failed = true; }
+        try { Task.WaitAll(tasks.ToArray()); }
+        catch (AggregateException ae) { failure ??= ae.InnerExceptions[0]; }
+        if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(failure);
+
+        w.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (state.Stop)
+        {
+            // Kept whole, as the file in one piece would be: the pieces' work is dropped, their time kept.
+            foreach (var p in parts)
+            {
+                w.TPrep += p.TPrep; w.TParse += p.TParse; w.TScan += p.TScan;
+                for (var q = 0; q < PassNames.Length; q++) w.Pass[q] += p.Pass[q];
+            }
+            if (state.TimedOut || state.Failed)
+            {
+                w.Warnings.Add(state.TimedOut ? $"{path}: parse exceeded the {ParseBudgetMs} ms budget — kept whole, not carved"
+                                              : $"{path}: parse failed — kept whole, not carved");
+                if (IsTranslationUnit(path)) w.ForceKeeps.Add(path);
+                KeptWholeRefs(w, path, s.Text, w.FileNode(path), w.Refs);
+            }
+            else
+            {
+                w.BudgetSymbols = state.Symbols;
+                var how = IsTranslationUnit(path) ? "force-rooted, kept whole" : "kept whole via #include-closure";
+                w.Warnings.Add($"{path}: would mint {state.Symbols:N0} symbols (> {PerFileSymbolBudget:N0} budget) — {how}, not carved (guards graph-memory blow-up)");
+                if (IsTranslationUnit(path)) w.ForceKeeps.Add(path);
+                KeptWholeRefs(w, path, s.Text, w.FileNode(path), w.Refs, callShapedOnly: !IsTranslationUnit(path));
+            }
+            return;
+        }
+        // One file with parse errors, however many of its pieces have them.
+        var errors = parts.Sum(p => p.ErrorFiles);
+        foreach (var p in parts) p.ErrorFiles = 0;
+        parts[0].ErrorFiles = Math.Min(errors, 1);
+        w.Parts = parts;
+        TemplateInstancesPass(w, path, s.Text, dead, fileNodeByPath, pathsByBasename, name => parts.Any(p => p.Functions.ContainsKey(name)));
+        w.Lap(9);
+    }
+
+    /// <summary>
+    /// Where a big file can be cut into pieces of about <paramref name="pieceChars"/> (at most
+    /// <paramref name="maxPieces"/>) that parse as they do in the whole file: (line, offset) of each piece's first line,
+    /// the first piece's (0, 0) included. A cut is at a line start outside any brace, parenthesis, bracket, #if,
+    /// comment, literal or continued line, after a `;` or after the `}` of a function body (a `{` after the `)` of a
+    /// lower-case name that is no attribute), and not before a line that would go on the construct before it. Not
+    /// after a K&amp;R head's parameter declarations: once a top-level `)` is followed by a word, no cut until a `{`.
+    /// </summary>
+    internal static List<(int Line, int Offset)> SplitLines(string t, int pieceChars, int maxPieces)
+    {
+        var cuts = new List<(int Line, int Offset)> { (0, 0) };
+        var pieces = (int)Math.Min(maxPieces, t.Length / Math.Max(1, pieceChars));
+        if (pieces < 2) return cuts;
+        var step = t.Length / pieces;
+        int braces = 0, parens = 0, pp = 0, line = 0, i = 0, n = t.Length;
+        var last = ';';                      // the last significant character outside directives (a word is 'a')
+        string? word = null, parenWord = null;
+        bool bodyOpen = false, bodyClose = false, krHead = false, lineStart = true, directive = false;
+        var externs = new Stack<bool>();     // per open `{`: an `extern "C" {`, which counts for nothing
+        var next = step;
+        static bool IsAttribute(string? w) => w is "__attribute__" or "__attribute" or "__declspec" or "alignas" or "_Alignas"
+                                                   or "__asm__" or "__asm" or "asm" or "__align";
+        static bool LowerCaseName(string? w) => w is not null && w.Any(char.IsLower) && !IsAttribute(w);
+        while (i < n)
+        {
+            var c = t[i];
+            if (c == '\n')
+            {
+                var continued = i > 0 && (t[i - 1] == '\\' || (t[i - 1] == '\r' && i > 1 && t[i - 2] == '\\'));
+                i++; line++;
+                lineStart = true;
+                if (!continued) directive = false;
+                if (i >= next && !continued && braces == 0 && parens == 0 && pp == 0 && !krHead
+                    && (last == ';' || (last == '}' && bodyClose)) && n - i >= step / 2 && CutBefore(t, i))
+                {
+                    cuts.Add((line, i));
+                    if (cuts.Count == pieces) break;
+                    next = i + step;
+                }
+                continue;
+            }
+            if (c is ' ' or '\t' or '\r' or '\f' or '\v') { i++; continue; }
+            if (c == '/' && i + 1 < n && t[i + 1] == '/')
+            {
+                var e = t.IndexOf('\n', i);
+                i = e < 0 ? n : e;
+                continue;
+            }
+            if (c == '/' && i + 1 < n && t[i + 1] == '*')
+            {
+                var e = t.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                e = e < 0 ? n : e + 2;
+                for (var q = i; q < e; q++) if (t[q] == '\n') line++;
+                i = e;
+                lineStart = false;
+                continue;
+            }
+            if (lineStart && c == '#')
+            {
+                lineStart = false;
+                directive = true;
+                var j = i + 1;
+                while (j < n && t[j] is ' ' or '\t') j++;
+                var w0 = j;
+                while (j < n && char.IsAsciiLetter(t[j])) j++;
+                var d = t.AsSpan(w0, j - w0);
+                if (d is "if" or "ifdef" or "ifndef") pp++;
+                else if (d is "endif" && pp > 0) pp--;
+                i = j;
+                continue;
+            }
+            lineStart = false;
+            if (c is '"' or '\'')
+            {
+                var j = i + 1;
+                while (j < n && t[j] != c && t[j] != '\n') j += t[j] == '\\' ? 2 : 1;
+                i = j < n && t[j] == c ? j + 1 : Math.Min(j, n);
+                if (!directive) last = c;
+                continue;
+            }
+            if (directive) { i++; continue; }
+            if (char.IsAsciiLetterOrDigit(c) || c == '_')
+            {
+                var j = i;
+                while (j < n && (char.IsAsciiLetterOrDigit(t[j]) || t[j] == '_')) j++;
+                if (last == ')' && braces == 0 && parens == 0) krHead = true;
+                word = char.IsAsciiDigit(c) ? null : t[i..j];
+                last = 'a';
+                i = j;
+                continue;
+            }
+            switch (c)
+            {
+                case '{':
+                    var isExtern = last == '"' && word == "extern";
+                    externs.Push(isExtern);
+                    if (!isExtern)
+                    {
+                        if (braces == 0 && parens == 0) bodyOpen = last == ')' && LowerCaseName(parenWord);
+                        braces++;
+                        krHead = false;
+                        last = c;
+                    }
+                    break;
+                case '}':
+                    if (externs.Count > 0 && externs.Pop()) break;
+                    if (braces > 0) braces--;
+                    if (braces == 0) bodyClose = bodyOpen;
+                    last = c;
+                    break;
+                case '(':
+                    if (braces == 0 && parens == 0) parenWord = last == 'a' ? word : null;
+                    parens++;
+                    last = c;
+                    break;
+                case '[': parens++; last = c; break;
+                case ')': case ']': if (parens > 0) parens--; last = c; break;
+                default: last = c; break;
+            }
+            i++;
+        }
+        return cuts;
+    }
+
+    /// <summary>Whether a cut may go before offset <paramref name="at"/>: the next line does not go on what came before it
+    /// (`;`, `,`, `=`, a bracket, a `{`, an attribute, a C++ continuation).</summary>
+    private static bool CutBefore(string t, int at)
+    {
+        while (at < t.Length && char.IsWhiteSpace(t[at])) at++;
+        if (at >= t.Length) return false;
+        var c = t[at];
+        if (c is ';' or ',' or '=' or '[' or ']' or '(' or ')' or '{' or '}' or ':' or '.' or '-' or '?' or '|' or '&' or '+' or '*') return false;
+        if (!char.IsAsciiLetter(c) && c != '_') return true;
+        var j = at;
+        while (j < t.Length && (char.IsAsciiLetterOrDigit(t[j]) || t[j] == '_')) j++;
+        return t.AsSpan(at, j - at) is not ("__attribute__" or "__attribute" or "__asm__" or "__asm" or "asm" or "else" or "catch"
+                                             or "const" or "volatile" or "noexcept" or "throw" or "override" or "final");
+    }
+
+    /// <summary>
+    /// Pass 2a: names a template header defines in this translation unit (`#define TNAME red` / `#include "tmpl.h"`
+    /// with `int CAT(TNAME, get)(void) { ... }` inside). Each instance is a node at the instantiating line, kept
+    /// with the file (removing that #include would remove every instance), so a call to red_get keeps this unit.
+    /// The build's function-like -D macros name heads too (`'-DHIDE(n)=hid_##n'`: `int HIDE(den)(void) {`). Reads the
+    /// whole file's text; <paramref name="definedElsewhere"/> names the functions a split file's pieces define.
+    /// </summary>
+    private void TemplateInstancesPass(FileWork w, string path, string text, bool[]? dead, Dictionary<string, NodeId> fileNodeByPath,
+                                       Dictionary<string, List<string>> pathsByBasename, Func<string, bool>? definedElsewhere)
+    {
+        var graph = w.Graph;
+        var cmdFnMacros = CodeCarver.Core.Preprocess.CommandLineMacros.AnyFunctionLike(CommandLineMacros);
+        // The template's macros may come from any header the unit includes first (a config header), so with a template
+        // header in the tree every unit that includes anything is walked.
+        if (_read is not null && IsTranslationUnit(path)
+            && ((_macroNamedHeaders.Count > 0 && text.Contains("include", StringComparison.Ordinal))
+                || (TemplateInstances.HasMacroNamedHead(text) && (text.Contains("define", StringComparison.Ordinal) || cmdFnMacros))))
+        {
+            string? ReadInclude(string raw)
+            {
+                var hit = ResolveInclude(path, raw, true, fileNodeByPath);
+                if (hit.Count == 0 && pathsByBasename.TryGetValue(BaseName(raw), out var byBase)) hit = byBase;
+                var h = hit.FirstOrDefault(_macroNamedHeaders.Contains) ?? hit.FirstOrDefault();
+                if (h is null) return null;
+                // Same string per header: TemplateInstances reads a header with no template once per unit.
+                if (!_includeDirectives.TryGetValue(h, out var t))
+                {
+                    t = SourceText.Normalize(_read(h));
+                    if (!_macroNamedHeaders.Contains(h)) t = TemplateInstances.DirectivesOnly(t);
+                    _includeDirectives[h] = t;
+                }
+                return t;
+            }
+            foreach (var (name, line) in TemplateInstances.Find(text, ReadInclude, CommandLineMacros))
+            {
+                if (Keywords.Contains(name) || (dead is not null && line < dead.Length && dead[line])) continue;
+                if (w.Functions.ContainsKey(name) || definedElsewhere?.Invoke(name) == true) continue;
+                var fileNode = w.FileNode(path);
+                var iid = graph.GetOrAddNode(NodeKind.Function, name, path, new SourceSpan(line, line));
+                graph.AddEdge(iid, fileNode, EdgeKind.DefinedIn);
+                graph.AddEdge(fileNode, iid, EdgeKind.References);
+                Add(w.Functions, name, iid);
+            }
+        }
+    }
+
     private void ProcessFile(FileWork w, string path, string text,
                              Dictionary<string, NodeId> fileNodeByPath,
                              Dictionary<string, List<string>> pathsByBasename,
                              MacroTable? defines,
-                             bool closedWorldDefines)
+                             bool closedWorldDefines,
+                             Piece? piece = null)
     {
         var graph = w.Graph;
         var functionsByName = w.Functions;
@@ -2309,7 +2669,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var pendingRefs = w.Refs;
         var pendingMacroRefs = w.MacroRefs;
         var pendingPastes = w.Pastes;
-        text = SourceText.Normalize(text);   // trigraphs, names split by a backslash-newline (offsets and lines kept)
+        if (piece is null) text = SourceText.Normalize(text);   // trigraphs, names split by a backslash-newline (offsets and lines kept)
         // Finding A: some headers are #include fragments (e.g. a bare byte list pasted inside an array
         // initializer) — valid in context, invalid alone. tree-sitter's error recovery on them is
         // super-linear (a 2.4 MB blob can stall for minutes). Detect the obvious data-fragment shape and
@@ -2318,7 +2678,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // Gate the fragment heuristic to non-.c files: a header kept-whole is always sound (#include-
         // closure keeps it), but skipping a translation unit would lose its symbols. TUs always parse
         // (the parse budget still backstops a pathological one).
-        if (!IsTranslationUnit(path) && LooksLikeIncludeFragment(text))
+        if (piece is null && !IsTranslationUnit(path) && LooksLikeIncludeFragment(text))
         {
             w.Warnings.Add($"{path}: looks like an #include data fragment (not valid stand-alone C) — kept whole, not carved");
             KeptWholeRefs(w, path, text, w.FileNode(path), pendingRefs);
@@ -2327,12 +2687,26 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
 
         w.Lap(16);
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-        var parseText = PrepareParseText(path, text, out var bareKAndR, out var blankedForParse);
-        if (blankedForParse.Length > 0) IdentifierRefs(blankedForParse, w.FileNode(path), pendingRefs, callShapedOnly: false);
+        // A piece of a split file is given its parse text, made once for the whole file (see ParseSplit).
+        string parseText;
+        List<(string Name, int Line, int EndLine)>? bareKAndR;
+        if (piece is not null) (parseText, bareKAndR) = (piece.ParseText, piece.BareKAndR);
+        else
+        {
+            parseText = PrepareParseText(path, text, out bareKAndR, out var blankedForParse);
+            if (blankedForParse.Length > 0) IdentifierRefs(blankedForParse, w.FileNode(path), pendingRefs, callShapedOnly: false);
+        }
         var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (piece?.State.Stop == true) return;
         using var tree = ParseWithBudget(w, parseText, path, out var timedOut);
         w.TPrep += t1 - t0; w.TParse += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
         w.Mark = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (piece is not null && (timedOut || tree is null))
+        {
+            // The whole file is kept whole instead (see ParseSplit).
+            if (timedOut) piece.State.TimedOut = true; else piece.State.Failed = true;
+            return;
+        }
         if (timedOut)
         {
             w.Warnings.Add($"{path}: parse exceeded the {ParseBudgetMs} ms budget — kept whole, not carved");
@@ -2353,7 +2727,16 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // just #define-dense ones. Sound: a TU is force-rooted (its code stays); a header rides #include-
         // closure — nothing it defines can be dropped. Only files big enough to POSSIBLY exceed the budget are
         // counted (a captured symbol needs >=2 bytes), so the overwhelming majority of small files pay nothing.
-        if (PerFileSymbolBudget > 0 && text.Length >= (long)PerFileSymbolBudget * 2)
+        // A piece counts what it would mint and adds it to its file's count; the file is kept whole when that is over the
+        // budget (see ParseSplit). Its count is the minted globals' one: the file's total isn't known yet.
+        if (piece is not null && PerFileSymbolBudget > 0)
+        {
+            var lines = new TextLines(text);
+            var symbols = CountCaptures(_defs, root) + CountCaptures(_globals, root, c => MintedGlobal(c.Node, path, lines, out _, out _, out _) is not null);
+            if (Interlocked.Add(ref piece.State.Symbols, symbols) > PerFileSymbolBudget) piece.State.Over = true;
+            if (piece.State.Stop) return;
+        }
+        else if (PerFileSymbolBudget > 0 && text.Length >= (long)PerFileSymbolBudget * 2)
         {
             // Every global capture counted is an upper bound: under the budget, no need to ask which would be minted
             // (a node and a walk per capture, then done again by the globals pass).
@@ -2382,13 +2765,14 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var scopes = new ScopeIndex(_scopes, root);
         var fileNode = w.FileNode(path);
         var srcLines = new TextLines(text);
-        bool[]? conditional = null;
+        bool[]? conditional = piece?.Conditional;
         bool Shadows(int row) => path.EndsWith(".c", StringComparison.OrdinalIgnoreCase)
                                  && (conditional ??= ConditionalLines(text)) is var c && (row >= c.Length || !c[row]);
 
-        // When configured, code in dead #ifdef branches is skipped (config-specific carve).
-        var dead = ExactDeadLines?.Invoke(path, text)
-                   ?? (defines is null ? null : PreprocessorScanner.DeadLineMap(text, defines, closedWorldDefines));
+        // When configured, code in dead #ifdef branches is skipped (config-specific carve). A piece's are the file's.
+        var dead = piece is not null ? piece.Dead
+                   : ExactDeadLines?.Invoke(path, text)
+                     ?? (defines is null ? null : PreprocessorScanner.DeadLineMap(text, defines, closedWorldDefines));
         bool IsDead(TsNode n) => dead is not null && n.StartPosition.Row + 1 is var ln && ln < dead.Length && dead[ln];
 
         var funcSpans = new List<(int Start, int End, NodeId Id)>();
@@ -2719,7 +3103,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             {
                 // `#include XSTR(IMPL_FILE)`: the file it names, expanded (review E3).
                 if (ComputedIncludeLine.Match(srcLines[li]) is { Success: true } cm)
-                    foreach (var tp in ComputedIncludeTargets(path, text, cm.Groups["op"].Value, fileNodeByPath))
+                    foreach (var tp in ComputedIncludeTargets(path, piece?.FileText ?? text, cm.Groups["op"].Value, fileNodeByPath))
                         if (tp != path) graph.AddEdge(fileNode, w.FileNode(tp), EdgeKind.Includes);
                 continue;
             }
@@ -2737,42 +3121,8 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         }
         w.Lap(8);
 
-        // Pass 2a: names a template header defines in this translation unit (`#define TNAME red` / `#include "tmpl.h"`
-        // with `int CAT(TNAME, get)(void) { ... }` inside). Each instance is a node at the instantiating line, kept
-        // with the file (removing that #include would remove every instance), so a call to red_get keeps this unit.
-        // The build's function-like -D macros name heads too (`'-DHIDE(n)=hid_##n'`: `int HIDE(den)(void) {`).
-        var cmdFnMacros = CodeCarver.Core.Preprocess.CommandLineMacros.AnyFunctionLike(CommandLineMacros);
-        // The template's macros may come from any header the unit includes first (a config header), so with a template
-        // header in the tree every unit that includes anything is walked.
-        if (_read is not null && IsTranslationUnit(path)
-            && ((_macroNamedHeaders.Count > 0 && text.Contains("include", StringComparison.Ordinal))
-                || (TemplateInstances.HasMacroNamedHead(text) && (text.Contains("define", StringComparison.Ordinal) || cmdFnMacros))))
-        {
-            string? ReadInclude(string raw)
-            {
-                var hit = ResolveInclude(path, raw, true, fileNodeByPath);
-                if (hit.Count == 0 && pathsByBasename.TryGetValue(BaseName(raw), out var byBase)) hit = byBase;
-                var h = hit.FirstOrDefault(_macroNamedHeaders.Contains) ?? hit.FirstOrDefault();
-                if (h is null) return null;
-                // Same string per header: TemplateInstances reads a header with no template once per unit.
-                if (!_includeDirectives.TryGetValue(h, out var t))
-                {
-                    t = SourceText.Normalize(_read(h));
-                    if (!_macroNamedHeaders.Contains(h)) t = TemplateInstances.DirectivesOnly(t);
-                    _includeDirectives[h] = t;
-                }
-                return t;
-            }
-            foreach (var (name, line) in TemplateInstances.Find(text, ReadInclude, CommandLineMacros))
-            {
-                if (Keywords.Contains(name) || (dead is not null && line < dead.Length && dead[line])) continue;
-                if (functionsByName.TryGetValue(name, out var have) && have.Any(h => graph.GetNode(h).FilePath == path)) continue;
-                var iid = graph.GetOrAddNode(NodeKind.Function, name, path, new SourceSpan(line, line));
-                graph.AddEdge(iid, fileNode, EdgeKind.DefinedIn);
-                graph.AddEdge(fileNode, iid, EdgeKind.References);
-                Add(functionsByName, name, iid);
-            }
-        }
+        // Pass 2a (see TemplateInstancesPass). A split file runs it once, on its whole text.
+        if (piece is null) TemplateInstancesPass(w, path, text, dead, fileNodeByPath, pathsByBasename, null);
         w.Lap(9);
 
         // Pass 2b: symbol aliases. `void NMI_Handler(void) __attribute__((alias("Default_Handler")))` is a
