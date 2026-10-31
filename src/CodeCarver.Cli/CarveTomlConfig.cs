@@ -21,6 +21,7 @@ public sealed class CarveTomlConfig
     public int? ParseTimeout;         // seconds (0 disables)
     public long? MemoryStopMb;        // stop the run when its private memory passes this (0 or unset: never)
     public int? MaxSymbolsPerFile;
+    public long? SplitParseChars;     // files of at least this many chars are parsed in pieces (0 or unset: never)
     public long? HeaderCarveMinutes;
     /// <summary>[advanced] decisionsMaxNodes: past this many graph nodes decisions.txt is a short note (default 500,000).</summary>
     public long? DecisionsMaxNodes;
@@ -80,7 +81,7 @@ public static class ConfigLoader
     public sealed record Result(CarveTomlConfig? Config, IReadOnlyList<string> Errors, IReadOnlyList<string> Warnings);
 
     private static readonly string[] TopKeys = { "outputDirectory", "analysisOnly", "common", "builds", "runs", "stages", "use", "advanced" };
-    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "memoryStopMb", "maxSymbolsPerFile", "headerCarveMinutes", "decisionsMaxNodes", "pathMap", "allowUnmatchedTraces", "pruneGarbage", "skipFilesNotBuilt", "placeholderFiles", "cacheEnabled", "cacheDirectory", "unparsedHeaderCache", "mirrorOf" };
+    private static readonly string[] AdvancedKeys = { "maxParseBytes", "parseTimeout", "memoryStopMb", "maxSymbolsPerFile", "splitParseChars", "headerCarveMinutes", "decisionsMaxNodes", "pathMap", "allowUnmatchedTraces", "pruneGarbage", "skipFilesNotBuilt", "placeholderFiles", "cacheEnabled", "cacheDirectory", "unparsedHeaderCache", "mirrorOf" };
     private static readonly string[] CommonKeys =
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
@@ -257,6 +258,7 @@ public static class ConfigLoader
             cfg.ParseTimeout = (int?)GetLong(adv, "parseTimeout", "[advanced]", ctx, min: 0, max: int.MaxValue / 1000);
             cfg.MemoryStopMb = GetLong(adv, "memoryStopMb", "[advanced]", ctx, min: 0, max: long.MaxValue / (1024 * 1024));
             cfg.MaxSymbolsPerFile = (int?)GetLong(adv, "maxSymbolsPerFile", "[advanced]", ctx, min: 1, max: int.MaxValue);
+            cfg.SplitParseChars = GetLong(adv, "splitParseChars", "[advanced]", ctx, min: 0, max: int.MaxValue);
             cfg.HeaderCarveMinutes = GetLong(adv, "headerCarveMinutes", "[advanced]", ctx, min: 0, max: 100000);
             cfg.DecisionsMaxNodes = GetLong(adv, "decisionsMaxNodes", "[advanced]", ctx, min: 0, max: int.MaxValue);
         }
@@ -280,7 +282,7 @@ public static class ConfigLoader
         # Inputs and options live here, so the command line stays short. Relative paths are relative to THIS
         # file's directory; globs (excludeDirectories, forceKeepFiles) are relative to the source dir.
         # Rarely needed: analysisOnly = true (top level: plan + reports, no carved tree) and an [advanced]
-        # section (maxParseBytes, parseTimeout, memoryStopMb, maxSymbolsPerFile, headerCarveMinutes, decisionsMaxNodes, pathMap, allowUnmatchedTraces, pruneGarbage, skipFilesNotBuilt, placeholderFiles, cacheEnabled, cacheDirectory, mirrorOf) — see USAGE.md.
+        # section (maxParseBytes, parseTimeout, memoryStopMb, maxSymbolsPerFile, splitParseChars, headerCarveMinutes, decisionsMaxNodes, pathMap, allowUnmatchedTraces, pruneGarbage, skipFilesNotBuilt, placeholderFiles, cacheEnabled, cacheDirectory, mirrorOf) — see USAGE.md.
 
         # Where the carved project + reports go — must be OUTSIDE the source tree. CodeCarver manages a
         # carved/ + codecarver/ layout under it, and never replaces an existing directory it did not create.

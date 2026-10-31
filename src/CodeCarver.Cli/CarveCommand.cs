@@ -1923,6 +1923,7 @@ public static class CarveCommand
             if (commandLineMacros.Count > 0) tsfe.CommandLineMacros = commandLineMacros;
             if (parseTimeoutMs is not null) tsfe.ParseBudgetMs = parseTimeoutMs.Value;
             if (maxSymbolsPerFile is not null) tsfe.PerFileSymbolBudget = maxSymbolsPerFile.Value;
+            if (cv.SplitParseChars is long spc and > 0) tsfe.SplitMinChars = (int)spc;
             if (refIncludes.Count > 0) tsfe.ReferenceOnlyIncludes = refIncludes;
             if (perFileDefines is not null) tsfe.PerFileDefines = perFileDefines; // per-TU #ifdef config from the build log
             if (exactPre is not null) tsfe.ExactDeadLines = exactPre.DeadLines;
@@ -3468,6 +3469,7 @@ public static class CarveCommand
             Advanced = new[] { $"maxParseBytes = {maxParseBytes}", $"skipFilesNotBuilt = {(cv.SkipFilesNotBuilt ? "true" : "false")}",
                                $"allowUnmatchedTraces = {(cv.AllowUnmatchedTraces ? "true" : "false")}" }
                 .Concat(maxSymbolsPerFile is { } msfc ? new[] { $"maxSymbolsPerFile = {msfc}" } : Array.Empty<string>())
+                .Concat(cv.SplitParseChars is { } spcc ? new[] { $"splitParseChars = {spcc}" } : Array.Empty<string>())
                 .Concat(cv.ParseTimeout is { } ptc ? new[] { $"parseTimeout = {ptc}" } : Array.Empty<string>()).ToList(),
         };
         // The drop-in: the output of building this stage's carved tree, saved as <stage>/build-output.txt. Its errors
@@ -4011,6 +4013,7 @@ public static class CarveCommand
             sb.AppendLine($"maxParseBytes = {maxParseBytes}");
             if (cv.ParseTimeout is { } ptv) sb.AppendLine($"parseTimeout = {ptv}");
             if (maxSymbolsPerFile is { } msf) sb.AppendLine($"maxSymbolsPerFile = {msf}");
+            if (cv.SplitParseChars is { } spv) sb.AppendLine($"splitParseChars = {spv}");
             sb.AppendLine($"allowUnmatchedTraces = {(cv.AllowUnmatchedTraces ? "true" : "false")}");
             sb.AppendLine($"pruneGarbage = {(pruneGarbage ? "true" : "false")}");
             if (cv.MirrorOf is { } mo) sb.AppendLine($"mirrorOf = {Q(mo)}");

@@ -47,6 +47,7 @@ public sealed class ResolvedCarve
     public int? ParseTimeout;                      // seconds
     public long? MemoryStopMb;                     // see CarveTomlConfig.MemoryStopMb
     public int? MaxSymbolsPerFile;
+    public long? SplitParseChars;
     public long? HeaderCarveMinutes;
     public long? DecisionsMaxNodes;                // see CarveTomlConfig.DecisionsMaxNodes               // see CarveTomlConfig.HeaderCarveMinutes
 }
@@ -116,6 +117,7 @@ public static class CarveResolver
         r.ParseTimeout = cfg.ParseTimeout;
         r.MemoryStopMb = cfg.MemoryStopMb;
         r.MaxSymbolsPerFile = cfg.MaxSymbolsPerFile;
+        r.SplitParseChars = cfg.SplitParseChars;
         r.HeaderCarveMinutes = cfg.HeaderCarveMinutes;
         r.DecisionsMaxNodes = cfg.DecisionsMaxNodes;
 

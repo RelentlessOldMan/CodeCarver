@@ -310,10 +310,11 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private const int EarlyMinChars = 256 * 1024;
     private const long EarlyMaxChars = 64L << 20;
     private const int BudgetMinBytes = 256 * 1024;
-    // A file of at least SplitMinChars is parsed in pieces of about SplitPieceChars, cut between top-level definitions
-    // (see SplitLines), at once on threads of their own: at work one file was a parse of over a minute, and its tree held
-    // a big share of the parse memory all that time. At most SplitMaxPieces pieces. Settable for tests.
-    internal int SplitMinChars { get; set; } = 1 << 20;
+    // A file of at least SplitMinChars ([advanced] splitParseChars; by default none) is parsed in pieces of about
+    // SplitPieceChars, cut between top-level definitions (see SplitLines), at once on threads of their own: at work one
+    // file was a parse of over a minute. On by default in 1.0.383-384, where work's build-graph took twice as long.
+    // At most SplitMaxPieces pieces.
+    public int SplitMinChars { get; set; } = int.MaxValue;
     internal int SplitPieceChars { get; set; } = 512 * 1024;
     private const int SplitMaxPieces = 16;
     // Threads a split file's pieces may take besides the one parsing the file: one fewer than the parse has.
