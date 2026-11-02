@@ -722,7 +722,7 @@ carries `mem.<step>.peakMb` and `stageN.mem.<step>.peakMb` (private memory), and
 What a step keeps, not only what it peaked at: as each step ends the run collects the heap in full and records what
 is still live, `mem.<step>.liveMb` and `stageN.mem.<step>.liveMb` (the collections together: `mem.liveGc.ms`), and
 each link check loop records `check.<loop>.liveMaxMb`. A step whose live memory jumps is the one holding it. The roots
-step records each of its parts too (`mem.roots.<part>.liveMb`). While a step runs, a `held    :` line follows the `memory  :` line with what each part of the run says it holds now: for the
+step records each of its parts too (`mem.roots.<part>.liveMb`). After that collection the run also splits its private memory: what the GC still has committed (`mem.<step>.gcCommittedMb`, `mem.<stage>.<step>.gcCommittedMb`), and of that the free space left inside the heap (`fragmentedMb`) and the large-object heap's size and free space (`lohMb`, `lohFragmentedMb`); the rest is native memory (`nativeMb`): tree-sitter's heap, and the server GC's own tables, which grow with its heap count. While a step runs, a `held    :` line follows the `memory  :` line with what each part of the run says it holds now: for the
 link check, header text held (`headerTextMb`), text handed on to its scans (`handedOnMb`), the work running under each
 budget (`scanningMb`, `readingMb`, `walkingMb`, `parsingMb`) and its tables (`headerInfos`, `droppedDefs`, `uses`, ...).
 

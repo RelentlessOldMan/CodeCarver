@@ -463,6 +463,24 @@ public static class CarveCommand
             var sw = System.Diagnostics.Stopwatch.StartNew();
             GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: false);
             var live = GC.GetTotalMemory(false) / (1024 * 1024);
+            // What the private memory is after that collection: what the GC still has committed, and the rest (native: mostly
+            // tree-sitter's heap, which keeps what its trees freed). At work the check held 6.2 GB live at 12.9 GB private.
+            try
+            {
+                using var self = System.Diagnostics.Process.GetCurrentProcess();
+                var info = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+                var gc = info.TotalCommittedBytes / (1024 * 1024);
+                // Free space the collection left inside the heap, and in the large-object heap (file texts; swept, not compacted).
+                summary[$"mem.{where}.fragmentedMb"] = info.FragmentedBytes / (1024 * 1024);
+                if (info.GenerationInfo.Length > 3)
+                {
+                    summary[$"mem.{where}.lohMb"] = info.GenerationInfo[3].SizeAfterBytes / (1024 * 1024);
+                    summary[$"mem.{where}.lohFragmentedMb"] = info.GenerationInfo[3].FragmentationAfterBytes / (1024 * 1024);
+                }
+                summary[$"mem.{where}.gcCommittedMb"] = gc;
+                summary[$"mem.{where}.nativeMb"] = Math.Max(0, self.PrivateMemorySize64 / (1024 * 1024) - gc);
+            }
+            catch (InvalidOperationException) { }
             summary["mem.liveGc.ms"] = _liveGcMs += sw.ElapsedMilliseconds;
             return live;
         }
