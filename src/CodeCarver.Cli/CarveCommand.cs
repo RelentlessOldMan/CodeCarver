@@ -3726,8 +3726,13 @@ public static class CarveCommand
         void MemoryKeys(IDictionary<string, object?> into)
         {
             const long MB = 1024 * 1024;
-            into["mem.run.peakPrivateMb"] = Math.Max(_runPeakPrivate, Interlocked.Read(ref _peakPrivate)) / MB;
-            into["mem.run.peakWorkingSetMb"] = _runPeakWorkingSet / MB;
+            // The OS keeps the exact peaks; the heartbeat looks only every few seconds and missed short ones (regtree: a link
+            // check loop measured 1,546 MB private while the run peak said 1,367).
+            long osPeakPrivate = 0, osPeakWorkingSet = 0;
+            try { using var p = System.Diagnostics.Process.GetCurrentProcess(); osPeakPrivate = p.PeakPagedMemorySize64; osPeakWorkingSet = p.PeakWorkingSet64; }
+            catch (InvalidOperationException) { }
+            into["mem.run.peakPrivateMb"] = Math.Max(osPeakPrivate, Math.Max(_runPeakPrivate, Interlocked.Read(ref _peakPrivate))) / MB;
+            into["mem.run.peakWorkingSetMb"] = Math.Max(osPeakWorkingSet, _runPeakWorkingSet) / MB;
             if (_minMachineFree != long.MaxValue) into["mem.run.minMachineFreeMb"] = _minMachineFree / MB;
             if (_minCommitFree != long.MaxValue) into["mem.run.minCommitRoomMb"] = _minCommitFree / MB;
             into["mem.stopMb"] = _memoryStop / MB;
