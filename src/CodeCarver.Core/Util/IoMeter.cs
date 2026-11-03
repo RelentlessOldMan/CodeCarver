@@ -102,7 +102,7 @@ public static class IoMeter
                 // text twice over for every file. A large file reads through the reader as before (a pooled buffer of
                 // hundreds of MB would stay held).
                 if (fs.Length > PooledMax) return ReadToEnd(fs, encoding);
-                var buf = System.Buffers.ArrayPool<byte>.Shared.Rent((int)Math.Max(fs.Length, 1));
+                var buf = Pool.Rent((int)Math.Max(fs.Length, 1));
                 try
                 {
                     var n = 0;
@@ -111,19 +111,23 @@ public static class IoMeter
                         {
                             // The file grew since its length was taken: the reader reads the rest.
                             if (n >= PooledMax) { fs.Position = 0; return ReadToEnd(fs, encoding); }
-                            var bigger = System.Buffers.ArrayPool<byte>.Shared.Rent(buf.Length * 2);
+                            var bigger = Pool.Rent(buf.Length * 2);
                             Array.Copy(buf, bigger, n);
-                            System.Buffers.ArrayPool<byte>.Shared.Return(buf);
+                            Pool.Return(buf);
                             buf = bigger;
                         }
                     return Decode(buf.AsSpan(0, n), encoding ?? Encoding.UTF8);
                 }
-                finally { System.Buffers.ArrayPool<byte>.Shared.Return(buf); }
+                finally { Pool.Return(buf); }
             }
             finally { fs.Dispose(); }
         }
     }
     const int PooledMax = 4 << 20;
+    // The shared pool keeps up to 32 arrays a size for each core and gives them back only under memory pressure: a run
+    // held 65 idle 4 MB read buffers (273 MB of the 594 MB live at regtree's check), more on a box with more cores.
+    // Its own pool keeps one a size for each core.
+    static readonly System.Buffers.ArrayPool<byte> Pool = System.Buffers.ArrayPool<byte>.Create(PooledMax, Environment.ProcessorCount);
     static string ReadToEnd(FileStream fs, Encoding? encoding)
     {
         // Latin-1 is a character per byte: the text is decoded straight into its string, where the reader holds it
@@ -145,7 +149,7 @@ public static class IoMeter
     }
     static string ReadLatin1(FileStream fs)
     {
-        var buf = System.Buffers.ArrayPool<byte>.Shared.Rent(Buffer);
+        var buf = Pool.Rent(Buffer);
         try
         {
             var text = string.Create((int)fs.Length, (fs, buf), static (span, st) =>
@@ -160,7 +164,7 @@ public static class IoMeter
             if (fs.Read(buf, 0, 1) == 0) return text;
         }
         catch (EndOfStreamException) { }
-        finally { System.Buffers.ArrayPool<byte>.Shared.Return(buf); }
+        finally { Pool.Return(buf); }
         // The file changed size while it was read: the reader reads it as it is now.
         fs.Position = 0;
         using var r = new StreamReader(fs, Encoding.Latin1, detectEncodingFromByteOrderMarks: true, Buffer, leaveOpen: true);

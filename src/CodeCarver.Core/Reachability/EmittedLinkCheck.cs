@@ -688,6 +688,9 @@ public static class EmittedLinkCheck
         var typedDef = new HashSet<string>(StringComparer.Ordinal);
         var definers = new Dictionary<string, List<string>>(StringComparer.Ordinal);
         var functionMacros = new HashSet<string>(StringComparer.Ordinal);
+        // The dropped files' function-like macros, by MacroKey (DroppedEntry.FunctionMacros).
+        var droppedMacros = new HashSet<ulong>();
+        bool FunctionMacro(string name) => functionMacros.Contains(name) || droppedMacros.Contains(MacroKey(name));
         // A dropped file's definitions: its own scan (kept for the run when the file can't change), the names template
         // headers it includes define (redone when a header it read now reads differently), and C99 inline emitters.
         ScanResult? ScanDropped((string Rel, string Path) f)
@@ -715,7 +718,7 @@ public static class EmittedLinkCheck
                     e = new DroppedEntry
                     {
                         Definitions = own.Definitions,
-                        FunctionMacros = own.FunctionMacros,
+                        FunctionMacros = own.FunctionMacros.Select(MacroKey).ToArray(),
                         HasInclude = text.Contains("include", StringComparison.Ordinal),
                         MacroHead = CodeCarver.Core.Preprocess.TemplateInstances.HasMacroNamedHead(text),
                         HasDefine = text.Contains("define", StringComparison.Ordinal),
@@ -750,8 +753,8 @@ public static class EmittedLinkCheck
             s.Definitions.AddRange(e.Definitions);
             s.Definitions.AddRange(templateDefs);
             s.Definitions.AddRange(e.C99);
-            s.FunctionMacros.UnionWith(e.FunctionMacros);
             Renamed(s);
+            s.FunctionMacroKeys = e.FunctionMacros;
             return s;
         }
         var droppedSorted = droppedList.OrderBy(d => d.Rel, StringComparer.Ordinal).ToList();
@@ -763,7 +766,7 @@ public static class EmittedLinkCheck
             if (dscan is null) { skipped++; continue; }
             checkedFiles++;
             var header = IsHeader(rel);
-            functionMacros.UnionWith(dscan.FunctionMacros);
+            if (dscan.FunctionMacroKeys is { } fk) droppedMacros.UnionWith(fk);
             foreach (var d in dscan.Definitions)
                 if (header || !d.Static)
                 {
@@ -1064,7 +1067,7 @@ public static class EmittedLinkCheck
         foreach (var (name, rel, line, isDead) in macroCalls)
         {
             // Only a name some file #defines as a function-like macro can be one (the include closure is the cost).
-            if (functionMacros.Contains(name) && Sees(rel, name)) continue;   // a macro invocation, not a reference
+            if (FunctionMacro(name) && Sees(rel, name)) continue;   // a macro invocation, not a reference
             (isDead ? dead : live).TryAdd(name, (rel, line));
         }
 
@@ -1073,7 +1076,7 @@ public static class EmittedLinkCheck
         {
             if (emittedDefs.Contains(name)) continue;
 
-            if (functionMacros.Contains(name) && !typedDef.Contains(name)) continue;
+            if (FunctionMacro(name) && !typedDef.Contains(name)) continue;
             var isLive = live.TryGetValue(name, out var at);
             if (!isLive) at = dead[name];
             var def = droppedDefs[name];
@@ -1087,7 +1090,9 @@ public static class EmittedLinkCheck
     internal sealed class DroppedEntry
     {
         public required List<Definition> Definitions;
-        public required HashSet<string> FunctionMacros;
+        // The names it #defines as function-like macros, by MacroKey: a register header defines tens of thousands, and held
+        // as strings for the run they were most of what a check kept live (regtree: 3.8M names, 305 MB of 324).
+        public required ulong[] FunctionMacros;
         public required bool HasInclude, MacroHead, HasDefine, MayHead;
         public required string[] Includes;
         public required List<Definition> C99;
@@ -1222,6 +1227,10 @@ public static class EmittedLinkCheck
         return h;
     }
 
+    /// <summary>A name as a 64-bit key: its hash with its length, the identity the cache already takes for a file's text
+    /// (Walks, Originals: length and hash).</summary>
+    static ulong MacroKey(string name) => ContentHash(name) ^ ((ulong)name.Length << 56);
+
     static string? TryRead(string path, long maxBytes)
     {
         try
@@ -1305,6 +1314,8 @@ public static class EmittedLinkCheck
         public HashSet<string> FunctionMacros { get; } = new(StringComparer.Ordinal);
         /// <summary>Each function-like #define, with its line.</summary>
         public List<(string Name, int Line)> FunctionMacroLines { get; } = new();
+        /// <summary>A dropped file's function-like macros as its cache entry holds them (MacroKey), in place of FunctionMacros.</summary>
+        public ulong[]? FunctionMacroKeys { get; set; }
         /// <summary>What each #include names ("x.h" or &lt;x.h&gt;, without the delimiters).</summary>
         public List<string> Includes { get; } = new();
         /// <summary>Uses written as a call, <c>name(</c>: a function-like macro of that name would expand them.</summary>
