@@ -112,6 +112,26 @@ public sealed class CodeGraph
         return set.ToList();
     }
 
+    /// <summary>What the graph holds, by count and an estimate of its bytes (an upper bound: a name string shared by
+    /// several nodes is counted for each), for the census keys: a run that holds gigabytes says whether the graph is it.</summary>
+    public IEnumerable<(string Key, long Value)> Census()
+    {
+        long edges = 0, edgeRoom = 0, nameChars = 0, setEntries = 0;
+        foreach (var l in _out) { edges += l.Count; edgeRoom += l.Capacity; }
+        foreach (var n in _nodes) nameChars += n.Name.Length;
+        foreach (var s in _edgeSets.Values) setEntries += s.Count;
+        long nodes = _nodes.Count;
+        yield return ("nodes", nodes);
+        yield return ("edges", edges);
+        yield return ("edgeSets", _edgeSets.Count);
+        yield return ("nameChars", nameChars);
+        // A node record (~56 B) and its slot (8), its edge list (~56 B and 12 a slot of room), its intern entry (~52 B);
+        // an edge set entry (~20 B); a name string (22 B and 2 a char). File strings are shared by a file's nodes.
+        yield return ("nodesEstMb", nodes * (56 + 8 + 52) >> 20);
+        yield return ("edgesEstMb", (nodes * 56 + edgeRoom * 12 + setEntries * 20) >> 20);
+        yield return ("namesEstMb", (nodes * 22 + nameChars * 2) >> 20);
+    }
+
     private void Validate(NodeId id)
     {
         if (!id.IsValid || id.Value >= _nodes.Count)

@@ -10,6 +10,9 @@ public sealed class NamePool
     string?[] _slots = new string?[256];
     int _count;
 
+    /// <summary>The strings it holds.</summary>
+    public int Count => _count;
+
     /// <summary>Single characters as strings, shared by every pool.</summary>
     static readonly string[] s_chars = Enumerable.Range(0, 128).Select(c => ((char)c).ToString()).ToArray();
 

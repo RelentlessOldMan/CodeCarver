@@ -496,6 +496,8 @@ public static class CarveCommand
                 }
                 summary[$"mem.{where}.gcCommittedMb"] = gc;
                 summary[$"mem.{where}.nativeMb"] = Math.Max(0, self.PrivateMemorySize64 / (1024 * 1024) - gc);
+                // The run's peak so far (the OS keeps it exactly): the first step where it reaches mem.run.peakPrivateMb is where the peak was.
+                summary[$"mem.{where}.runPeakMb"] = self.PeakPagedMemorySize64 / (1024 * 1024);
             }
             catch (InvalidOperationException) { }
             summary["mem.liveGc.ms"] = _liveGcMs += sw.ElapsedMilliseconds;
@@ -2356,6 +2358,11 @@ public static class CarveCommand
             outsideDefines.Clear();
         }
         var graph = fe.BuildGraph(parseRels, ReadRel, defines, closedWorld);
+        // The reference-only includes' texts were for the graph, and nothing reads them after it, but the front-end held
+        // them for the run: on bigtree they were 130 MB of the 161 MB live after build-graph.
+        if (fe is TreeSitterFrontEnd tsRef) tsRef.ReferenceOnlyIncludes = Array.Empty<(string, string)>();
+        refIncludes.Clear();
+        refIncludes.TrimExcess();
         if (fe is TreeSitterFrontEnd tsTiming)
             foreach (var (k, v) in tsTiming.Timing)
                 summary[k.StartsWith("files.", StringComparison.Ordinal) ? "parse." + k : $"time.build-graph.{k}.ms"] = v;
@@ -2364,6 +2371,7 @@ public static class CarveCommand
         var unparsedFiles = new HashSet<string>(skipParse, CodeCarver.Core.Util.PathComparer.Default);
         if (fe is TreeSitterFrontEnd tsUnparsed) unparsedFiles.UnionWith(tsUnparsed.UnparsedFiles);
         Mark("build-graph");
+        foreach (var (k, v) in graph.Census()) summary[$"census.graph.{k}"] = v;
         // Where the roots step goes: time.roots.<part>.ms, roots.cpu.<part>.ms, roots.io.<part>.<kind>.*.
         var rootsSw = System.Diagnostics.Stopwatch.StartNew();
         var rootsIo = CodeCarver.Core.Util.IoMeter.Now();
@@ -4120,6 +4128,9 @@ public static class CarveCommand
                 summary[akey] = TakeAllocatedMb() + (summary.TryGetValue(akey, out var aw) && aw is long al ? al : 0L);
                 var lkey = $"{summaryStage}.mem.{step}.liveMb";   // the largest over the check rounds
                 summary[lkey] = Math.Max(LiveMb($"{summaryStage}.{step}"), summary.TryGetValue(lkey, out var lw) && lw is long ll ? ll : 0L);
+                if (step == "check")
+                    foreach (var (k, v) in linkCache.Census())
+                        summary[$"{summaryStage}.census.{k}"] = Math.Max(v, summary.TryGetValue($"{summaryStage}.census.{k}", out var cw) && cw is long cl ? cl : 0L);
                 Progress($"{(stage.Name.Length == 0 ? "stage" : stage.Name)} {step}");
                 var key = $"{summaryStage}.time.{step}.ms";
                 summary[key] = (summary.TryGetValue(key, out var was) && was is long w ? w : 0L) + stageClock.ElapsedMilliseconds;

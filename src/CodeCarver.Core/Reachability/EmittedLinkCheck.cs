@@ -66,6 +66,51 @@ public sealed class LinkCheckCache
 
     private object?[]? _inputs;
 
+    /// <summary>What each part holds, by count and an estimate of its bytes (an item about 32 B, a name it alone holds
+    /// about 60, a macro key 8), for the census keys: at work the check left 2 GB more live than the graph.</summary>
+    public IEnumerable<(string Key, long Value)> Census()
+    {
+        long dDefs = 0, dKeys = 0, dIncludes = 0, dTemplate = 0;
+        foreach (var e in Dropped.Values)
+            if (e is not null)
+            {
+                dDefs += e.Definitions.Count + e.C99.Count; dKeys += e.FunctionMacros.Length; dIncludes += e.Includes.Length;
+                lock (e) { dTemplate += (e.Deps?.Count ?? 0) + (e.TemplateDefs?.Count ?? 0); }
+            }
+        yield return ("dropped.files", Dropped.Count);
+        yield return ("dropped.definitions", dDefs);
+        yield return ("dropped.macroKeys", dKeys);
+        yield return ("dropped.estMb", (Dropped.Count * 200 + (dDefs + dTemplate) * 32 + dKeys * 8 + dIncludes * 60) >> 20);
+        long eItems = 0, eHashes = 0, eWanted = 0;
+        var wanted = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        foreach (var d in Emitted.Values)
+        {
+            eItems += d.Items; eHashes += d.UseHashes?.Length ?? 0;
+            if (wanted.Add(d.Wanted)) eWanted += d.Wanted.Count;
+        }
+        yield return ("emitted.files", Emitted.Count);
+        yield return ("emitted.items", eItems);
+        yield return ("emitted.wantedNames", eWanted);
+        yield return ("emitted.estMb", (Emitted.Count * 300 + eItems * 32 + eHashes * 4 + eWanted * 24) >> 20);
+        long wDeps = 0, wDefs = 0;
+        foreach (var w in Walks.Values) { wDeps += w.Deps.Count; wDefs += w.Defs.Count; }
+        yield return ("walks.units", Walks.Count);
+        yield return ("walks.estMb", (Walks.Count * 150 + wDeps * 40 + wDefs * 32) >> 20);
+        long hText = 0;
+        foreach (var h in Headers.Values) hText += h.TemplateText?.Length ?? 0;
+        yield return ("headers.files", Headers.Count);
+        yield return ("headers.estMb", (Headers.Count * 150 + hText * 2) >> 20);
+        long oDefs = 0;
+        foreach (var o in Originals.Values) oDefs += o?.Definitions.Count ?? 0;
+        yield return ("originals.files", Originals.Count);
+        yield return ("originals.estMb", (Originals.Count * 150 + oDefs * 32) >> 20);
+        long iNames = 0;
+        foreach (var i in HeaderIncludes.Values) iNames += i.Length;
+        yield return ("includes.estMb", (HeaderIncludes.Count * 150 + iNames * 60) >> 20);
+        yield return ("names.pooled", Names.Count);
+        yield return ("names.estMb", Names.Count * 68L >> 20);
+    }
+
     /// <summary>True when these are the inputs of the first run that used it.</summary>
     internal bool Matches(params object?[] inputs)
     {
