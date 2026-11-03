@@ -457,11 +457,28 @@ public static class CarveCommand
         // What the run still holds as a step ends: the managed heap after a full collection (MB). A peak says how much a
         // step had, not what it kept for the steps after; at work a stop in the check could not say whether the check or
         // an earlier step held the memory. The collections cost time (mem.liveGc.ms, all of them).
-        long _liveGcMs = 0;
+        long _liveGcMs = 0, _lohCompactions = 0, _lohCompactMs = 0;
+        var _lohCompactMb = long.TryParse(Environment.GetEnvironmentVariable("CODECARVER_LOH_COMPACT_MB"), out var lcm) && lcm >= 0 ? lcm : 512;
         long LiveMb(string where)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: false);
+            // The large-object heap (file texts) is swept, never compacted, and its free space only grows: at work the check
+            // ended with 2.4 GB there, 1.5 GB of it free. Past LohCompactMb free, compact it once here, so the steps after
+            // start from less. DOTNET_GCConserveMemory=9 also kept it small, but slowed every step (work: 1,059 -> 1,603 s).
+            try
+            {
+                var full = GC.GetGCMemoryInfo(GCKind.FullBlocking);
+                if (full.GenerationInfo.Length > 3 && full.GenerationInfo[3].FragmentationAfterBytes >> 20 >= _lohCompactMb)
+                {
+                    var c0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+                    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                    summary["mem.lohCompactions"] = ++_lohCompactions;
+                    summary["mem.lohCompact.ms"] = _lohCompactMs += (long)System.Diagnostics.Stopwatch.GetElapsedTime(c0).TotalMilliseconds;
+                }
+            }
+            catch (InvalidOperationException) { }
             var live = GC.GetTotalMemory(false) / (1024 * 1024);
             // What the private memory is after that collection: what the GC still has committed, and the rest (native: mostly
             // tree-sitter's heap, which keeps what its trees freed). At work the check held 6.2 GB live at 12.9 GB private.
