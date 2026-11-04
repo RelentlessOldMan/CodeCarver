@@ -13,7 +13,9 @@ namespace CodeCarver.Core.Graph;
 public sealed class CodeGraph
 {
     private readonly List<Node> _nodes = new();
-    private readonly List<List<Edge>> _out = new();
+    // A node's out-edges hold only the target and kind: the source is the node, and storing it in each edge cost 4 of
+    // 12 bytes (190 MB on work's 47M edges).
+    private readonly List<List<OutEdge>> _out = new();
     // Keyed by a tuple of references to strings the nodes already hold — not a formatted string per node, which
     // cost a fresh "kind name path line" copy for every node (gigabytes at 13M nodes; review RB2).
     private readonly Dictionary<(NodeKind, string, string?, int), int> _intern = new();
@@ -52,7 +54,7 @@ public sealed class CodeGraph
 
         var id = _nodes.Count;
         _nodes.Add(new Node { Id = new NodeId(id), Kind = kind, Name = name, File = file, Span = span, Flags = flags });
-        _out.Add(new List<Edge>());
+        _out.Add(new List<OutEdge>());
         _intern[key] = id;
         return new NodeId(id);
     }
@@ -65,19 +67,19 @@ public sealed class CodeGraph
         if (list.Count < EdgeSetThreshold)
         {
             foreach (var e in list)
-                if (e.To == to && e.Kind == kind) return;
+                if (e.To == to.Value && e.Kind == kind) return;
         }
         else
         {
             if (!_edgeSets.TryGetValue(from.Value, out var set))
             {
                 set = new HashSet<(int, EdgeKind)>();
-                foreach (var e in list) set.Add((e.To.Value, e.Kind));
+                foreach (var e in list) set.Add((e.To, e.Kind));
                 _edgeSets[from.Value] = set;
             }
             if (!set.Add((to.Value, kind))) return;
         }
-        list.Add(new Edge(from, to, kind));
+        list.Add(new OutEdge(to.Value, kind));
     }
 
     /// <summary>Lets go of what only building the graph needs: the de-duplication sets (rebuilt from a node's list if an
@@ -110,7 +112,7 @@ public sealed class CodeGraph
     public EdgeList OutEdges(NodeId id)
     {
         Validate(id);
-        return new EdgeList(_out[id.Value]);
+        return new EdgeList(_out[id.Value], id);
     }
 
     /// <summary>All distinct file paths any node lives in, sorted — the universe a carve prunes from.</summary>
@@ -138,10 +140,10 @@ public sealed class CodeGraph
         yield return ("nameChars", nameChars);
         yield return ("edgeRoom", edgeRoom);
         yield return ("edgeSetEntries", setEntries);
-        // A node record (~56 B) and its slot (8), its edge list (~56 B and 12 a slot of room), its intern entry (~52 B);
+        // A node record (~56 B) and its slot (8), its edge list (~56 B and 8 a slot of room), its intern entry (~52 B);
         // an edge set entry (~20 B); a name string (22 B and 2 a char). File strings are shared by a file's nodes.
         yield return ("nodesEstMb", nodes * (56 + 8 + 52) >> 20);
-        yield return ("edgesEstMb", (nodes * 56 + edgeRoom * 12 + setEntries * 20) >> 20);
+        yield return ("edgesEstMb", (nodes * 56 + edgeRoom * 8 + setEntries * 20) >> 20);
         yield return ("namesEstMb", (nodes * 22 + nameChars * 2) >> 20);
     }
 
@@ -155,17 +157,33 @@ public sealed class CodeGraph
         => (kind, name, file, line);
 }
 
+/// <summary>An out-edge as a node's list stores it: the source is the node that holds the list.</summary>
+internal readonly record struct OutEdge(int To, EdgeKind Kind);
+
 /// <summary>A node's out-edges, read-only. A foreach over it makes no enumerator object, as one over an
 /// <see cref="IReadOnlyList{T}"/> did (one per node visited, on every walk of the graph).</summary>
 public readonly struct EdgeList : IReadOnlyList<Edge>
 {
-    private readonly List<Edge> _edges;
+    private readonly List<OutEdge> _edges;
+    private readonly NodeId _from;
 
-    internal EdgeList(List<Edge> edges) => _edges = edges;
+    internal EdgeList(List<OutEdge> edges, NodeId from) { _edges = edges; _from = from; }
 
     public int Count => _edges.Count;
-    public Edge this[int index] => _edges[index];
-    public List<Edge>.Enumerator GetEnumerator() => _edges.GetEnumerator();
-    IEnumerator<Edge> IEnumerable<Edge>.GetEnumerator() => _edges.GetEnumerator();
-    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => _edges.GetEnumerator();
+    public Edge this[int index] { get { var e = _edges[index]; return new Edge(_from, new NodeId(e.To), e.Kind); } }
+    public Enumerator GetEnumerator() => new(_edges.GetEnumerator(), _from);
+    IEnumerator<Edge> IEnumerable<Edge>.GetEnumerator() => GetEnumerator();
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+
+    public struct Enumerator : IEnumerator<Edge>
+    {
+        private List<OutEdge>.Enumerator _inner;
+        private readonly NodeId _from;
+        internal Enumerator(List<OutEdge>.Enumerator inner, NodeId from) { _inner = inner; _from = from; }
+        public Edge Current { get { var e = _inner.Current; return new Edge(_from, new NodeId(e.To), e.Kind); } }
+        object System.Collections.IEnumerator.Current => Current;
+        public bool MoveNext() => _inner.MoveNext();
+        public void Reset() => ((System.Collections.IEnumerator)_inner).Reset();
+        public void Dispose() => _inner.Dispose();
+    }
 }
