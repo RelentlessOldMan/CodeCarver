@@ -80,6 +80,17 @@ public sealed class CodeGraph
         list.Add(new Edge(from, to, kind));
     }
 
+    /// <summary>Lets go of what only building the graph needs: the de-duplication sets (rebuilt from a node's list if an
+    /// edge is added later) and each edge list's spare room. On work's tree the sets and the room were most of an
+    /// estimated 1.8 GB of edges, in a graph of 47M edges.</summary>
+    public void TrimForReads()
+    {
+        _edgeSets.Clear();
+        _edgeSets.TrimExcess();
+        foreach (var l in _out)
+            if (l.Capacity > l.Count) l.TrimExcess();
+    }
+
     /// <summary>Merge additional flags onto an existing node (e.g. mark a function address-taken once a
     /// front-end discovers its address is used somewhere).</summary>
     public void AddFlag(NodeId id, NodeFlags flags)
@@ -125,6 +136,8 @@ public sealed class CodeGraph
         yield return ("edges", edges);
         yield return ("edgeSets", _edgeSets.Count);
         yield return ("nameChars", nameChars);
+        yield return ("edgeRoom", edgeRoom);
+        yield return ("edgeSetEntries", setEntries);
         // A node record (~56 B) and its slot (8), its edge list (~56 B and 12 a slot of room), its intern entry (~52 B);
         // an edge set entry (~20 B); a name string (22 B and 2 a char). File strings are shared by a file's nodes.
         yield return ("nodesEstMb", nodes * (56 + 8 + 52) >> 20);

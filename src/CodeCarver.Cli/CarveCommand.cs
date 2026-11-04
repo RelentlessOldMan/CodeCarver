@@ -2370,8 +2370,12 @@ public static class CarveCommand
         // verify uses this to say when a failure comes from such a file (cause useInUnparsedFile).
         var unparsedFiles = new HashSet<string>(skipParse, CodeCarver.Core.Util.PathComparer.Default);
         if (fe is TreeSitterFrontEnd tsUnparsed) unparsedFiles.UnionWith(tsUnparsed.UnparsedFiles);
-        Mark("build-graph");
         foreach (var (k, v) in graph.Census()) summary[$"census.graph.{k}"] = v;
+        // Nothing adds edges after this, so the de-duplication sets and the lists' spare room go before the step's live
+        // memory is taken (census.graph.trimmed.* is the census after).
+        graph.TrimForReads();
+        foreach (var (k, v) in graph.Census()) if (k.EndsWith("EstMb", StringComparison.Ordinal) || k == "edgeRoom") summary[$"census.graph.trimmed.{k}"] = v;
+        Mark("build-graph");
         // Where the roots step goes: time.roots.<part>.ms, roots.cpu.<part>.ms, roots.io.<part>.<kind>.*.
         var rootsSw = System.Diagnostics.Stopwatch.StartNew();
         var rootsIo = CodeCarver.Core.Util.IoMeter.Now();

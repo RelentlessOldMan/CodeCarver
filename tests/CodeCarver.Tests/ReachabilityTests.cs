@@ -216,6 +216,24 @@ public class ReachabilityTests
 public class GraphModelTests
 {
     [Fact]
+    public void TrimForReads_KeepsEdges_AndLaterAddsStillDeduplicate()
+    {
+        var g = new CodeGraph();
+        var from = g.GetOrAddNode(NodeKind.Function, "hub", "a.c");
+        var to = Enumerable.Range(0, 40).Select(i => g.GetOrAddNode(NodeKind.Function, $"f{i}", "a.c")).ToArray();
+        foreach (var t in to) { g.AddEdge(from, t, EdgeKind.Calls); g.AddEdge(from, t, EdgeKind.Calls); }
+        Assert.Equal(40, g.OutEdges(from).Count);
+        g.TrimForReads();
+        Assert.Equal(to, g.OutEdges(from).Select(e => e.To).ToArray());
+        Assert.Equal(0, g.Census().Single(c => c.Key == "edgeSets").Value);
+        foreach (var t in to) g.AddEdge(from, t, EdgeKind.Calls);
+        var extra = g.GetOrAddNode(NodeKind.Function, "late", "a.c");
+        g.AddEdge(from, extra, EdgeKind.Calls);
+        g.AddEdge(from, extra, EdgeKind.Calls);
+        Assert.Equal(41, g.OutEdges(from).Count);
+    }
+
+    [Fact]
     public void Interning_ReturnsSameId_ForSameIdentity()
     {
         var g = new CodeGraph();
