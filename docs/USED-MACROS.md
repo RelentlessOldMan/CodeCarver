@@ -186,6 +186,7 @@ budget runs alone (`mem.overBudgetAlone`): it needs what one compile of the buil
 | `world.usedMacros.trusted` | `1` when the header carve used the files |
 | `world.ppTrace.version` | the `LLVM version` line pp-trace printed, or `unknown` |
 | `world.ppTrace.commands` / `.succeeded` / `.failed` | commands pp-trace was to run, ran clean, and didn't |
+| `world.ppTrace.duplicateCommands` | commands the selected builds share, run once and not counted in `commands` |
 | `world.ppTrace.succeeded.pastParseErrors` | of `succeeded`, runs whose only errors came from the parse after preprocessing (or a rejected option, or a warning made an error) |
 | `world.ppTrace.succeeded.pastWarningsAsErrors` | of `pastParseErrors`, runs where some error was a warning made one |
 | `world.ppTrace.succeeded.pastStubbedHeaders` / `world.ppTrace.headersStubbed` | runs that lacked only headers outside the tree and ran clean with an empty one in each one's place; and those headers, distinct |

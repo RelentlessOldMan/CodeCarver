@@ -1305,7 +1305,8 @@ public static class CarveCommand
                     return configured.FirstOrDefault(c2 => c2.Name == name).Exe ?? (Path.IsPathFullyQualified(d2) ? Resolve(d2) : null);
                 });
             }
-            var absCmds = buildCmds.Select(c => c with { Directory = Path.IsPathFullyQualified(c.Directory) ? c.Directory : Path.GetFullPath(Path.Combine(dir, c.Directory)) }).ToList();
+            var absCmds = RunOnce(buildCmds.Select(c => c with { Directory = Path.IsPathFullyQualified(c.Directory) ? c.Directory : Path.GetFullPath(Path.Combine(dir, c.Directory)) }));
+            summary["world.preprocessed.duplicateCommands"] = buildCmds.Count - absCmds.Count;
             // Headers are decided only when every translation unit the build compiles has a command that ran.
             var tuExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
             var units = parseRels.Where(r => !notBuilt.Contains(r) && tuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)));
@@ -1387,7 +1388,8 @@ public static class CarveCommand
                 return 2;
             }
             var exe = FindExe(cv.PpTraces[0])!;   // checked with the other inputs
-            var absCmds = buildCmds.Select(c => c with { Directory = Path.IsPathFullyQualified(c.Directory) ? c.Directory : Path.GetFullPath(Path.Combine(dir, c.Directory)) }).ToList();
+            var absCmds = RunOnce(buildCmds.Select(c => c with { Directory = Path.IsPathFullyQualified(c.Directory) ? c.Directory : Path.GetFullPath(Path.Combine(dir, c.Directory)) }));
+            summary["world.ppTrace.duplicateCommands"] = buildCmds.Count - absCmds.Count;
             var logged = buildCmds.Select(CmdRel).Where(r => r is not null).Select(r => r!).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var unitsWithout = parseRels.Count(r => !notBuilt.Contains(r) && usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !logged.Contains(r));
             err.WriteLine($"  config  : running pp-trace on {absCmds.Count:N0} compile command(s) ...");
@@ -4471,6 +4473,15 @@ public static class CarveCommand
         lines.Sort((a, b) => StringComparer.Ordinal.Compare(a.Rel, b.Rel));
         var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', lines.Select(l => l.Rel + " " + l.Sha))));
         return Convert.ToHexString(hash, 0, 8).ToLowerInvariant();
+    }
+
+    /// <summary>The commands to run the compiler on: each one once. Builds that compile a file with the same driver, directory
+    /// and arguments (a library several targets link) would run the same command and get the same answer again.</summary>
+    internal static List<CompileCommand> RunOnce(IEnumerable<CompileCommand> cmds)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        return cmds.Where(c => seen.Add(string.Join('\0', new[] { c.Driver ?? "", c.Directory, c.File, c.Incomplete ? "1" : "0",
+                                                                  string.Join('\0', c.AlternativeDirectories) }.Concat(c.Arguments)))).ToList();
     }
 
     /// <summary>Where a run stopped by memoryStopMb leaves its numbers: under outputDirectory/codecarver/.</summary>

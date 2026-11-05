@@ -124,6 +124,29 @@ public sealed class CompilerPreprocessTests
         Assert.False(t.Kept("slow.c"), o + e);
     }
 
+    /// <summary>Two builds that compile a file with the same command run the compiler on it once; the same file with other
+    /// flags still runs, and the carve is the same.</summary>
+    [Fact]
+    public void SameCommandInTwoBuilds_RunsOnce()
+    {
+        var gcc = FindGcc();
+        if (gcc is null) return;
+        using var t = new TreeCarve();
+        t.W("main.c", "int fast_path(void);\nint slow_path(void);\n"
+                    + "int main(void){\n#ifdef FAST\n  return fast_path();\n#else\n  return slow_path();\n#endif\n}\n")
+         .W("fast.c", "int fast_path(void){ return 1; }\n")
+         .W("slow.c", "int slow_path(void){ return 2; }\n")
+         .Compile("main.c", "-DFAST").Compile("fast.c").Compile("slow.c")
+         .Compile("main.c", "-DFAST").Compile("fast.c").Compile("main.c", "-DFAST -DOTHER");
+        var (code, o, e) = t.Carve(extraToml: Gcc(gcc));
+        Assert.True(code == 0, o + e);
+        Assert.Contains("world.preprocessed.duplicateCommands = 2", t.Summary);
+        Assert.Contains("world.preprocessed.commands = 4", t.Summary);
+        Assert.Contains("world.preprocessed.failed = 0", t.Summary);
+        Assert.True(t.Kept("fast.c"), o + e);
+        Assert.False(t.Kept("slow.c"), o + e);
+    }
+
     /// <summary>An #ifdef among a multi-line macro call's arguments, taken by the build: its callee stays.</summary>
     [Fact]
     public void BlockInMacroArguments_TakenByTheBuild_KeepsItsCallee()

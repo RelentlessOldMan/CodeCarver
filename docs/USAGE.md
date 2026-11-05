@@ -489,7 +489,9 @@ CodeCarver **derives this automatically**; the `world:` line says which and why.
     call print blank, the whole expansion on the call's first line) or one holding an `#include`. Files with `#line`
     directives, and everything not decided, keep the rules above; so does verify's view of a source file whose
     content carving removed lines.
-  - **Cost.** One preprocess per command, on all cores but one, up to 5 minutes each. The `config :` line and
+  - **Cost.** One preprocess per distinct command, on all cores but one, up to 5 minutes each. A command several
+    builds share (same driver, directory and arguments) runs once: `world.preprocessed.duplicateCommands` counts the
+    ones skipped, so each added build costs only the commands that differ. The `config :` line and
     `world.preprocessed.commands` / `.failed` / `.failedMissingPaths` / `.refused` / `.filesDecided` say how it went.
   - **Memory.** A compiler holds every define its compile includes (840 MB for 1.4 million, nearly all of it in
     `cc1`, the process `gcc` starts), outside the carve's own limit. So the runs share what `memoryStopMb` leaves the
