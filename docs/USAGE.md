@@ -257,7 +257,10 @@ kind, traces, `.cmm`, per-stage sizes and verify counts, warnings by category, e
 send back when the source must not leave the machine. The one exception to "numbers only" is two short digests per stage:
 `<stage>.keptFilesSha` and `<stage>.emittedFilesSha` are the first 16 hex digits of a SHA-256 over the sorted list of kept or
 written file paths. When two runs or versions show the same value, they kept or wrote the same files, which equal counts
-alone don't prove. A digest says nothing about which files they are. Repeated warnings (unresolved `#include`s, front-end notes) are capped at 20 per category on the console;
+alone don't prove. They hash names, not contents: `<stage>.emittedContentSha` adds the contents of the code files the stage
+wrote. Per path it takes the SHA-256 of the bytes the carve wrote (a pruned file, a carved header, a placeholder), or a
+fixed mark for a file copied byte for byte from the source, so it reads nothing back from the output. The same value means
+the same code files with the same bytes over the same tree. A digest says nothing about which files they are. Repeated warnings (unresolved `#include`s, front-end notes) are capped at 20 per category on the console;
 the full list is in `warnings.txt` and the count per category in the summary. `decisions.txt` is replaced by a short note above
 500,000 graph nodes (use `--why` or `manifest.json` then).
 

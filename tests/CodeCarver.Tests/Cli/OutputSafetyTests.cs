@@ -208,6 +208,39 @@ public sealed class OutputSafetyTests
     }
 
     [Fact]
+    public void Summary_ContentDigest_TellsApartTheSameFilesWithOtherContents()
+    {
+        // A pruned carve keeps main.c either way, without the function it doesn't call: the file list is the same, the
+        // contents are not.
+        (string Files, string Content) Run(string call)
+        {
+            var work = NewWork();
+            try
+            {
+                var src = Path.Combine(work, "src");
+                Directory.CreateDirectory(src);
+                File.WriteAllText(Path.Combine(src, "main.c"), $"void a(void){{}}\n\nvoid b(void){{}}\n\nint main(void){{ {call} return 0; }}\n");
+                File.WriteAllText(Path.Combine(src, "util.h"), "#define UNUSED 1\n");
+                var cfg = Path.Combine(work, "carve.toml");
+                File.WriteAllText(cfg, "outputDirectory = \"out\"\n[common]\nentryPoints = [\"main\"]\n[stages.s]\ncarveSourceFileContents = true\n");
+                var se = new StringWriter();
+                Assert.True(CarveCommand.Run(new[] { "carve", src, "--config", cfg }, new StringWriter(), se) == 0, se.ToString());
+                var text = File.ReadAllText(Path.Combine(work, "out", "s", "codecarver", "summary.txt"));
+                var files = System.Text.RegularExpressions.Regex.Match(text, @"stage0\.emittedFilesSha = ([0-9a-f]{16})\b");
+                var content = System.Text.RegularExpressions.Regex.Match(text, @"stage0\.emittedContentSha = ([0-9a-f]{16})\b");
+                Assert.True(files.Success && content.Success, text);
+                return (files.Groups[1].Value, content.Groups[1].Value);
+            }
+            finally { try { Directory.Delete(work, true); } catch { } }
+        }
+        var first = Run("a();");
+        Assert.Equal(first, Run("a();"));            // another directory, the same output
+        var other = Run("b();");
+        Assert.Equal(first.Files, other.Files);      // the same files...
+        Assert.NotEqual(first.Content, other.Content);   // ...written differently
+    }
+
+    [Fact]
     public void ConfigRelativePaths_ResolveAgainstTheConfigFile_U1()
     {
         var work = NewWork();

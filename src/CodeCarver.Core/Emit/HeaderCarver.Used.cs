@@ -80,12 +80,12 @@ public static partial class HeaderCarver
             var before = new FileInfo(path).Length;
             var tmp = path + ".carve.tmp";
             int kept = 0, dropped = 0;
-            RewriteDroppingUnneeded(path, tmp, Wanted, ref kept, ref dropped, _ => { });
+            var sha = RewriteDroppingUnneeded(path, tmp, Wanted, ref kept, ref dropped, _ => { });
             var attrs = File.GetAttributes(path);
             if ((attrs & FileAttributes.ReadOnly) != 0) File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
             File.Delete(path);
             File.Move(tmp, path);
-            return (Before: before, After: new FileInfo(path).Length, Kept: kept, Dropped: dropped);
+            return (Before: before, After: new FileInfo(path).Length, Kept: kept, Dropped: dropped, Sha: sha);
         });
         partDone?.Invoke("used.names", used.Count);
         partDone?.Invoke("keptByUsed", keptByUsed);
@@ -94,7 +94,7 @@ public static partial class HeaderCarver
         Activity.Doing(null);
         return new HeaderCarveResult(rewritten.Sum(r => r.Before), rewritten.Sum(r => r.After), rewritten.Sum(r => r.Kept), rewritten.Sum(r => r.Dropped))
         {
-            Passes = passes,
+            Passes = passes, ContentSha = Shas(bigHeaderRels, rewritten.Select(r => r.Sha)),
         };
     }
 

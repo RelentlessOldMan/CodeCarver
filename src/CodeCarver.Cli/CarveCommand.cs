@@ -4252,13 +4252,17 @@ public static class CarveCommand
 
             // The size of each code file this stage wrote, for the summary's split by extension.
             var codeSizes = new Dictionary<string, long>(res.Sizes ?? new Dictionary<string, long>(), CodeCarver.Core.Util.PathComparer.Default);
+            // What the stage rewrote, by path (the final write wins): with the list of what it wrote, the content key below.
+            var contentSha = new Dictionary<string, string>(res.ContentSha ?? new Dictionary<string, string>(), CodeCarver.Core.Util.PathComparer.Default);
             var placeholders = PlaceholderTus(splan);
             foreach (var ph in placeholders)
             {
                 var target = Path.Combine(stageDir, ph);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
                 var text = PlaceholderText(ph);
-                File.WriteAllText(target, text);
+                var bytes = System.Text.Encoding.UTF8.GetBytes(text);
+                File.WriteAllBytes(target, bytes);
+                contentSha[ph] = CodeCarver.Core.Util.HashingStream.Of(bytes);
                 carvedBytes += text.Length;
                 codeSizes[ph] = text.Length;
             }
@@ -4334,6 +4338,7 @@ public static class CarveCommand
                     summary[$"{summaryStage}.headerCarve.pasteMacros"] = hc.PasteMacros;
                     summary[$"{summaryStage}.headerCarve.forwardingMacros"] = hc.ForwardingMacros;
                     carvedBytes -= hc.BytesBefore - hc.BytesAfter;
+                    foreach (var (rel, sha) in hc.ContentSha) contentSha[rel] = sha;
                     if (hc.BytesAfter != hc.BytesBefore)
                         foreach (var rel in keptBig) codeSizes[rel] = new FileInfo(Path.Combine(stageDir, rel)).Length;
                     if (hc.AbandonedIn is { } abandonedIn)
@@ -4350,6 +4355,7 @@ public static class CarveCommand
                 }
             }
 
+            summary[$"{summaryStage}.emittedContentSha"] = ContentSha(codeSizes.Keys, contentSha);
             Step("headerCarve");
             try { CancelHook.Promote(staged); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -4453,6 +4459,17 @@ public static class CarveCommand
         var sorted = rels.Select(r => r.Replace('\\', '/')).ToList();
         sorted.Sort(StringComparer.Ordinal);
         var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', sorted)));
+        return Convert.ToHexString(hash, 0, 8).ToLowerInvariant();
+    }
+
+    /// <summary>A hash of what a stage wrote, path and content: per sorted relative path, the SHA-256 of the bytes the carve
+    /// wrote, or "=" for a file copied byte for byte from the source (the same bytes by construction, so nothing is read
+    /// back). Two runs over the same tree with the same key wrote the same files with the same contents.</summary>
+    internal static string ContentSha(IEnumerable<string> rels, IReadOnlyDictionary<string, string> rewritten)
+    {
+        var lines = rels.Select(r => (Rel: r.Replace('\\', '/'), Sha: rewritten.TryGetValue(r, out var s) ? s : "=")).ToList();
+        lines.Sort((a, b) => StringComparer.Ordinal.Compare(a.Rel, b.Rel));
+        var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', lines.Select(l => l.Rel + " " + l.Sha))));
         return Convert.ToHexString(hash, 0, 8).ToLowerInvariant();
     }
 

@@ -25,6 +25,9 @@ public sealed record HeaderCarveResult(long BytesBefore, long BytesAfter, int De
 
     /// <summary>It gave up past its time limit, not its memory limit.</summary>
     public bool AbandonedOverTime { get; init; }
+
+    /// <summary>The SHA-256 of each header it rewrote, by relative path; empty when it rewrote none (gave up, or none to carve).</summary>
+    public IReadOnlyDictionary<string, string> ContentSha { get; init; } = new Dictionary<string, string>();
 }
 
 /// <summary>
@@ -417,13 +420,13 @@ public static partial class HeaderCarver
             var tmp = path + ".carve.tmp";
             int kept = 0, dropped = 0;
             var pasteNames = new HashSet<string>(StringComparer.Ordinal);
-            RewriteDroppingUnneeded(path, tmp, WantedCounted, ref kept, ref dropped, name => { if (pasters.Contains(NameKey.Short(name))) pasteNames.Add(name); });
+            var sha = RewriteDroppingUnneeded(path, tmp, WantedCounted, ref kept, ref dropped, name => { if (pasters.Contains(NameKey.Short(name))) pasteNames.Add(name); });
             // A read-only source copy (Perforce) must not make the replace throw.
             var attrs = File.GetAttributes(path);
             if ((attrs & FileAttributes.ReadOnly) != 0) File.SetAttributes(path, attrs & ~FileAttributes.ReadOnly);
             File.Delete(path);
             File.Move(tmp, path);
-            return (Before: before, After: new FileInfo(path).Length, Kept: kept, Dropped: dropped, Pasters: pasteNames);
+            return (Before: before, After: new FileInfo(path).Length, Kept: kept, Dropped: dropped, Pasters: pasteNames, Sha: sha);
         });
         PartDone("emit");
         if (partDone is not null)
@@ -453,7 +456,16 @@ public static partial class HeaderCarver
             Passes = passes, PartMs = partMs,
             PasteMacros = rewritten.SelectMany(r => r.Pasters).Distinct(StringComparer.Ordinal).Count(),
             ForwardingMacros = counts.Forwarding,
+            ContentSha = Shas(bigHeaderRels, rewritten.Select(r => r.Sha)),
         };
+    }
+
+    /// <summary>Each rewritten header's hash by its relative path (the rewrite ran over the headers in this order).</summary>
+    private static Dictionary<string, string> Shas(IEnumerable<string> rels, IEnumerable<string> shas)
+    {
+        var by = new Dictionary<string, string>(PathComparer.Default);
+        foreach (var (rel, sha) in rels.Zip(shas)) by[rel] = sha;
+        return by;
     }
 
     private static void AddText(Dictionary<ulong, List<string>> texts, ulong key, string text)
@@ -731,9 +743,16 @@ public static partial class HeaderCarver
     /// Byte-transparent (Latin-1) and every kept line keeps its own line ending (review E1). A line inside a comment
     /// (a block comment, or a line comment a trailing backslash continues) is text, and a define that leaves a
     /// comment open is kept: dropping it would cut the comment, or splice the next line into one.</summary>
-    private static void RewriteDroppingUnneeded(string src, string dst, Func<string, bool> wanted, ref int kept, ref int dropped, Action<string> defined)
+    /// <returns>The SHA-256 of what it wrote (<see cref="HeaderCarveResult.ContentSha"/>), hashed as it is written.</returns>
+    private static string RewriteDroppingUnneeded(string src, string dst, Func<string, bool> wanted, ref int kept, ref int dropped, Action<string> defined)
     {
-        using var w = new StreamWriter(dst, false, Encoding.Latin1);
+        var hs = new HashingStream(new FileStream(dst, FileMode.Create, FileAccess.Write, FileShare.Read));
+        using (var w = new StreamWriter(hs, Encoding.Latin1)) RewriteDroppingUnneeded(src, w, wanted, ref kept, ref dropped, defined);
+        return hs.Hex;
+    }
+
+    private static void RewriteDroppingUnneeded(string src, TextWriter w, Func<string, bool> wanted, ref int kept, ref int dropped, Action<string> defined)
+    {
         using var e = ReadLinesWithEol(src).GetEnumerator();
         var inComment = Comment.None;
         var lineStart = true;
