@@ -15,6 +15,8 @@ public static class LineCoverage
 {
     private static readonly Regex Location = new(@"(?<file>(?:[A-Za-z]:)?[^\s:()]*\.[A-Za-z0-9_+]+):(?<from>\d+)(?:-(?<to>\d+))?",
                                                  RegexOptions.Compiled);
+    private static readonly Regex WholeLocation = new(@"^(?<file>\S.*\.[A-Za-z0-9_+]+):(?<from>\d+)(?:-(?<to>\d+))?$", RegexOptions.Compiled);
+    private static readonly Regex Discriminator = new(@"\s*\(discriminator \d+\)\s*$", RegexOptions.Compiled);
 
     public readonly record struct Lines(string File, int From, int To);
 
@@ -27,8 +29,13 @@ public static class LineCoverage
         {
             var line = raw.Trim();
             if (line.Length == 0 || line[0] == '#') continue;
+            // A path may hold spaces (C:\Program Files\...): addr2line puts it after " at ", a plain list has it whole.
+            // Anything else: the last space-free location on the line.
             Match? last = null;
-            for (var m = Location.Match(line); m.Success; m = m.NextMatch()) last = m;
+            var at = line.LastIndexOf(" at ", StringComparison.Ordinal);
+            var whole = WholeLocation.Match(at >= 0 ? Discriminator.Replace(line[(at + 4)..], "") : line);
+            if (whole.Success && (at >= 0 || !line.Contains(": ", StringComparison.Ordinal))) last = whole;
+            else for (var m = Location.Match(line); m.Success; m = m.NextMatch()) last = m;
             if (last is null || !int.TryParse(last.Groups["from"].Value, out var from) || from < 1) { unmatched++; continue; }
             var to = last.Groups["to"].Success && int.TryParse(last.Groups["to"].Value, out var t) && t >= from && t - from <= 100_000 ? t : from;
             result.Add(new Lines(last.Groups["file"].Value, from, to));

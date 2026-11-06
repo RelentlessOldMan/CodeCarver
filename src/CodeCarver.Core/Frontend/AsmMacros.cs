@@ -19,6 +19,10 @@ public sealed class AsmMacros
     static readonly Regex Endm = new(@"^\s*\.endm\b", RegexOptions.Compiled);
     static readonly Regex Define = new(@"^\s*#\s*define\s+([A-Za-z_]\w*)(\(([^)]*)\))?\s*(.*)$", RegexOptions.Compiled);
     static readonly Regex Paste = new(@"\s*##\s*", RegexOptions.Compiled);
+    static readonly Regex LoopHead = new(@"^\s*\.(irpc|irp|rept)\b\s*(.*)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    static readonly Regex Endr = new(@"^\s*\.endr\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    static readonly Regex LoopSymbol = new(@"^\s*([A-Za-z_.$][\w.$]*)\s*,?\s*(.*)$", RegexOptions.Compiled);
+    const int MaxUnrolled = 100_000;   // the lines one loop may unroll to
 
     sealed record GasMacro(string[] Params, string[] Defaults, List<string> Body);
     readonly Dictionary<string, GasMacro> _gas = new(StringComparer.OrdinalIgnoreCase);   // gas macro names ignore case
@@ -27,6 +31,8 @@ public sealed class AsmMacros
     GasMacro? _open;
     int _openDepth;
     string _pending = "";   // a #define continued with a backslash
+    List<string>? _loop;    // a .irp/.irpc/.rept block outside a macro, until its .endr
+    int _loopDepth;
 
     public bool Any => _gas.Count > 0 || _cppFn.Count > 0 || _cppObj.Count > 0;
 
@@ -59,6 +65,25 @@ public sealed class AsmMacros
                 m.Body.Add(line);
                 continue;
             }
+            if (_loop is not null)
+            {
+                _loop.Add(line);
+                if (LoopHead.IsMatch(line)) _loopDepth++;
+                else if (Endr.IsMatch(line) && _loopDepth-- == 0)
+                {
+                    var block = _loop;
+                    _loop = null;
+                    if (sb is not null)
+                        foreach (var u in Unroll(block))
+                        {
+                            var b = u.Replace("\\()", "");
+                            sb.Append(b).Append('\n');
+                            foreach (var statement in b.Split(';')) Expand(statement, 0, sb);
+                        }
+                }
+                continue;
+            }
+            if (LoopHead.IsMatch(line)) { _loop = new List<string> { line }; _loopDepth = 0; continue; }
             var h = MacroHead.Match(line);
             if (h.Success)
             {
@@ -170,15 +195,61 @@ public sealed class AsmMacros
             else if (values.Length > 0) values[^1] += "," + a;   // :vararg takes the rest
         }
         var order = Enumerable.Range(0, mac.Params.Length).OrderByDescending(i => mac.Params[i].Length).ToArray();
+        var lines = new List<string>(mac.Body.Count);
         foreach (var bodyLine in mac.Body)
         {
             var b = bodyLine;
             foreach (var i in order)
                 if (mac.Params[i].Length > 0) b = b.Replace("\\" + mac.Params[i], values[i]);
-            b = b.Replace("\\()", "").Replace("\\@", "0");
+            lines.Add(b.Replace("\\@", "0"));
+        }
+        foreach (var u in Unroll(lines))   // a loop in the body: its \() stays until the loop's symbol is in
+        {
+            var b = u.Replace("\\()", "");
             sb.Append(b).Append('\n');
             Expand(b, depth + 1, sb);
         }
+    }
+
+    /// <summary><paramref name="lines"/> with each gas loop unrolled: <c>.irp sym, a, b</c> once per value and <c>.irpc
+    /// sym, ab</c> once per character, with <c>\sym</c> replaced; a <c>.rept</c> body once (what it names doesn't change
+    /// with the count). Nested loops too; a loop with no <c>.endr</c> is left as it was.</summary>
+    internal static List<string> Unroll(IReadOnlyList<string> lines)
+    {
+        var res = new List<string>();
+        for (var i = 0; i < lines.Count; i++)
+        {
+            var h = LoopHead.Match(lines[i]);
+            if (!h.Success) { res.Add(lines[i]); continue; }
+            var end = -1;
+            for (int j = i + 1, d = 0; j < lines.Count; j++)
+            {
+                if (LoopHead.IsMatch(lines[j])) d++;
+                else if (Endr.IsMatch(lines[j]) && d-- == 0) { end = j; break; }
+            }
+            if (end < 0) { res.Add(lines[i]); continue; }
+            var body = lines.Skip(i + 1).Take(end - i - 1).ToList();
+            var kind = h.Groups[1].Value.ToLowerInvariant();
+            var m = LoopSymbol.Match(h.Groups[2].Value);
+            if (kind == "rept" || !m.Success) res.AddRange(Unroll(body));
+            else
+            {
+                var sym = "\\" + m.Groups[1].Value;
+                var arg = m.Groups[2].Value;
+                var cut = arg.IndexOfAny(new[] { '@', ';' });
+                if (cut >= 0) arg = arg[..cut];
+                arg = arg.Trim();
+                var values = kind == "irpc" ? arg.Where(c => !char.IsWhiteSpace(c)).Select(c => c.ToString()).ToList()
+                    : arg.Length == 0 ? new List<string> { "" } : SplitArgs(arg);
+                foreach (var v in values)
+                {
+                    if (res.Count > MaxUnrolled) break;
+                    res.AddRange(Unroll(body.Select(b => b.Replace(sym, v)).ToList()));
+                }
+            }
+            i = end;
+        }
+        return res;
     }
 
     void ExpandCpp(string line, int depth, StringBuilder sb)

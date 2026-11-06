@@ -145,14 +145,13 @@ public static class ReadAhead
                     if (stop || next >= n) return;
                     i = next++;
                 }
-                R r;
-                try { r = read(items[i]); }
+                R r; long w;
+                try { r = read(items[i]); w = weigh(r); }
                 catch (Exception ex)
                 {
                     lock (gate) { failed ??= System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex); stop = true; Monitor.PulseAll(gate); }
                     return;
                 }
-                var w = weigh(r);
                 lock (gate) { results[i] = r; done[i] = true; held += w; Monitor.PulseAll(gate); }
             }
         }
@@ -260,14 +259,13 @@ public static class ReadAhead
                         i = next++;
                     }
                 }
-                R r;
-                try { r = f(item); }
+                R r; long w;
+                try { r = f(item); w = weigh(r); }
                 catch (Exception ex)
                 {
                     lock (gate) { failed ??= System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex); stop = true; Monitor.PulseAll(gate); }
                     return;
                 }
-                var w = weigh(r);
                 lock (gate) { results[i] = (item, r); held += w; Monitor.PulseAll(gate); }
             }
         }

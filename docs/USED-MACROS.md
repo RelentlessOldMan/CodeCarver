@@ -117,7 +117,9 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
 - A header outside the tree that this machine lacks (a host system header, included by a host-side unit that the target's
   toolchain has no copy of) doesn't fail the command. It's run again with an empty header in its place, searched after
   every real include directory, up to 16 such headers per command (`succeeded.pastStubbedHeaders`, `headersStubbed`).
-  The carve carves no define of such a header. All that's lost is a branch of the unit on that header's own macros.
+  The carve carves no define of such a header. Under the empty header a branch on its macros may not be taken, so what
+  that branch tests or uses goes unrecorded: every name in the tree's files such a run read, but on their `#define`
+  lines, is kept too, with what those names' defines name (`namesPastStubs` from `filesPastStubs` files).
   This never applies to a header the tree has elsewhere, a C standard library header, or, for a command missing an
   include directory inside the root where the build writes its output, a header the build could have made there (a
   host system header such as `unistd.h` or `sys/*.h` is stubbed even then). Those still fail it. `stubStoppedBy.*`
@@ -152,8 +154,9 @@ ppTrace   = "C:/Program Files/LLVM/bin/pp-trace.exe"       # or a name on PATH
 - A driver named for its target (`aarch64-none-elf-clang`) gets that target passed as `--target`. `clang++` and the
   file's extension pick C++.
 - `.S` and `.sx` files run too: pp-trace parses them as C after preprocessing, so their parse errors are expected;
-  only a fatal error (a missing include) fails one. `.s` and `.asm` files have no preprocessor and are skipped
-  (`notPreprocessed`).
+  so are the preprocessor's complaints about assembly text (a `#` comment line, an apostrophe in a comment). A fatal
+  error (a missing include), an `#error`, or an `#if` it could not evaluate fails one. `.s` and
+  `.asm` files have no preprocessor and are skipped (`notPreprocessed`).
 - Text files the build runs through the preprocessor (a linker script, `clang -E` on a template) aren't compile
   commands in the log. Their names come in as for any kept non-C file (`keptByOther`).
 - `ppTrace` and `usedMacros` say the same thing; set one of them. One carve runs one pp-trace.

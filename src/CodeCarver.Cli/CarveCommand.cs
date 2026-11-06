@@ -55,9 +55,9 @@ public static class CarveCommand
         catch (Exception ex)
         {
             err.WriteLine($"carve failed unexpectedly: {ex.GetType().Name}: {ex.Message}");
-            // Auto-diagnose ANY unhandled crash, even without --diag: a one-time failure shouldn't force the
-            // user to reproduce it just to capture a report. Write to the user's --diag path if given, else a
-            // default temp path. Source-free, so it's always safe to auto-write and safe to share.
+            // Auto-diagnose ANY unhandled crash: a one-time failure shouldn't force the
+            // user to reproduce it just to capture a report. Write it to a default
+            // temp path. Source-free, so it's always safe to auto-write and safe to share.
             if (DiagState.Report is { } rpt)
             {
                 rpt.SetFailure(ex);
@@ -204,6 +204,24 @@ public static class CarveCommand
                                       .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             var missing = inputFiles.Where(f => !File.Exists(f))
                                     .Concat(cv.UsedMacros.Where(f => !File.Exists(f) && !Directory.Exists(f))).ToList();
+            // Conflicts the config alone shows, before the scan and the preprocess they would otherwise wait for.
+            if (cv.PpTraces.Count > 1)
+            {
+                err.WriteLine($"the selected builds name {cv.PpTraces.Count} different ppTrace exes; one carve runs one: {string.Join(", ", cv.PpTraces)}");
+                return 2;
+            }
+            if (cv.PpTraces.Count > 0 && cv.UsedMacros.Count > 0)
+            {
+                err.WriteLine("ppTrace and usedMacros both say what the compiles used: set one of them.");
+                return 2;
+            }
+            if ((cv.PpTraces.Count > 0 || cv.UsedMacros.Count > 0) && buildLogs.Count == 0)
+            {
+                err.WriteLine(cv.PpTraces.Count > 0
+                    ? "ppTrace runs the build log's compile commands: set buildLogs in the same [builds.X]."
+                    : "usedMacros needs the build log the files came from: set buildLogs in the same [builds.X].");
+                return 2;
+            }
             if (cv.PpTraces.FirstOrDefault(p => FindExe(p) is null) is { } noPpTrace)
             {
                 err.WriteLine($"ppTrace: {noPpTrace} not found. Install the LLVM release your build's Clang comes from; pp-trace is in its bin folder.");
@@ -288,14 +306,13 @@ public static class CarveCommand
         var sourceAtStart = cv.AnalysisOnly ? EmitFrom.SourceHash(dir) : default;
 
         // Diagnostic collector for this run: a source-free snapshot (version/env/params/stats/warnings/timings)
-        // written to ONE shareable .zip on request via --diag, or automatically on an unhandled failure (the
+        // written to ONE shareable .zip on an unhandled failure (the
         // top-level handler in the dispatcher reads DiagState). Cheap to build unconditionally so breadcrumbs
-        // accumulate; only WRITTEN when --diag is set. Paths are redacted at write time (no username leaks).
+        // accumulate; only WRITTEN on a crash. Paths are redacted at write time (no username leaks).
         var diag = DiagnosticReport.Start();
         DiagState.Report = diag;
         DiagState.Path = null;          // no --diag flag; an unexpected failure still auto-writes to DefaultPath
-        // Default landing spot for an auto-written package (unhandled crash, or --diag-repro/--diag-verbose used
-        // without an explicit --diag path). Session-stamped so concurrent runs don't collide.
+        // Where an auto-written package lands on an unhandled crash. Session-stamped so concurrent runs don't collide.
         DiagState.DefaultPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"CodeCarver_diag_{diag.SessionId}.zip");
         diag.Set("codecarverVersion", Version());
         diag.Set("os", System.Runtime.InteropServices.RuntimeInformation.OSDescription);
@@ -327,7 +344,10 @@ public static class CarveCommand
         // Strings from THIS run that free text (exception messages) could carry: scrubbed at write time (D1).
         diag.AddSensitive(roots.Concat(new[] { dir, Path.GetFullPath(dir), configPath, outputDirectory, outputFull, cv.CacheDirectory ?? "" })
             .Concat(buildLogs).Concat(traceList).Concat(buildFileTraces).Concat(runFileTraces).Concat(defineSpecs)
-            .Concat(cv.ForceKeepFiles).Concat(cv.ExcludeDirectories));
+            .Concat(cv.ForceKeepFiles).Concat(cv.ExcludeDirectories)
+            .Concat(cv.RunLineCoverage).Concat(cv.UsedMacros).Concat(cv.PpTraces).Concat(new[] { cv.MirrorOf ?? "" })
+            .Concat(cv.PathMap.SelectMany(m => new[] { m.From, m.To })).Where(s => !string.IsNullOrEmpty(s)));
+        CodeCarver.Core.Util.TempReap.Old();   // what a stopped or killed carve left in the temp folder
         diag.Set("commandLine", SanitizeCommandLine(args));
         diag.Set("sourceRootKind", ClassifyRoot(dir));
         diag.Set("lang", lang);
@@ -1339,6 +1359,7 @@ public static class CarveCommand
         // What the build's compiles used, from -E -dU (docs/USED-MACROS.md): trusted only when every compile command has
         // its file, and then, in each stage, only when every source file the stage keeps has a command.
         IReadOnlySet<ulong>? usedMacros = null;
+        IReadOnlySet<ulong>? usedFollow = null;   // names to keep with what their bodies name (pp-trace past a stubbed header)
         HashSet<string>? usedLogged = null;   // the source files the log's commands compile
         var usedTuExts = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm" };
         if (cv.UsedMacros.Count > 0)
@@ -1351,7 +1372,7 @@ public static class CarveCommand
             var um = CodeCarver.Core.Preprocess.UsedMacros.Read(cv.UsedMacros);
             var logged = buildCmds.Select(CmdRel).Where(r => r is not null).Select(r => r!).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var unitsWithout = parseRels.Count(r => !notBuilt.Contains(r) && usedTuExts.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)) && !logged.Contains(r));
-            var cov = um.Check(buildCmds, dir, MapPath, 0);   // source files without a command: checked per stage, kept ones only
+            var cov = um.Check(RunOnce(buildCmds), dir, MapPath, 0);   // builds sharing a command share its file; source files without a command: checked per stage, kept ones only
             summary["world.usedMacros.files"] = um.Files;
             summary["world.usedMacros.incomplete"] = um.Incomplete;
             summary["world.usedMacros.noSource"] = um.NoSource;
@@ -1456,7 +1477,9 @@ public static class CarveCommand
             summary["world.ppTrace.mem.peakRunning"] = trace.PeakRunning;
             summary["world.ppTrace.mem.rerunForMemory"] = trace.Evictions;
             summary["world.ppTrace.mem.overBudgetAlone"] = trace.OverBudgetAlone;
-            if (trusted) { usedMacros = trace.Names; usedLogged = logged; usedLogged.UnionWith(read); }
+            summary["world.ppTrace.namesPastStubs"] = trace.NamesPastStubs.Count;
+            summary["world.ppTrace.filesPastStubs"] = trace.FilesPastStubs;
+            if (trusted) { usedMacros = trace.Names; usedFollow = trace.NamesPastStubs; usedLogged = logged; usedLogged.UnionWith(read); }
             // Where the missing headers might be: this machine's console only (names and paths), never a summary key.
             foreach (var (header, dirs) in trace.HeadersNotFoundWhere.Take(20))
                 err.WriteLine($"  warn    : pp-trace: '{header}' not found" + (dirs.Count == 0 ? "" :
@@ -1464,7 +1487,7 @@ public static class CarveCommand
                     + string.Join(", ", dirs.Take(10)) + (dirs.Count > 10 ? $", +{dirs.Count - 10:N0} more" : "")));
             if (trace.SucceededPastStubbedHeaders > 0)
                 err.WriteLine($"  config  : pp-trace: {trace.SucceededPastStubbedHeaders:N0} run(s) lacked only header(s) outside the tree that aren't on this machine "
-                    + $"({trace.HeadersStubbed:N0} in all) and ran clean with an empty one in each one's place: the tree's macros they use are counted");
+                    + $"({trace.HeadersStubbed:N0} in all) and ran clean with an empty one in each one's place: the tree's macros they use are counted, and every name the tree's files they read hold, but on #define lines ({trace.NamesPastStubs.Count:N0} from {trace.FilesPastStubs:N0} file(s))");
             var ran = trace.Failed - trace.MissingPaths - trace.Refused - trace.Incomplete;
             err.WriteLine($"  config  : pp-trace ({trace.Version ?? "version unknown"}): {trace.Succeeded:N0} of {trace.Commands:N0} compile command(s) ran clean, {trace.Names.Count:N0} name(s)"
                 + (trusted ? UsedFor(unitsWithout)
@@ -2376,6 +2399,7 @@ public static class CarveCommand
         // Nothing adds edges after this, so the de-duplication sets and the lists' spare room go before the step's live
         // memory is taken (census.graph.trimmed.* is the census after).
         graph.TrimForReads();
+        if (fe is TreeSitterFrontEnd tsDone) tsDone.ReleaseParseState();   // the parse-only tables (review R1)
         foreach (var (k, v) in graph.Census()) if (k.EndsWith("EstMb", StringComparison.Ordinal) || k == "edgeRoom") summary[$"census.graph.trimmed.{k}"] = v;
         Mark("build-graph");
         // Where the roots step goes: time.roots.<part>.ms, roots.cpu.<part>.ms, roots.io.<part>.<kind>.*.
@@ -2616,6 +2640,7 @@ public static class CarveCommand
             summary["link.inputsNotFromLog"] = links.InputsNotFromLog;
             summary["link.coversTheImages"] = links.CoversTheImages ? 1 : 0;
             summary["link.archivesNotFromLog"] = links.ArchivesNotFromLog;
+            summary["link.unresolvedLibraries"] = links.UnresolvedLibraries;
             bool Held(Root r) => graph.GetNode(r.Node).FilePath is { } f && links.StatusOf(f) == LinkStatus.ArchiveOnly;
             foreach (var r in implicitRoots.Concat(sectionRoots).Where(Held))
             {
@@ -3355,7 +3380,7 @@ public static class CarveCommand
                     string full;
                     try { full = Path.IsPathFullyQualified(cand) ? Path.GetFullPath(cand) : Path.GetFullPath(Path.Combine(rootFull, cand)); }
                     catch { outside++; continue; }
-                    if (!full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+                    if (!full.StartsWith(rootPrefix, CodeCarver.Core.Util.PathComparer.Comparison))
                     {
                         outside++;
                         if (Path.IsPathRooted(cand) && misses.Count < 400) misses.Add(cand);
@@ -4364,13 +4389,22 @@ public static class CarveCommand
                 if (keptBig.Count > 0)
                 {
                     // Names the carved tree can't show: what headers outside it name, and the build's -D values.
-                    var elsewhere = new HashSet<string>(outsideNames, StringComparer.Ordinal);
-                    foreach (var spec in buildCmds.SelectMany(c => c.Defines).Concat(defineSpecs))
-                        foreach (var m in Identifier.EnumerateMatches(spec)) elsewhere.Add(spec.Substring(m.Index, m.Length));
+                    // Only the static carve reads them: the used-macros carve has what the compiles used.
+                    HashSet<string> Elsewhere()
+                    {
+                        var elsewhere = new HashSet<string>(outsideNames, StringComparer.Ordinal);
+                        foreach (var spec in buildCmds.SelectMany(c => c.Defines).Concat(defineSpecs))
+                            foreach (var m in Identifier.EnumerateMatches(spec)) elsewhere.Add(spec.Substring(m.Index, m.Length));
+                        return elsewhere;
+                    }
                     // The -D values as #define lines ("F(a)=body" -> "#define F(a) body", "N" -> "#define N 1").
-                    var elsewhereDefines = new List<string>(outsideDefineTexts);
-                    foreach (var spec in buildCmds.SelectMany(c => c.Defines).Concat(defineSpecs).Distinct(StringComparer.Ordinal))
-                        elsewhereDefines.Add(spec.IndexOf('=') is var eq and > 0 ? $"#define {spec[..eq]} {spec[(eq + 1)..]}" : $"#define {spec} 1");
+                    List<string> ElsewhereDefines()
+                    {
+                        var elsewhereDefines = new List<string>(outsideDefineTexts);
+                        foreach (var spec in buildCmds.SelectMany(c => c.Defines).Concat(defineSpecs).Distinct(StringComparer.Ordinal))
+                            elsewhereDefines.Add(spec.IndexOf('=') is var eq and > 0 ? $"#define {spec[..eq]} {spec[(eq + 1)..]}" : $"#define {spec} 1");
+                        return elsewhereDefines;
+                    }
                     void HcKey(string key, long value) => summary[$"{summaryStage}.headerCarve.{key}"] = value;
                     // The compiles said what they used: no model of the paste macros needed (docs/USED-MACROS.md). A kept
                     // source file no command compiles used macros nobody saw: then the stage models them itself.
@@ -4407,8 +4441,8 @@ public static class CarveCommand
                         err.WriteLine($"  headers : {keptWithout:N0} kept source file(s) in no compile command define what compiled code uses: the used macros don't cover them, so the header carve models the paste macros itself");
                     var stageUsed = keptWithout > 0 ? null : usedMacros;
                     var hc = stageUsed is not null
-                        ? HeaderCarver.CarveFromUsed(stageDir, keptBig, stageUsed, HcKey)
-                        : HeaderCarver.Carve(stageDir, keptBig, elsewhere, HcKey, elsewhereDefines,
+                        ? HeaderCarver.CarveFromUsed(stageDir, keptBig, stageUsed, HcKey, usedFollow)
+                        : HeaderCarver.Carve(stageDir, keptBig, Elsewhere(), HcKey, ElsewhereDefines(),
                                              TimeSpan.FromMinutes(cv.HeaderCarveMinutes ?? DefaultHeaderCarveMinutes));
                     summary[$"{summaryStage}.headerCarve.fromUsedMacros"] = stageUsed is not null ? 1 : 0;
                     summary[$"{summaryStage}.headerCarve.bytesBefore"] = hc.BytesBefore;
@@ -4794,7 +4828,7 @@ public static class CarveCommand
         var valueFlags = new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
         {
             // Only the value-carrying flags the CLI still accepts (inputs/tuning moved to --config, whose path is
-            // elided too). The config FILE's contents are never read into the diag package, so no values leak.
+            // elided too). The config FILE's contents are never read into the diagnostic .zip, so no values leak.
             "--config", "--stage", "--why",
         };
         var sb = new System.Text.StringBuilder("carve <source>");

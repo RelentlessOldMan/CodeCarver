@@ -51,6 +51,28 @@ public class AssemblyPasteTests
     }
 
     [Fact]
+    public void LoopPastedHandlerName_IsKept()
+    {
+        using var t = Tree("    .section .isr_vector\n    .irp n, KQ_UART, KQ_SPARE\n    .word \\n\\()_IRQHandler\n    .endr\n" + Reset);
+        var r = t.Carve(entry: "Reset_Handler");
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.True(t.Kept("handlers.c"), r.Out + r.Err);
+        Assert.False(t.Kept("dead.c"), r.Out + r.Err);
+    }
+
+    [Fact]
+    public void Unroll_IrpIrpcRept_NestedAndInAMacro()
+    {
+        var lines = new[] { ".irp a, KQ_X, KQ_Y", ".irpc c, 01", ".word \\a\\()_\\c", ".endr", ".endr", ".rept 4", "nop", ".endr", "b ." };
+        Assert.Equal(new[] { ".word KQ_X\\()_0",".word KQ_X\\()_1", ".word KQ_Y\\()_0", ".word KQ_Y\\()_1", "nop", "b ." },
+                     AsmMacros.Unroll(lines));
+        var m = new AsmMacros();
+        var text = m.Feed("    .macro vecs first, second\n    .irp h, \\first, \\second\n    .word \\h\\()_IRQHandler\n    .endr\n    .endm\n    vecs KQ_UART, KQ_TIM\n");
+        Assert.Contains("KQ_UART_IRQHandler", text);
+        Assert.Contains("KQ_TIM_IRQHandler", text);
+    }
+
+    [Fact]
     public void MacroFromAnIncludedFile_IsExpanded()
     {
         using var t = Tree(".include \"vec.inc\"\n    def_vec KQ_UART\n" + Reset,
@@ -144,5 +166,21 @@ public class AssemblyPasteTests
         Assert.True(t.Kept("init.c"), r.Out + r.Err);
         Assert.Equal(underIf, t.Kept("other.c"));
         Assert.Equal(underIf, t.Kept("dead.c"));
+    }
+
+    [Fact]
+    public void AStaticInAFileWithAParseError_ShadowsNothing()
+    {
+        // tree-sitter may recover a block-scope static at top level, so a broken file's statics can't be trusted
+        // to hide the global.
+        using var t = new TreeCarve()
+            .W("main.c", Main)
+            .W("init.c", "static int kq_shd(void){ return 3; }\nint kq_init(void){ return kq_shd() + ) ; }\n")
+            .W("other.c", "int kq_dead(void);\nint kq_shd(void){ return kq_dead(); }\n")
+            .W("dead.c", "int kq_dead(void){ return 2; }\n");
+        t.Compile("main.c").Compile("init.c").Compile("other.c").Compile("dead.c");
+        var r = t.Carve(entry: "main");
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.True(t.Kept("other.c"), r.Out + r.Err);
     }
 }

@@ -39,6 +39,24 @@ public sealed class PpTraceTests
     static HashSet<ulong> Keys(params string[] names) => names.Select(n => NameKey.Short(n)).ToHashSet();
 
     [Fact]
+    public void AddNamesButDefines_TakesTheBranchNotTaken_NotTheDefines()
+    {
+        // Run past an empty stand-in for a host header: the #ifdef on its macro was false, so KQ_FAST_TIMER went unrecorded.
+        var f = Path.Combine(Path.GetTempPath(), "cc-ppt-names-" + Guid.NewGuid().ToString("N") + ".c");
+        File.WriteAllText(f, "#ifdef KQ_HOST_VERSION\n#ifdef KQ_FAST_TIMER\nkq_fast(0x1Fu);\n#endif\n#endif\n#define KQ_LOCAL_ONLY \\\n  KQ_BODY_ONLY\nint kq_after;\n");
+        try
+        {
+            var names = new HashSet<ulong>();
+            PpTrace.AddNamesButDefines(names, f);
+            Assert.Superset(Keys("KQ_HOST_VERSION", "KQ_FAST_TIMER", "kq_fast", "kq_after"), names);
+            Assert.DoesNotContain(NameKey.Short("KQ_LOCAL_ONLY"), names);
+            Assert.DoesNotContain(NameKey.Short("KQ_BODY_ONLY"), names);   // the continuation line is the define's
+            Assert.DoesNotContain(NameKey.Short("x1Fu"), names);
+        }
+        finally { File.Delete(f); }
+    }
+
+    [Fact]
     public void ReadNames_TakesEveryMacroNameTokLine()
     {
         var yaml = "---\n- Callback: MacroExpands\n  MacroNameTok: KQ_CAT\n  MacroDirective: MD_Define\n"
@@ -168,6 +186,17 @@ public sealed class PpTraceTests
     [InlineData("a.c:5:16: warning: unknown attribute 'kq' ignored [-Wunknown-attributes]", PpTrace.Stage.None)]
     public void ErrorStage_ReadsClangsCategory(string line, PpTrace.Stage stage) =>
         Assert.Equal(stage, PpTrace.ErrorStage(line));
+
+    [Theory]
+    [InlineData("start.S:7:2: error: invalid preprocessing directive [Lexical or Preprocessor Issue]", true)]
+    [InlineData("start.S:9:30: error: missing terminating ' character [Lexical or Preprocessor Issue]", true)]
+    [InlineData("start.S:3:5: error: invalid token at start of a preprocessor expression [Lexical or Preprocessor Issue]", false)]
+    [InlineData("start.S:1:2: error: \"kq\" [User-Defined Issue]", false)]
+    public void AnAssemblyFilesPreprocessorError_IsAllowedOnlyForItsAssemblyText(string line, bool allowed)
+    {
+        Assert.Equal(PpTrace.Stage.Preprocessor, PpTrace.ErrorStage(line));
+        Assert.Equal(allowed, PpTrace.AsmTextLexical(line));
+    }
 
     [SkippableFact]
     public void Run_PutsAnEmptyHeaderInPlaceOfOneOutsideTheTreeThisMachineLacks()

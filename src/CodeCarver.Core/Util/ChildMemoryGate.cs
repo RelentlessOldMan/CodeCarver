@@ -25,6 +25,7 @@ public sealed class ChildMemoryGate : IDisposable
     readonly List<Lease> _running = new();
     readonly List<Lease> _stopping = new();   // stopped, still holding their memory until they exit
     readonly Timer _sampler;
+    int _sampling;   // 1 while a sample runs: a slow one is not overlapped by the next tick
     int _starting;
     long _order;
     long _biggest;   // the most any finished child held
@@ -46,7 +47,11 @@ public sealed class ChildMemoryGate : IDisposable
     {
         _budget = Math.Max(1, budgetBytes);
         _maxRunning = Math.Max(1, maxRunning);
-        _sampler = new Timer(_ => Sample(), null, sampleMs, sampleMs);
+        _sampler = new Timer(_ =>
+        {
+            if (Interlocked.Exchange(ref _sampling, 1) != 0) return;
+            try { Sample(); } finally { Volatile.Write(ref _sampling, 0); }
+        }, null, sampleMs, sampleMs);
     }
 
     /// <summary>The budget for a run's children: the run's limit (memoryStopMb, or the machine's memory when less),

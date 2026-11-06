@@ -13,9 +13,9 @@
 # Exit: 0 SOUND, 1 link/compile failed, 3 bad arguments, 4 g++ missing.
 #
 # Example (after carving to .oracle-cpp/tinyxml2 on the Windows side):
-#   INC="-I/mnt/c/Playground/CodeCarver/.oracle-cpp/tinyxml2/carved" \
-#   bash wsl-cpp-oracle.sh /mnt/c/Playground/CodeCarver/.oracle-cpp/tinyxml2/carved \
-#        /mnt/c/Playground/CodeCarver/oracle/tinyxml2_driver.cpp
+#   INC="-I/build/agent/repo/.oracle-cpp/tinyxml2/carved" \
+#   bash wsl-cpp-oracle.sh /build/agent/repo/.oracle-cpp/tinyxml2/carved \
+#        /build/agent/repo/oracle/tinyxml2_driver.cpp
 set -u
 [ $# -ge 2 ] || { echo "usage: $0 <carvedDir> <driver.cpp> [g++ flags...]"; exit 3; }
 carved="$1"; driver="$2"; shift 2

@@ -440,6 +440,24 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private PasteMacros.Table _headPasteTable = new();
     private NameScan? _headPasteUse;
     private NameScan? _pasteUse;
+
+    /// <summary>Lets go of what only the parse reads, once the graph is built: the paste tables and their scans, the
+    /// rename map the parse follows, and the pre-pass's file lengths. What later steps ask for stays: the names a symbol
+    /// is spelled as (SourceNamesOf), the macro bodies (FunctionMacro), DefinerSet and the C99 inline functions.
+    /// The run's closure would otherwise hold these to the end (a heartbeat timer keeps it alive).</summary>
+    public void ReleaseParseState()
+    {
+        _pasteTable = new();
+        _headPasteTable = new();
+        _pasteUse = null;
+        _headPasteUse = null;
+        _renamesTo.Clear();
+        _renamesTo.TrimExcess();
+        _parseLengths.Clear();
+        _parseLengths.TrimExcess();
+        _argReferenced.Clear();
+    }
+
     private HashSet<string> _objectMacros = new(StringComparer.Ordinal);
     /// <summary>The tree's definer macros, for the emitted-tree check (null when there are none).</summary>
     public DefinerMacros.Set? DefinerSet { get; private set; }
@@ -2125,10 +2143,13 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // The use's own file has a static of the name that no #if surrounds: the use is that one and no other.
         if (shadows is not null)
         {
-            var own = (functionsByName.TryGetValue(name, out var f1) ? f1 : Enumerable.Empty<NodeId>())
-                .Concat(globalsByName.TryGetValue(name, out var g1) ? g1 : Enumerable.Empty<NodeId>())
-                .Where(t => shadows(from, t)).ToList();
-            if (own.Count > 0)
+            // A plain loop: this runs for every use, and almost none has a static of its name in its own file.
+            List<NodeId>? own = null;
+            if (functionsByName.TryGetValue(name, out var f1))
+                foreach (var t in f1) if (shadows(from, t)) (own ??= new()).Add(t);
+            if (globalsByName.TryGetValue(name, out var g1))
+                foreach (var t in g1) if (shadows(from, t)) (own ??= new()).Add(t);
+            if (own is not null)
             {
                 foreach (var target in own)
                 {
@@ -2550,7 +2571,17 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (c is '"' or '\'')
             {
                 var j = i + 1;
-                while (j < n && t[j] != c && t[j] != '\n') j += t[j] == '\\' ? 2 : 1;
+                while (j < n && t[j] != c && t[j] != '\n')
+                {
+                    // a splice inside the literal (the parse text keeps those) is a line too
+                    if (t[j] == '\\' && j + 1 < n && (t[j + 1] == '\n' || (t[j + 1] == '\r' && j + 2 < n && t[j + 2] == '\n')))
+                    {
+                        j += t[j + 1] == '\n' ? 2 : 3;
+                        line++;
+                        continue;
+                    }
+                    j += t[j] == '\\' ? 2 : 1;
+                }
                 i = j < n && t[j] == c ? j + 1 : Math.Min(j, n);
                 if (!directive) last = c;
                 continue;
@@ -2772,7 +2803,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         var fileNode = w.FileNode(path);
         var srcLines = new TextLines(text);
         bool[]? conditional = piece?.Conditional;
-        bool Shadows(int row) => path.EndsWith(".c", StringComparison.OrdinalIgnoreCase)
+        // Not in a tree with a parse error: tree-sitter can recover a block-scope static at top level (review F3).
+        var treeRecovered = root.HasError;
+        bool Shadows(int row) => !treeRecovered && path.EndsWith(".c", StringComparison.OrdinalIgnoreCase)
                                  && (conditional ??= ConditionalLines(text)) is var c && (row >= c.Length || !c[row]);
 
         // When configured, code in dead #ifdef branches is skipped (config-specific carve). A piece's are the file's.

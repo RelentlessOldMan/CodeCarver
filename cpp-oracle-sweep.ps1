@@ -15,7 +15,7 @@ $c    = Join-Path $root '.corpus'
 $o    = Join-Path $root '.oracle-cpp'
 
 # Windows path -> WSL /mnt path, derived from $root so the sweep works from ANY clone location
-# (was hardcoded to /mnt/c/Playground/CodeCarver, which broke on any other checkout).
+# (a fixed /mnt path broke on any other checkout).
 function ToWsl([string]$p) {
     $full = [IO.Path]::GetFullPath($p)
     if ($full -notmatch '^([A-Za-z]):[\\/](.*)$') { throw "not a Windows drive path: $p" }

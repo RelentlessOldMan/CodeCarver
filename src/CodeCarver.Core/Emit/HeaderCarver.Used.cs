@@ -12,6 +12,12 @@ public static partial class HeaderCarver
         ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm", ".h", ".hh", ".hpp", ".hxx", ".h++", ".inl", ".ipp", ".tcc", ".tpp",
     };
 
+    /// <summary>The headers among <see cref="CompiledExts"/>: a small one is kept whole, but its defines can pass a name on.</summary>
+    private static readonly HashSet<string> HeaderExts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".h", ".hh", ".hpp", ".hxx", ".h++", ".inl", ".ipp", ".tcc", ".tpp",
+    };
+
     /// <summary>The most passes the closure over the other files' names takes (each reads every big header).</summary>
     private const int UsedClosurePasses = 16;
 
@@ -23,7 +29,7 @@ public static partial class HeaderCarver
     /// collected, so names pasted from there are not followed.
     /// </summary>
     public static HeaderCarveResult CarveFromUsed(string outDir, IReadOnlyCollection<string> bigHeaderRels, IReadOnlySet<ulong> used,
-                                                  Action<string, long>? partDone = null)
+                                                  Action<string, long>? partDone = null, IReadOnlySet<ulong>? follow = null)
     {
         var bigSet = new HashSet<string>(bigHeaderRels, StringComparer.OrdinalIgnoreCase);
         var bigFull = bigHeaderRels.Select(r => Path.Combine(outDir, r)).ToList();
@@ -36,16 +42,38 @@ public static partial class HeaderCarver
         var frontier = new HashSet<ulong>();
         Activity.Doing("reading the kept non-C files for names", () => $"{needed.Count:N0} names");
         var walk = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.System };
-        var others = Directory.EnumerateFiles(outDir, "*", walk)
-            .Where(f => !CompiledExts.Contains(Path.GetExtension(f)) && !bigSet.Contains(Path.GetRelativePath(outDir, f).Replace('\\', '/')))
-            .ToList();
+        var others = new List<string>();
+        var smallHeaders = new List<string>();
+        foreach (var f in Directory.EnumerateFiles(outDir, "*", walk))
+        {
+            if (bigSet.Contains(Path.GetRelativePath(outDir, f).Replace('\\', '/'))) continue;
+            var ext = Path.GetExtension(f);
+            if (!CompiledExts.Contains(ext)) others.Add(f);
+            else if (HeaderExts.Contains(ext)) smallHeaders.Add(f);
+        }
         var otherNames = 0;
+        // Names a compile may have used unseen (one past a stubbed header): kept, their bodies followed, as other files'.
+        if (follow is not null) foreach (var k in follow) if (needed.Add(k)) frontier.Add(k);
         foreach (var (_, names) in ReadAhead.Ordered(others, OtherNames, ReadAhead.Window))
             if (names is not null)
                 foreach (var k in names)
                     if (needed.Add(k)) { frontier.Add(k); otherNames++; }
         partDone?.Invoke("used.otherFiles", others.Count);
         partDone?.Invoke("used.otherNames", otherNames);
+
+        // The small headers are kept whole, but a name can pass through one: a script preprocessed outside the log
+        // includes memmap.h, whose define names a big header's. Their defines are read once, as name → the names its
+        // body and the conditions around it hold, and followed with the big headers'.
+        Dictionary<ulong, HashSet<ulong>>? small = null;
+        if (frontier.Count > 0 && smallHeaders.Count > 0)
+        {
+            Activity.Doing("reading the small headers' defines", () => $"{smallHeaders.Count:N0} files");
+            small = new Dictionary<ulong, HashSet<ulong>>();
+            foreach (var (_, defs) in ReadAhead.Ordered(smallHeaders, DefineNames, ReadAhead.Window))
+                foreach (var (k, names) in defs)
+                    if (small.TryGetValue(k, out var had)) had.UnionWith(names); else small[k] = names;
+        }
+        partDone?.Invoke("used.smallHeaders", small is null ? 0 : smallHeaders.Count);
 
         var passes = 0;
         var pastes = 0L;
@@ -55,6 +83,10 @@ public static partial class HeaderCarver
             var reading = frontier;
             Activity.Doing($"reading the big headers for what other files' names need, pass {passes}", () => $"{needed.Count:N0} names, {reading.Count:N0} to follow");
             var next = new HashSet<ulong>();
+            if (small is not null)
+                foreach (var k in reading)
+                    if (small.TryGetValue(k, out var names))
+                        foreach (var n in names) if (needed.Add(n)) next.Add(n);
             foreach (var (names, paste) in ReadAhead.Each(bigFull, path => Follow(path, reading, needed)))
             {
                 pastes += paste;
@@ -107,16 +139,68 @@ public static partial class HeaderCarver
         return names;
     }
 
+    /// <summary>Each define in a small header: its name and the names its body and the conditions around it hold.</summary>
+    private static List<(ulong Key, HashSet<ulong> Names)> DefineNames(string path)
+    {
+        var defs = new List<(ulong, HashSet<ulong>)>();
+        if (LooksBinary(path)) return defs;
+        var none = new HashSet<ulong>();
+        var conds = new List<List<string>>();
+        foreach (var (name, text, kind) in EnumerateLogicalLines(path))
+        {
+            if (TrackConditions(conds, text, kind) || kind != LineKind.Define || name is null) continue;
+            var names = new HashSet<ulong>();
+            foreach (var frame in conds) foreach (var c in frame) AddNewIdentifiers(names, none, c);
+            AddNewIdentifiers(names, none, text, except: name);
+            defs.Add((NameKey.Short(name), names));
+        }
+        return defs;
+    }
+
+    /// <summary>Keep the stack of open conditionals (each with its #elif lines) up to date; true if the line was one.</summary>
+    private static bool TrackConditions(List<List<string>> conds, string text, LineKind kind)
+    {
+        if (kind == LineKind.Conditional)
+        {
+            if (DirectiveWord(text) == "elif" && conds.Count > 0) conds[^1].Add(text); else conds.Add(new List<string> { text });
+            return true;
+        }
+        if (kind == LineKind.Other && DirectiveWord(text) == "endif")
+        {
+            if (conds.Count > 0) conds.RemoveAt(conds.Count - 1);
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>The word after a directive's <c>#</c> (<c>endif</c> of <c>#  endif</c>), or null.</summary>
+    private static string? DirectiveWord(string text)
+    {
+        var i = 0;
+        while (i < text.Length && (text[i] == ' ' || text[i] == '\t')) i++;
+        if (i >= text.Length || text[i] != '#') return null;
+        i++;
+        while (i < text.Length && (text[i] == ' ' || text[i] == '\t')) i++;
+        var s = i;
+        while (i < text.Length && char.IsAsciiLetter(text[i])) i++;
+        return i > s ? text[s..i] : null;
+    }
+
     /// <summary>The names in the bodies of one header's defines of the names in <paramref name="follow"/> that are not
-    /// <paramref name="needed"/> yet, and how many of those bodies paste.</summary>
+    /// <paramref name="needed"/> yet, and how many of those bodies paste. The conditions around such a define count too:
+    /// the compiles may never have entered its block (a linker-only #ifdef), so what decides whether it is defined, or
+    /// which of two it is, was never recorded as used.</summary>
     private static (HashSet<ulong> Names, int Pastes) Follow(string path, HashSet<ulong> follow, HashSet<ulong> needed)
     {
         var names = new HashSet<ulong>();
         var pastes = 0;
         var def = new PpDefine();
+        var conds = new List<List<string>>();
         foreach (var (name, text, kind) in EnumerateLogicalLines(path))
         {
+            if (TrackConditions(conds, text, kind)) continue;
             if (kind != LineKind.Define || name is null || !follow.Contains(NameKey.Short(name))) continue;
+            foreach (var frame in conds) foreach (var c in frame) AddNewIdentifiers(names, needed, c);
             if (!def.Parse(text)) { AddNewIdentifiers(names, needed, text, except: name); continue; }
             AddBodyNames(names, needed, def);
             if (def.Body.Any(t => t.Kind == PpTok.HashHash)) pastes++;

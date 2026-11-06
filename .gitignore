@@ -37,7 +37,6 @@ dist/
 
 # Machine-local MCP config; never belongs in the repo.
 .mcp.json
-**/discordinator/
 
 perf-baseline.json
 

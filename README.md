@@ -15,9 +15,9 @@ minimal slice that still **builds and links**.
 > entry points, config) and hand it to a CodeCarver session; it configures and hardens the tool for
 > you, no private code required.
 
-> ⚠️ **WIP — not yet validated on a real-world production build.** The engine works and the carved
-> output compiles across 20+ open-source repos (below), but it hasn't been proven on a large
-> proprietary target yet. Treat intra-file carving (`carveSourceFileContents`) as experimental; file-level
+> ⚠️ **WIP.** The carved
+> output compiles across 20+ open-source repos (below) and has carved and built a large proprietary firmware tree, but
+> it is still young. Treat intra-file carving (`carveSourceFileContents`) as experimental; file-level
 > carving is the sound default.
 >
 > Status: **working for C, C++, C#, and TRACE32 `.cmm`, on Windows and Linux.** Tree-sitter front-end, deterministic reachability engine,

@@ -18,7 +18,8 @@ public sealed class CodeGraph
     private readonly List<List<OutEdge>> _out = new();
     // Keyed by a tuple of references to strings the nodes already hold — not a formatted string per node, which
     // cost a fresh "kind name path line" copy for every node (gigabytes at 13M nodes; review RB2).
-    private readonly Dictionary<(NodeKind, string, string?, int), int> _intern = new();
+    // Dropped by TrimForReads (nothing adds nodes after build-graph) and rebuilt from the nodes if something does.
+    private Dictionary<(NodeKind, string, string?, int), int>? _intern = new();
     // Out-edges are de-duplicated: a function calling another 50 times needs one edge. Small lists are scanned;
     // a node whose out-degree passes EdgeSetThreshold gets a set.
     private const int EdgeSetThreshold = 16;
@@ -32,7 +33,7 @@ public sealed class CodeGraph
     {
         _nodes.EnsureCapacity(nodes);
         _out.EnsureCapacity(nodes);
-        _intern.EnsureCapacity(nodes);
+        Intern().EnsureCapacity(nodes);
     }
     public IEnumerable<Node> Nodes => _nodes;
 
@@ -42,7 +43,8 @@ public sealed class CodeGraph
                                SourceSpan span = default, NodeFlags flags = NodeFlags.None)
     {
         var key = Key(kind, name, file, span.StartLine);
-        if (_intern.TryGetValue(key, out var existing))
+        var intern = Intern();
+        if (intern.TryGetValue(key, out var existing))
         {
             var cur = _nodes[existing];
             var mergedFlags = cur.Flags | flags;
@@ -55,7 +57,7 @@ public sealed class CodeGraph
         var id = _nodes.Count;
         _nodes.Add(new Node { Id = new NodeId(id), Kind = kind, Name = name, File = file, Span = span, Flags = flags });
         _out.Add(new List<OutEdge>());
-        _intern[key] = id;
+        intern[key] = id;
         return new NodeId(id);
     }
 
@@ -82,11 +84,21 @@ public sealed class CodeGraph
         list.Add(new OutEdge(to.Value, kind));
     }
 
+    Dictionary<(NodeKind, string, string?, int), int> Intern()
+    {
+        if (_intern is not null) return _intern;
+        var d = new Dictionary<(NodeKind, string, string?, int), int>(_nodes.Count);
+        foreach (var n in _nodes) d[Key(n.Kind, n.Name, n.File, n.Span.StartLine)] = n.Id.Value;
+        return _intern = d;
+    }
+
     /// <summary>Lets go of what only building the graph needs: the de-duplication sets (rebuilt from a node's list if an
-    /// edge is added later) and each edge list's spare room. On work's tree the sets and the room were most of an
-    /// estimated 1.8 GB of edges, in a graph of 47M edges.</summary>
+    /// edge is added later), each edge list's spare room, and the node intern table (rebuilt from the nodes if a node is
+    /// added later). On work's tree the sets and the room were most of an estimated 1.8 GB of edges, in a graph of 47M
+    /// edges; the intern table is about 45 bytes a node.</summary>
     public void TrimForReads()
     {
+        _intern = null;
         _edgeSets.Clear();
         _edgeSets.TrimExcess();
         foreach (var l in _out)

@@ -55,6 +55,27 @@ public class LinkModelTests
     }
 
     [Fact]
+    public void ALibraryNoCommandBuiltAndNotOnDisk_InTheBuildsDirectory_IsNotFromTheLog()
+    {
+        // An incremental log: libkqdrv.a was up to date, so no ar line; it isn't on this box either.
+        const string log = """
+            make[1]: Entering directory '/w/fw'
+            arm-none-eabi-gcc -Iinc -c main.c -o out/main.o
+            arm-none-eabi-gcc -T fw.ld -o out/fw.axf out/main.o -Lout/lib -L/opt/tc/lib -lkqdrv -lm -lc -lgcc
+
+            """;
+        var m = Model(log);
+        Assert.Equal(1, m.UnresolvedLibraries);          // -lkqdrv; the runtime libraries aren't the build's
+        Assert.Equal(1, m.InputsNotFromLog);
+        Assert.False(m.CoversTheImages);
+        Assert.True(m.ArchiveMayHoldUncompiled);
+
+        var sys = Model(log.Replace("-Lout/lib ", "").Replace("-lkqdrv ", "-lkqvendor "));   // searched only outside the tree
+        Assert.Equal(0, sys.InputsNotFromLog);
+        Assert.True(sys.CoversTheImages);
+    }
+
+    [Fact]
     public void OfCopiesWithTheObjectsName_TheOneInItsDirectoryIsLinked()
     {
         const string log = """

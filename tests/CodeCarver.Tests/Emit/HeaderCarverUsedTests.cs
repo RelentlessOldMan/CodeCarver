@@ -63,6 +63,56 @@ public sealed class HeaderCarverUsedTests : IDisposable
     }
 
     [Fact]
+    public void ADefineAnotherFileNames_KeepsWhatDecidesItsBlock()
+    {
+        // No compile enters the linker-only block, so -dU never records KQ_BOOT_FROM_SRAM; the linker script needs it.
+        W("chip.h", """
+            #define KQ_UNUSED 1
+            #ifdef KQ_FOR_LINKER
+            #if KQ_BOOT_FROM_SRAM
+            #define KQ_TEXT_REGION SRAM
+            #else
+            #define KQ_TEXT_REGION FLASH
+            #endif
+            #endif
+            #define KQ_BOOT_FROM_SRAM 1
+            #define KQ_FOR_LINKER_NOT 2
+            """);
+        W("link.ld", "SECTIONS { .text : { *(.text) } > KQ_TEXT_REGION }\n");
+        HeaderCarver.CarveFromUsed(_dir, new[] { "chip.h" }, new HashSet<ulong>());
+        var carved = R("chip.h");
+        Assert.Contains("#define KQ_BOOT_FROM_SRAM 1", carved);
+        Assert.Contains("#define KQ_TEXT_REGION FLASH", carved);
+        Assert.DoesNotContain("KQ_UNUSED", carved);
+        Assert.DoesNotContain("KQ_FOR_LINKER_NOT", carved);
+    }
+
+    [Fact]
+    public void ANamePassingThroughASmallHeader_KeepsTheBigHeadersDefine()
+    {
+        W("chip.h", "#define KQ_SRAM_BASE 0x20000000\n#define KQ_OTHER_BASE 0x30000000\n");
+        W("memmap.h", "#define KQ_RAM_ORIGIN KQ_SRAM_BASE\n");   // small: kept whole, not carved
+        W("link.ld", "#include \"memmap.h\"\nMEMORY { RAM : ORIGIN = KQ_RAM_ORIGIN }\n");
+        var keys = new Dictionary<string, long>();
+        HeaderCarver.CarveFromUsed(_dir, new[] { "chip.h" }, new HashSet<ulong>(), (k, v) => keys[k] = v);
+        Assert.Contains("#define KQ_SRAM_BASE", R("chip.h"));
+        Assert.DoesNotContain("KQ_OTHER_BASE", R("chip.h"));
+        Assert.Equal("#define KQ_RAM_ORIGIN KQ_SRAM_BASE\n", R("memmap.h"));
+        Assert.Equal(1, keys["used.smallHeaders"]);
+    }
+
+    [Fact]
+    public void NamesToFollow_AreKeptWithWhatTheirBodiesName()
+    {
+        W("chip.h", "#define KQ_FAST_TIMER (KQ_TIMER_BASE + 4)\n#define KQ_TIMER_BASE 0x4000\n#define KQ_SLOW 1\n");
+        var follow = new HashSet<ulong> { NameKey.Short("KQ_FAST_TIMER") };
+        HeaderCarver.CarveFromUsed(_dir, new[] { "chip.h" }, new HashSet<ulong>(), follow: follow);
+        Assert.Contains("#define KQ_FAST_TIMER", R("chip.h"));
+        Assert.Contains("#define KQ_TIMER_BASE", R("chip.h"));
+        Assert.DoesNotContain("KQ_SLOW", R("chip.h"));
+    }
+
+    [Fact]
     public void NoUsedNames_AndNoOtherFiles_KeepsOnlyNonDefineLines()
     {
         W("chip.h", Chip);

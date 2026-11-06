@@ -207,6 +207,21 @@ public sealed class DeterminismTests
             Assert.True(lines[line - 1] is "}" or "" || lines[line - 1].EndsWith(";") || lines[line - 1].EndsWith("*/"), $"cut after '{lines[line - 1]}'");
     }
 
+    /// <summary>A splice inside a string literal is a line: each cut's line is the count of newlines before its offset
+    /// (it was one short per spliced literal, so every node after it sat that many lines early).</summary>
+    [Fact]
+    public void SplitLines_CountsASpliceInsideALiteral()
+    {
+        var sb = new System.Text.StringBuilder();
+        for (var k = 0; k < 400; k++)
+            sb.Append("static const char* kq_banner").Append(k).Append(" = \"hello \\\nworld\";\nint kq_f").Append(k).Append("(void) { return ").Append(k).Append("; }\n");
+        var t = sb.ToString();
+        var cuts = TreeSitterFrontEnd.SplitLines(t, 4 * 1024, 16);
+        Assert.True(cuts.Count > 4);
+        foreach (var (line, offset) in cuts)
+            Assert.Equal(t.AsSpan(0, offset).Count('\n'), line);
+    }
+
     /// <summary>The same on real code, when a corpus repo is fetched (.corpus): thousands of definitions, real parse
     /// errors and macros.</summary>
     [SkippableTheory]

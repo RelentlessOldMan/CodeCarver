@@ -27,6 +27,12 @@ public sealed class PpTrace
     public HashSet<ulong> Names { get; } = new();
     /// <summary>The files the runs that succeeded read (sources and every header), full paths.</summary>
     public HashSet<string> FilesRead { get; } = new(PathComparer.Default);
+    /// <summary>The names in the tree's files a run that went on past a stubbed header read, but for its <c>#define</c>
+    /// lines: the stub is empty, so a branch on a macro it would have defined was not taken, and what the branch not taken
+    /// tests or uses went unrecorded. The carve keeps these and follows their bodies, as it does the names other files name.</summary>
+    public HashSet<ulong> NamesPastStubs { get; } = new();
+    /// <summary>The files <see cref="NamesPastStubs"/> was read from.</summary>
+    public int FilesPastStubs { get; private set; }
 
     /// <summary>Commands pp-trace runs: every one but those assembling a file the preprocessor never reads (<c>.s</c>, <c>.asm</c>).</summary>
     public int Commands { get; private set; }
@@ -183,6 +189,7 @@ public sealed class PpTrace
         var inTreeSeen = new System.Collections.Concurrent.ConcurrentDictionary<string, bool>(StringComparer.Ordinal);
         bool InTree(string header) => tree is not null && inTreeSeen.GetOrAdd(header, h => TreeHas(tree, h.Replace('\\', '/')));
         int pastStubs = 0;
+        var pastStubFiles = new HashSet<string>(PathComparer.Default);
         var stubStopped = new int[Enum.GetValues<StubStop>().Length];
         var stubbedHeaders = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
         Parallel.ForEach(traced, new ParallelOptions { MaxDegreeOfParallelism = most }, cmd =>
@@ -213,7 +220,7 @@ public sealed class PpTrace
             string? header, includer;
             // A header outside the tree that this machine lacks (a host C library's, for a unit the target never
             // builds): run again with an empty one in its place, after every real include dir, so the rest of the
-            // unit is read. The carve carves no define of such a header; what's lost is only a branch on its macros.
+            // unit is read. The carve carves no define of such a header; a branch on its macros may not be taken, so the names in the tree's files the run read count (NamesPastStubs).
             string? stubDir = null;
             var stubbed = new List<string>();
             (Failure Why, string? Header, string? Includer)? first = null;
@@ -245,8 +252,18 @@ public sealed class PpTrace
                     if (stop != StubStop.None) { Interlocked.Increment(ref stubStopped[(int)stop]); break; }
                     stubDir ??= Path.Combine(Path.GetTempPath(), "codecarver-stub-" + Guid.NewGuid().ToString("N"));
                     var stub = Path.Combine(stubDir, header.Replace('\\', '/'));
-                    Directory.CreateDirectory(Path.GetDirectoryName(stub)!);
-                    File.WriteAllText(stub, "");
+                    try
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(stub)!);
+                        File.WriteAllText(stub, "");
+                    }
+                    // A name this file system can't hold (<>| on Windows, a device name, too long) or a full disk:
+                    // this command falls back like any other unstubbable header, the carve goes on.
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+                    {
+                        Interlocked.Increment(ref stubStopped[(int)StubStop.NotStubbable]);
+                        break;
+                    }
                     stubbed.Add(header);
                     names.Clear(); read.Clear();
                 }
@@ -290,8 +307,14 @@ public sealed class PpTrace
             if (pastErrors) Interlocked.Increment(ref pastParse);
             if (pastErrors && errs.WarningAsError) Interlocked.Increment(ref pastWarnings);
             var full = read.Select(f => FullIn(cmd.Directory, f)).Where(f => f is not null).Select(f => f!).ToList();   // a header found by -Iinc is inc/x.h
-            lock (namesLock) { r.Names.UnionWith(names); r.FilesRead.UnionWith(full); }
+            lock (namesLock) { r.Names.UnionWith(names); r.FilesRead.UnionWith(full); if (stubbed.Count > 0) pastStubFiles.UnionWith(full); }
         });
+        foreach (var f in pastStubFiles)
+        {
+            if (rootFull is not null && !Within(f, rootFull)) continue;
+            r.FilesPastStubs++;
+            AddNamesButDefines(r.NamesPastStubs, f);
+        }
         r.Succeeded = succeeded;
         r.SucceededPastStubbedHeaders = pastStubs;
         r.HeadersStubbed = stubbedHeaders.Count;
@@ -379,8 +402,16 @@ public sealed class PpTrace
             });
             if (p is null) return null;
             p.StandardInput.Close();
-            var text = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
-            if (!p.WaitForExit(30_000)) { try { p.Kill(true); } catch { /* already gone */ } return null; }
+            // Both pipes read at once and the wait bounded: a stalled tool, or one that fills stderr first, must not
+            // hang the carve before the timeout is reached.
+            var stdout = p.StandardOutput.ReadToEndAsync();
+            var stderr = p.StandardError.ReadToEndAsync();
+            if (!p.WaitForExit(30_000) || !Task.WaitAll(new Task[] { stdout, stderr }, 5_000))
+            {
+                try { p.Kill(true); } catch { /* already gone */ }
+                return null;
+            }
+            var text = stdout.Result + stderr.Result;
             return Regex.Match(text, @"LLVM version \S+") is { Success: true } m ? m.Value : null;
         }
         catch (Exception ex) when (ex is not OutOfMemoryException) { return null; }
@@ -599,6 +630,12 @@ public sealed class PpTrace
     // The category ends an error line: "[Semantic Issue]", or after its flags: "[-Werror,-Wkq,Semantic Issue]".
     static readonly Regex CategoryTail = new(@"\[(?:-[^,\]]*,)*(?<cat>[^,\]\-][^,\]]*)\]\s*$", RegexOptions.CultureInvariant);
 
+    /// <summary>A preprocessor complaint that assembly text gives when it is parsed as C: a `#` comment line, or an
+    /// apostrophe in a comment. Neither touches a directive the preprocessor obeys.</summary>
+    internal static bool AsmTextLexical(string line) =>
+        line.Contains("invalid preprocessing directive", StringComparison.Ordinal)
+        || line.Contains("missing terminating", StringComparison.Ordinal);
+
     internal static Stage ErrorStage(string line)
     {
         if (!line.Contains("error:", StringComparison.Ordinal)) return Stage.None;
@@ -708,6 +745,9 @@ public sealed class PpTrace
             // Drained so a full stderr pipe can't block it. Unsafe: a crash, or an error neither the parse after
             // preprocessing nor a rejected option gave.
             bool fatal = false, optionError = false, parseError = false, unsafeError = false;   // parseError: or a warning made one
+            // A .S file is parsed as C, so its assembly gives errors; one the preprocessor gave about something other than
+            // assembly text (an #if it could not evaluate, an #error) means names went unrecorded.
+            var asmUnsafe = false;
             var said = new List<string>();   // what's needed to say why it failed: error lines, the source line under each, and a crash's
             var afterError = false;
             p.ErrorDataReceived += (_, e) =>
@@ -721,6 +761,7 @@ public sealed class PpTrace
                 errs.Add(line, stage);
                 var isUnsafe = crash || stage is Stage.Fatal or Stage.Preprocessor or Stage.Other;
                 if (isUnsafe) unsafeError = true;
+                if (crash || (stage == Stage.Preprocessor && !AsmTextLexical(line))) asmUnsafe = true;
                 // Past the first 128 lines only those that say why it failed: the parse's errors can be thousands.
                 var keep = (stage != Stage.None || afterError || crash) && (said.Count < 128 || (said.Count < 512 && (isUnsafe || afterError)));
                 if (keep) said.Add(line);
@@ -738,7 +779,7 @@ public sealed class PpTrace
             // Exit 1 and only the parse's errors, or warnings made errors: nothing stopped the preprocessor before the
             // end of the source, and it put out what it would have without them.
             var pastParse = p.ExitCode == 1 && !fatal && !unsafeError && parseError;
-            var clean = p.ExitCode == 0 || pastParse || (AssemblyWithCpp(cmd.File) && p.ExitCode == 1 && !fatal);
+            var clean = p.ExitCode == 0 || pastParse || (AssemblyWithCpp(cmd.File) && p.ExitCode == 1 && !fatal && !asmUnsafe);
             var ok = !timedOut && !lease.Evicted && clean;
             var (why, header, includer) = ok ? (Failure.NoMessage, null, null) : Classify(said);
             return (ok, timedOut, why, header, includer, optionError, ok && pastParse);
@@ -756,6 +797,48 @@ public sealed class PpTrace
 
     /// <summary>The names of pp-trace's YAML output: one <c>MacroNameTok: NAME</c> line per callback. And the files it
     /// read: a <c>FileChanged</c> callback's <c>Loc: "PATH:1:1"</c>, then <c>Reason: EnterFile</c>.</summary>
+    /// <summary>Every identifier in <paramref name="path"/> but on its <c>#define</c> lines (and their continuations).</summary>
+    internal static void AddNamesButDefines(HashSet<ulong> names, string path)
+    {
+        try
+        {
+            using var rd = new StreamReader(path, System.Text.Encoding.Latin1);
+            var inDefine = false;
+            string? line;
+            while ((line = rd.ReadLine()) is not null)
+            {
+                var t = line.AsSpan().Trim();
+                var cont = t.Length > 0 && t[^1] == '\\';
+                if (!inDefine && t.Length > 0 && t[0] == '#')
+                {
+                    var d = t[1..].TrimStart();
+                    inDefine = d.StartsWith("define") && (d.Length == 6 || d[6] is ' ' or '\t');
+                }
+                if (!inDefine) AddIdentifiers(names, line);
+                if (!cont) inDefine = false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* gone: nothing to add */ }
+    }
+
+    static void AddIdentifiers(HashSet<ulong> names, string text)
+    {
+        var i = 0;
+        while (i < text.Length)
+        {
+            var c = text[i];
+            if (char.IsAsciiLetter(c) || c == '_' || c == '$')
+            {
+                var s = i;
+                while (i < text.Length && (char.IsAsciiLetterOrDigit(text[i]) || text[i] is '_' or '$')) i++;
+                names.Add(NameKey.Short(text.AsSpan(s, i - s)));
+            }
+            else if (char.IsAsciiDigit(c))
+                while (i < text.Length && (char.IsAsciiLetterOrDigit(text[i]) || text[i] is '_' or '.')) i++;
+            else i++;
+        }
+    }
+
     internal static void ReadNames(TextReader output, HashSet<ulong> names, HashSet<string>? read = null)
     {
         string? loc = null;

@@ -102,7 +102,10 @@ Every carve is sound with just `entryPoints`. Each extra input lets it carve **t
 > The same lines say whether the log is the whole build: `link.inputsNotFromLog` counts the objects its links
 > take that no compile in the log wrote, where the build's own would be (in the carve root, or beside the objects
 > the log's compiles write; an archive beside them). An incremental build's log, which skips compiles that were up to
-> date, shows them here (`link.archivesNotFromLog` of them archives). At `0` (`link.coversTheImages = 1`) no compile
+> date, shows them here (`link.archivesNotFromLog` of them archives). A `-l` library no archive command built and
+> no `-L` directory holds, searched in a directory in the carve root or one the log writes to, counts as one of those
+> archives (`link.unresolvedLibraries`): a prebuilt library would be on disk. A toolchain's runtime libraries (`-lc`,
+> `-lm`, `-lgcc` ...) never count. At `0` (`link.coversTheImages = 1`) no compile
 > the log lacks is in an image. Otherwise a source file no compile in the log names is in an image only if one of those
 > objects is named after it (`a.o`, `a.obj`, `a.c.o`; of several files with that name, the ones whose directories
 > best match the object's), or, if one of those archives could hold it, when the image
@@ -325,6 +328,8 @@ compiled.
     And an entry point found only in a prebuilt binary and in a source file the build never opened is the
     binary's: it is counted in `roots.entryPointsOnlyInBinaries`, not failed after the graph. So is one the
     source only declares or calls and a prebuilt binary defines (`roots.entryPointsCalledButDefinedInBinaries`).
+    An entry point only an assembly file defines (a startup `Reset_Handler`) roots that file instead, so what it
+    calls is kept (`roots.entryPointsDefinedInAssembly`).
     When entry points still don't resolve, a `roots   : unresolved by reason:` line counts them by reason.
   - **Give the build log too: it checks the trace.** The log and the trace describe the same build, so every
     in-root source the log compiled must appear in the trace as opened. If any don't, the trace is incomplete
@@ -441,6 +446,7 @@ runLineCoverage = ["cov.txt"]
 | `cold.arms`, `cold.armLines` | cold arms and their lines |
 | `cold.armsJudged`, `cold.armsNotJudged` | arms looked at, and branches that could not be judged |
 | `cold.freedFunctions`, `cold.freedGlobals`, `cold.freedLines` | what removing the cold arms would free |
+| `cold.bodiesUnread` | kept functions in covered files whose body could not be read or found, so not judged |
 | `cold.functionsRan`, `cold.functionsNeverRan`, `cold.functionsNeverRanLines` | kept functions in covered files |
 | `cold.functionsInUncoveredFiles` | kept functions in files the coverage never names |
 | `cold.coveredFiles`, `cold.coverageLocations`, `cold.coverageOutsideRoot`, `cold.coverageUnreadableLines` | what the coverage matched |
@@ -707,18 +713,19 @@ sets the number (`1` for one file at a time).
 
 A long run says how far it has got on stderr: a `progress:` line for each step that took half a second or
 more, and a `working :` line once a minute while a step runs on, with its count so far. If nothing counted
-moves for 3 minutes, or one directory listing, file read, copy or compiler run has been waiting that long, a
+moves for 3 minutes (`CODECARVER_WATCHDOG_SECONDS=N` sets it), or one directory listing, file read, copy or compiler run has been waiting that long, a
 `watchdog:` block follows: the step, its count, CPU over the last minutes, memory, threads, and this step's
 waits (how many, average and slowest time, how many still waiting and for how long), ending in a one-line
 verdict — busy computing, waiting on a slow drive, or idle on something not counted. It names no path or
-symbol, goes into the `--diag` package too, and repeats every 15 minutes while the step stays like that; it
+symbol, goes into the diagnostic `.zip` a crash writes too, and repeats every 15 minutes while the step stays like that; it
 never stops the run. The summary carries the run's totals: `io.<list|read|copy|launch>.count`, `.ms` (time
 spent waiting, summed over threads) and `.maxMs`, and `watchdog.reports`.
 A step of several parts says which runs now in a `doing   :` line after `working :` and in the watchdog block: the
 part, how long it has run, and its own numbers. The header carve names its parts (reading the kept files, learning
 paste macros from the big headers, reading paste-macro calls, each pass over the big headers, rewriting them) with how
 many paste macros, forwarding macros, names and paste pieces it has learned; the summary carries
-`stageN.headerCarve.pasteMacros`, `.forwardingMacros` and, for each part (`seed`, `bigDefines`, `pasteCalls`,
+`stageN.headerCarve.definesKept`, `.definesDropped`, `.passes` (passes over the big headers until nothing new is
+kept), `.pasteMacros`, `.forwardingMacros` and, for each part (`seed`, `bigDefines`, `pasteCalls`,
 `fixpoint`, `emit`), `.<part>.ms`, `.cpuMs` (all threads), `.allocatedMb` (memory it allocated), `.privateMb` (the
 process's private memory as it ended) and `.liveMb` (what is still live after it, from a full collection). A memory
 stop's `stopped-summary.txt` carries those of the parts that finished.
@@ -783,6 +790,14 @@ starts, so one that exists is the last run's.
 of the machine's memory, or of `memoryStopMb` when that is less. A lower stop makes the run hold less at once (and can
 make the parse slower); it never changes what is kept. Most of a run's peak is the .NET heap's headroom over its live
 data: `DOTNET_GCConserveMemory=9` (default 7) trades about 15% of the peak for a slower graph build.
+
+Each of those fractions can be set in MB instead, for one run or a test: `CODECARVER_PARSE_MEMORY_MB` (the parse's
+trees in flight; default a quarter), `CODECARVER_CHECK_HEADER_MB` (the check's header text held at once; a 32nd),
+`CODECARVER_CHECK_READ_MB` (the check's reads in flight; a 32nd, at least 64 MB), `CODECARVER_CHECK_SCAN_MB` (one
+scan's work; a 512th, at least 16 MB) and `CODECARVER_CHECK_HANDON_MB` (header text the header pass hands on to the
+scans; 256 MB). `CODECARVER_LOH_COMPACT_MB` (default 512) is how much free large-object heap a step must leave
+before the run compacts it once at the step's end (`mem.lohCompactions`, `mem.lohCompact.ms`); 0 compacts at
+every step's end. None of them changes what is kept.
 
 The link check's template walks share a budget of an eighth of that memory (each takes what the largest walk before
 it allocated), and so do the first parses of headers in all walks; `CODECARVER_CHECK_WALK_MB=N` sets

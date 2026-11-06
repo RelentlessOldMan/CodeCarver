@@ -43,6 +43,16 @@ public sealed class LinkModel
 
     readonly List<string> _objectsNotFromLog = new();
 
+    /// <summary>Of <see cref="ArchivesNotFromLog"/>, <c>-l</c> libraries found nowhere though a <c>-L</c> directory is the build's.</summary>
+    public int UnresolvedLibraries { get; private set; }
+
+    /// <summary>Toolchain runtime libraries: a <c>-l</c> of one is never the build's own.</summary>
+    static readonly HashSet<string> RuntimeLibs = new(StringComparer.Ordinal)
+    {
+        "c", "m", "g", "gcc", "gcc_s", "gcc_eh", "nosys", "rdimon", "c_nano", "g_nano", "stdc++", "stdc++_nano", "supc++",
+        "supc++_nano", "c++", "c++abi", "unwind", "pthread", "dl", "rt", "atomic", "clang_rt.builtins", "compiler-rt", "semihost",
+    };
+
     /// <summary>Could a link in the log take <paramref name="rel"/>'s object whole though no command in it compiles the file?</summary>
     public bool MayLinkUncompiled(string rel) => UncompiledLinkedWhole(new[] { rel })(rel);
 
@@ -142,6 +152,9 @@ public sealed class LinkModel
         var direct = new HashSet<string>(StringComparer.Ordinal);       // objects and sources a link takes whole
         var searched = new HashSet<string>(StringComparer.Ordinal);     // members of archives a link searches
         var archivesSearched = new HashSet<string>(StringComparer.Ordinal);
+        // -l libraries no archive command built: an existing file is read as an archive named on the line; one found
+        // nowhere is judged below by its -L directories (an up-to-date library of the build's own isn't in its log).
+        var unresolvedLibs = new List<(string Name, List<string> Dirs)>();
         foreach (var l in links)
         {
             var a = l.Arguments;
@@ -169,6 +182,10 @@ public sealed class LinkModel
                 foreach (var d in libDirs)
                     foreach (var f in files)
                         if (Full(l.Directory, Path.Combine(d, f)) is { } full && members.ContainsKey(full)) { Archive(full); return; }
+                foreach (var d in libDirs)
+                    foreach (var f in files)
+                        if (Full(l.Directory, Path.Combine(d, f)) is { } full && File.Exists(full)) { direct.Add(full); return; }
+                unresolvedLibs.Add((name, libDirs.Select(d => Full(l.Directory, d)).Where(d => d is not null).Select(d => d!.TrimEnd('\\', '/')).ToList()));
             }
             for (var i = 0; i < a.Count; i++)
             {
@@ -200,8 +217,14 @@ public sealed class LinkModel
                 !made.Contains(full) && !sourceRel.ContainsKey(full)
                 && (HasExt(full, ObjectExts) ? InRoot(full) || outDirs.Contains(Path.GetDirectoryName(full) ?? "")
                     : HasExt(full, ArchiveExts) && outDirs.Contains(Path.GetDirectoryName(full) ?? ""))).ToList();
-            InputsNotFromLog = notFromLog.Count;
-            ArchivesNotFromLog = notFromLog.Count(f => HasExt(f, ArchiveExts));
+            // A library found nowhere, searched in a directory of the build's (in the root, or where it writes): a prebuilt
+            // one would be on disk, so the build made it in an earlier run, from sources this log may not compile. A
+            // toolchain's runtime libraries are searched there too and are not.
+            var libsNotFromLog = unresolvedLibs.Count(u => !RuntimeLibs.Contains(u.Name)
+                && u.Dirs.Any(d => d == rootKey || InRoot(d) || outDirs.Contains(d)));
+            UnresolvedLibraries = libsNotFromLog;
+            InputsNotFromLog = notFromLog.Count + libsNotFromLog;
+            ArchivesNotFromLog = notFromLog.Count(f => HasExt(f, ArchiveExts)) + libsNotFromLog;
             _objectsNotFromLog.AddRange(notFromLog.Where(f => HasExt(f, ObjectExts)));
         }
 

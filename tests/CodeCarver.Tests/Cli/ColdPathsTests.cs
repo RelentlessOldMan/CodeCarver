@@ -149,9 +149,11 @@ public sealed class ColdPathsTests
     [Fact]
     public void Coverage_ReadsAddr2lineAndPlainLines()
     {
-        var recs = LineCoverage.Parse(new[] { "0x0800a1c4: run at C:/w/src/a.c:12 (discriminator 3)", "src/b.c:4-6", "12:34:56 tick", "?? ??:0", "" }, out var bad);
+        var recs = LineCoverage.Parse(new[] { "0x0800a1c4: run at C:/w/src/a.c:12 (discriminator 3)", "src/b.c:4-6", "12:34:56 tick", "?? ??:0", "", "0x0800a1d0: tick at C:/Program Files/w/c.c:7", "D:/My Tree/d.c:3-4" }, out var bad);
         Assert.Equal(2, bad);
         Assert.Equal(new LineCoverage.Lines("C:/w/src/a.c", 12, 12), recs[0]);
         Assert.Equal(new LineCoverage.Lines("src/b.c", 4, 6), recs[1]);
+        Assert.Equal(new LineCoverage.Lines("C:/Program Files/w/c.c", 7, 7), recs[2]);
+        Assert.Equal(new LineCoverage.Lines("D:/My Tree/d.c", 3, 4), recs[3]);
     }
 }

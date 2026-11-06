@@ -187,9 +187,15 @@ public sealed class StagedOutput : IDisposable
         }
         catch
         {
-            // Put the prior output back so a failed promote leaves the user exactly where they started.
-            if (!Directory.Exists(_finalOut))
-                try { Directory.Move(backup, _finalOut); } catch { /* best effort restore */ }
+            // Put the prior output back so a failed promote leaves the user exactly where they started. The prior
+            // output was moved aside above, so anything now at the final path is a partial copy the fallback made:
+            // drop it first, or the restore never runs and the next run's ReapOrphans deletes the only whole copy.
+            if (Directory.Exists(backup))
+            {
+                if (Directory.Exists(_finalOut)) TryDelete(_finalOut);
+                if (!Directory.Exists(_finalOut))
+                    try { Directory.Move(backup, _finalOut); } catch { /* best effort restore */ }
+            }
             throw;
         }
         _promoted = true;
@@ -262,7 +268,7 @@ public sealed class StagedOutput : IDisposable
     private static void ReplaceInPlace(string src, string dst)
     {
         var files = Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories).ToList();
-        var staged = new HashSet<string>(files.Select(f => Path.GetRelativePath(src, f)), StringComparer.OrdinalIgnoreCase);
+        var staged = new HashSet<string>(files.Select(f => Path.GetRelativePath(src, f)), CodeCarver.Core.Util.PathComparer.Default);
 
         // PRE-FLIGHT: every existing destination we'll overwrite must be openable for write BEFORE we mutate
         // anything, so a persistent lock bails with the prior tree genuinely UNCHANGED (not half-replaced —

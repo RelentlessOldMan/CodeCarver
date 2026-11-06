@@ -33,8 +33,8 @@ public sealed class AnonymizedExamplesTests
         var src = Path.Combine(r.Dir, "src");
         var maps = new[]
         {
-            ($"/mnt/c/Playground/CodeCarver/examples/{example}/src", src),
-            ($"/mnt/c/Playground/CodeCarver/examples/{example}/sdk", Path.Combine(r.Dir, "sdk")),
+            ($"/build/agent/repo/examples/{example}/src", src),
+            ($"/build/agent/repo/examples/{example}/sdk", Path.Combine(r.Dir, "sdk")),
         };
         string Map(string p)
         {

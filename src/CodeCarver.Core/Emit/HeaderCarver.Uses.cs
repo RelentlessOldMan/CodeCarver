@@ -467,9 +467,10 @@ public static partial class HeaderCarver
 
             Edges = edgeFrom.Count;
             // Rule 1: a name forwarding to a paste macro is one (a reverse closure from the direct ones).
-            var from = edgeFrom.ToArray();
+            var from = edgeFrom.ToArray();   // each list's chunks go before the next copy: never both lists and both arrays
+            edgeFrom = new ULongs();
             var to = edgeTo.ToArray();
-            edgeFrom = edgeTo = new ULongs();
+            edgeTo = new ULongs();
             Array.Sort(to, from);
             var pasters = new HashSet<ulong>(direct);
             var work = new Stack<ulong>(direct);

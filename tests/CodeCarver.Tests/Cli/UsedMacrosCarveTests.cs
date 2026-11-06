@@ -64,6 +64,20 @@ public sealed class UsedMacrosCarveTests
     }
 
     [Fact]
+    public void ACommandTheLogRepeats_NeedsOneFile()
+    {
+        // The same command twice (a library two targets link) prints the same names: one file covers both.
+        using var t = Tree();
+        t.Compile("dev.c");
+        Du(t, "main.du", "main.c", "KQ_CHIP_H", "KQ_REG_3");
+        Du(t, "dev.du", "dev.c", "KQ_CHIP_H", "KQ_REG_5");
+        var (code, o, e) = t.Carve(extraToml: $"usedMacros = [\"{t.Outside("du")}\"]\n" + Stages);
+        Assert.True(code == 0, o + e);
+        Assert.Contains("world.usedMacros.trusted = 1", MaxSummary(t));
+        Assert.Contains("world.usedMacros.commands = 2", MaxSummary(t));
+    }
+
+    [Fact]
     public void ACommandWithoutItsFile_FallsBackToTheStaticCarve()
     {
         using var t = Tree();
