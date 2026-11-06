@@ -63,6 +63,7 @@ public sealed class RunSection
 {
     public List<string> RunTraceFiles = new();
     public List<string> RunTraceLogs = new();
+    public List<string> RunLineCoverage = new();              // source lines a run executed (cold-path report)
     public bool DropUnobservedCmm;
 }
 
@@ -86,7 +87,7 @@ public static class ConfigLoader
         { "entryPoints", "entryPointsFile", "languages", "excludeDirectories", "forceKeepFiles",
           "carveSourceFileContents", "carveHeaderFileContents" };
     private static readonly string[] BuildKeys = { "buildLogs", "compiler", "compilerNames", "defines", "buildTraceFiles", "usedMacros", "ppTrace", "ppTraceArgs", "ppTraceDropOptions" };
-    private static readonly string[] RunKeys = { "runTraceFiles", "runTraceLogs", "dropUnobservedCmm" };
+    private static readonly string[] RunKeys = { "runTraceFiles", "runTraceLogs", "runLineCoverage", "dropUnobservedCmm" };
     private static readonly string[] StageKeys = { "carveSourceFileContents", "carveHeaderFileContents", "stubUnexecuted" };
     private static readonly string[] UseKeys = { "builds", "runs" };
 
@@ -123,6 +124,7 @@ public static class ConfigLoader
         {
             run.RunTraceFiles = run.RunTraceFiles.Select(R).ToList();
             run.RunTraceLogs = run.RunTraceLogs.Select(R).ToList();
+            run.RunLineCoverage = run.RunLineCoverage.Select(R).ToList();
         }
     }
 
@@ -191,6 +193,7 @@ public static class ConfigLoader
             {
                 RunTraceFiles = GetStringList(t, "runTraceFiles", $"[runs.{name}]", ctx),
                 RunTraceLogs = GetStringList(t, "runTraceLogs", $"[runs.{name}]", ctx),
+                RunLineCoverage = GetStringList(t, "runLineCoverage", $"[runs.{name}]", ctx),
                 DropUnobservedCmm = GetBool(t, "dropUnobservedCmm", $"[runs.{name}]", ctx) ?? false,
             };
         }
@@ -326,6 +329,7 @@ public static class ConfigLoader
         # [runs.smoke]
         # runTraceFiles = ["flash.csv"]  # files opened while RUNNING/flashing; catches the loader/.cmm/data layer
         # runTraceLogs  = ["run.log"]    # functions that actually ran (one name per line, or "name file:line")
+        # runLineCoverage = ["cov.txt"]  # source lines that ran ("file:line" per line, e.g. addr2line -p output): cold-path report only
 
         # ===== stages (optional: emit several aggressiveness tiers in one run) =====
         # Each [stages.NAME] is a tier; only the two carve toggles vary. Pick one with --stage NAME, or omit to

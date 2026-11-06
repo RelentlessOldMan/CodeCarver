@@ -180,6 +180,7 @@ use only letters, digits, `_` and `-`.
 |---|---|
 | `runTraceFiles = ["run.trace"]` | files opened while **running/flashing** — catches the loader/`.cmm`/data layer |
 | `runTraceLogs = ["run.log"]` | functions that actually ran → roots (format below) |
+| `runLineCoverage = ["cov.txt"]` | source lines that ran: the [cold-path report](#cold-paths-report-only) (changes no carve) |
 | `dropUnobservedCmm = true` | opt in to dropping `.cmm` scripts the run neither opened nor reaches by `DO`/`GOSUB` (see Languages). Needed on **every** selected run that has a file trace. |
 
 **`[stages.NAME]`** — aggressiveness tiers; each sets the two carve toggles. `--stage` picks one; omit to run all.
@@ -406,6 +407,43 @@ stubUnexecuted = true
   and their uses are followed as usual.
 - `<stage>.stub.functions` in `summary.txt` counts the stubbed bodies; `<stage>.stubUnexecuted` says the stage stubbed.
 - The verify check reads the stubbed output, so whatever a stub still names is kept.
+
+## Cold paths (report only)
+
+The static carve keeps every branch that *can* run. A switch on a register value keeps all 1,000 cases when only one
+ever runs, and so do the compiler and the linker. Line coverage from real runs says which branches did run. Give it to
+a run and the carve reports the branches that never did, and what removing them would free. **Nothing is removed:**
+the carved output is the same with or without it (`<stage>.emittedContentSha` matches).
+
+```toml
+[runs.board]
+runLineCoverage = ["cov.txt"]
+```
+
+- **Format:** one executed location per line, the last `file:line` or `file:line-line` on it. addr2line's `-p` output
+  (`0x0800a1c4: run at src/a.c:12 (discriminator 3)`) reads as is, so a list of executed addresses becomes coverage
+  with `addr2line -e image.elf -p -f -a < addresses.txt`. Line 0 and `??` are skipped and counted. Paths captured
+  in another checkout need `[advanced] pathMap`; when no location is under the carve root, the run says so and
+  writes no report.
+- **An arm** is a `case`/`default` group of a switch, or a braced `if`/`else` block, in a kept function that ran. It
+  is **cold** when none of its lines ran. It is judged only when its lines are its own: an unbraced branch, two arms
+  on one line, or a label inside a nested block are counted in `cold.armsNotJudged`.
+- **Freed** is what the carve keeps now and would not once the cold arms are gone: the functions and globals that
+  only cold arms name. A macro a cold arm expands is not followed, so this can undercount.
+- **Only as true as the coverage is complete:** gather it from every scenario and every target the image must run.
+  Optimized code can map lines loosely; check an arm before acting on it.
+
+`codecarver/cold-paths.txt` lists the cold arms, the freed definitions and the kept functions that never ran, by name
+(keep it local). `summary.txt` has the counts:
+
+| Key | Meaning |
+|---|---|
+| `cold.arms`, `cold.armLines` | cold arms and their lines |
+| `cold.armsJudged`, `cold.armsNotJudged` | arms looked at, and branches that could not be judged |
+| `cold.freedFunctions`, `cold.freedGlobals`, `cold.freedLines` | what removing the cold arms would free |
+| `cold.functionsRan`, `cold.functionsNeverRan`, `cold.functionsNeverRanLines` | kept functions in covered files |
+| `cold.functionsInUncoveredFiles` | kept functions in files the coverage never names |
+| `cold.coveredFiles`, `cold.coverageLocations`, `cold.coverageOutsideRoot`, `cold.coverageUnreadableLines` | what the coverage matched |
 
 ## Languages
 

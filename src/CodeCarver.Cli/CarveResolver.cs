@@ -34,6 +34,7 @@ public sealed class ResolvedCarve
     public bool PlaceholderFiles = true;           // [advanced] a dropped file the build compiled is emitted as a stand-in
     public List<string> RunTraceFiles = new();
     public List<string> RunTraceLogs = new();
+    public List<string> RunLineCoverage = new();   // the selected runs' line coverage: the cold-path report (changes no carve)
     public List<string> ExcludeDirectories = new();
     public List<string> ForceKeepFiles = new();
     public bool ClosedWorld;                       // derived: a selected build has a build log or a compiler
@@ -152,6 +153,7 @@ public static class CarveResolver
             if (!cfg.Runs.TryGetValue(rn, out var rs)) continue;
             r.RunTraceFiles.AddRange(rs.RunTraceFiles);
             r.RunTraceLogs.AddRange(rs.RunTraceLogs);
+            r.RunLineCoverage.AddRange(rs.RunLineCoverage);
         }
         r.BuildLogs = r.BuildLogs.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.Defines = r.Defines.Distinct(StringComparer.Ordinal).ToList();
@@ -174,6 +176,7 @@ public static class CarveResolver
         r.PpTraceDropOptions = r.PpTraceDropOptions.Distinct(StringComparer.Ordinal).ToList();
         r.RunTraceFiles = r.RunTraceFiles.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.RunTraceLogs = r.RunTraceLogs.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        r.RunLineCoverage = r.RunLineCoverage.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         r.Compilers = r.Compilers.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
         // Derive open/closed #ifdef world: a build log or a compiler means we know the real define set.

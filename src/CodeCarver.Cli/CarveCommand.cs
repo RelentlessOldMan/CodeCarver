@@ -200,7 +200,7 @@ public static class CarveCommand
 
         // Fail fast if any referenced INPUT file is missing (a typo'd path must not carve with less than intended).
         {
-            var inputFiles = buildLogs.Concat(traceList).Concat(buildFileTraces).Concat(runFileTraces)
+            var inputFiles = buildLogs.Concat(traceList).Concat(buildFileTraces).Concat(runFileTraces).Concat(cv.RunLineCoverage)
                                       .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             var missing = inputFiles.Where(f => !File.Exists(f))
                                     .Concat(cv.UsedMacros.Where(f => !File.Exists(f) && !Directory.Exists(f))).ToList();
@@ -3335,6 +3335,84 @@ public static class CarveCommand
             return m;
         }
 
+        // Cold paths ([runs.X] runLineCoverage): the arms of kept functions no run executed, and what removing them would
+        // free. A report only: the carve is unchanged. Names stay in cold-paths.txt; the summary gets the counts.
+        string? coldText = null;
+        if (cv.RunLineCoverage.Count > 0)
+        {
+            var rootFull = Path.GetFullPath(dir);
+            var rootPrefix = CodeCarver.Core.Util.PathComparer.DirectoryPrefix(rootFull);
+            var executed = new Dictionary<string, HashSet<int>>(StringComparer.OrdinalIgnoreCase);
+            int located = 0, outside = 0, unreadable = 0;
+            var misses = new List<string>();
+            foreach (var cp in cv.RunLineCoverage)
+            {
+                var recs = LineCoverage.Parse(CodeCarver.Core.Util.IoMeter.ReadLines(cp), out var bad);
+                unreadable += bad;
+                foreach (var rec in recs)
+                {
+                    var cand = MapPath(rec.File);
+                    string full;
+                    try { full = Path.IsPathFullyQualified(cand) ? Path.GetFullPath(cand) : Path.GetFullPath(Path.Combine(rootFull, cand)); }
+                    catch { outside++; continue; }
+                    if (!full.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        outside++;
+                        if (Path.IsPathRooted(cand) && misses.Count < 400) misses.Add(cand);
+                        continue;
+                    }
+                    var rel = Path.GetRelativePath(rootFull, full).Replace('\\', '/');
+                    if (!executed.TryGetValue(rel, out var set)) executed[rel] = set = new HashSet<int>();
+                    for (var l = rec.From; l <= rec.To; l++) set.Add(l);
+                    located++;
+                }
+            }
+            summary["cold.coverageLocations"] = located;
+            summary["cold.coverageOutsideRoot"] = outside;
+            summary["cold.coverageUnreadableLines"] = unreadable;
+            if (located == 0)
+            {
+                var hint = SuggestPathMap(misses, rootFull);
+                err.WriteLine($"  warn    : runLineCoverage: none of its locations is under '{rootFull}'"
+                    + (hint is null ? " — no cold-path report" : $" — it looks captured under '{hint}'. Add [advanced] pathMap = [{{ from = \"{hint.Replace('\\', '/')}\", to = \".\" }}]"));
+            }
+            else
+            {
+                var cold = ColdPaths.Analyze(graph, rootSet, plan.IsKept, executed, SourceText, IsMacro);
+                summary["cold.coveredFiles"] = cold.CoveredFiles;
+                summary["cold.functionsRan"] = cold.FunctionsRan;
+                summary["cold.functionsNeverRan"] = cold.FunctionsNeverRan;
+                summary["cold.functionsNeverRanLines"] = cold.NeverRanLines;
+                summary["cold.functionsInUncoveredFiles"] = cold.FunctionsInUncoveredFiles;
+                summary["cold.bodiesUnread"] = cold.BodiesUnread;
+                summary["cold.armsJudged"] = cold.ArmsJudged;
+                summary["cold.armsNotJudged"] = cold.ArmsNotJudged;
+                summary["cold.arms"] = cold.Cold.Count;
+                summary["cold.armLines"] = cold.ColdLines;
+                summary["cold.freedFunctions"] = cold.Freed.Count(n => n.Kind == NodeKind.Function);
+                summary["cold.freedGlobals"] = cold.Freed.Count(n => n.Kind == NodeKind.Global);
+                summary["cold.freedLines"] = cold.FreedLines;
+                @out.WriteLine($"  cold    : {cold.Cold.Count:N0} of {cold.ArmsJudged:N0} judged branch arm(s) in functions that ran never ran "
+                    + $"({cold.ColdLines:N0} lines); removing them would free {cold.Freed.Count:N0} function(s)/global(s) ({cold.FreedLines:N0} lines). "
+                    + $"{cold.FunctionsNeverRan:N0} kept function(s) never ran ({cold.NeverRanLines:N0} lines). Report only: nothing removed");
+                var sb = new System.Text.StringBuilder();
+                sb.Append("# Cold paths: what the carve keeps that the line coverage says never ran. Report only; nothing was removed.\n")
+                  .Append("# Names paths and symbols — keep it local. Only as true as the coverage is complete (every scenario,\n")
+                  .Append("# every target), and optimized code can map lines loosely: check an arm before removing it.\n\n")
+                  .Append($"## Cold arms ({cold.Cold.Count}): in functions that ran, a case group or braced if/else block none of whose lines ran\n");
+                foreach (var a in cold.Cold)
+                    sb.Append($"{a.Function.FilePath}:{a.StartLine}-{a.EndLine}  {a.Kind.ToString().ToLowerInvariant()}  in {a.Function.Name}\n");
+                sb.Append($"\n## Freed ({cold.Freed.Count}): reached now, and only through cold arms\n");
+                foreach (var n in cold.Freed)
+                    sb.Append($"{n.FilePath}:{n.Span}  {n.Kind.ToString().ToLowerInvariant()}  {n.Name}\n");
+                sb.Append($"\n## Kept functions that never ran ({cold.NeverRan.Count}), in files the coverage covers\n");
+                foreach (var n in cold.NeverRan)
+                    sb.Append($"{n.FilePath}:{n.Span}  {n.Name}\n");
+                coldText = sb.ToString();
+            }
+            Mark("coldPaths");
+        }
+
         CarvePlan PlanFor(int kind)
         {
             if (!closeOverEmit) return plan;
@@ -3854,6 +3932,7 @@ public static class CarveCommand
             summary["watchdog.reports"] = _watchdogReports;
             MemoryKeys(summary);
             summary["exitCode"] = verifyFailed ? 3 : 0;
+            if (coldText is not null) WriteArtifact(Path.Combine(ccDir, "cold-paths.txt"), coldText, "cold");
             WriteArtifact(Path.Combine(ccDir, "summary.txt"),
                 "# CodeCarver summary — numbers only: no path, file name or symbol. Safe to send back.\n"
                 + string.Concat(summary.Select(kv => $"{kv.Key} = {Fmt(kv.Value)}\n")), "summary");
