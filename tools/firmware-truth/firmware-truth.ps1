@@ -147,10 +147,15 @@ foreach ($cc in $Compilers) {
         if ($RequireCompilers) { Fail "compiler $cc not found" } else { Write-Host "skip  $cc (not found)" }
         continue
     }
-    $bad = 0
+    $bad = 0; $units = 0
     foreach ($e in $entries) {
+        # Plain assembly has no C to check (clang -Werror rejects the unused input); the function carve below assembles it.
+        if ($e.file -cmatch '\.(s|asm)$') { continue }   # -cmatch: a .S is preprocessed and checked
+        $units++
         $a = @($e.arguments | Select-Object -Skip 1 | ForEach-Object { $_.Replace($root, $carved) })
         $a = @($a | Where-Object { $_ -ne '-c' }) + @('-Wall', '-Werror', '-fsyntax-only')
+        # The host gcc targets only itself: the corpus's ARM target flags don't change what a syntax check reads.
+        if ($cc -eq 'gcc') { $a = @($a | Where-Object { $_ -notmatch '^(--target=|-mcpu=|-mfpu=|-mfloat-abi=|-mthumb$|-marm$)' }) }
         # Windows PowerShell (and 7.x before Standard argument passing) drops a quote inside an argument, so
         # -DFW_HDR="fw_cfg.h" reached the compiler as -DFW_HDR=fw_cfg.h; escape it the way the C runtime reads it.
         if ($PSVersionTable.PSVersion.Major -lt 7 -or $PSNativeCommandArgumentPassing -eq 'Legacy') {
@@ -165,8 +170,8 @@ foreach ($cc in $Compilers) {
             if ($bad -le 3) { Write-Host "  $cc $($e.file): $(($o | Select-Object -First 3) -join ' | ')" }
         }
     }
-    if ($bad) { Fail "$cc`: $bad of $($entries.Count) unit(s) do not compile against the carved tree" }
-    else { Write-Host "ok    $cc compiles all $($entries.Count) units" }
+    if ($bad) { Fail "$cc`: $bad of $units unit(s) do not compile against the carved tree" }
+    else { Write-Host "ok    $cc compiles all $units units" }
 }
 
 # Functions (a manifest with roots): carve each build from its entry points with nothing forced, source contents

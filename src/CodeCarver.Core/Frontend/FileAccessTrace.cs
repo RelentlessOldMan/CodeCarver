@@ -25,8 +25,9 @@ public static class FileAccessTrace
 {
     private static readonly Regex Quoted = new("\"((?:\\\\.|[^\"\\\\])*)\"", RegexOptions.Compiled);
     // strace -y: the path behind the returned descriptor, absolute — "= 3</abs/path>".
-    private static readonly Regex StraceFdPath = new(@"\) = \d+<(.+)>$", RegexOptions.Compiled);
-    private static readonly Regex StraceLine = new(@"^\s*(?:\[pid\s+\d+\]\s*|\d+\s+)?(?:\d[\d:.]*\s+)?\w+\(|resumed>", RegexOptions.Compiled);
+    // A split call may also end on its own line as a bare ")   = 3</abs/path>" (no "resumed" marker).
+    private static readonly Regex StraceFdPath = new(@"\)\s+= \d+<(.+)>$", RegexOptions.Compiled);
+    private static readonly Regex StraceLine = new(@"^\s*(?:\[pid\s+\d+\]\s*|\d+\s+)?(?:\d[\d:.]*\s+)?\w+\(|resumed>|^\s*\)\s+= ", RegexOptions.Compiled);
 
     public static IReadOnlyCollection<string> Paths(string text, Regex? pattern = null) =>
         string.IsNullOrEmpty(text) ? new HashSet<string>() : Paths(text.Split('\n'), pattern);

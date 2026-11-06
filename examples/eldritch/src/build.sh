@@ -4,7 +4,8 @@
 # SKIP_MISSING=1 skips listed files that are absent (a carve made without build inputs writes no placeholders).
 set -e
 S=$(cd "$1" && pwd); mkdir -p "$2"; O=$(cd "$2" && pwd); K=$(cd "$3" && pwd)
-CF="-O0 -w -I$S/include -I $K/include -I$S/include2 -iquote $S/quoted -isystem $S/sys -idirafter $S/after -include force.h -D VERBOSE_LEVEL=2 @$S/flags.rsp"
+# -std=gnu17: main.c calls K&R-declared functions with arguments, which C23 (gcc 15's default) rejects.
+CF="-std=gnu17 -O0 -w -I$S/include -I $K/include -I$S/include2 -iquote $S/quoted -isystem $S/sys -idirafter $S/after -include force.h -D VERBOSE_LEVEL=2 @$S/flags.rsp"
 # EXTRA_CFLAGS / EXTRA_LDFLAGS: the oracle builds an instrumented copy this way to record which functions run.
 CF="$CF${EXTRA_CFLAGS:+ $EXTRA_CFLAGS}"
 has() { [ -f "$S/$1" ] || [ -z "${SKIP_MISSING:-}" ]; }

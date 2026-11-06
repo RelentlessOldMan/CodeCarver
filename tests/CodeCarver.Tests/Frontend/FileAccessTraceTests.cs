@@ -37,6 +37,17 @@ public sealed class FileAccessTraceTests
     }
 
     [Fact]
+    public void Paths_Strace_CallFinishedOnABareLine_ReadsItsDescriptorPath()
+    {
+        // strace -f -y may end a split call on the next line with ")   = 3</path>" and no "resumed" marker.
+        var text = "472   openat(AT_FDCWD</o>, \"src/kq_q1.c\", O_RDONLY|O_NOCTTY <unfinished ...>\n"
+                 + ")                                       = 3</w/src/kq_q1.c>\n";
+        var paths = FileAccessTrace.Paths(text);
+        Assert.Contains("/w/src/kq_q1.c", paths);
+        Assert.DoesNotContain(paths, p => p.StartsWith(')'));
+    }
+
+    [Fact]
     public void Paths_Strace_Openat_ExtractsQuotedPath()
     {
         var text =

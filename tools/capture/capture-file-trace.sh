@@ -45,14 +45,25 @@ consolidate() {
   local raw="$1" out="$2"
   # Successful open/openat/openat2/creat: the path is the one strace -y prints behind the returned fd,
   # "= 3</abs/path>". This form also appears on "<... openat resumed>" lines, so a call split across
-  # unfinished/resumed lines is handled. Write-only and directory opens are not dependencies.
+  # unfinished/resumed lines is handled. strace may instead finish a split call on the next line with a bare
+  # ")   = 3</path>" (no "resumed" marker) when nothing was printed in between: joined() puts that line back on
+  # its call, or the open is lost. Write-only and directory opens are not dependencies.
   # execve: "execve("/usr/bin/x", ...) = 0" — the executed program.
   {
-    grep -E '(open|openat|openat2|creat)\(|(open|openat|openat2|creat) resumed>' "$raw" \
+    joined "$raw" | grep -E '(open|openat|openat2|creat)\(|(open|openat|openat2|creat) resumed>' \
       | grep -v -E 'O_WRONLY|O_DIRECTORY' \
       | sed -n -E 's/.*\) = [0-9]+<(.*)>$/\1/p'
-    grep -E 'execve\(' "$raw" | grep -E '\) = 0$' | sed -n -E 's/.*execve\("((\\.|[^"\\])*)".*/\1/p'
+    joined "$raw" | grep -E 'execve\(' | grep -E '\) = 0$' | sed -n -E 's/.*execve\("((\\.|[^"\\])*)".*/\1/p'
   } | decode | sed -e 's/ (deleted)$//' | LC_ALL=C sort -u > "$out"
+}
+
+# Join "call(... <unfinished ...>" and a following line that starts with ")" into one line.
+joined() {
+  awk '{ if (held != "" && $0 ~ /^[ \t]*\)/) { sub(/^[ \t]*\)[ \t]*/, ") "); print held $0; held = ""; next }
+         if (held != "") { print held; held = "" }
+         if ($0 ~ / <unfinished \.\.\.>$/) { held = substr($0, 1, length($0) - 17); next }
+         print }
+       END { if (held != "") print held }' "$1"
 }
 
 # strace escapes non-ASCII and special bytes: caf\303\251.c, \", \\ . Decode them back to the real bytes.
