@@ -147,12 +147,9 @@ foreach ($cc in $Compilers) {
         if ($RequireCompilers) { Fail "compiler $cc not found" } else { Write-Host "skip  $cc (not found)" }
         continue
     }
-    $bad = 0; $units = 0
-    foreach ($e in $entries) {
-        # Plain assembly has no C to check (clang -Werror rejects the unused input); the function carve below assembles it.
-        if ($e.file -cmatch '\.(s|asm)$') { continue }   # -cmatch: a .S is preprocessed and checked
-        $units++
-        $a = @($e.arguments | Select-Object -Skip 1 | ForEach-Object { $_.Replace($root, $carved) })
+    $bad = 0; $units = 0; $hostCant = 0
+    function Check-Unit($e, $tree) {
+        $a = @($e.arguments | Select-Object -Skip 1 | ForEach-Object { $_.Replace($root, $tree) })
         $a = @($a | Where-Object { $_ -ne '-c' }) + @('-Wall', '-Werror', '-fsyntax-only')
         # The host gcc targets only itself: the corpus's ARM target flags don't change what a syntax check reads.
         if ($cc -eq 'gcc') { $a = @($a | Where-Object { $_ -notmatch '^(--target=|-mcpu=|-mfpu=|-mfloat-abi=|-mthumb$|-marm$)' }) }
@@ -164,14 +161,26 @@ foreach ($cc in $Compilers) {
         # Under Stop, Windows PowerShell turns the compiler's first stderr line into a terminating error.
         $ErrorActionPreference = 'Continue'
         $o = & $cc @a 2>&1
+        $ok = $LASTEXITCODE -eq 0
         $ErrorActionPreference = 'Stop'
-        if ($LASTEXITCODE -ne 0) {
-            $bad++
-            if ($bad -le 3) { Write-Host "  $cc $($e.file): $(($o | Select-Object -First 3) -join ' | ')" }
-        }
+        return [pscustomobject]@{ Ok = $ok; Out = $o }
     }
-    if ($bad) { Fail "$cc`: $bad of $units unit(s) do not compile against the carved tree" }
-    else { Write-Host "ok    $cc compiles all $units units" }
+    foreach ($e in $entries) {
+        # Plain assembly has no C to check (clang -Werror rejects the unused input); the function carve below assembles it.
+        if ($e.file -cmatch '\.(s|asm)$') { continue }   # -cmatch: a .S is preprocessed and checked
+        $units++
+        $r = Check-Unit $e $carved
+        if ($r.Ok) { continue }
+        # A host compiler may not support what the target's does (MinGW gcc: no `retain`, no .pushsection): a unit
+        # that fails against the ORIGINAL tree too says nothing about the carve.
+        if (-not (Check-Unit $e $root).Ok) { $hostCant++; continue }
+        $bad++
+        if ($bad -le 3) { Write-Host "  $cc $($e.file): $(($r.Out | Select-Object -First 3) -join ' | ')" }
+    }
+    $note = if ($hostCant) { " ($hostCant more fail against the original tree too: not checked by this $cc)" } else { '' }
+    if ($bad) { Fail "$cc`: $bad of $units unit(s) do not compile against the carved tree$note" }
+    elseif ($hostCant -eq $units) { Fail "$cc`: no unit compiles against the original tree either" }
+    else { Write-Host "ok    $cc compiles all $($units - $hostCant) units it can$note" }
 }
 
 # Functions (a manifest with roots): carve each build from its entry points with nothing forced, source contents
