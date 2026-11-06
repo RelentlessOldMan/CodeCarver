@@ -95,6 +95,27 @@ public sealed class UsedMacrosExampleTests
         Assert.Contains("KQ_SPI_CTRL_OFF", Defines(kept.Carved("max", "inc/kq_regs.h")));
     }
 
+    /// <summary>Several logs: each is checked on its own, so the keys say which one links an object it never compiled
+    /// (a partial log), which the combined count can't.</summary>
+    [Fact]
+    public void SeveralLogs_EachSaysWhetherItIsWhole()
+    {
+        using var r = new Run("[builds.main]\nbuildLogs = [\"inputs/build.log\", \"inputs/partial.log\"]\nusedMacros = [\"inputs/du\"]\n", d =>
+        {
+            File.WriteAllText(Path.Combine(d, "src", "spare.c"), "unsigned kq_spare(void) { return 0; }\n");
+            var log = File.ReadAllText(Path.Combine(d, "inputs", "build.log"));
+            File.WriteAllText(Path.Combine(d, "inputs", "partial.log"),
+                log.Replace("/obj/dma.o\ngcc -E", "/obj/dma.o /build/used-macros/obj/spare.o\ngcc -E"));
+        });
+        Assert.True(r.Code == 0, r.Output);
+        var s = r.Summary("max");
+        Assert.Contains("buildLog.1.inputsNotFromLog = 0", s);
+        Assert.Contains("buildLog.2.inputsNotFromLog = 1", s);
+        Assert.Contains("buildLog.2.links = 1", s);
+        Assert.Contains("link.logsNotWhole = 1", s);
+        Assert.Contains("build log 2 ('", r.Output);
+    }
+
     /// <summary>Another chip's variant of a compiled function: kept, since the carve resolves the call by name, but the
     /// build compiles the other one, so the stage still carves from the names and drops what only the variant uses.</summary>
     [Fact]

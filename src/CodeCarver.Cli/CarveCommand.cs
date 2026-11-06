@@ -667,10 +667,12 @@ public static class CarveCommand
             },
         };
         var linkSteps = new List<BuildLogScraper.ToolStep>();   // the logs' link and archive commands
+        var perLog = new List<(string Log, List<CompileCommand> Cmds, List<BuildLogScraper.ToolStep> Steps)>();   // each log on its own, to tell which is partial
         foreach (var bl in buildLogs.Distinct())
         {
             var logText = CodeCarver.Core.Util.IoMeter.ReadAllText(bl);
             var cmds = BuildLogScraper.Parse(logText, scrape);
+            var stepStart = linkSteps.Count;
             linkSteps.AddRange(BuildLogScraper.ParseToolSteps(logText, scrape).Select(t => cv.PathMap.Count == 0 ? t : t with
             {
                 Directory = MapPath(t.Directory),
@@ -694,6 +696,7 @@ public static class CarveCommand
                 ForcedIncludes = c.ForcedIncludes.Select(MapPath).ToList(),
                 AlternativeDirectories = c.AlternativeDirectories.Select(MapPath).ToList(),
             }));
+            perLog.Add((bl, buildCmds.GetRange(buildCmds.Count - cmds.Count, cmds.Count), linkSteps.GetRange(stepStart, linkSteps.Count - stepStart)));
         }
         // make -j: a command printed while several sub-makes were in progress may have run in any of their
         // directories. Keep the ones where its file exists; when that is more than one, each copy gets the command
@@ -2641,6 +2644,27 @@ public static class CarveCommand
             summary["link.coversTheImages"] = links.CoversTheImages ? 1 : 0;
             summary["link.archivesNotFromLog"] = links.ArchivesNotFromLog;
             summary["link.unresolvedLibraries"] = links.UnresolvedLibraries;
+            // Each log on its own: an incremental or partial log links objects no compile in it wrote. Several logs
+            // summed can't say which one, and a small build is no evidence either way, so this is the per-log check.
+            if (perLog.Count > 1)
+            {
+                var notWhole = 0;
+                for (var i = 0; i < perLog.Count; i++)
+                {
+                    var (log, cmds, steps) = perLog[i];
+                    var one = new LinkModel(cmds, steps, d => Path.IsPathFullyQualified(d) ? d : Path.Combine(dir, d), CmdRel, dir);
+                    summary[$"buildLog.{i + 1}.commands"] = cmds.Count;
+                    summary[$"buildLog.{i + 1}.links"] = one.Links;
+                    summary[$"buildLog.{i + 1}.inputsNotFromLog"] = one.InputsNotFromLog;
+                    if (one.InputsNotFromLog > 0)
+                    {
+                        notWhole++;
+                        err.WriteLine($"  build   : WARNING - build log {i + 1} ('{log}'): its links take {one.InputsNotFromLog:N0} object(s) or archive(s) "
+                            + "no compile in it wrote. Likely an incremental or partial log (or one that links another build's output): capture a clean, full build.");
+                    }
+                }
+                summary["link.logsNotWhole"] = notWhole;
+            }
             bool Held(Root r) => graph.GetNode(r.Node).FilePath is { } f && links.StatusOf(f) == LinkStatus.ArchiveOnly;
             foreach (var r in implicitRoots.Concat(sectionRoots).Where(Held))
             {

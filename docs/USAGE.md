@@ -110,6 +110,12 @@ Every carve is sound with just `entryPoints`. Each extra input lets it carve **t
 > objects is named after it (`a.o`, `a.obj`, `a.c.o`; of several files with that name, the ones whose directories
 > best match the object's), or, if one of those archives could hold it, when the image
 > uses it. The used macros ([USED-MACROS.md](USED-MACROS.md)) rely on it.
+>
+> With several logs, each is also checked on its own, in the order the config names them:
+> `buildLog.<n>.commands`, `buildLog.<n>.links` and `buildLog.<n>.inputsNotFromLog`, and a warning naming each log
+> whose links take objects or archives no compile in it wrote (`link.logsNotWhole` of them). Such a log is
+> incremental or partial, or links another log's output; the carve treats the logs together either way, so this
+> only says which log to capture again.
 
 ## The CLI
 
