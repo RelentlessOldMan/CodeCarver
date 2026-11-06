@@ -34,16 +34,14 @@ public sealed class ExternalIncludersTests
                 files.Add(f);
             }
             var lookup = new CodeCarver.Core.Util.FileLookup();
-            var sw = System.Diagnostics.Stopwatch.StartNew();
             var r = ExternalIncluders.Find(files, dirs, root, new[] { "pub/mod_api.h" }, _ => false, File.ReadLines, lookup);
-            sw.Stop();
             Assert.Equal(new[] { "pub/mod_api.h" }, r.Headers);
             Assert.Equal(3000 + 3000 + 1, r.FilesScanned);   // and the root header, followed for what it includes
             // Every directory is listed once, whatever the number of (dir, name) probes: 300 -I dirs and the pub/ each
             // could hold, 30 glue dirs, the root and its pub/. Probing each pair with File.Exists took 13 s here on
-            // Windows; this takes about 2 s (it reads all 6,000 files). The limit leaves room for a loaded test run.
+            // Windows; this takes about 2 s (it reads all 6,000 files). The count is the check: a time limit failed at
+            // random on a loaded CI runner.
             Assert.True(lookup.DirectoriesListed <= 2 * 301 + 30 + 2, $"listed {lookup.DirectoriesListed}");
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(8), $"took {sw.Elapsed}");
         }
         finally { try { Directory.Delete(work, true); } catch { } }
     }
