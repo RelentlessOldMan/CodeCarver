@@ -46,6 +46,22 @@ public static class CommandLineMacros
         return r;
     }
 
+    /// <summary>Every object-like value <paramref name="specs"/> give a name (<c>-DHDR=\"x.h\"</c> is HDR = <c>"x.h"</c>):
+    /// what a computed <c>#include HDR</c> may expand to. A name given different values keeps each.</summary>
+    public static Dictionary<string, List<string>> ValuesFromSpecs(IEnumerable<string> specs)
+    {
+        var r = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var s in specs)
+        {
+            var m = Spec.Match(s.Trim());
+            if (!m.Success || m.Groups["params"].Success) continue;
+            var body = m.Groups["body"].Value.Trim();
+            if (!r.TryGetValue(m.Groups["name"].Value, out var l)) r[m.Groups["name"].Value] = l = new();
+            if (!l.Contains(body)) l.Add(body);
+        }
+        return r;
+    }
+
     /// <summary>True when any of <paramref name="macros"/> is function-like.</summary>
     public static bool AnyFunctionLike(IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? macros)
         => macros is not null && macros.Values.Any(l => l.Any(v => v.Params is not null));

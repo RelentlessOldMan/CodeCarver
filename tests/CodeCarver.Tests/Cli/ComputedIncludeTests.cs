@@ -62,6 +62,57 @@ public class ComputedIncludeTests
         Assert.DoesNotContain("lib/unrelated.c", included);
     }
 
+    // A header named only by a -D string value (escaped in one command, bare in another): it was cut, and the build failed.
+    [Fact]
+    public void ComputedInclude_OfAHeaderNamedByADashDString_IsKept()
+    {
+        using var t = new TreeCarve()
+            .W("main.c", "#include KQ_BOARD_HDR\nint main(void){ return KQ_BOARD_ID; }\n")
+            .W("other.c", "int kq_other(void){ return 1; }\n")
+            .W("inc/kq_board_a.h", "#define KQ_BOARD_ID 7\n")
+            .W("inc/kq_board_b.h", "#define KQ_BOARD_OTHER 9\n");
+        t.Compile("main.c", $"-I{t.S("inc")} -DKQ_BOARD_HDR=\\\"kq_board_a.h\\\"");
+        t.Compile("other.c", $"-I{t.S("inc")} -DKQ_BOARD_HDR=\"kq_board_a.h\"");
+        var r = t.Carve();
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.True(t.Kept("inc/kq_board_a.h"), r.Out + r.Err);
+        Assert.False(t.Kept("inc/kq_board_b.h"), r.Out + r.Err);
+        Assert.Contains("includes.computedUnresolved = 0", t.Summary);
+    }
+
+    // A macro the carve sees no value for: the include may be any file, so it no longer drops the one the build opened.
+    [Fact]
+    public void ComputedInclude_ThatNamesNoHeader_KeepsWhatItMayBe_AndSaysSo()
+    {
+        using var t = new TreeCarve()
+            .W("main.c", "#include KQ_UNSEEN_HDR\nint main(void){ return 0; }\n")
+            .W("inc/needed.h", "#define KQ_NEEDED 1\n");
+        t.Compile("main.c");
+        var r = t.Carve();
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.True(t.Kept("inc/needed.h"), r.Out + r.Err);
+        Assert.Contains("includes.computedUnresolved = 1", t.Summary);
+        Assert.Contains("computed #include that names no header", r.Err);
+    }
+
+    // languages = ["c"] and the log compiles a .cpp: it is code, so the header only it includes stays.
+    [Fact]
+    public void ACompiledCpp_UnderLanguagesC_IsCarvedAsCode()
+    {
+        using var t = new TreeCarve()
+            .W("main.c", "int kq_util(void);\nint main(void){ return kq_util(); }\n")
+            .W("util.cpp", "#include \"only_cpp.h\"\nextern \"C\" int kq_util(void){ return KQ_ONLY; }\n")
+            .W("only_cpp.h", "#define KQ_ONLY 3\n");
+        t.Compile("main.c");
+        t.Compile("util.cpp");
+        var r = t.Carve();
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.True(t.Kept("util.cpp"), r.Out + r.Err);
+        Assert.True(t.Kept("only_cpp.h"), r.Out + r.Err);
+        Assert.Contains("languages.addedFromBuildLog = 1", t.Summary);
+        Assert.Contains("lang = cpp", t.Summary);
+    }
+
     [Theory]
     [InlineData("XSTR(IMPL_FILE)", "impl/engine.c")]
     [InlineData("HDR", "cfg/board.h")]

@@ -719,6 +719,33 @@ public static class CarveCommand
             }
             buildCmds = resolved;
         }
+        // A file the build compiles is code, whatever [common] languages says: under languages = ["c"] a compiled .cpp was
+        // infrastructure, its #includes never followed, and the headers only it used were cut from a carve that then
+        // didn't build. Add the C-family language each compiled file is in.
+        if (buildCmds.Count > 0 && cv.Languages.All(l => l is "c" or "cpp"))
+        {
+            static string? LangOf(string file) => Path.GetExtension(file) is ".C" ? "cpp" : Path.GetExtension(file).ToLowerInvariant() switch
+            {
+                ".c" => "c",
+                ".cpp" or ".cc" or ".cxx" => "cpp",
+                _ => null,
+            };
+            var added = buildCmds.Select(c => c.File).Distinct(StringComparer.Ordinal).Select(LangOf)
+                                 .Where(l => l is not null && !cv.Languages.Contains(l!)).GroupBy(l => l!).Select(g => (Lang: g.Key, Count: g.Count())).ToList();
+            foreach (var (l, n) in added)
+            {
+                cv.Languages.Add(l);
+                err.WriteLine($"  note    : the build log compiles {n:N0} {(l == "cpp" ? "C++" : "C")} file(s) and languages doesn't name \"{l}\": "
+                    + "carving them as code too (add it to [common] languages to silence this).");
+            }
+            summary["languages.addedFromBuildLog"] = added.Count;
+            if (added.Count > 0)
+            {
+                lang = cv.Languages.Contains("cpp") ? "cpp" : cv.Languages[0];
+                diag.Set("lang", lang);
+                summary["lang"] = lang;
+            }
+        }
         Mark("buildLogs");
         // Per-TU preprocessor config from the build log. A build can compile the SAME file in multiple configs;
         // unioning all TUs' -D and applying it globally would mark a macro "defined" for a file that was compiled
@@ -1109,6 +1136,8 @@ public static class CarveCommand
         // The build log and the build trace describe the same build: every in-root source the log compiled must show
         // up as opened in the trace. -1 = not checked (no log or no trace).
         var traceMissedCompiled = -1;
+        // The in-root files the traced builds opened, when the traces are whole: what a computed #include naming no header may be.
+        HashSet<string>? buildOpenedRels = null;
         if (closureLang && cv.EveryBuildTraced)
         {
             var rootF = CodeCarver.Core.Util.PathComparer.DirectoryPrefix(Path.GetFullPath(dir));
@@ -1177,6 +1206,7 @@ public static class CarveCommand
                         + "never opened (an incremental build: capture a clean, full one). Every file is read instead.");
                 }
             }
+            if (complete && traceMissedCompiled <= 0) buildOpenedRels = openedByBuild;
             if (cv.SkipFilesNotBuilt && complete && opened.Count > 0 && traceMissedCompiled <= 0)
             {
                 foreach (var glob in auxGlobs.Where(g => !BuildSupportEmitter.GlobEscapesRoot(g)))
@@ -1986,6 +2016,9 @@ public static class CarveCommand
         {
             tsfe.Log = err;
             if (commandLineMacros.Count > 0) tsfe.CommandLineMacros = commandLineMacros;
+            var commandLineValues = CodeCarver.Core.Preprocess.CommandLineMacros.ValuesFromSpecs(buildCmds.SelectMany(c => c.Defines));
+            if (commandLineValues.Count > 0) tsfe.CommandLineValues = commandLineValues;
+            tsfe.UnresolvedIncludeCandidates = buildOpenedRels;
             if (parseTimeoutMs is not null) tsfe.ParseBudgetMs = parseTimeoutMs.Value;
             if (maxSymbolsPerFile is not null) tsfe.PerFileSymbolBudget = maxSymbolsPerFile.Value;
             if (cv.SplitParseChars is long spc and > 0) tsfe.SplitMinChars = (int)spc;
@@ -2398,6 +2431,15 @@ public static class CarveCommand
         // verify uses this to say when a failure comes from such a file (cause useInUnparsedFile).
         var unparsedFiles = new HashSet<string>(skipParse, CodeCarver.Core.Util.PathComparer.Default);
         if (fe is TreeSitterFrontEnd tsUnparsed) unparsedFiles.UnionWith(tsUnparsed.UnparsedFiles);
+        if (fe is TreeSitterFrontEnd tsComputed)
+        {
+            var unresolved = tsComputed.UnresolvedComputedIncludes.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
+            summary["includes.computedUnresolved"] = unresolved.Count;
+            if (unresolved.Count > 0)
+                err.WriteLine($"  include : WARNING - {unresolved.Count:N0} file(s) have a computed #include that names no header with the macros the carve "
+                    + $"sees (from a forced include, the toolchain, or a flag the log doesn't show), e.g. {string.Join(", ", unresolved.Take(3))}. Each is taken to "
+                    + (buildOpenedRels is null ? "include every file (add a build trace to narrow it to what the build opened)." : "include every file the traced build opened."));
+        }
         foreach (var (k, v) in graph.Census()) summary[$"census.graph.{k}"] = v;
         // Nothing adds edges after this, so the de-duplication sets and the lists' spare room go before the step's live
         // memory is taken (census.graph.trimmed.* is the census after).

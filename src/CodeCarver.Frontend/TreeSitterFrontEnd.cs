@@ -145,6 +145,18 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <summary>The build's command-line macros that rename what a file defines (see <see cref="CommandLineMacros"/>).</summary>
     public IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? CommandLineMacros { get; set; }
 
+    /// <summary>Every object-like value the build's -D flags give a name (<c>-DHDR=\"x.h\"</c>), for computed includes.</summary>
+    public IReadOnlyDictionary<string, List<string>>? CommandLineValues { get; set; }
+
+    /// <summary>The files a computed #include that names no header may be: the ones the traced build opened (tree-relative),
+    /// or null for every file.</summary>
+    public IReadOnlySet<string>? UnresolvedIncludeCandidates { get; set; }
+
+    private readonly System.Collections.Concurrent.ConcurrentBag<string> _unresolvedIncludes = new();
+    /// <summary>Files with a computed #include whose operand expands to no header name with what the carve knows: each is
+    /// taken to include every candidate (<see cref="UnresolvedIncludeCandidates"/>).</summary>
+    public IReadOnlyCollection<string> UnresolvedComputedIncludes => _unresolvedIncludes;
+
     // `for (auto &x : range)`: a `:` (not `::`) inside the parentheses, with no `;`.
     private static readonly Regex RangeFor = new(@"\bfor\s*\((?:[^;()]|\([^;()]*\))*?(?<!:):(?!:)", RegexOptions.Compiled);
     // `auto [a, b] = p;`, `const auto &[k, v] : m`.
@@ -1467,17 +1479,53 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
                 : null;
             l.Add((ps, d.Groups["b"].Value));
         }
-        IReadOnlyList<(IReadOnlyList<string>? Params, string Body)>? Lookup(string n)
+        List<(IReadOnlyList<string>? Params, string Body)>? Defs(string n)
         {
-            if (local.TryGetValue(n, out var l)) return l;
-            if (CommandLineMacros is { } clm && clm.TryGetValue(n, out var c)) return c.Select(v => ((IReadOnlyList<string>?)v.Params, v.Body)).ToList();
+            if (local.TryGetValue(n, out var l)) return l.ToList();
+            var r = new List<(IReadOnlyList<string>? Params, string Body)>();
+            if (CommandLineMacros is { } clm && clm.TryGetValue(n, out var c)) r.AddRange(c.Select(v => ((IReadOnlyList<string>?)v.Params, v.Body)));
+            if (CommandLineValues is { } clv && clv.TryGetValue(n, out var vs))
+                foreach (var v in vs) if (!r.Any(x => x.Params is null && x.Body == v)) r.Add((null, v));
+            if (r.Count > 0) return r;
             return FunctionMacro(n)?.Select(f => ((IReadOnlyList<string>?)f.Params, f.Body)).ToList();
         }
-        var name = ComputedInclude.Expand(operand, Lookup, n => _objectMacros.Contains(n) || _funcLikeMacroNames.Contains(n));
-        if (string.IsNullOrWhiteSpace(name)) return new List<string>();
-        if (!name.Contains(ComputedInclude.Unknown) && ResolveInclude(includer, name, true, files) is { Count: > 0 } exact) return exact;
-        var pattern = ComputedInclude.PathPattern(name);
-        return files.Keys.Where(k => pattern.IsMatch(k)).ToList();
+        bool Unknown(string n) => _objectMacros.Contains(n) || _funcLikeMacroNames.Contains(n);
+
+        // A macro with several values (different -D across compiles) may be any of them: try each, and take every header
+        // they name. A value that names no header can't be what a compile that included it used, so it adds nothing.
+        var targets = new HashSet<string>(StringComparer.Ordinal);
+        var named = false;
+        var pending = new Queue<Dictionary<string, int>>();
+        pending.Enqueue(new Dictionary<string, int>(StringComparer.Ordinal));
+        for (var tries = 0; pending.Count > 0; tries++)
+        {
+            if (tries == 64) { named = false; break; }   // too many combinations to try: unresolved (sound)
+            var pick = pending.Dequeue();
+            string? open = null;
+            var name = ComputedInclude.Expand(operand, n =>
+            {
+                var d = Defs(n);
+                if (d is not { Count: > 1 }) return d;
+                if (pick.TryGetValue(n, out var k)) return new[] { d[k] };
+                open ??= n;
+                return new[] { d[0] };
+            }, Unknown);
+            if (open is not null)
+            {
+                for (var k = 0; k < Defs(open)!.Count; k++) pending.Enqueue(new Dictionary<string, int>(pick, StringComparer.Ordinal) { [open] = k });
+                continue;
+            }
+            if (string.IsNullOrWhiteSpace(name)) continue;
+            named = true;
+            if (!name.Contains(ComputedInclude.Unknown) && ResolveInclude(includer, name, true, files) is { Count: > 0 } exact) { targets.UnionWith(exact); continue; }
+            var pattern = ComputedInclude.PathPattern(name);
+            targets.UnionWith(files.Keys.Where(k => pattern.IsMatch(k)));
+        }
+        if (named) return targets.ToList();
+        // It names no header with what the carve knows (a macro from a forced include, the toolchain, a flag the log
+        // doesn't show): the file may be any the build could open. Dropping the include instead cut a header a build needed.
+        _unresolvedIncludes.Add(includer);
+        return UnresolvedIncludeCandidates is { } cands ? files.Keys.Where(cands.Contains).ToList() : files.Keys.ToList();
     }
 
     private List<string> ResolveInclude(string includer, string raw, bool quoted, Dictionary<string, NodeId> files)

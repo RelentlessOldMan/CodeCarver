@@ -473,6 +473,14 @@ runLineCoverage = ["cov.txt"]
   body is `alias(#arg)`), `#pragma weak a = b`, `_Pragma("weak a = b")` and asm `.set`/`.equ`. A call written
   `name(...)` where a function-like macro `name` is visible goes through the macro, not to a same-named function.
   See [`examples/eldritch`](../examples/eldritch/README.md) for all of these in one program.
+  A file a build log compiles is code even when `languages` doesn't name its language: with `languages = ["c"]`
+  and a log that compiles `.cpp` files, `cpp` is added (a note says so; key `languages.addedFromBuildLog`).
+  A computed `#include MACRO` follows the macro's value from the tree or from the logs' `-D` flags, including a
+  string value (`-DHDR=\"board.h\"`); when compiles give it different values, every header they name is kept.
+  If it names no header with what the carve sees (the macro comes from a forced include, the toolchain, or a
+  flag the log doesn't show), the file is taken to include every file the traced build opened, or every file
+  without a whole build trace, and a warning names it (key `includes.computedUnresolved`). It used to drop
+  the include, which could cut a header the build needed.
 - **C#** (`languages = ["csharp"]`): always **file-level** — a `.cs` file is kept or dropped whole;
   `carveSourceFileContents` is ignored with a note. The file set is closed over identifier and type
   references: a kept file that mentions a name keeps every type and method of that name. Files with top-level
