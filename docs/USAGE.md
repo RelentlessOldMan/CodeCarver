@@ -480,7 +480,13 @@ runLineCoverage = ["cov.txt"]
   If it names no header with what the carve sees (the macro comes from a forced include, the toolchain, or a
   flag the log doesn't show), the file is taken to include every file the traced build opened, or every file
   without a whole build trace, and a warning names it (key `includes.computedUnresolved`). It used to drop
-  the include, which could cut a header the build needed.
+  the include, which could cut a header the build needed. A bare file-name value (`-DHDR="board.h"` run through a
+  shell gives `HDR = board.h`) is also tried as `"board.h"`.
+  A macro that defines an object through a parenthesised declarator (`#define TABLE_START(n) const T (n)[] = {`)
+  credits `n` to the file that uses it, like any other defining macro.
+  A directory the carve would leave empty but a kept build file names (a makefile path such as
+  `$(SIDE_DIR)/../target/` walks through it) is written with an empty `.keep` file, so the path still resolves (key
+  `<stage>.dirsKeptForBuildFiles`).
 - **C#** (`languages = ["csharp"]`): always **file-level** — a `.cs` file is kept or dropped whole;
   `carveSourceFileContents` is ignored with a note. The file set is closed over identifier and type
   references: a kept file that mentions a name keeps every type and method of that name. Files with top-level

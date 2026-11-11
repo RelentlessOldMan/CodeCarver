@@ -4087,6 +4087,7 @@ public static class CarveCommand
         // opened by a build trace). Build files that list sources (a Makefile, a .vcxproj) still name it, so the carved
         // tree gets a stand-in that defines nothing: the unchanged build still finds every file it lists, and the
         // binary loses the code. Off with [advanced] placeholderFiles = false (then edit the build's file list).
+        (HashSet<string> Words, List<string> Texts)? buildFileWords = null;   // see BuildFileWords
         var tuExtsP = new[] { ".c", ".cc", ".cpp", ".cxx", ".c++" };
         var compiledTus = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (cv.PlaceholderFiles && closureLang)
@@ -4102,8 +4103,10 @@ public static class CarveCommand
                     && tuExtsP.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)))));
             compiledTus.RemoveWhere(r => !tuExtsP.Any(e => r.EndsWith(e, StringComparison.OrdinalIgnoreCase)));
         }
-        IEnumerable<string> NamedByBuildFiles(IEnumerable<string> candidates)
+        // The words the tree's build files spell (file names, stems, directory names) and their texts, read once.
+        (HashSet<string> Words, List<string> Texts) BuildFileWords()
         {
+            if (buildFileWords is { } done) return done;
             var words = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var texts = new List<string>();
             foreach (var (_, p) in buildScripts)
@@ -4118,6 +4121,26 @@ public static class CarveCommand
                     if (dot > 0) words.Add(w[..dot]);
                 }
             }
+            buildFileWords = (words, texts);
+            return (words, texts);
+        }
+        // Directories the carve emptied that a build file names (VAR := $(SIDE)/../target/ walks through SIDE): a path
+        // through a missing directory doesn't resolve, so make stopped before any compile. Each comes back with a .keep
+        // file (so a repo keeps it too).
+        List<string> DirsNamedByBuildFiles(CarvePlan p, string stageDir)
+        {
+            if (buildScripts.Count == 0) return new();
+            var dirs = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var rel in p.DroppedFiles)
+                for (var d = Path.GetDirectoryName(rel); !string.IsNullOrEmpty(d); d = Path.GetDirectoryName(d))
+                    if (!dirs.Add(d)) break;
+            var words = BuildFileWords().Words;
+            return dirs.Where(d => !Directory.Exists(Path.Combine(stageDir, d)) && words.Contains(Path.GetFileName(d)))
+                       .OrderBy(d => d, StringComparer.Ordinal).ToList();
+        }
+        IEnumerable<string> NamedByBuildFiles(IEnumerable<string> candidates)
+        {
+            var (words, texts) = BuildFileWords();
             foreach (var rel in candidates)
             {
                 var name = Path.GetFileName(rel);
@@ -4441,6 +4464,15 @@ public static class CarveCommand
             if (placeholders.Count > 0)
                 @out.WriteLine($"  placeholders: {placeholders.Count:N0} dropped file(s) the build compiled written as stand-ins (build files that list them keep working)");
             summary[$"{summaryStage}.placeholderFiles"] = placeholders.Count;
+            var keptDirs = DirsNamedByBuildFiles(splan, stageDir);
+            foreach (var d in keptDirs)
+            {
+                Directory.CreateDirectory(Path.Combine(stageDir, d));
+                File.WriteAllText(Path.Combine(stageDir, d, ".keep"), "");
+            }
+            if (keptDirs.Count > 0)
+                @out.WriteLine($"  dirs    : {keptDirs.Count:N0} emptied director(ies) a build file names kept (with a .keep file), e.g. {string.Join(", ", keptDirs.Take(3))}");
+            summary[$"{summaryStage}.dirsKeptForBuildFiles"] = keptDirs.Count;
 
             Step("placeholders");
             // After the infrastructure copy: assembly, linker scripts and other text files seed what the header

@@ -58,9 +58,14 @@ public static class CommandLineMacros
             var body = m.Groups["body"].Value.Trim();
             if (!r.TryGetValue(m.Groups["name"].Value, out var l)) r[m.Groups["name"].Value] = l = new();
             if (!l.Contains(body)) l.Add(body);
+            // -DHDR="x.h" in a shell-run log reaches the compiler as HDR = x.h, which #include can't use, so the log's
+            // writer most likely meant "x.h" (a build-system quoting layer the log doesn't show): try that too.
+            if (BareFileName.IsMatch(body) && !l.Contains('"' + body + '"')) l.Add('"' + body + '"');
         }
         return r;
     }
+
+    static readonly Regex BareFileName = new(@"^[\w./\\-]*\.\w+$", RegexOptions.Compiled);
 
     /// <summary>True when any of <paramref name="macros"/> is function-like.</summary>
     public static bool AnyFunctionLike(IReadOnlyDictionary<string, List<(List<string>? Params, string Body)>>? macros)

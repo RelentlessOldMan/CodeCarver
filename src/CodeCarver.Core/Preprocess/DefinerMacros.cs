@@ -154,6 +154,15 @@ public static class DefinerMacros
                 var next = end + 1 < toks.Count ? toks[end + 1] : null;
                 var declPrev = prev == "*" || (prev is not null && IsIdent(prev) && !NotDeclaratorPrefix.Contains(prev));
                 var declNext = next is null || DeclaratorFollow.Contains(next) || IsIdent(next);
+                // A parenthesised declarator, `T (n)[] = {`: an array or initialised object, not a call `f(n)` (a call is
+                // not followed by '[' or '=').
+                if (prev == "(" && next == ")" && i >= 2 && end + 2 < toks.Count && toks[end + 2] is "[" or "="
+                    && (toks[i - 2] == "*" || (IsIdent(toks[i - 2]) && !NotDeclaratorPrefix.Contains(toks[i - 2]) && !ps.Contains(toks[i - 2]))))
+                {
+                    AddT(name, new Template(param, pre, suf, false));
+                    i = end;
+                    continue;
+                }
                 if (declPrev && declNext)
                 {
                     // `name(...)` is a function only when a body follows: in the macro (`{` after the ')'), or at the

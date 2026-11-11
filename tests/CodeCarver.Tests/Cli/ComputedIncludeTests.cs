@@ -80,6 +80,25 @@ public class ComputedIncludeTests
         Assert.Contains("includes.computedUnresolved = 0", t.Summary);
     }
 
+    // From a kept header, with the value bare after the shell took the quotes: the header and what only it includes stay.
+    [Fact]
+    public void ComputedInclude_FromAHeader_OfABareDashDValue_KeepsTheHeadersChain()
+    {
+        using var t = new TreeCarve()
+            .W("main.c", "#include \"kq_glue.h\"\nint main(void){ return KQ_INNER_ID; }\n")
+            .W("inc/kq_glue.h", "#include KQ_BOARD_HDR2\n")
+            .W("inc/kq_board_c.h", "#include \"kq_inner.h\"\n")
+            .W("inc/kq_inner.h", "#define KQ_INNER_ID 5\n")
+            .W("inc/kq_spare.h", "#define KQ_SPARE 1\n");
+        t.Compile("main.c", $"-I{t.S("inc")} -DKQ_BOARD_HDR2=\"kq_board_c.h\"");
+        var r = t.Carve();
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.True(t.Kept("inc/kq_board_c.h"), r.Out + r.Err);
+        Assert.True(t.Kept("inc/kq_inner.h"), r.Out + r.Err);
+        Assert.False(t.Kept("inc/kq_spare.h"), r.Out + r.Err);
+        Assert.Contains("includes.computedUnresolved = 0", t.Summary);
+    }
+
     // A macro the carve sees no value for: the include may be any file, so it no longer drops the one the build opened.
     [Fact]
     public void ComputedInclude_ThatNamesNoHeader_KeepsWhatItMayBe_AndSaysSo()
