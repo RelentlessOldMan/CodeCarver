@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 0   # full history so the build's 1.0.<commit-count> version stamp is accurate
+          fetch-depth: 0   # full history so the build's <year>.<month>.<day>.<n> version stamp counts the whole day
 
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
@@ -30,6 +30,15 @@ jobs:
 
       - name: Build
         run: dotnet build CodeCarver.sln -c Release
+
+      # The version stamp is made by git calls in Directory.Build.targets, escaped per OS: a stamp that fell back to
+      # the csproj default (1.0.0) or lost its day count would ship unnoticed.
+      - name: Version stamp
+        shell: bash
+        run: |
+          v=$(dotnet src/CodeCarver.Cli/bin/Release/net8.0/codecarver.dll version)
+          echo "$v"
+          echo "$v" | grep -qE '^CodeCarver 20[0-9]{2}[.][0-9]{1,2}[.][0-9]{1,2}[.][0-9]+[+][0-9a-f]{9}$'
 
       # Fast suite. The BuildVerify namespace compiles carved output with pinned toolchains that are not
       # committed, so it runs locally, not here; its compiler-free halves live in
@@ -102,7 +111,7 @@ jobs:
           ./tools/firmware-truth/firmware-truth.ps1 -Work "$env:RUNNER_TEMP/t2" -Exe src/CodeCarver.Cli/bin/Release/net8.0/codecarver.exe -RequireCompilers
           exit $LASTEXITCODE
 
-  # Every green push to main publishes its zip as GitHub Release v1.0.<commit-count>, the same number the
+  # Every green push to main publishes its zip as GitHub Release v<year>.<month>.<day>.<n>, the same number the
   # build stamps into `codecarver version`. Packaging is release.ps1, exactly as run locally; the tests already
   # passed in the jobs above, so it skips its own test gate.
   release:
@@ -115,7 +124,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          fetch-depth: 0   # the version is the commit count
+          fetch-depth: 0   # the version counts the day's commits
 
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
@@ -127,7 +136,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = "1.0.$(git rev-list --count HEAD)"
+          # As Directory.Build.targets: HEAD's commit day, and how many commits that day its history holds.
+          $dates = @(git log --format=%cd --date=format:%Y-%m-%d HEAD)
+          $day = $dates[0].Split('-')
+          $version = "$([int]$day[0]).$([int]$day[1]).$([int]$day[2]).$(@($dates | Where-Object { $_ -eq $dates[0] }).Count)"
           # A re-run of an already released commit is a no-op, not a failure.
           # (Not `gh release view`: its not-found message on stderr is a terminating error under PowerShell 5.1.)
           $tags = gh release list --limit 1000 --json tagName -q '.[].tagName'
@@ -136,6 +148,9 @@ jobs:
           if (-not $?) { throw "release.ps1 failed" }
           # Run the shipped self-check from the unpacked zip, so a release is only cut if the zip itself passes it.
           Expand-Archive "dist/codecarver-$version.zip" "dist/check"
+          # The tag and the stamp are worked out in two places: release only when they agree.
+          $built = (dotnet dist/check/codecarver.dll version | Out-String).Trim()
+          if (-not $built.StartsWith("CodeCarver $version+")) { throw "built '$built' is not tag v$version" }
           powershell -NoProfile -ExecutionPolicy Bypass -File dist/check/tools/selfcheck/selfcheck.ps1
           if ($LASTEXITCODE -ne 0) { throw "self-check failed" }
           $short = (git rev-parse --short=7 HEAD).Trim()

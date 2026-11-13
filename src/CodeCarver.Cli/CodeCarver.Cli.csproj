@@ -18,8 +18,8 @@
     <Product>CodeCarver</Product>
     <!-- The command every doc uses: codecarver(.exe) / codecarver.dll. -->
     <AssemblyName>codecarver</AssemblyName>
-    <!-- Fallback only (no git): the real version is 1.0.<commit-count> set by StampGitSha below, so the
-         patch number bumps by one on every commit/push (like CodeCompass 1.0.NNN). -->
+    <!-- Fallback only (no git): the real version is <year>.<month>.<day>.<n> set by StampGitSha, n bumping on
+         every commit that day. -->
     <Version>1.0.0</Version>
     <!-- A run scans thousands of files on every core and allocates as it goes: with the default (workstation) GC the
          threads queue on collections, and the emitted-tree check took 4x longer. Server GC with DATAS (heaps sized to
@@ -38,7 +38,7 @@
     <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="7" />
   </ItemGroup>
 
-  <!-- The git version stamp (1.0.<count>+<sha>[-dirty]) is the StampGitSha target in Directory.Build.targets,
+  <!-- The git version stamp (<year>.<month>.<day>.<n>+<sha>[-dirty]) is the StampGitSha target in Directory.Build.targets,
        so Core and Frontend carry the same version as this CLI. -->
 
 </Project>

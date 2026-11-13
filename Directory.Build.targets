@@ -11,11 +11,18 @@
           ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="_GitSha" />
     </Exec>
-    <!-- Monotonic patch number = total commit count, so it increments on every commit/push (CodeCompass
-         style). Needs full history: a shallow CI clone would count 1 (CI sets fetch-depth: 0). -->
-    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; rev-list --count HEAD"
+    <!-- Date version <year>.<month>.<day>.<n>: the day HEAD was committed (in the committer's own time zone, as the
+         commit records it, so every machine computes the same day), and n = how many commits that day HEAD's history
+         holds, so it starts at 1 and bumps on every commit that day. The ci.yml release job computes the same.
+         Needs full history: a shallow CI clone would count 1 (CI sets fetch-depth: 0). cmd reads % as a variable
+         marker, so Windows doubles it; %25 is MSBuild's escape for a literal %. -->
+    <PropertyGroup>
+      <_GitDateFormat Condition="'$(OS)' == 'Windows_NT'">--format=%25%25cd --date=format:%25%25Y-%25%25m-%25%25d</_GitDateFormat>
+      <_GitDateFormat Condition="'$(OS)' != 'Windows_NT'">--format=%25cd --date=format:%25Y-%25m-%25d</_GitDateFormat>
+    </PropertyGroup>
+    <Exec Command="git -C &quot;$(MSBuildProjectDirectory)&quot; log $(_GitDateFormat) HEAD"
           ConsoleToMSBuild="true" ContinueOnError="true" StandardOutputImportance="low">
-      <Output TaskParameter="ConsoleOutput" PropertyName="_GitCount" />
+      <Output TaskParameter="ConsoleOutput" ItemName="_GitDates" />
     </Exec>
     <!-- The untracked-files=no flag: only TRACKED modifications mean "dirty". A plain porcelain status also
          lists untracked files (a scratch dir, build output), so it falsely stamped dirty on a clean
@@ -25,11 +32,19 @@
       <Output TaskParameter="ConsoleOutput" PropertyName="_GitDirty" />
     </Exec>
     <PropertyGroup>
+      <!-- git log lists newest first, so the first line is HEAD's day. -->
+      <_GitDateList>@(_GitDates)</_GitDateList>
+      <_GitHeadDate>$(_GitDateList.Split(';')[0])</_GitHeadDate>
+      <_GitDateOk>$([System.Text.RegularExpressions.Regex]::IsMatch('$(_GitHeadDate)', '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'))</_GitDateOk>
+    </PropertyGroup>
+    <ItemGroup Condition="'$(_GitDateOk)' == 'True'">
+      <_GitSameDay Include="@(_GitDates)" Condition="'%(Identity)' == '$(_GitHeadDate)'" />
+    </ItemGroup>
+    <PropertyGroup>
       <!-- Only well-formed values: when git fails, ConsoleOutput holds its ERROR text, which must not become the
            version ("1.0.fatal: ambiguous argument ..."; review SC-E1). -->
-      <_GitCountOk>$([System.Text.RegularExpressions.Regex]::IsMatch('$(_GitCount)', '^[0-9]+$'))</_GitCountOk>
       <_GitShaOk>$([System.Text.RegularExpressions.Regex]::IsMatch('$(_GitSha)', '^[0-9a-f]{7,40}$'))</_GitShaOk>
-      <Version Condition="'$(_GitCountOk)' == 'True'">1.0.$(_GitCount)</Version>
+      <Version Condition="'$(_GitDateOk)' == 'True'">$([System.Int32]::Parse($(_GitHeadDate.Substring(0,4)))).$([System.Int32]::Parse($(_GitHeadDate.Substring(5,2)))).$([System.Int32]::Parse($(_GitHeadDate.Substring(8,2)))).@(_GitSameDay->Count())</Version>
       <SourceRevisionId Condition="'$(_GitShaOk)' == 'True' and '$(_GitDirty)' == ''">$(_GitSha)</SourceRevisionId>
       <SourceRevisionId Condition="'$(_GitShaOk)' == 'True' and '$(_GitDirty)' != ''">$(_GitSha)-dirty</SourceRevisionId>
     </PropertyGroup>
