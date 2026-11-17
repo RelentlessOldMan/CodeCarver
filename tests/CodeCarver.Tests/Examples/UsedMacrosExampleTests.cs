@@ -116,6 +116,26 @@ public sealed class UsedMacrosExampleTests
         Assert.Contains("build log 2 ('", r.Output);
     }
 
+    /// <summary>A log whose links take an object no source in the tree is named for (shipped built, a vendor blob): not a
+    /// partial log, so it isn't counted as one or warned about.</summary>
+    [Fact]
+    public void ALogLinkingAPrebuiltObject_ReadsAsWhole()
+    {
+        using var r = new Run("[builds.main]\nbuildLogs = [\"inputs/build.log\", \"inputs/blob.log\"]\nusedMacros = [\"inputs/du\"]\n", d =>
+        {
+            var log = File.ReadAllText(Path.Combine(d, "inputs", "build.log"));
+            File.WriteAllText(Path.Combine(d, "inputs", "blob.log"),
+                log.Replace("/obj/dma.o\ngcc -E", "/obj/dma.o /build/used-macros/obj/kq_vendor_blob.o\ngcc -E"));
+        });
+        Assert.True(r.Code == 0, r.Output);
+        var s = r.Summary("max");
+        Assert.Contains("buildLog.2.inputsNotFromLog = 1", s);
+        Assert.Contains("buildLog.2.inputsWithSourceInTree = 0", s);
+        Assert.Contains("link.logsNotWhole = 0", s);
+        Assert.Contains("link.logsLinkingOnlyPrebuilt = 1", s);
+        Assert.DoesNotContain("WARNING - build log 2", r.Output);
+    }
+
     /// <summary>Another chip's variant of a compiled function: kept, since the carve resolves the call by name, but the
     /// build compiles the other one, so the stage still carves from the names and drops what only the variant uses.</summary>
     [Fact]

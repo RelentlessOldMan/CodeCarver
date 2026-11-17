@@ -49,6 +49,17 @@ public static class CarveCommand
     private static readonly System.Text.RegularExpressions.Regex Identifier =
         new(@"[A-Za-z_]\w*", System.Text.RegularExpressions.RegexOptions.Compiled);
 
+    // Sources a compile names its object for (foo.c -> foo.o / foo.c.o / foo.obj), for telling a shipped object from a
+    // skipped compile's.
+    private static readonly HashSet<string> SourceStemExts = new(StringComparer.OrdinalIgnoreCase)
+        { ".c", ".cc", ".cpp", ".cxx", ".c++", ".s", ".S", ".asm", ".m", ".mm" };
+    // foo.o, foo.c.o, foo.obj, foo.c.obj -> foo.
+    internal static string ObjectStem(string objectName)
+    {
+        var stem = Path.GetFileNameWithoutExtension(objectName);
+        return SourceStemExts.Contains(Path.GetExtension(stem)) ? Path.GetFileNameWithoutExtension(stem) : stem;
+    }
+
     public static int Run(string[] args, TextWriter @out, TextWriter err)
     {
         try { return RunCore(args, @out, err); }
@@ -2435,6 +2446,7 @@ public static class CarveCommand
         {
             var unresolved = tsComputed.UnresolvedComputedIncludes.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToList();
             summary["includes.computedUnresolved"] = unresolved.Count;
+            summary["includes.computedUnresolved.definedNowhere"] = tsComputed.UnresolvedComputedIncludesDefinedNowhere.Distinct(StringComparer.Ordinal).Count();
             if (unresolved.Count > 0)
                 err.WriteLine($"  include : WARNING - {unresolved.Count:N0} file(s) have a computed #include that names no header with the macros the carve "
                     + $"sees (from a forced include, the toolchain, or a flag the log doesn't show), e.g. {string.Join(", ", unresolved.Take(3))}. Each is taken to "
@@ -2690,7 +2702,19 @@ public static class CarveCommand
             // summed can't say which one, and a small build is no evidence either way, so this is the per-log check.
             if (perLog.Count > 1)
             {
-                var notWhole = 0;
+                // An object or archive member no source in the tree is named for can't be a compile the log skipped: it
+                // was shipped built (a vendor library, a prebuilt blob). One a source is named for may be.
+                var sourceStems = treeFiles.Where(f => SourceStemExts.Contains(Path.GetExtension(f)))
+                    .Select(f => Path.GetFileNameWithoutExtension(f)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var members = new Dictionary<string, List<string>?>(StringComparer.Ordinal);
+                bool MayBeSkippedCompile(string full)
+                {
+                    if (!Path.GetExtension(full).Equals(".a", StringComparison.OrdinalIgnoreCase) && !Path.GetExtension(full).Equals(".lib", StringComparison.OrdinalIgnoreCase))
+                        return sourceStems.Contains(ObjectStem(Path.GetFileName(full)));
+                    if (!members.TryGetValue(full, out var names)) members[full] = names = ArchiveMembers.Names(full);
+                    return names is null || names.Any(n => sourceStems.Contains(ObjectStem(n)));   // unreadable: may be
+                }
+                var notWhole = 0; var prebuiltOnly = 0;
                 for (var i = 0; i < perLog.Count; i++)
                 {
                     var (log, cmds, steps) = perLog[i];
@@ -2698,14 +2722,25 @@ public static class CarveCommand
                     summary[$"buildLog.{i + 1}.commands"] = cmds.Count;
                     summary[$"buildLog.{i + 1}.links"] = one.Links;
                     summary[$"buildLog.{i + 1}.inputsNotFromLog"] = one.InputsNotFromLog;
-                    if (one.InputsNotFromLog > 0)
+                    if (one.InputsNotFromLog <= 0) continue;
+                    var suspect = one.InputFilesNotFromLog.Count(MayBeSkippedCompile) + one.UnresolvedLibraries;
+                    summary[$"buildLog.{i + 1}.inputsWithSourceInTree"] = suspect;
+                    if (suspect > 0)
                     {
                         notWhole++;
-                        err.WriteLine($"  build   : WARNING - build log {i + 1} ('{log}'): its links take {one.InputsNotFromLog:N0} object(s) or archive(s) "
-                            + "no compile in it wrote. Likely an incremental or partial log (or one that links another build's output): capture a clean, full build.");
+                        err.WriteLine($"  build   : WARNING - build log {i + 1} ('{log}'): its links take {suspect:N0} object(s) or archive(s) "
+                            + "no compile in it wrote, named for a source in the tree. Likely an incremental or partial log (or one that links "
+                            + "another build's output): capture a clean, full build.");
+                    }
+                    else
+                    {
+                        prebuiltOnly++;
+                        @out.WriteLine($"  build   : build log {i + 1} ('{log}') links {one.InputsNotFromLog:N0} prebuilt object(s) or archive(s) "
+                            + "no source in the tree is named for (shipped built), so it reads as whole.");
                     }
                 }
                 summary["link.logsNotWhole"] = notWhole;
+                summary["link.logsLinkingOnlyPrebuilt"] = prebuiltOnly;
             }
             bool Held(Root r) => graph.GetNode(r.Node).FilePath is { } f && links.StatusOf(f) == LinkStatus.ArchiveOnly;
             foreach (var r in implicitRoots.Concat(sectionRoots).Where(Held))

@@ -42,6 +42,9 @@ public sealed class LinkModel
     public bool ArchiveMayHoldUncompiled => InputsNotFromLog < 0 || ArchivesNotFromLog > 0;
 
     readonly List<string> _objectsNotFromLog = new();
+    readonly List<string> _inputsNotFromLog = new();
+    /// <summary>The files counted in <see cref="InputsNotFromLog"/> (full paths; libraries found nowhere aren't files, so not here).</summary>
+    public IReadOnlyList<string> InputFilesNotFromLog => _inputsNotFromLog;
 
     /// <summary>Of <see cref="ArchivesNotFromLog"/>, <c>-l</c> libraries found nowhere though a <c>-L</c> directory is the build's.</summary>
     public int UnresolvedLibraries { get; private set; }
@@ -226,6 +229,7 @@ public sealed class LinkModel
             InputsNotFromLog = notFromLog.Count + libsNotFromLog;
             ArchivesNotFromLog = notFromLog.Count(f => HasExt(f, ArchiveExts)) + libsNotFromLog;
             _objectsNotFromLog.AddRange(notFromLog.Where(f => HasExt(f, ObjectExts)));
+            _inputsNotFromLog.AddRange(notFromLog);
         }
 
         foreach (var (full, rel) in sourceRel)

@@ -111,7 +111,32 @@ public class ComputedIncludeTests
         Assert.True(r.Code == 0, r.Out + r.Err);
         Assert.True(t.Kept("inc/needed.h"), r.Out + r.Err);
         Assert.Contains("includes.computedUnresolved = 1", t.Summary);
+        Assert.Contains("includes.computedUnresolved.definedNowhere = 1", t.Summary);
         Assert.Contains("computed #include that names no header", r.Err);
+    }
+
+
+    // A config header picks the register header per build in #if/#elif: each branch's header may be what a compile used,
+    // so all stay and the include is resolved; one no branch names goes.
+    [Fact]
+    public void ComputedInclude_OfAHeaderMacroTheTreeDefinesPerBranch_KeepsEachBranchsHeader()
+    {
+        using var t = new TreeCarve()
+            .W("inc/kq_cfg.h", "#if defined KQ_FOR_A\n#define KQ_REGS_HDR \"kq_regs_a.h\"\n#elif defined KQ_FOR_B\n"
+                             + "#define KQ_REGS_HDR \"kq_regs_b.h\"\n#else\n#define KQ_REGS_HDR <kq_regs_c.h>\n#endif\n")
+            .W("main.c", "#include \"kq_cfg.h\"\n#include KQ_REGS_HDR\nint main(void){ return KQ_REG_ID; }\n")
+            .W("inc/kq_regs_a.h", "#define KQ_REG_ID 1\n")
+            .W("inc/kq_regs_b.h", "#define KQ_REG_ID 2\n")
+            .W("inc/kq_regs_c.h", "#define KQ_REG_ID 3\n")
+            .W("inc/kq_spare.h", "#define KQ_SPARE 1\n");
+        t.Compile("main.c", $"-I{t.S("inc")} -DKQ_FOR_A");
+        var r = t.Carve();
+        Assert.True(r.Code == 0, r.Out + r.Err);
+        Assert.True(t.Kept("inc/kq_regs_a.h"), r.Out + r.Err);
+        Assert.True(t.Kept("inc/kq_regs_b.h"), r.Out + r.Err);
+        Assert.True(t.Kept("inc/kq_regs_c.h"), r.Out + r.Err);
+        Assert.False(t.Kept("inc/kq_spare.h"), r.Out + r.Err);
+        Assert.Contains("includes.computedUnresolved = 0", t.Summary);
     }
 
     // languages = ["c"] and the log compiles a .cpp: it is code, so the header only it includes stays.

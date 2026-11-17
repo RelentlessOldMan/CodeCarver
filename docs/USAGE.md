@@ -113,7 +113,10 @@ Every carve is sound with just `entryPoints`. Each extra input lets it carve **t
 >
 > With several logs, each is also checked on its own, in the order the config names them:
 > `buildLog.<n>.commands`, `buildLog.<n>.links` and `buildLog.<n>.inputsNotFromLog`, and a warning naming each log
-> whose links take objects or archives no compile in it wrote (`link.logsNotWhole` of them). Such a log is
+> whose links take objects or archives no compile in it wrote and that a source in the tree is named for
+> (`buildLog.<n>.inputsWithSourceInTree`; `link.logsNotWhole` of such logs). An object, or an archive whose members,
+> no source in the tree is named for was shipped built (a vendor library or blob): a log whose only such inputs are
+> these reads as whole, and a note says so (`link.logsLinkingOnlyPrebuilt`). A log of the first kind is
 > incremental or partial, or links another log's output; the carve treats the logs together either way, so this
 > only says which log to capture again.
 
@@ -477,9 +480,13 @@ runLineCoverage = ["cov.txt"]
   and a log that compiles `.cpp` files, `cpp` is added (a note says so; key `languages.addedFromBuildLog`).
   A computed `#include MACRO` follows the macro's value from the tree or from the logs' `-D` flags, including a
   string value (`-DHDR=\"board.h\"`); when compiles give it different values, every header they name is kept.
+  A header-name value the tree itself defines (`#define HDR "board_a.h"`, often one per `#if`/`#elif` branch of a
+  config header) counts too: every header its branches name is kept, since any may be what a compile took.
   If it names no header with what the carve sees (the macro comes from a forced include, the toolchain, or a
   flag the log doesn't show), the file is taken to include every file the traced build opened, or every file
-  without a whole build trace, and a warning names it (key `includes.computedUnresolved`). It used to drop
+  without a whole build trace, and a warning names it (key `includes.computedUnresolved`). Of those,
+  `includes.computedUnresolved.definedNowhere` counts the ones whose macro nothing in the tree or the logs defines
+  (a toolchain header's, or an include in a branch no compile takes). It used to drop
   the include, which could cut a header the build needed. A bare file-name value (`-DHDR="board.h"` run through a
   shell gives `HDR = board.h`) is also tried as `"board.h"`.
   A macro that defines an object through a parenthesised declarator (`#define TABLE_START(n) const T (n)[] = {`)

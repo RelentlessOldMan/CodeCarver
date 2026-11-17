@@ -156,6 +156,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     /// <summary>Files with a computed #include whose operand expands to no header name with what the carve knows: each is
     /// taken to include every candidate (<see cref="UnresolvedIncludeCandidates"/>).</summary>
     public IReadOnlyCollection<string> UnresolvedComputedIncludes => _unresolvedIncludes;
+    private readonly System.Collections.Concurrent.ConcurrentBag<string> _unresolvedNowhere = new();
+    /// <summary>Of <see cref="UnresolvedComputedIncludes"/>, those whose macro nothing the carve reads defines.</summary>
+    public IReadOnlyCollection<string> UnresolvedComputedIncludesDefinedNowhere => _unresolvedNowhere;
+    private static readonly Regex LeadingName = new(@"^[A-Za-z_]\w*", RegexOptions.Compiled);
 
     // `for (auto &x : range)`: a `:` (not `::`) inside the parentheses, with no `;`.
     private static readonly Regex RangeFor = new(@"\bfor\s*\((?:[^;()]|\([^;()]*\))*?(?<!:):(?!:)", RegexOptions.Compiled);
@@ -391,6 +395,12 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
     private readonly List<(NodeId File, string Macro, List<string> Names)> _wordInvocations = new();
     // Every function-like #define's "params) body" by name, at most 8 per name.
     private Dictionary<string, (bool FnLike, List<string> Bodies)> _macroBodies = new(StringComparer.Ordinal);
+    // Object-like macros the tree defines as a header name somewhere (`#define REG_HDR "kq_regs_a.h"`, often one per
+    // #if/#elif branch), with every object-like body the tree gives them, for computed includes. Null: more bodies than
+    // were kept (or ones from before the header body that were let go), so the name stays unresolved.
+    private readonly Dictionary<string, List<string>?> _headerNameMacros = new(StringComparer.Ordinal);
+    private const int HeaderNameMacroBodies = 32;
+    private static readonly Regex HeaderNameBody = new(@"^(?:""[^""\r\n]+""|<[^<>\r\n]+>)$", RegexOptions.Compiled);
     // How many #define lines the pre-pass found (to size the graph before the parse).
     private long _defineSites;
     // Each non-empty file's length in chars, from the macro pre-pass: picks the files the parse starts first.
@@ -574,6 +584,7 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         _forceKeepSet.Clear();
         _read = read;
         _macroNamedHeaders.Clear();
+        _headerNameMacros.Clear();
         _includeDirectives.Clear();
         _c99InlineFns.Clear();
         _renamedFrom.Clear();
@@ -1074,7 +1085,20 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             foreach (var (name, fn, body) in f.Defines)
             {
                 if (!bodies.TryGetValue(name, out var b)) bodies[name] = b = (fn, new List<string>());
+                var before = b.Bodies.Count;
                 if (b.Bodies.Count < 8) b.Bodies.Add(body);
+                if (fn) continue;
+                var value = SourceText.CodeOnly(body).Trim();
+                if (_headerNameMacros.TryGetValue(name, out var hv))
+                {
+                    if (hv is null || hv.Contains(value)) continue;
+                    if (hv.Count == HeaderNameMacroBodies) _headerNameMacros[name] = null;
+                    else hv.Add(value);
+                }
+                else if (HeaderNameBody.IsMatch(value))
+                    // The bodies before this one are those kept in `bodies`, unless it was already full: then some were let go.
+                    _headerNameMacros[name] = before >= 8 ? null
+                        : b.Bodies.Select(x => SourceText.CodeOnly(x).Trim()).Distinct(StringComparer.Ordinal).ToList();
             }
             foreach (var (name, flags) in f.EmptyDefines)
             {
@@ -1486,6 +1510,9 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
             if (CommandLineMacros is { } clm && clm.TryGetValue(n, out var c)) r.AddRange(c.Select(v => ((IReadOnlyList<string>?)v.Params, v.Body)));
             if (CommandLineValues is { } clv && clv.TryGetValue(n, out var vs))
                 foreach (var v in vs) if (!r.Any(x => x.Params is null && x.Body == v)) r.Add((null, v));
+            // The tree's own `#define NAME "header.h"` (every value it gives NAME, each #if branch's): all may be what a compile used.
+            if (_headerNameMacros.TryGetValue(n, out var hv) && hv is not null)
+                foreach (var v in hv) if (!r.Any(x => x.Params is null && x.Body == v)) r.Add((null, v));
             if (r.Count > 0) return r;
             return FunctionMacro(n)?.Select(f => ((IReadOnlyList<string>?)f.Params, f.Body)).ToList();
         }
@@ -1525,6 +1552,10 @@ public abstract class TreeSitterFrontEnd : ICarveFrontEnd
         // It names no header with what the carve knows (a macro from a forced include, the toolchain, a flag the log
         // doesn't show): the file may be any the build could open. Dropping the include instead cut a header a build needed.
         _unresolvedIncludes.Add(includer);
+        // A macro nothing the carve reads defines: the include is in a branch no compile takes, or the name comes from outside
+        // the tree (a toolchain header). Counted apart from macros the tree defines in a way not followed.
+        if (LeadingName.Match(operand) is { Success: true } lead && Defs(lead.Value) is null && !Unknown(lead.Value) && !_headerNameMacros.ContainsKey(lead.Value))
+            _unresolvedNowhere.Add(includer);
         return UnresolvedIncludeCandidates is { } cands ? files.Keys.Where(cands.Contains).ToList() : files.Keys.ToList();
     }
 
